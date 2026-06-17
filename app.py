@@ -129,6 +129,9 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/cookbook/setup",  # remote pacman/apt installs
     "/api/upload",          # large files
     "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
+    "/api/study/materials", # AI question extraction — chunked LLM calls, minutes on long PDFs
+    "/api/study/ai",        # AI card generation
+    "/api/study/questions", # attempt grading, hints, explanations — LLM-backed
 )
 
 
@@ -701,6 +704,10 @@ logger.info("Webhook & API token routes initialized")
 # Notes (Google Keep-style notes/todos)
 from routes.note_routes import setup_note_routes
 app.include_router(setup_note_routes(task_scheduler))
+
+# Study (FSRS flashcards, AI quiz/grading, exam plans, focus timer)
+from routes.study_routes import setup_study_routes
+app.include_router(setup_study_routes())
 
 # Email
 from routes.email_routes import setup_email_routes

@@ -130,6 +130,15 @@ DEFAULT_SETTINGS = {
     # Ordered fallback chain for the Utility model (summarization, naming,
     # tidy actions, etc.).
     "utility_model_fallbacks": [],
+    # Study module: model used for question extraction / grading / hints.
+    # Empty -> falls back to utility, then default chat model.
+    "study_endpoint_id": "",
+    "study_model": "",
+    # Optional: a separate model on the SAME study endpoint for text-only Study
+    # calls (extraction from text, discovery, grading, hints). Lets a vision
+    # model (e.g. Kimi) stay selected for image extraction while a faster text
+    # model (e.g. DeepSeek) handles everything text. Empty -> use study_model.
+    "study_text_model": "",
     "teacher_model": "",
     "teacher_enabled": False,
     # Skills: minimum self-reported confidence for an auto-written (LLM-authored)
@@ -246,6 +255,7 @@ _PER_USER_KEYS = {
     # got injected into the chat composer on first open.
     "default_endpoint_id", "default_model", "default_model_fallbacks",
     "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
+    "study_endpoint_id", "study_model", "study_text_model",
     "research_endpoint_id", "research_model",
 }
 

@@ -24,6 +24,7 @@ import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
+import studyModule from './js/study.js';
 import adminModule from './js/admin.js';
 import settingsModule from './js/settings.js';
 // Eagerly bind unified minimize/restore behavior across all tool modals.
@@ -912,6 +913,16 @@ function initializeEventListeners() {
     toolNotesBtn.addEventListener('click', () => {
       if (notesModule) {
         notesModule.togglePanel();
+      }
+    });
+  }
+
+  // Study tool button
+  const toolStudyBtn = el('tool-study-btn');
+  if (toolStudyBtn) {
+    toolStudyBtn.addEventListener('click', () => {
+      if (studyModule) {
+        studyModule.togglePanel();
       }
     });
   }
@@ -2409,6 +2420,7 @@ function initializeEventListeners() {
     'tool-library':        '#tool-library-btn',
     'tool-memory':         '#tool-memory-btn',
     'tool-notes':          '#tool-notes-btn',
+    'tool-study':          '#tool-study-btn',
     'tool-tasks':          '#tool-tasks-btn',
     'tool-theme':          '#tool-theme-btn',
     'user-bar':            '#user-bar-profile',
