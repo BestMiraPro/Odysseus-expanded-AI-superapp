@@ -852,6 +852,12 @@ function _renderMarkdownInto(el, md) {
   if (!el) return;
   try { el.innerHTML = mdToHtml(md || '', {}); }
   catch { el.textContent = md || ''; }
+  // Source-material links (page citations in notes / explain-further) open in a
+  // new browser tab at the file + #page anchor.
+  el.querySelectorAll('a[href*="/api/upload/"]').forEach(a => {
+    a.target = '_blank';
+    a.rel = 'noopener';
+  });
 }
 
 // Open an uploaded file inside the app (PDF/text/image render inline; other

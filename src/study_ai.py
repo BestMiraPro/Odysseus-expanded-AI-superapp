@@ -526,18 +526,19 @@ Use the learner's language for feedback/followup. No markdown, no commentary."""
 
 EXPLAIN_FURTHER_SYSTEM = """You give a student the theory they need to understand a practice question or flashcard, grounded in THEIR course material — and point them to where to review it.
 
-You receive the question/card (and its answer), the source material text, and the AI study notes. The material text is annotated with "[Page N text]:" markers.
+You receive the question/card (and its answer), the AI study notes, and the subject's materials. Each material is given under a "=== MATERIAL <id>: <name> ===" header; PDF text is annotated with "[Page N text]:" markers.
 
-Write a focused theoretical explanation: the concept(s), definition(s), and reasoning the answer rests on — enough to actually understand it, not just restate the answer. Stay faithful to the provided material; do not invent facts that aren't supported by it.
+Write a focused theoretical explanation: the concept(s), definition(s), and reasoning the answer rests on — enough to actually understand it, not just restate the answer. Stay faithful to the provided materials; do not invent facts they don't support.
 
-Then locate the theory:
-- "page": the 1-based page number in the material where this theory is presented (from the [Page N] markers); null if you can't tell.
+Then locate the theory ACROSS ALL the materials:
+- The theory usually lives in a DIFFERENT file from where the question came. Practice exams, problem sets and answer keys contain QUESTIONS, not theory — do not cite them as the theory source. Cite the lecture/theory material(s) that actually explain the concept.
+- The theory may span several materials; list every relevant location.
+- For each location give: "material_id" (the id from its header), "page" (1-based page from the [Page N] markers, or null if unknown), and a short "label" (e.g. the chapter/topic name).
 - "summary_section": the heading of the relevant section in the AI study notes (e.g. "Key concepts"); null if none applies.
-- "material_id": when several materials are provided each under a "=== MATERIAL <id>: <name> ===" header, the id of the one the theory comes from; null if a single material or unknown.
 
 Output ONLY a JSON object:
-{"explanation": "<markdown explanation>", "page": <int|null>, "summary_section": "<string|null>", "material_id": "<string|null>"}
-Use the language of the material. No prose outside the JSON."""
+{"explanation": "<markdown explanation>", "summary_section": "<string|null>", "locations": [{"material_id": "<id>", "page": <int|null>, "label": "<short label>"}]}
+"locations" may be empty if no material covers the theory. Use the language of the materials. No prose outside the JSON."""
 
 STUDY_NOTES_SYSTEM = """You write a study-notes document from course material (a chapter, lecture, or paper), for a student to consult while practising problems. Be faithful to the material — summarize and organize it, never invent content.
 

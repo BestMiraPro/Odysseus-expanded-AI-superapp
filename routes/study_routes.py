@@ -496,31 +496,77 @@ def _study_figures_dir(material_id: str) -> str:
     return os.path.join(UPLOAD_DIR, ".study_figures", os.path.basename(material_id))
 
 
-def _explain_further_markdown(value: Dict, *, file_id: Optional[str],
-                              material_name: Optional[str]) -> str:
+def _explain_further_markdown(value: Dict, by_id: Dict[str, Dict]) -> str:
     """Assemble the 'explain further' Markdown: the theory plus a 'Where to
-    review' footer linking to the source page and naming the notes section."""
+    review' footer linking to each cited theory location across the subject's
+    files (new browser tab, at the page when known) and the notes section.
+
+    `value` is the model reply: {explanation, summary_section, locations:[{material_id, page, label}]}.
+    `by_id` maps material_id -> {name, file_id}.
+    """
     explanation = str((value or {}).get("explanation") or "").strip()
     if not explanation:
         return ""
-    try:
-        page = int(value.get("page"))
-        page = page if page >= 1 else None
-    except (TypeError, ValueError):
-        page = None
     section = str((value or {}).get("summary_section") or "").strip()
 
+    locations = value.get("locations")
+    if not isinstance(locations, list):
+        locations = []
+    seen = set()
     bits = []
-    if file_id:
-        where = material_name or "the material"
+    for loc in locations:
+        if not isinstance(loc, dict):
+            continue
+        mat = by_id.get(str(loc.get("material_id") or ""))
+        if not mat or not mat.get("file_id"):
+            continue
+        try:
+            page = int(loc.get("page"))
+            page = page if page >= 1 else None
+        except (TypeError, ValueError):
+            page = None
+        key = (mat["file_id"], page)
+        if key in seen:
+            continue
+        seen.add(key)
+        label = str(loc.get("label") or "").strip() or mat.get("name") or "source"
         if page:
-            bits.append(f"**{where}** — [p.{page}](/api/upload/{file_id}?inline=1#page={page})")
-        else:
-            bits.append(f"**{where}** — [open](/api/upload/{file_id}?inline=1)")
+            label += f", p.{page}"
+        url = f"/api/upload/{mat['file_id']}?inline=1" + (f"#page={page}" if page else "")
+        # The frontend opens /api/upload links in a new tab (link post-processor).
+        bits.append(f"[{label}]({url})")
     if section:
         bits.append(f"study notes → *{section}*")
     footer = ("\n\n---\n*Where to review:* " + " · ".join(bits)) if bits else ""
     return explanation + footer
+
+
+def _deck_material_context(db, deck_id: str, user, *, char_budget: int = 90000):
+    """Gather a deck's materials for an explain-further search across files.
+
+    Returns (blocks, by_id): `blocks` is a list of
+    "=== MATERIAL <id>: <name> ===\\n<text>" strings (text carries the PDF
+    [Page N] markers), `by_id` maps id -> {name, file_id, summary}. Lets the
+    model find theory in whichever file holds it — not just the one a question
+    came from (practice exams have questions, not theory)."""
+    mq = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
+    if user is not None:
+        mq = mq.filter(StudyMaterial.owner == user)
+    mats = mq.order_by(StudyMaterial.created_at.asc()).all()
+    by_id = {m.id: {"name": m.name, "file_id": m.file_id, "summary": m.summary or ""}
+             for m in mats}
+    blocks, budget = [], char_budget
+    per = max(6000, char_budget // max(1, len(mats))) if mats else char_budget
+    for m in mats:
+        body = (m.content or "").strip()
+        if not body:
+            continue
+        chunk = f"=== MATERIAL {m.id}: {m.name} ===\n{body[:per]}"
+        blocks.append(chunk)
+        budget -= len(chunk)
+        if budget <= 0:
+            break
+    return blocks, by_id
 
 
 async def _build_figures_section(owner, material_id: str, file_id: str,
@@ -2320,36 +2366,35 @@ def setup_study_routes():
                 return {"explanation": row.deep_explanation, "cached": True}
             q_text, options = row.question, json.loads(row.options) if row.options else None
             reference = row.reference or ""
-            material_id = row.material_id
+            deck_id = row.deck_id
+            own_material_id = row.material_id
+            # Search the WHOLE subject — theory lives in the lecture files, not
+            # the practice exam this question was extracted from.
+            blocks, by_id = _deck_material_context(db, deck_id, user)
         finally:
             db.close()
-
-        material_text = summary = name = file_id = None
-        if material_id:
-            db = SessionLocal()
-            try:
-                m = db.query(StudyMaterial).filter(StudyMaterial.id == material_id).first()
-                if m and (user is None or m.owner == user):
-                    material_text, summary = m.content or "", m.summary or ""
-                    name, file_id = m.name, m.file_id
-            finally:
-                db.close()
 
         prompt_parts = [f"QUESTION:\n{q_text}"]
         if options:
             prompt_parts.append("OPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options)))
         if reference:
             prompt_parts.append(f"ANSWER / REFERENCE:\n{reference}")
-        if summary:
-            prompt_parts.append(f"--- AI STUDY NOTES ---\n{summary[:20000]}")
-        prompt_parts.append("--- MATERIAL ---\n" + ((material_text or
-                            "(no source material text available — explain from general theory)")[:90000]))
+        if own_material_id and own_material_id in by_id:
+            prompt_parts.append(f"(This question was extracted from MATERIAL "
+                                f"{own_material_id} — likely a practice exam, not the theory source.)")
+        notes_blocks = [f"### {by_id[mid]['name']}\n{by_id[mid]['summary'][:6000]}"
+                        for mid in by_id if by_id[mid].get("summary")]
+        if notes_blocks:
+            prompt_parts.append("--- AI STUDY NOTES (by chapter) ---\n"
+                                + "\n\n".join(notes_blocks)[:24000])
+        prompt_parts.append("--- SUBJECT MATERIALS ---\n" + ("\n\n".join(blocks)
+                            if blocks else "(no source materials available — explain from general theory)"))
         value = await _llm_json(user, EXPLAIN_FURTHER_SYSTEM, "\n\n".join(prompt_parts),
                                 temperature=0.3, max_tokens=8000, timeout=240,
                                 thinking_off=True)
         if not isinstance(value, dict):
             raise HTTPException(502, "The model reply was not usable. Try again.")
-        md = _explain_further_markdown(value, file_id=file_id, material_name=name)
+        md = _explain_further_markdown(value, by_id)
         if not md:
             raise HTTPException(502, "The model did not return an explanation. Try again.")
         db = SessionLocal()
@@ -2364,9 +2409,8 @@ def setup_study_routes():
     @router.post("/cards/{card_id}/explain-further")
     async def card_explain_further(request: Request, card_id: str,
                                    refresh: bool = False):
-        """Material-grounded theory for a flashcard. Cards have no material
-        link, so search the deck's materials and let the model pick the chapter
-        the theory comes from. Cached on the card; ?refresh=1 regenerates."""
+        """Material-grounded theory for a flashcard. Searches all of the deck's
+        materials (theory lives in the lecture files). Cached; ?refresh=1 regenerates."""
         user = _owner(request)
         db = SessionLocal()
         try:
@@ -2375,49 +2419,26 @@ def setup_study_routes():
                 return {"explanation": card.deep_explanation, "cached": True}
             front, back, notes = card.front, card.back, card.notes or ""
             deck_id = card.deck_id
-        finally:
-            db.close()
-
-        # Gather the deck's materials, each tagged with its id so the model can
-        # say which one the theory comes from; cap total size.
-        db = SessionLocal()
-        try:
-            mq = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
-            if user is not None:
-                mq = mq.filter(StudyMaterial.owner == user)
-            mats = mq.order_by(StudyMaterial.created_at.asc()).all()
-            by_id = {m.id: {"name": m.name, "file_id": m.file_id,
-                            "summary": m.summary or ""} for m in mats}
-            blocks, budget = [], 90000
-            for m in mats:
-                body = (m.content or "").strip()
-                if not body:
-                    continue
-                chunk = f"=== MATERIAL {m.id}: {m.name} ===\n{body[:20000]}"
-                blocks.append(chunk)
-                budget -= len(chunk)
-                if budget <= 0:
-                    break
+            blocks, by_id = _deck_material_context(db, deck_id, user)
         finally:
             db.close()
 
         prompt_parts = [f"FLASHCARD FRONT:\n{front}", f"FLASHCARD BACK (answer):\n{back}"]
         if notes:
             prompt_parts.append(f"CARD NOTES:\n{notes}")
-        if blocks:
-            prompt_parts.append("\n\n".join(blocks))
-        else:
-            prompt_parts.append("(no source materials available — explain from general theory)")
+        notes_blocks = [f"### {by_id[mid]['name']}\n{by_id[mid]['summary'][:6000]}"
+                        for mid in by_id if by_id[mid].get("summary")]
+        if notes_blocks:
+            prompt_parts.append("--- AI STUDY NOTES (by chapter) ---\n"
+                                + "\n\n".join(notes_blocks)[:24000])
+        prompt_parts.append("--- SUBJECT MATERIALS ---\n" + ("\n\n".join(blocks)
+                            if blocks else "(no source materials available — explain from general theory)"))
         value = await _llm_json(user, EXPLAIN_FURTHER_SYSTEM, "\n\n".join(prompt_parts),
                                 temperature=0.3, max_tokens=8000, timeout=240,
                                 thinking_off=True)
         if not isinstance(value, dict):
             raise HTTPException(502, "The model reply was not usable. Try again.")
-        chosen = by_id.get(str(value.get("material_id") or ""))
-        md = _explain_further_markdown(
-            value,
-            file_id=(chosen or {}).get("file_id"),
-            material_name=(chosen or {}).get("name"))
+        md = _explain_further_markdown(value, by_id)
         if not md:
             raise HTTPException(502, "The model did not return an explanation. Try again.")
         db = SessionLocal()
