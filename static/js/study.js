@@ -16,6 +16,7 @@
  */
 
 import * as Modals from './modalManager.js';
+import { mdToHtml } from './markdown.js';
 
 const API = window.location.origin;
 
@@ -214,6 +215,24 @@ function injectStyles() {
 .study-qchip.mcq { color: var(--accent, #5b8abf); }
 .study-qchip.open { color: var(--green, #4f9e60); }
 .study-qchip.hard { color: var(--red, #e05555); }
+/* file viewer */
+.study-viewer { position: fixed; inset: 4vh 5vw; z-index: 170; display: flex; flex-direction: column;
+  background: var(--panel, var(--bg)); border: 1px solid var(--border); border-radius: 12px;
+  overflow: hidden; box-shadow: 0 12px 48px rgba(0,0,0,0.5); }
+.study-viewer-head { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+  border-bottom: 1px solid var(--border); }
+.study-viewer-head b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.study-viewer iframe { flex: 1; width: 100%; border: 0; background: #fff; }
+.study-viewer-empty { flex: 1; display: flex; align-items: center; justify-content: center;
+  text-align: center; padding: 24px; opacity: 0.7; font-size: 13px; line-height: 1.6; }
+.study-viewer-body { flex: 1; overflow: auto; padding: 18px 24px; font-size: 13.5px; line-height: 1.6; }
+.study-viewer-body img { max-width: 100%; height: auto; border: 1px solid var(--border);
+  border-radius: 8px; margin: 8px 0; background: #fff; }
+.study-viewer-body h1 { font-size: 17px; margin: 4px 0 10px; }
+.study-viewer-body h2 { font-size: 15px; margin: 18px 0 8px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.study-viewer-body h3 { font-size: 13.5px; margin: 14px 0 6px; }
+.study-viewer-body ul, .study-viewer-body ol { padding-left: 22px; }
+.study-viewer-body em { opacity: 0.7; font-size: 12px; }
 /* plan */
 .study-plan-day { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-bottom: 8px; }
 .study-plan-day.today { border-color: var(--accent, #5b8abf); }
@@ -303,7 +322,13 @@ export function openPanel() {
   });
 
   _keyHandler = (e) => {
-    if (e.key === 'Escape') { closePanel(); return; }
+    if (e.key === 'Escape') {
+      // Close an open file viewer first, leaving the study pane open.
+      const v = (_pane || document).querySelector('#study-viewer');
+      if (v) { v.remove(); return; }
+      closePanel();
+      return;
+    }
     if (_tab === 'review') reviewKeydown(e);
   };
   document.addEventListener('keydown', _keyHandler);
@@ -593,6 +618,7 @@ function renderSubjectDetail() {
       <b style="font-size:14px;">${esc(s.deck.name)}</b>
       <span class="study-subtle">${s.questions.length} questions · ${s.cards.length} cards</span>
       <span style="flex:1;"></span>
+      <button class="study-btn small" id="study-subj-overview" title="An AI overview of the subject that ties the chapters together">Overview</button>
       <button class="study-btn small" id="study-subj-review" ${!s.cards.length ? 'disabled' : ''}>Review cards</button>
       <button class="study-btn small primary" id="study-subj-practice" ${!s.questions.length ? 'disabled' : ''}>Practice questions</button>
     </div>
@@ -637,6 +663,7 @@ function renderSubjectDetail() {
   el.querySelector('#study-subj-back').addEventListener('click', () => { S.subject = null; renderSubjects(); });
   el.querySelector('#study-subj-review').addEventListener('click', () => startReview(s.deck.id));
   el.querySelector('#study-subj-practice').addEventListener('click', () => startPractice(s.deck.id));
+  el.querySelector('#study-subj-overview').addEventListener('click', () => openSubjectOverview(s.deck.id, s.deck.name));
   el.querySelector('#study-deck-npd').addEventListener('change', async (e) => {
     try { await jput(`/api/study/decks/${s.deck.id}`, { new_per_day: parseInt(e.target.value || '0', 10) }); }
     catch (err) { toast(err.message, true); }
@@ -731,6 +758,130 @@ function renderSubjectDetail() {
   });
 }
 
+// Shared overlay shell (one viewer open at a time). `actionsHtml` goes in the
+// header before Close; `inner` is the body markup. Returns the overlay element.
+function _viewerShell(title, actionsHtml, inner) {
+  const root = _pane || document.body;
+  root.querySelector('#study-viewer')?.remove();
+  const v = document.createElement('div');
+  v.id = 'study-viewer';
+  v.className = 'study-viewer';
+  v.innerHTML = `
+    <div class="study-viewer-head">
+      <b class="grow">${esc(title || '')}</b>
+      ${actionsHtml || ''}
+      <button class="study-btn small" id="study-viewer-close">Close</button>
+    </div>
+    ${inner || ''}`;
+  root.appendChild(v);
+  v.querySelector('#study-viewer-close').addEventListener('click', () => v.remove());
+  return v;
+}
+
+function _renderMarkdownInto(el, md) {
+  if (!el) return;
+  try { el.innerHTML = mdToHtml(md || '', {}); }
+  catch { el.textContent = md || ''; }
+}
+
+// Open an uploaded file inside the app (PDF/text/image render inline; other
+// types offer a new-tab/download link). Reused by the practice Consult drawer.
+function openFileViewer(fileId, name) {
+  if (!fileId) return;
+  const url = `${API}/api/upload/${encodeURIComponent(fileId)}?inline=1`;
+  const ext = (String(name || '').split('.').pop() || '').toLowerCase();
+  const viewable = ['pdf', 'txt', 'md', 'csv', 'png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext);
+  _viewerShell(
+    name || 'File',
+    `<a class="study-btn small" href="${url}" target="_blank" rel="noopener">Open in new tab</a>`,
+    viewable
+      ? `<iframe src="${url}" title="${esc(name || 'File')}"></iframe>`
+      : `<div class="study-viewer-empty">This file type can’t be previewed inline.<br>Use “Open in new tab” to view or download it.</div>`);
+}
+
+// Generate-if-missing then show a Markdown doc (study notes / subject overview)
+// in the viewer, with a Regenerate action. `kind` is 'material' or 'deck'.
+async function _openMarkdownDoc({ title, getPath, postPath, field, confirmMsg, busyMsg }) {
+  let r;
+  try { r = await jget(getPath); }
+  catch (e) { toast(e.message, true); return; }
+  if (!r || !r[field]) {
+    if (!confirm(confirmMsg)) return;
+    toast(busyMsg);
+    try { r = await jpost(postPath, {}); }
+    catch (e) { toast(e.message, true); return; }
+    reloadSubject();
+  }
+  const v = _viewerShell(title,
+    `<button class="study-btn small" id="study-doc-regen">Regenerate</button>`,
+    `<div class="study-viewer-body" id="study-viewer-body"></div>`);
+  _renderMarkdownInto(v.querySelector('#study-viewer-body'), r[field]);
+  v.querySelector('#study-doc-regen').addEventListener('click', async () => {
+    toast(busyMsg);
+    try {
+      const rr = await jpost(postPath, {});
+      _renderMarkdownInto(v.querySelector('#study-viewer-body'), rr[field]);
+      reloadSubject();
+    } catch (e) { toast(e.message, true); }
+  });
+}
+
+function openMaterialNotes(materialId, name) {
+  return _openMarkdownDoc({
+    title: `${name} — study notes`,
+    getPath: `/api/study/materials/${materialId}/notes`,
+    postPath: `/api/study/materials/${materialId}/notes`,
+    field: 'summary',
+    confirmMsg: `No study notes for “${name}” yet. Generate them now? (uses the AI model — may take a minute)`,
+    busyMsg: 'Writing study notes… (this can take a minute)',
+  });
+}
+
+function openSubjectOverview(deckId, name) {
+  return _openMarkdownDoc({
+    title: `${name} — overview`,
+    getPath: `/api/study/decks/${deckId}/overview`,
+    postPath: `/api/study/decks/${deckId}/overview`,
+    field: 'overview',
+    confirmMsg: `No overview for “${name}” yet. Generate one now? (uses the AI model)`,
+    busyMsg: 'Writing subject overview…',
+  });
+}
+
+// Practice consult chooser: subject overview / chapter notes / original file.
+// When `penalize` (i.e. the answer isn't submitted yet), the first consult
+// flags the attempt so it counts like a hint — preserving retrieval effort.
+function openConsultMenu(q, penalize) {
+  const note = penalize
+    ? '<div class="study-viewer-empty" style="flex:0;padding:12px 24px 0;">Consulting now counts like a hint — this question will be scheduled sooner. Once you’ve answered, it’s free.</div>'
+    : '';
+  const inner = `${note}
+    <div class="study-viewer-body">
+      <p class="study-subtle" style="margin-top:0;">Open a resource to consult:</p>
+      <div class="study-form-row">
+        <button class="study-btn" data-consult="overview">Subject overview</button>
+        ${q.material_id ? '<button class="study-btn" data-consult="notes">Chapter notes</button>' : ''}
+        ${q.material_id ? '<button class="study-btn" data-consult="file">Original file</button>' : ''}
+      </div>
+    </div>`;
+  const v = _viewerShell('Consult', '', inner);
+  v.querySelectorAll('[data-consult]').forEach(b => b.addEventListener('click', async () => {
+    if (penalize) { S.practice.consulted = true; }
+    const what = b.dataset.consult;
+    if (what === 'overview') {
+      openSubjectOverview(q.deck_id, 'Subject');
+    } else if (what === 'notes') {
+      openMaterialNotes(q.material_id, q.topic || 'Chapter notes');
+    } else if (what === 'file') {
+      try {
+        const r = await jget(`/api/study/materials/${q.material_id}/notes`);
+        if (r.file_id) openFileViewer(r.file_id, r.name);
+        else toast('This material has no original file (pasted text).', true);
+      } catch (e) { toast(e.message, true); }
+    }
+  }));
+}
+
 function renderMaterialList() {
   const wrap = body()?.querySelector('#study-mat-list');
   const s = S.subject;
@@ -745,9 +896,12 @@ function renderMaterialList() {
         <span class="study-subtle"> · ${m.kind} · ${(m.char_count / 1000).toFixed(1)}k chars · ${m.question_count} questions extracted</span></span>
       ${s.extracting === m.id
         ? '<span class="study-subtle">Extracting… (vision can take a few minutes)</span>'
-        : `<button class="study-btn small primary" data-extract="${m.id}" title="Pull the actual questions out of a past paper / problem set">Extract questions</button>
+        : `${m.file_id ? `<button class="study-btn small" data-view="${m.id}" title="Open this file inside the app">View</button>` : ''}
+           <button class="study-btn small" data-notes="${m.id}" title="${m.has_summary ? 'View AI study notes for this material' : 'Generate AI study notes to consult while practising'}">${m.has_summary ? 'Notes' : 'Make notes'}</button>
+           <button class="study-btn small primary" data-extract="${m.id}" title="Pull the actual questions out of a past paper / problem set">Extract questions</button>
            ${m.kind === 'pdf' ? `<button class="study-btn small" data-vextract="${m.id}" title="Renders the PDF pages as images for a vision model — use for formula-heavy or scanned exams. Also runs automatically when text extraction finds nothing.">Extract (vision)</button>` : ''}
            <button class="study-btn small" data-author="${m.id}" title="Write new exam-style questions from notes">Author questions</button>
+           ${m.kind !== 'text' ? `<button class="study-btn small" data-reextract="${m.id}" title="Re-read the full file text. Older uploads were capped at 15k characters — use this to pick up the rest.">↻ text</button>` : ''}
            <button class="study-btn small danger" data-delmat="${m.id}">✕</button>`}
     </div>`).join('');
   wrap.onclick = async (e) => {
@@ -755,10 +909,34 @@ function renderMaterialList() {
     const vx = e.target.closest('[data-vextract]')?.dataset.vextract;
     const au = e.target.closest('[data-author]')?.dataset.author;
     const del = e.target.closest('[data-delmat]')?.dataset.delmat;
+    const rx = e.target.closest('[data-reextract]')?.dataset.reextract;
+    const vw = e.target.closest('[data-view]')?.dataset.view;
+    const nt = e.target.closest('[data-notes]')?.dataset.notes;
+    if (vw) {
+      const m = s.materials.find(x => x.id === vw);
+      if (m) openFileViewer(m.file_id, m.name);
+      return;
+    }
+    if (nt) {
+      const m = s.materials.find(x => x.id === nt);
+      if (m) openMaterialNotes(m.id, m.name);
+      return;
+    }
     if (del) {
       if (!confirm('Remove this material? (Extracted questions stay.)')) return;
       try { await jdel(`/api/study/materials/${del}`); reloadSubject(); }
       catch (err) { toast(err.message, true); }
+      return;
+    }
+    if (rx) {
+      try {
+        const r = await jpost(`/api/study/materials/${rx}/reextract-text`, {});
+        const grew = r.char_count > r.previous;
+        toast(grew
+          ? `Re-read full text: ${(r.char_count / 1000).toFixed(1)}k chars (was ${(r.previous / 1000).toFixed(1)}k)`
+          : `Text unchanged (${(r.char_count / 1000).toFixed(1)}k chars)`);
+        reloadSubject();
+      } catch (err) { toast(err.message, true); }
       return;
     }
     const id = ex || vx || au;
@@ -1051,6 +1229,7 @@ async function startPractice(deckId = null, limit = 12) {
   S.practice = { queue: [], idx: 0, deckId, loading: true,
                  phase: 'answer', confidence: null, choice: null,
                  hints: [], hintBusy: false, answerDraft: '', result: null,
+                 consulted: false,
                  explainText: null, explainBusy: false,
                  log: [], startTs: Date.now(), qShownTs: Date.now() };
   renderPractice();
@@ -1143,6 +1322,7 @@ async function renderPractice() {
           <button class="study-btn primary" id="study-prac-submit">Check answer</button>
           <button class="study-btn" id="study-prac-hint" ${p.hints.length >= 3 || p.hintBusy ? 'disabled' : ''}>
             ${p.hintBusy ? 'Thinking…' : `Hint (${p.hints.length}/3)`}</button>
+          <button class="study-btn" id="study-prac-consult" title="Open the subject overview, chapter notes, or the original file. Consulting before you answer counts like a hint.">Consult${p.consulted ? ' •' : ''}</button>
           <button class="study-btn" id="study-prac-skip">Skip</button>
         </div>` : `
         <div class="study-grade ${res.correct === true || (res.score ?? 0) >= 85 ? 'correct' : (res.correct === false || (res.score ?? 0) < 60 ? 'incorrect' : '')}">
@@ -1158,6 +1338,7 @@ async function renderPractice() {
         <div class="study-form-row" style="margin-top:12px;">
           <button class="study-btn primary" id="study-prac-next">Next →</button>
           ${isMcq && !p.explainText ? `<button class="study-btn" id="study-prac-explain" ${p.explainBusy ? 'disabled' : ''}>${p.explainBusy ? 'Explaining…' : 'Explain options'}</button>` : ''}
+          <button class="study-btn" id="study-prac-consult" title="Open the subject overview, chapter notes, or the original file (free now that you've answered)">Consult</button>
         </div>`}
     </div>`;
 
@@ -1189,6 +1370,10 @@ async function renderPractice() {
     advancePractice();
   });
 
+  el.querySelector('#study-prac-consult')?.addEventListener('click', () => {
+    openConsultMenu(q, !p.result);  // penalize only before the answer is submitted
+  });
+
   el.querySelector('#study-prac-submit')?.addEventListener('click', async () => {
     if (isMcq && p.choice == null) { toast('Pick an option first', true); return; }
     if (!isMcq && !p.answerDraft.trim()) {
@@ -1201,7 +1386,8 @@ async function renderPractice() {
         choice_index: isMcq ? p.choice : null,
         answer: isMcq ? null : p.answerDraft,
         confidence: p.confidence,
-        hints_used: p.hints.length,
+        // Consulting before answering counts like a hint (retrieval was assisted).
+        hints_used: p.hints.length + (p.consulted ? 1 : 0),
         duration_ms: Date.now() - p.qShownTs,
       });
       p.log.push({ q, result: p.result, confidence: p.confidence, hints: p.hints.length });
@@ -1235,6 +1421,7 @@ function advancePractice() {
   p.idx += 1;
   p.result = null; p.choice = null; p.confidence = null;
   p.hints = []; p.answerDraft = ''; p.explainText = null;
+  p.consulted = false;
   p.qShownTs = Date.now();
   renderPractice();
 }
