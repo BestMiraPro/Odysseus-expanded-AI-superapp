@@ -733,9 +733,15 @@ def _migrate_add_study_summary_columns():
         deck_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_decks)")]
         if "overview" not in deck_cols:
             conn.execute("ALTER TABLE study_decks ADD COLUMN overview TEXT")
+        q_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_questions)")]
+        if "deep_explanation" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN deep_explanation TEXT")
+        card_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_cards)")]
+        if "deep_explanation" not in card_cols:
+            conn.execute("ALTER TABLE study_cards ADD COLUMN deep_explanation TEXT")
         conn.commit()
         conn.close()
-        logging.getLogger(__name__).info("Migrated: study summary/overview columns")
+        logging.getLogger(__name__).info("Migrated: study summary/overview/explanation columns")
     except Exception as e:
         logging.getLogger(__name__).warning(f"study summary columns migration failed: {e}")
 
@@ -1546,6 +1552,7 @@ class StudyCard(TimestampMixin, Base):
     tags        = Column(Text, nullable=True)       # JSON list of strings
     suspended   = Column(Boolean, default=False)
     source      = Column(String, default="user")    # "user" or "ai"
+    deep_explanation = Column(Text, nullable=True)  # cached "explain further" (theory + location)
     # FSRS state
     state       = Column(String, default="new", index=True)  # new/learning/review/relearning
     stability   = Column(String, default="0")       # float as str (SQLite-safe, lossless)
@@ -1639,6 +1646,7 @@ class StudyQuestion(TimestampMixin, Base):
     correct_index   = Column(Integer, nullable=True)    # mcq answer
     reference       = Column(Text, nullable=True)       # model answer / solution
     explanation     = Column(Text, nullable=True)       # cached AI explanation (mcq)
+    deep_explanation = Column(Text, nullable=True)      # cached "explain further" (theory + location)
     topic           = Column(String, nullable=True, index=True)
     difficulty      = Column(String, default="medium")  # easy | medium | hard
     origin          = Column(String, default="extracted")  # "extracted" | "authored" | "user"

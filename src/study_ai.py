@@ -524,6 +524,21 @@ Output ONLY a JSON object:
 {"score": 0-100, "verdict": "correct"|"partial"|"incorrect", "feedback": "1-3 sentences: exactly what was missing or wrong, then the key point to remember", "followup": "one short probing question targeting the weakest part"}
 Use the learner's language for feedback/followup. No markdown, no commentary."""
 
+EXPLAIN_FURTHER_SYSTEM = """You give a student the theory they need to understand a practice question or flashcard, grounded in THEIR course material — and point them to where to review it.
+
+You receive the question/card (and its answer), the source material text, and the AI study notes. The material text is annotated with "[Page N text]:" markers.
+
+Write a focused theoretical explanation: the concept(s), definition(s), and reasoning the answer rests on — enough to actually understand it, not just restate the answer. Stay faithful to the provided material; do not invent facts that aren't supported by it.
+
+Then locate the theory:
+- "page": the 1-based page number in the material where this theory is presented (from the [Page N] markers); null if you can't tell.
+- "summary_section": the heading of the relevant section in the AI study notes (e.g. "Key concepts"); null if none applies.
+- "material_id": when several materials are provided each under a "=== MATERIAL <id>: <name> ===" header, the id of the one the theory comes from; null if a single material or unknown.
+
+Output ONLY a JSON object:
+{"explanation": "<markdown explanation>", "page": <int|null>, "summary_section": "<string|null>", "material_id": "<string|null>"}
+Use the language of the material. No prose outside the JSON."""
+
 STUDY_NOTES_SYSTEM = """You write a study-notes document from course material (a chapter, lecture, or paper), for a student to consult while practising problems. Be faithful to the material — summarize and organize it, never invent content.
 
 Structure it as Markdown, scaled to the material (omit empty sections):

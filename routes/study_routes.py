@@ -46,6 +46,7 @@ from core.database import (
 from src.study_ai import (
     AUTHOR_QUESTIONS_SYSTEM,
     DISCOVER_QUESTIONS_SYSTEM,
+    EXPLAIN_FURTHER_SYSTEM,
     EXPLAIN_SYSTEM,
     EXTRACT_QUESTIONS_SYSTEM,
     FIGURE_CAPTION_SYSTEM,
@@ -493,6 +494,33 @@ def _study_figures_dir(material_id: str) -> str:
     import os
     from src.constants import UPLOAD_DIR
     return os.path.join(UPLOAD_DIR, ".study_figures", os.path.basename(material_id))
+
+
+def _explain_further_markdown(value: Dict, *, file_id: Optional[str],
+                              material_name: Optional[str]) -> str:
+    """Assemble the 'explain further' Markdown: the theory plus a 'Where to
+    review' footer linking to the source page and naming the notes section."""
+    explanation = str((value or {}).get("explanation") or "").strip()
+    if not explanation:
+        return ""
+    try:
+        page = int(value.get("page"))
+        page = page if page >= 1 else None
+    except (TypeError, ValueError):
+        page = None
+    section = str((value or {}).get("summary_section") or "").strip()
+
+    bits = []
+    if file_id:
+        where = material_name or "the material"
+        if page:
+            bits.append(f"**{where}** — [p.{page}](/api/upload/{file_id}?inline=1#page={page})")
+        else:
+            bits.append(f"**{where}** — [open](/api/upload/{file_id}?inline=1)")
+    if section:
+        bits.append(f"study notes → *{section}*")
+    footer = ("\n\n---\n*Where to review:* " + " · ".join(bits)) if bits else ""
+    return explanation + footer
 
 
 async def _build_figures_section(owner, material_id: str, file_id: str,
@@ -2279,6 +2307,128 @@ def setup_study_routes():
             db.close()
         return {"explanation": explanation, "cached": False}
 
+    @router.post("/questions/{question_id}/explain-further")
+    async def question_explain_further(request: Request, question_id: str,
+                                       refresh: bool = False):
+        """Material-grounded theory for a question + where to review it.
+        Cached on the question; ?refresh=1 regenerates."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            row = _get_question(db, question_id, user)
+            if row.deep_explanation and not refresh:
+                return {"explanation": row.deep_explanation, "cached": True}
+            q_text, options = row.question, json.loads(row.options) if row.options else None
+            reference = row.reference or ""
+            material_id = row.material_id
+        finally:
+            db.close()
+
+        material_text = summary = name = file_id = None
+        if material_id:
+            db = SessionLocal()
+            try:
+                m = db.query(StudyMaterial).filter(StudyMaterial.id == material_id).first()
+                if m and (user is None or m.owner == user):
+                    material_text, summary = m.content or "", m.summary or ""
+                    name, file_id = m.name, m.file_id
+            finally:
+                db.close()
+
+        prompt_parts = [f"QUESTION:\n{q_text}"]
+        if options:
+            prompt_parts.append("OPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options)))
+        if reference:
+            prompt_parts.append(f"ANSWER / REFERENCE:\n{reference}")
+        if summary:
+            prompt_parts.append(f"--- AI STUDY NOTES ---\n{summary[:20000]}")
+        prompt_parts.append("--- MATERIAL ---\n" + ((material_text or
+                            "(no source material text available — explain from general theory)")[:90000]))
+        value = await _llm_json(user, EXPLAIN_FURTHER_SYSTEM, "\n\n".join(prompt_parts),
+                                temperature=0.3, max_tokens=8000, timeout=240,
+                                thinking_off=True)
+        if not isinstance(value, dict):
+            raise HTTPException(502, "The model reply was not usable. Try again.")
+        md = _explain_further_markdown(value, file_id=file_id, material_name=name)
+        if not md:
+            raise HTTPException(502, "The model did not return an explanation. Try again.")
+        db = SessionLocal()
+        try:
+            row = _get_question(db, question_id, user)
+            row.deep_explanation = md
+            db.commit()
+        finally:
+            db.close()
+        return {"explanation": md, "cached": False}
+
+    @router.post("/cards/{card_id}/explain-further")
+    async def card_explain_further(request: Request, card_id: str,
+                                   refresh: bool = False):
+        """Material-grounded theory for a flashcard. Cards have no material
+        link, so search the deck's materials and let the model pick the chapter
+        the theory comes from. Cached on the card; ?refresh=1 regenerates."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            card = _get_card(db, card_id, user)
+            if card.deep_explanation and not refresh:
+                return {"explanation": card.deep_explanation, "cached": True}
+            front, back, notes = card.front, card.back, card.notes or ""
+            deck_id = card.deck_id
+        finally:
+            db.close()
+
+        # Gather the deck's materials, each tagged with its id so the model can
+        # say which one the theory comes from; cap total size.
+        db = SessionLocal()
+        try:
+            mq = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
+            if user is not None:
+                mq = mq.filter(StudyMaterial.owner == user)
+            mats = mq.order_by(StudyMaterial.created_at.asc()).all()
+            by_id = {m.id: {"name": m.name, "file_id": m.file_id,
+                            "summary": m.summary or ""} for m in mats}
+            blocks, budget = [], 90000
+            for m in mats:
+                body = (m.content or "").strip()
+                if not body:
+                    continue
+                chunk = f"=== MATERIAL {m.id}: {m.name} ===\n{body[:20000]}"
+                blocks.append(chunk)
+                budget -= len(chunk)
+                if budget <= 0:
+                    break
+        finally:
+            db.close()
+
+        prompt_parts = [f"FLASHCARD FRONT:\n{front}", f"FLASHCARD BACK (answer):\n{back}"]
+        if notes:
+            prompt_parts.append(f"CARD NOTES:\n{notes}")
+        if blocks:
+            prompt_parts.append("\n\n".join(blocks))
+        else:
+            prompt_parts.append("(no source materials available — explain from general theory)")
+        value = await _llm_json(user, EXPLAIN_FURTHER_SYSTEM, "\n\n".join(prompt_parts),
+                                temperature=0.3, max_tokens=8000, timeout=240,
+                                thinking_off=True)
+        if not isinstance(value, dict):
+            raise HTTPException(502, "The model reply was not usable. Try again.")
+        chosen = by_id.get(str(value.get("material_id") or ""))
+        md = _explain_further_markdown(
+            value,
+            file_id=(chosen or {}).get("file_id"),
+            material_name=(chosen or {}).get("name"))
+        if not md:
+            raise HTTPException(502, "The model did not return an explanation. Try again.")
+        db = SessionLocal()
+        try:
+            card = _get_card(db, card_id, user)
+            card.deep_explanation = md
+            db.commit()
+        finally:
+            db.close()
+        return {"explanation": md, "cached": False}
+
     # ------------------------------------------------------------------ overview + stats
 
     @router.get("/overview")
@@ -2431,6 +2581,71 @@ def setup_study_routes():
                     "focus_min": sum(v["focus_min"] for v in by_day.values()),
                 },
             }
+        finally:
+            db.close()
+
+    @router.get("/history")
+    def history(request: Request, limit: int = 100):
+        """Answered-question + card-review log, newest first. Reads the existing
+        append-only StudyAttempt / StudyReview tables joined to their text."""
+        user = _owner(request)
+        limit = max(1, min(500, limit))
+        db = SessionLocal()
+        try:
+            aq = db.query(StudyAttempt)
+            if user is not None:
+                aq = aq.filter(StudyAttempt.owner == user)
+            attempts = aq.order_by(StudyAttempt.attempted_at.desc()).limit(limit).all()
+            q_ids = {a.question_id for a in attempts}
+            qmap = {qq.id: qq for qq in db.query(StudyQuestion).filter(
+                StudyQuestion.id.in_(q_ids)).all()} if q_ids else {}
+
+            entries = []
+            for a in attempts:
+                q = qmap.get(a.question_id)
+                grading = None
+                if a.grading:
+                    try:
+                        grading = json.loads(a.grading)
+                    except Exception:
+                        grading = None
+                entries.append({
+                    "kind": "question",
+                    "when": _iso(a.attempted_at),
+                    "deck_id": a.deck_id,
+                    "qtype": a.qtype,
+                    "title": q.question if q else "(question deleted)",
+                    "answer": a.answer,
+                    "correct": a.correct,
+                    "score": a.score,
+                    "rating": a.rating,
+                    "confidence": a.confidence,
+                    "hints_used": a.hints_used or 0,
+                    "feedback": (grading or {}).get("feedback"),
+                    "followup": (grading or {}).get("followup"),
+                    "reference": q.reference if q else None,
+                })
+
+            rq = db.query(StudyReview)
+            if user is not None:
+                rq = rq.filter(StudyReview.owner == user)
+            reviews = rq.order_by(StudyReview.reviewed_at.desc()).limit(limit).all()
+            c_ids = {r.card_id for r in reviews}
+            cmap = {cc.id: cc for cc in db.query(StudyCard).filter(
+                StudyCard.id.in_(c_ids)).all()} if c_ids else {}
+            for r in reviews:
+                c = cmap.get(r.card_id)
+                entries.append({
+                    "kind": "card",
+                    "when": _iso(r.reviewed_at),
+                    "deck_id": r.deck_id,
+                    "title": c.front if c else "(card deleted)",
+                    "back": c.back if c else None,
+                    "rating": r.rating,
+                })
+
+            entries.sort(key=lambda e: e["when"] or "", reverse=True)
+            return {"entries": entries[:limit]}
         finally:
             db.close()
 
