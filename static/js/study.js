@@ -181,7 +181,7 @@ function injectStyles() {
   padding-top: 18px; border-top: 1px solid var(--border); }
 .study-card-meta { font-size: 10.5px; opacity: 0.45; margin-top: 10px; }
 .study-rate-row { display: flex; gap: 10px; justify-content: center; margin-top: 28px; flex-wrap: wrap; }
-.study-rate { min-width: 86px; padding: 10px 8px; border-radius: 9px; border: 1px solid var(--border);
+.study-rate { min-width: 86px; height: auto; padding: 10px 8px; border-radius: 9px; border: 1px solid var(--border);
   background: none; color: var(--fg); cursor: pointer; }
 .study-rate:hover { background: rgba(128,128,128,0.12); }
 .study-rate b { display: block; font-size: 12.5px; }
@@ -190,7 +190,8 @@ function injectStyles() {
 .study-rate[data-r="4"] b { color: var(--green, #4f9e60); }
 /* practice */
 .study-q-wrap { max-width: 720px; margin: 0 auto; text-align: left; }
-.study-opt { display: block; width: 100%; text-align: left; margin-bottom: 8px; padding: 11px 14px;
+.study-opt { display: block; width: 100%; height: auto; box-sizing: border-box; text-align: left;
+  margin-bottom: 8px; padding: 11px 14px;
   border: 1px solid var(--border); border-radius: 9px; background: none; color: var(--fg);
   cursor: pointer; font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; }
 .study-opt:hover { background: rgba(128,128,128,0.1); }
@@ -605,8 +606,8 @@ function renderSubjectDetail() {
       <input class="study-input" id="study-mat-name" placeholder="Material name (optional)" style="width:220px;">
       <button class="study-btn" id="study-mat-add-text">Add pasted text</button>
       <label class="study-btn" style="cursor:pointer;">
-        Upload file (PDF/docx/txt)
-        <input type="file" id="study-mat-file" accept=".pdf,.txt,.md,.docx,.pptx,.csv" style="display:none;">
+        Upload files (PDF/docx/txt)
+        <input type="file" id="study-mat-file" accept=".pdf,.txt,.md,.docx,.pptx,.csv" multiple style="display:none;">
       </label>
     </div>
     <div id="study-mat-list"></div>
@@ -655,20 +656,37 @@ function renderSubjectDetail() {
     } catch (e) { toast(e.message, true); }
   });
   el.querySelector('#study-mat-file').addEventListener('change', async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    toast(`Uploading ${file.name}…`);
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    const nameBox = el.querySelector('#study-mat-name');
+    const single = files.length === 1;
+    toast(single ? `Uploading ${files[0].name}…`
+                 : `Uploading ${files.length} papers…`);
     try {
+      // /api/upload takes the whole batch in one request and returns the
+      // stored files in order.
       const fd = new FormData();
-      fd.append('files', file);
+      files.forEach((f) => fd.append('files', f));
       const res = await fetch(`${API}/api/upload`, { method: 'POST', body: fd, credentials: 'same-origin' });
       const data = await res.json();
       if (!res.ok || !data.files?.length) throw new Error(data.detail || 'Upload failed');
-      await jpost(`/api/study/decks/${s.deck.id}/materials`, {
-        file_id: data.files[0].id,
-        name: el.querySelector('#study-mat-name')?.value.trim() || file.name,
-      });
-      toast('Material added — text extracted');
+      // One material per uploaded paper. A shared name box only makes sense
+      // for a single file; otherwise each paper keeps its own filename.
+      let added = 0;
+      const failed = [];
+      for (const f of data.files) {
+        try {
+          await jpost(`/api/study/decks/${s.deck.id}/materials`, {
+            file_id: f.id,
+            name: (single && nameBox?.value.trim()) ? nameBox.value.trim() : f.name,
+          });
+          added++;
+        } catch (err) { failed.push(f.name || f.id); }
+      }
+      if (nameBox) nameBox.value = '';
+      const msg = `${added} material${added === 1 ? '' : 's'} added`
+        + (failed.length ? ` — ${failed.length} failed (${failed.join(', ')})` : '');
+      toast(msg, failed.length > 0);
       reloadSubject();
     } catch (err) { toast(err.message, true); }
     e.target.value = '';
