@@ -40,6 +40,7 @@ const S = {
 const TABS = [
   ['today', 'Today'], ['subjects', 'Subjects'], ['review', 'Cards'],
   ['practice', 'Practice'], ['plan', 'Plan'], ['focus', 'Focus'],
+  ['history', 'History'],
 ];
 
 const TIPS = [
@@ -233,6 +234,13 @@ function injectStyles() {
 .study-viewer-body h3 { font-size: 13.5px; margin: 14px 0 6px; }
 .study-viewer-body ul, .study-viewer-body ol { padding-left: 22px; }
 .study-viewer-body em { opacity: 0.7; font-size: 12px; }
+/* history */
+.study-histrow { display: flex; gap: 10px; align-items: flex-start; padding: 8px 4px 8px 8px;
+  border-bottom: 1px solid var(--border); font-size: 12.5px; }
+.study-histrow .grow { flex: 1; min-width: 0; }
+.study-histrow.ok { border-left: 2px solid var(--green, #4f9e60); }
+.study-histrow.bad { border-left: 2px solid var(--red, #e05555); }
+.study-histrow .study-state { white-space: nowrap; opacity: 0.7; font-size: 11px; }
 /* plan */
 .study-plan-day { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-bottom: 8px; }
 .study-plan-day.today { border-color: var(--accent, #5b8abf); }
@@ -438,6 +446,7 @@ function setTab(tab) {
   const render = {
     today: renderToday, subjects: renderSubjects, review: renderReview,
     practice: renderPractice, plan: renderPlan, focus: renderFocus,
+    history: renderHistory,
   }[tab];
   if (render) render();
 }
@@ -448,6 +457,67 @@ function setTabSilent(tab) {
   if (b) b.onclick = null;
   _pane?.querySelectorAll('.study-tab').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.tab === tab));
+}
+
+// ---------------------------------------------------------------------------
+// HISTORY
+// ---------------------------------------------------------------------------
+
+function _histDayLabel(day) {
+  const today = new Date().toISOString().slice(0, 10);
+  const yest = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  if (day === today) return 'Today';
+  if (day === yest) return 'Yesterday';
+  return day;
+}
+
+function renderHistoryEntry(e) {
+  const time = (e.when || '').slice(11, 16);
+  if (e.kind === 'card') {
+    const label = ['', 'Again', 'Hard', 'Good', 'Easy'][e.rating] || '';
+    const ok = e.rating >= 3;
+    return `<div class="study-histrow ${ok ? 'ok' : 'bad'}">
+      <span class="study-qchip">card</span>
+      <div class="grow">${esc(e.title)}</div>
+      <span class="study-state">${label} · ${time}</span>
+    </div>`;
+  }
+  const ok = e.correct === true || (e.score != null && e.score >= 60);
+  const outcome = e.qtype === 'mcq'
+    ? (e.correct ? '✓ correct' : '✗ wrong')
+    : (e.score != null ? `${e.score}/100` : '');
+  const conf = e.confidence ? ` · ${esc(e.confidence)}` : '';
+  return `<div class="study-histrow ${ok ? 'ok' : 'bad'}">
+    <span class="study-qchip ${e.qtype || ''}">${esc(e.qtype || 'q')}</span>
+    <div class="grow">
+      <div>${esc(e.title)}</div>
+      ${e.answer ? `<div class="study-subtle" style="margin-top:2px;">Your answer: ${esc(e.answer)}</div>` : ''}
+      ${e.feedback ? `<div class="study-subtle" style="margin-top:2px;">Feedback: ${esc(e.feedback)}</div>` : ''}
+    </div>
+    <span class="study-state">${outcome}${conf} · ${time}</span>
+  </div>`;
+}
+
+async function renderHistory() {
+  const el = body();
+  el.innerHTML = '<div class="study-empty">Loading…</div>';
+  let entries;
+  try { entries = (await jget('/api/study/history?limit=300')).entries; }
+  catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  if (_tab !== 'history') return;
+  if (!entries.length) {
+    el.innerHTML = '<div class="study-empty">No history yet — answer some practice questions or review cards and they’ll show up here.</div>';
+    return;
+  }
+  const groups = {};
+  for (const e of entries) {
+    const day = (e.when || '').slice(0, 10) || 'unknown';
+    (groups[day] = groups[day] || []).push(e);
+  }
+  el.innerHTML = `<div class="study-subtle" style="margin-bottom:8px;">Every answer you’ve given and the feedback on it. Newest first.</div>` +
+    Object.keys(groups).sort().reverse().map(day =>
+      `<div class="study-section-title">${esc(_histDayLabel(day))}</div>
+       ${groups[day].map(renderHistoryEntry).join('')}`).join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +658,7 @@ async function renderSubjects() {
 async function openSubject(deckId) {
   const deck = S.decks.find(d => d.id === deckId) || { id: deckId, name: 'Subject' };
   S.subject = { deck, cards: [], materials: [], questions: [], proposals: null,
-                qFilter: '', extracting: null };
+                qFilter: '', extracting: new Set() };
   await reloadSubject();
 }
 
@@ -848,6 +918,27 @@ function openSubjectOverview(deckId, name) {
   });
 }
 
+// "Explain further": material-grounded theory for a question or card, shown in
+// the viewer with a "Where to review" footer (page link + notes section).
+async function openExplainFurther(kind, id) {
+  const path = kind === 'card'
+    ? `/api/study/cards/${id}/explain-further`
+    : `/api/study/questions/${id}/explain-further`;
+  const v = _viewerShell('Explain further',
+    '<button class="study-btn small" id="study-ef-regen">Regenerate</button>',
+    '<div class="study-viewer-body" id="study-viewer-body"></div>');
+  const body = v.querySelector('#study-viewer-body');
+  const load = async (refresh) => {
+    body.innerHTML = '<div class="study-empty">Pulling the theory from your material…</div>';
+    try {
+      const r = await jpost(path + (refresh ? '?refresh=1' : ''), {});
+      _renderMarkdownInto(body, r.explanation);
+    } catch (e) { body.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; }
+  };
+  v.querySelector('#study-ef-regen').addEventListener('click', () => load(true));
+  load(false);
+}
+
 // Practice consult chooser: subject overview / chapter notes / original file.
 // When `penalize` (i.e. the answer isn't submitted yet), the first consult
 // flags the attempt so it counts like a hint — preserving retrieval effort.
@@ -894,7 +985,7 @@ function renderMaterialList() {
     <div class="study-row">
       <span class="grow"><b>${esc(m.name)}</b>
         <span class="study-subtle"> · ${m.kind} · ${(m.char_count / 1000).toFixed(1)}k chars · ${m.question_count} questions extracted</span></span>
-      ${s.extracting === m.id
+      ${s.extracting.has(m.id)
         ? '<span class="study-subtle">Extracting… (vision can take a few minutes)</span>'
         : `${m.file_id ? `<button class="study-btn small" data-view="${m.id}" title="Open this file inside the app">View</button>` : ''}
            <button class="study-btn small" data-notes="${m.id}" title="${m.has_summary ? 'View AI study notes for this material' : 'Generate AI study notes to consult while practising'}">${m.has_summary ? 'Notes' : 'Make notes'}</button>
@@ -941,7 +1032,10 @@ function renderMaterialList() {
     }
     const id = ex || vx || au;
     if (!id) return;
-    S.subject.extracting = id;
+    if (S.subject.extracting.has(id)) return;   // already running for this material
+    // Set-based so several materials can extract in parallel without the
+    // single-flag bug that orphaned the earlier task.
+    S.subject.extracting.add(id);
     renderMaterialList();
     try {
       const res = await jpost(`/api/study/materials/${id}/extract`,
@@ -956,8 +1050,8 @@ function renderMaterialList() {
         : `${res.created} questions added`;
       toast(`${head}${res.vision ? ' (vision)' : ''}${dupNote}${res.chunk_errors ? ` (${res.chunk_errors} batch(es) failed)` : ''}${covNote}`, !!(cov && cov.missing && cov.missing.length));
     } catch (err) { toast(err.message, true); }
-    S.subject.extracting = null;
-    reloadSubject();
+    S.subject.extracting.delete(id);
+    reloadSubject();   // leaves S.subject.extracting intact for still-running ones
   };
 }
 
@@ -1168,7 +1262,8 @@ async function renderReview() {
       <div class="study-progress"><i style="width:${progress}%"></i></div>
       <div class="study-card-front">${esc(card.front)}</div>
       ${r.revealed ? `<div class="study-card-back">${esc(card.back)}</div>
-        ${card.notes ? `<div class="study-card-meta">${esc(card.notes)}</div>` : ''}` : ''}
+        ${card.notes ? `<div class="study-card-meta">${esc(card.notes)}</div>` : ''}
+        <div style="margin-top:10px;"><button class="study-btn small" id="study-card-explain" title="Pull the underlying theory from your subject's material, with where to review it">Explain further</button></div>` : ''}
       <div class="study-card-meta">${r.idx + 1}/${r.queue.length} · ${esc(card.state)}${card.lapses ? ` · ${card.lapses} lapses` : ''}</div>
       <div class="study-rate-row">
         ${r.revealed
@@ -1180,6 +1275,7 @@ async function renderReview() {
       </div>
     </div>`;
   el.querySelector('#study-reveal')?.addEventListener('click', revealCard);
+  el.querySelector('#study-card-explain')?.addEventListener('click', () => openExplainFurther('card', card.id));
   el.querySelectorAll('.study-rate').forEach(b =>
     b.addEventListener('click', () => rateCard(parseInt(b.dataset.r, 10))));
 }
@@ -1338,6 +1434,7 @@ async function renderPractice() {
         <div class="study-form-row" style="margin-top:12px;">
           <button class="study-btn primary" id="study-prac-next">Next →</button>
           ${isMcq && !p.explainText ? `<button class="study-btn" id="study-prac-explain" ${p.explainBusy ? 'disabled' : ''}>${p.explainBusy ? 'Explaining…' : 'Explain options'}</button>` : ''}
+          <button class="study-btn" id="study-prac-explain-further" title="Pull the underlying theory from your material, with where to review it">Explain further</button>
           <button class="study-btn" id="study-prac-consult" title="Open the subject overview, chapter notes, or the original file (free now that you've answered)">Consult</button>
         </div>`}
     </div>`;
@@ -1372,6 +1469,10 @@ async function renderPractice() {
 
   el.querySelector('#study-prac-consult')?.addEventListener('click', () => {
     openConsultMenu(q, !p.result);  // penalize only before the answer is submitted
+  });
+
+  el.querySelector('#study-prac-explain-further')?.addEventListener('click', () => {
+    openExplainFurther('question', q.id);
   });
 
   el.querySelector('#study-prac-submit')?.addEventListener('click', async () => {
