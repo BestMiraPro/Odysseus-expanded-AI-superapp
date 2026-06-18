@@ -107,6 +107,72 @@ def batch_pages(items: List[str], per_batch: int = 3) -> List[List[str]]:
     return [items[i:i + per_batch] for i in range(0, len(items), per_batch)]
 
 
+def extract_pdf_figures(pdf_path: str, out_dir: str, *, min_side: int = 180,
+                        max_figs: int = 12) -> List[dict]:
+    """Best-effort: pull raster figures out of a PDF, largest first.
+
+    Returns ``[{"idx", "page", "path", "width", "height"}]``. Vector-only PDFs
+    (figures drawn as paths, not embedded bitmaps) yield ``[]`` — callers fall
+    back to citing the source page instead. Never raises: figure extraction is
+    a nice-to-have and must not break notes generation.
+    """
+    import os
+    try:
+        from pypdf import PdfReader
+        from PIL import Image  # noqa: F401
+    except Exception as e:
+        logger.info("study_vision: figure extraction unavailable: %s", e)
+        return []
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as e:
+        logger.warning("study_vision: could not open PDF for figures: %s", e)
+        return []
+
+    candidates = []  # (area, page_no, PIL image)
+    for pno, page in enumerate(reader.pages, start=1):
+        try:
+            images = list(page.images)
+        except Exception:
+            images = []
+        for im in images:
+            try:
+                pil = im.image  # pypdf -> PIL
+                w, h = pil.size
+                if min(w, h) < min_side:
+                    continue  # skip icons, rules, tiny decorations
+                candidates.append((w * h, pno, pil))
+            except Exception:
+                continue
+
+    candidates.sort(key=lambda c: c[0], reverse=True)  # biggest figures first
+    os.makedirs(out_dir, exist_ok=True)
+    out: List[dict] = []
+    for i, (_area, pno, pil) in enumerate(candidates[:max_figs]):
+        try:
+            if pil.mode not in ("RGB", "L"):
+                pil = pil.convert("RGB")
+            if max(pil.size) > MAX_SIDE:
+                ratio = MAX_SIDE / max(pil.size)
+                pil = pil.resize((int(pil.width * ratio), int(pil.height * ratio)))
+            path = os.path.join(out_dir, f"{i}.jpg")
+            pil.save(path, "JPEG", quality=85)
+            out.append({"idx": i, "page": pno, "path": path,
+                        "width": pil.width, "height": pil.height})
+        except Exception as e:
+            logger.debug("study_vision: figure %d save failed: %s", i, e)
+            continue
+    return out
+
+
+def figure_data_url(path: str) -> str:
+    """data: URL for one extracted figure image (for a vision captioning call)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    mime = "image/jpeg" if data[:3] == b"\xff\xd8\xff" else "image/png"
+    return f"data:{mime};base64," + base64.b64encode(data).decode("ascii")
+
+
 def text_layer_is_thin(char_count: int, page_count: int) -> bool:
     """Heuristic: a real text layer averages well over 400 chars/page.
 

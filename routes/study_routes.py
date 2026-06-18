@@ -48,9 +48,12 @@ from src.study_ai import (
     DISCOVER_QUESTIONS_SYSTEM,
     EXPLAIN_SYSTEM,
     EXTRACT_QUESTIONS_SYSTEM,
+    FIGURE_CAPTION_SYSTEM,
     GRADE_OPEN_SYSTEM,
     HINT_SYSTEM,
     REPAIR_JSON_SYSTEM,
+    STUDY_NOTES_SYSTEM,
+    SUBJECT_OVERVIEW_SYSTEM,
     chunk_material,
     dedupe_questions,
     missing_question_numbers,
@@ -479,8 +482,70 @@ def _material_to_dict(m: StudyMaterial) -> Dict:
         "id": m.id, "deck_id": m.deck_id, "name": m.name, "kind": m.kind,
         "file_id": m.file_id, "char_count": m.char_count or 0,
         "question_count": m.question_count or 0,
+        "has_summary": bool(m.summary),
         "created_at": _iso(m.created_at),
     }
+
+
+def _study_figures_dir(material_id: str) -> str:
+    """Where extracted figures for a material live (inside the persisted
+    uploads volume, one subdir per material)."""
+    import os
+    from src.constants import UPLOAD_DIR
+    return os.path.join(UPLOAD_DIR, ".study_figures", os.path.basename(material_id))
+
+
+async def _build_figures_section(owner, material_id: str, file_id: str,
+                                 pdf_path: str) -> str:
+    """Extract raster figures from a PDF, caption/keep the substantive ones via
+    a vision pass, and return a Markdown '## Key figures' section embedding them
+    with source-page citations. Best-effort: returns '' on any shortfall."""
+    from src.study_vision import extract_pdf_figures, figure_data_url
+
+    try:
+        figs = extract_pdf_figures(pdf_path, _study_figures_dir(material_id))
+    except Exception as e:
+        logger.warning("study notes: figure extraction failed: %s", e)
+        return ""
+    if not figs:
+        return ""
+
+    captions: Dict[int, str] = {}
+    keep: set = set()
+    value = None
+    try:
+        urls = [figure_data_url(f["path"]) for f in figs]
+        value = await _llm_json_vision(
+            owner, FIGURE_CAPTION_SYSTEM,
+            f"Caption these {len(urls)} figures, in order.", urls,
+            max_tokens=3000, timeout=180)
+    except Exception as e:
+        logger.warning("study notes: figure captioning failed: %s", e)
+    if isinstance(value, list):
+        for item in value:
+            if not isinstance(item, dict) or "idx" not in item:
+                continue
+            try:
+                ix = int(item["idx"])
+            except (TypeError, ValueError):
+                continue
+            captions[ix] = str(item.get("caption") or "").strip()
+            if item.get("keep"):
+                keep.add(ix)
+        kept = [f for f in figs if f["idx"] in keep]
+    else:
+        # Captioning unavailable — keep what we extracted with generic captions.
+        kept = figs
+
+    if not kept:
+        return ""
+    lines = ["\n\n## Key figures\n"]
+    for f in kept:
+        cap = captions.get(f["idx"]) or f"Figure (p.{f['page']})"
+        img_url = f"/api/study/figures/{material_id}/{f['idx']}"
+        src_url = f"/api/upload/{file_id}?inline=1#page={f['page']}"
+        lines.append(f"![{cap}]({img_url})\n\n*{cap} — [source: p.{f['page']}]({src_url})*\n")
+    return "\n".join(lines)
 
 
 def _question_fsrs_dict(q: StudyQuestion) -> Dict:
@@ -558,8 +623,11 @@ def _extract_file_text(file_id: str, owner) -> str:
     ext = os.path.splitext(path)[1].lower()
     try:
         from src import document_processor as dp
+        # max_chars=None: keep the FULL paper. The 15k cap on these extractors
+        # exists to protect a chat context window; study materials must not be
+        # silently truncated (extraction and notes need the whole document).
         if ext == ".pdf":
-            text = dp._process_pdf(path, owner=owner)
+            text = dp._process_pdf(path, owner=owner, max_chars=None)
         else:
             try:
                 from src.markitdown_runtime import is_markitdown_format
@@ -567,9 +635,10 @@ def _extract_file_text(file_id: str, owner) -> str:
             except Exception:
                 office = False
             if office:
-                text = dp._process_office_document(path, os.path.basename(path))
+                text = dp._process_office_document(path, os.path.basename(path),
+                                                   max_chars=None)
             else:
-                text = dp._process_text_file(path)
+                text = dp._process_text_file(path, max_chars=None)
     except HTTPException:
         raise
     except Exception as e:
@@ -1552,6 +1621,150 @@ def setup_study_routes():
             return {"ok": True}
         finally:
             db.close()
+
+    @router.post("/materials/{material_id}/reextract-text")
+    def reextract_material_text(request: Request, material_id: str):
+        """Re-read a file-backed material's text in full.
+
+        Materials uploaded before the 15k cap was lifted only stored the first
+        ~15k chars. This re-extracts the whole file so notes/extraction see all
+        of it. No-op for pasted-text materials (they were never truncated)."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            m = _get_material(db, material_id, user)
+            if not m.file_id:
+                raise HTTPException(400, "This material is pasted text, not a file.")
+            file_id = m.file_id
+        finally:
+            db.close()
+        text = _extract_file_text(file_id, user)  # max_chars=None -> full text
+        db = SessionLocal()
+        try:
+            m = _get_material(db, material_id, user)
+            before = m.char_count or 0
+            m.content = text
+            m.char_count = len(text)
+            db.commit()
+            return {"ok": True, "char_count": len(text), "previous": before}
+        finally:
+            db.close()
+
+    # ------------------------------------------------------------ study notes
+
+    @router.get("/figures/{material_id}/{idx}")
+    def get_study_figure(request: Request, material_id: str, idx: int):
+        """Serve one extracted figure image inline (embedded in study notes)."""
+        import os
+        from fastapi.responses import FileResponse
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            _get_material(db, material_id, user)  # ownership check
+        finally:
+            db.close()
+        path = os.path.join(_study_figures_dir(material_id), f"{int(idx)}.jpg")
+        if not os.path.isfile(path):
+            raise HTTPException(404, "Figure not found")
+        return FileResponse(path, media_type="image/jpeg",
+                            headers={"X-Content-Type-Options": "nosniff"},
+                            content_disposition_type="inline")
+
+    @router.get("/materials/{material_id}/notes")
+    def get_material_notes(request: Request, material_id: str):
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            m = _get_material(db, material_id, user)
+            return {"summary": m.summary or "", "name": m.name, "file_id": m.file_id}
+        finally:
+            db.close()
+
+    @router.post("/materials/{material_id}/notes")
+    async def generate_material_notes(request: Request, material_id: str):
+        """Generate (or regenerate) consultable study notes for one material:
+        a Markdown summary from the full text, plus a Key-figures section with
+        figures pulled from the source PDF and cited to their page."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            m = _get_material(db, material_id, user)
+            content = (m.content or "").strip()
+            name, file_id, kind = m.name, m.file_id, m.kind
+        finally:
+            db.close()
+        if len(content) < 200:
+            raise HTTPException(400, "Not enough text in this material to write "
+                                     "notes. If it is a scanned PDF, run vision "
+                                     "extraction or re-extract its text first.")
+        notes = await _llm_text(
+            user, STUDY_NOTES_SYSTEM,
+            f"Material name: {name}\n\n--- MATERIAL ---\n{content[:120000]}",
+            temperature=0.3, max_tokens=8000, timeout=240)
+
+        figures_md = ""
+        pdf_path = None
+        if file_id and (kind == "pdf" or str(file_id).lower().endswith(".pdf")):
+            try:
+                pdf_path = _resolve_uploaded_file(file_id)
+            except HTTPException:
+                pdf_path = None
+        if pdf_path:
+            figures_md = await _build_figures_section(user, material_id, file_id, pdf_path)
+
+        full = notes.strip() + figures_md
+        db = SessionLocal()
+        try:
+            m = _get_material(db, material_id, user)
+            m.summary = full
+            db.commit()
+        finally:
+            db.close()
+        return {"summary": full, "has_figures": bool(figures_md)}
+
+    @router.get("/decks/{deck_id}/overview")
+    def get_deck_overview(request: Request, deck_id: str):
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            deck = _get_deck(db, deck_id, user)
+            return {"overview": deck.overview or ""}
+        finally:
+            db.close()
+
+    @router.post("/decks/{deck_id}/overview")
+    async def generate_deck_overview(request: Request, deck_id: str):
+        """Generate a short subject overview from the chapter notes (preferred)
+        or raw material text, tying the chapters together."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            deck = _get_deck(db, deck_id, user)
+            deck_name = deck.name
+            q = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
+            if user is not None:
+                q = q.filter(StudyMaterial.owner == user)
+            parts = []
+            for m in q.order_by(StudyMaterial.created_at.asc()).all():
+                src = (m.summary or m.content or "")[:4000].strip()
+                if src:
+                    parts.append(f"### {m.name}\n{src}")
+        finally:
+            db.close()
+        if not parts:
+            raise HTTPException(400, "Add materials (and ideally generate chapter "
+                                     "notes) before generating a subject overview.")
+        prompt = (f"Subject: {deck_name}\n\n" + "\n\n".join(parts))[:60000]
+        overview = await _llm_text(user, SUBJECT_OVERVIEW_SYSTEM, prompt,
+                                   temperature=0.3, max_tokens=4000, timeout=180)
+        db = SessionLocal()
+        try:
+            deck = _get_deck(db, deck_id, user)
+            deck.overview = overview
+            db.commit()
+        finally:
+            db.close()
+        return {"overview": overview}
 
     @router.post("/materials/{material_id}/extract")
     async def extract_questions(request: Request, material_id: str, body: ExtractIn):

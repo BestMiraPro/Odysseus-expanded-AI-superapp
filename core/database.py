@@ -718,6 +718,28 @@ def _migrate_add_last_message_at_column():
     except Exception as e:
         logging.getLogger(__name__).warning(f"last_message_at migration failed: {e}")
 
+def _migrate_add_study_summary_columns():
+    """Add AI-summary columns to study tables: study_materials.summary (per-
+    chapter notes) and study_decks.overview (subject overview). Idempotent."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        mat_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_materials)")]
+        if "summary" not in mat_cols:
+            conn.execute("ALTER TABLE study_materials ADD COLUMN summary TEXT")
+        deck_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_decks)")]
+        if "overview" not in deck_cols:
+            conn.execute("ALTER TABLE study_decks ADD COLUMN overview TEXT")
+        conn.commit()
+        conn.close()
+        logging.getLogger(__name__).info("Migrated: study summary/overview columns")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"study summary columns migration failed: {e}")
+
+
 def _migrate_add_document_archived_column():
     """Add `archived` to documents (soft-archive flag). Guarded + idempotent."""
     import sqlite3
@@ -1506,6 +1528,7 @@ class StudyDeck(TimestampMixin, Base):
     archived    = Column(Boolean, default=False)
     new_per_day = Column(Integer, default=15)      # cap on new cards introduced per day
     retention   = Column(String, default="0.9")    # desired FSRS retention (stored as str for SQLite portability)
+    overview    = Column(Text, nullable=True)       # AI subject overview (markdown), for consultation
 
     cards = relationship("StudyCard", back_populates="deck", cascade="all, delete-orphan")
 
@@ -1594,6 +1617,7 @@ class StudyMaterial(TimestampMixin, Base):
     content        = Column(Text, nullable=True)       # extracted text
     char_count     = Column(Integer, default=0)
     question_count = Column(Integer, default=0)        # questions extracted so far
+    summary        = Column(Text, nullable=True)       # AI study notes (markdown), for consultation
 
 
 class StudyQuestion(TimestampMixin, Base):
@@ -1802,6 +1826,7 @@ def init_db():
     _migrate_add_task_run_model_column()
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()
+    _migrate_add_study_summary_columns()
     _migrate_add_last_message_at_column()
     _migrate_add_folder_column()
     _migrate_add_token_columns()

@@ -24,8 +24,13 @@ def _is_text_file(path: str) -> bool:
     )
 
 
-def _process_text_file(path: str) -> str:
-    """Process text file with enhanced formatting and metadata."""
+def _process_text_file(path: str, max_chars: int | None = -1) -> str:
+    """Process text file with enhanced formatting and metadata.
+
+    ``max_chars`` controls the cap: ``-1`` (default) uses the built-in
+    per-extension limit; ``None`` keeps the full text (Study uses this); a
+    positive int caps at that many characters.
+    """
     language_map = {
         ".py": "python", ".js": "javascript", ".html": "html", ".css": "css",
         ".json": "json", ".md": "markdown", ".txt": "text", ".csv": "csv",
@@ -39,7 +44,7 @@ def _process_text_file(path: str) -> str:
     filename = os.path.basename(path)
     _, ext = os.path.splitext(path.lower())
     language = language_map.get(ext, "text")
-    max_len = 30000 if ext != ".log" else 10000
+    max_len = (30000 if ext != ".log" else 10000) if max_chars == -1 else max_chars
 
     try:
         from src.personal_docs import read_text_file
@@ -69,7 +74,7 @@ def _process_text_file(path: str) -> str:
     content_length = len(content)
     truncated = False
 
-    if content_length > max_len:
+    if max_len is not None and content_length > max_len:
         truncation_point = max_len
         search_range = min(100, content_length - max_len)
         for i in range(search_range):
@@ -109,8 +114,15 @@ def _process_text_file(path: str) -> str:
         return result
 
 
-def _process_pdf(path: str, owner: str | None = None) -> str:
-    """Process PDF file with text extraction (pypdf). Uses VL model for image-heavy pages."""
+def _process_pdf(path: str, owner: str | None = None,
+                 max_chars: int | None = 15000) -> str:
+    """Process PDF file with text extraction (pypdf). Uses VL model for image-heavy pages.
+
+    ``max_chars`` caps the extracted text so a huge PDF can't blow a chat
+    context window (the default mirrors the historical chat limit). Pass
+    ``None`` to keep the full text — the Study module does this so long papers
+    aren't silently truncated.
+    """
     try:
         from pypdf import PdfReader
         pdf_text = ""
@@ -146,8 +158,8 @@ def _process_pdf(path: str, owner: str | None = None) -> str:
                         continue
 
         if pdf_text:
-            if len(pdf_text) > 15000:
-                pdf_text = pdf_text[:15000] + "\n[PDF content truncated]"
+            if max_chars is not None and len(pdf_text) > max_chars:
+                pdf_text = pdf_text[:max_chars] + "\n[PDF content truncated]"
             return f"\n\n[PDF content]:{pdf_text}"
         else:
             return "\n\n[PDF processed but no readable content found]"
@@ -199,11 +211,13 @@ def _fit_inline_attachment_text(
     return text[:remaining] + marker, 0
 
 
-def _process_office_document(path: str, display_name: str) -> str:
+def _process_office_document(path: str, display_name: str,
+                             max_chars: int | None = 15000) -> str:
     """Extract an Office/EPUB document to Markdown via the optional markitdown dep.
 
     Falls back to a friendly banner when markitdown is unavailable or finds no
     text, so a missing optional dependency never breaks the chat path.
+    ``max_chars=None`` keeps the full text (Study uses this).
     """
     from src.markitdown_runtime import (
         is_markitdown_format,
@@ -217,7 +231,10 @@ def _process_office_document(path: str, display_name: str) -> str:
     markdown = convert_to_markdown(path)
     if markdown and markdown.strip():
         title = os.path.splitext(os.path.basename(path))[0]
-        body, marker = _truncate_inline(markdown)
+        if max_chars is None:
+            body, marker = markdown, ""
+        else:
+            body, marker = _truncate_inline(markdown, max_chars)
         return f"\n\n[Document content — {title}]:\n{body}{marker}"
 
     # No content: tell the user whether to install the optional dep or whether

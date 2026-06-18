@@ -523,3 +523,33 @@ GRADE_OPEN_SYSTEM = """You grade a learner's free-recall answer against a refere
 Output ONLY a JSON object:
 {"score": 0-100, "verdict": "correct"|"partial"|"incorrect", "feedback": "1-3 sentences: exactly what was missing or wrong, then the key point to remember", "followup": "one short probing question targeting the weakest part"}
 Use the learner's language for feedback/followup. No markdown, no commentary."""
+
+STUDY_NOTES_SYSTEM = """You write a study-notes document from course material (a chapter, lecture, or paper), for a student to consult while practising problems. Be faithful to the material — summarize and organize it, never invent content.
+
+Structure it as Markdown, scaled to the material (omit empty sections):
+- A one-paragraph overview of what this material covers.
+- "## Key concepts" — the core ideas, each defined precisely and briefly.
+- "## Key formulas & results" — each with what its symbols mean and WHEN to use it. Write math in LaTeX delimited with $...$ (inline) or $$...$$ (display).
+- "## Methods & worked patterns" — the standard procedures/derivations the material teaches, as short step lists a student can follow on a new problem.
+- "## Common pitfalls" — mistakes the material warns about or that the topic invites.
+
+Rules:
+- Optimize for fast consultation: tight prose, lists over paragraphs, bold the term being defined.
+- Keep it comprehensive enough to solve the material's problems from, but do not pad.
+- Use the language of the source material.
+- Output ONLY the Markdown document. No preamble, no code fences around the whole thing."""
+
+SUBJECT_OVERVIEW_SYSTEM = """You write a short subject overview that ties together several chapters of study notes, as a map for a student.
+
+Given per-chapter summaries, output Markdown:
+- A 2-4 sentence overview of the subject and how the chapters connect.
+- "## Chapters" — one bullet per chapter: its title and the one or two things it's responsible for.
+- "## Threads" — 2-5 themes/techniques that recur across chapters, noting which chapters they appear in.
+
+Keep it brief (a map, not a re-summary). Use the language of the source material. Output ONLY the Markdown."""
+
+FIGURE_CAPTION_SYSTEM = """You are shown figures extracted from course material. For EACH image, in order, write a one-line caption of what it shows and decide whether it is a substantive learning figure (diagram, graph, chart, plotted curve, labeled illustration, table image) as opposed to decorative or page furniture (logos, header/footer art, photos of people, cover images, scanned plain text).
+
+Output ONLY a JSON array, one object per image in the order given:
+[{"idx": 0, "caption": "...", "keep": true}, {"idx": 1, "caption": "...", "keep": false}]
+Set "keep": false for anything decorative or that is just text. Use the language of the material for captions."""
