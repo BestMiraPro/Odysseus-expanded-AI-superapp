@@ -552,23 +552,51 @@ def _explain_further_markdown(value: Dict, by_id: Dict[str, Dict]) -> str:
     return explanation + footer
 
 
-def _deck_material_context(db, deck_id: str, user, *, char_budget: int = 90000):
-    """Gather a deck's materials for an explain-further search across files.
+# Theory vs exam/answer-key classification by filename. A "theory" marker
+# (chapter/lecture/notes/...) wins even when the name also says "solutions",
+# so a chapter like "ch2.1_withsolutions.pdf" stays theory; a bare
+# "...RegularExam_SolutionTopics.pdf" is an answer key.
+_THEORY_MARK_RE = re.compile(
+    r"(chapter|lecture|\bnotes\b|\bslides\b|\bunit\b|\bweek\b|ch\d|cap\d|aula|tema)", re.I)
+_ANSWER_KEY_RE = re.compile(
+    r"(exam|solution|resit|answer[\s_-]?key|gabarito|\bmock\b|\bquiz\b|\btest\b|past[\s_-]*paper|marking)", re.I)
+
+
+def _is_answer_key_material(name: str) -> bool:
+    """True for exam / answer-key / solutions files (which hold questions, not
+    theory). Chapter/lecture files are never treated as answer keys, even if
+    they bundle solutions."""
+    n = name or ""
+    if _THEORY_MARK_RE.search(n):
+        return False
+    return bool(_ANSWER_KEY_RE.search(n))
+
+
+def _deck_material_context(db, deck_id: str, user, *, char_budget: int = 90000,
+                           theory_only: bool = False):
+    """Gather a deck's materials for an explain-further / locate search.
 
     Returns (blocks, by_id): `blocks` is a list of
     "=== MATERIAL <id>: <name> ===\\n<text>" strings (text carries the PDF
-    [Page N] markers), `by_id` maps id -> {name, file_id, summary}. Lets the
-    model find theory in whichever file holds it — not just the one a question
-    came from (practice exams have questions, not theory)."""
+    [Page N] markers), `by_id` maps id -> {name, file_id, summary}.
+
+    With ``theory_only``, exam/answer-key files are excluded from the search
+    corpus so citations point at the lecture/theory material — unless that would
+    leave nothing, in which case all materials are used (graceful fallback)."""
     mq = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
     if user is not None:
         mq = mq.filter(StudyMaterial.owner == user)
     mats = mq.order_by(StudyMaterial.created_at.asc()).all()
     by_id = {m.id: {"name": m.name, "file_id": m.file_id, "summary": m.summary or ""}
              for m in mats}
+    corpus = mats
+    if theory_only:
+        theory = [m for m in mats if not _is_answer_key_material(m.name)]
+        if theory:                      # keep all if the deck is exams-only
+            corpus = theory
     blocks, budget = [], char_budget
-    per = max(6000, char_budget // max(1, len(mats))) if mats else char_budget
-    for m in mats:
+    per = max(6000, char_budget // max(1, len(corpus))) if corpus else char_budget
+    for m in corpus:
         body = (m.content or "").strip()
         if not body:
             continue
@@ -2381,7 +2409,7 @@ def setup_study_routes():
             own_material_id = row.material_id
             # Search the WHOLE subject — theory lives in the lecture files, not
             # the practice exam this question was extracted from.
-            blocks, by_id = _deck_material_context(db, deck_id, user)
+            blocks, by_id = _deck_material_context(db, deck_id, user, theory_only=True)
         finally:
             db.close()
 
@@ -2431,7 +2459,7 @@ def setup_study_routes():
             options = json.loads(row.options) if row.options else None
             reference = row.reference or ""
             deck_id = row.deck_id
-            blocks, by_id = _deck_material_context(db, deck_id, user)
+            blocks, by_id = _deck_material_context(db, deck_id, user, theory_only=True)
         finally:
             db.close()
 
@@ -2482,7 +2510,7 @@ def setup_study_routes():
                 return {"explanation": card.deep_explanation, "cached": True}
             front, back, notes = card.front, card.back, card.notes or ""
             deck_id = card.deck_id
-            blocks, by_id = _deck_material_context(db, deck_id, user)
+            blocks, by_id = _deck_material_context(db, deck_id, user, theory_only=True)
         finally:
             db.close()
 
