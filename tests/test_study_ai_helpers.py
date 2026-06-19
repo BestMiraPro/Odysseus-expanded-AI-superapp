@@ -54,6 +54,19 @@ def test_single_object_reply():
     assert parse_llm_json('{"score": 80}') == {"score": 80}
 
 
+def test_recovers_single_escaped_latex():
+    # model wrote LaTeX with single backslashes (invalid JSON) -> recovered
+    raw = '[{"q": "compute $\\sqrt{2}$ and $\\alpha + \\int_0^1 x$"}]'
+    out = parse_llm_json(raw)
+    assert out[0]["q"] == "compute $\\sqrt{2}$ and $\\alpha + \\int_0^1 x$"
+
+
+def test_keeps_correctly_escaped_latex():
+    raw = '[{"q": "$\\\\frac{a}{b}$"}]'   # properly double-escaped \\frac
+    out = parse_llm_json(raw)
+    assert out[0]["q"] == "$\\frac{a}{b}$"
+
+
 def test_raises_on_no_json():
     with pytest.raises(ValueError):
         parse_llm_json("I cannot answer that.")

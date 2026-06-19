@@ -936,7 +936,8 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
     system = EXTRACT_QUESTIONS_SYSTEM if mode == "extract" else AUTHOR_QUESTIONS_SYSTEM
     type_note = ("Only produce questions of type: " + ", ".join(types) + ". ")         if len(types) == 1 else ""
     verb = ("Extract every practice question visible in these exam pages, "
-            "transcribing formulas in plain notation (e.g. x^2, integral from 0 to 1)."
+            "transcribing all mathematics as LaTeX ($...$ inline, $$...$$ "
+            "display) faithfully to the original."
             if mode == "extract" else
             "Write practice questions from the content visible in these pages.")
 
@@ -1035,7 +1036,8 @@ Rules:
 - For formulas: one card for the formula, separate cards for what each symbol means and when to use it.
 - Write in the same language as the source material.
 
-Output ONLY a JSON array: [{"front": "...", "back": "..."}, ...]. No markdown, no commentary."""
+Write any mathematics as LaTeX ($...$ inline, $$...$$ display); inside the JSON strings double every backslash (\\\\frac, not \\frac).
+Output ONLY a JSON array: [{"front": "...", "back": "..."}, ...]. No markdown fences or commentary around the JSON."""
 
 QUIZ_AUTHOR_SYSTEM = """You write free-recall practice questions for active retrieval, targeting 70-85% expected success (effortful but doable).
 
@@ -1045,13 +1047,14 @@ Rules:
 - "reference" is the model answer used for grading: complete but concise.
 - Same language as the source material.
 
-Output ONLY a JSON array: [{"question": "...", "reference": "..."}, ...]. No markdown, no commentary."""
+Write any mathematics as LaTeX ($...$ inline, $$...$$ display); inside the JSON strings double every backslash (\\\\frac, not \\frac).
+Output ONLY a JSON array: [{"question": "...", "reference": "..."}, ...]. No markdown fences or commentary around the JSON."""
 
 GRADER_SYSTEM = """You grade a learner's free-recall answer against a reference answer. Be exacting but fair: grade meaning, not wording. Do not give credit for vague gestures at the topic.
 
 Output ONLY a JSON object:
 {"score": 0-100, "verdict": "correct"|"partial"|"incorrect", "feedback": "1-3 sentences: name exactly what was missing or wrong, then the key point to remember", "followup": "one short probing question that targets the weakest part of the answer"}
-Use the learner's language for feedback and followup. No markdown, no commentary."""
+Use the learner's language for feedback and followup. Write any mathematics as LaTeX ($...$); inside the JSON strings double every backslash (\\\\frac, not \\frac). No markdown fences or commentary around the JSON."""
 
 
 # ---------------------------------------------------------------------------

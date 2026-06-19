@@ -241,9 +241,23 @@ function injectStyles() {
 .study-histrow.ok { border-left: 2px solid var(--green, #4f9e60); }
 .study-histrow.bad { border-left: 2px solid var(--red, #e05555); }
 .study-histrow .study-state { white-space: nowrap; opacity: 0.7; font-size: 11px; }
-.study-cat { font-size: 11px; height: auto; padding: 2px 5px; margin-left: 8px;
+.study-cat { font-size: 11px; height: auto; padding: 2px 5px;
   background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 6px; vertical-align: middle; }
+  border-radius: 6px; vertical-align: middle; flex: 0 0 auto; }
+/* material rows wrap so the category dropdown + actions always fit */
+.study-mat-row { flex-wrap: wrap; }
+.study-mat-name { flex: 1 1 200px; min-width: 120px; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.study-row-actions { display: flex; align-items: center; gap: 6px;
+  flex-wrap: wrap; margin-left: auto; }
+/* rendered AI markdown (questions, options, references, notes…) */
+.study-md > :first-child { margin-top: 0; }
+.study-md > :last-child { margin-bottom: 0; }
+.study-md p { margin: 0.35em 0; }
+.study-md ul, .study-md ol { margin: 0.35em 0; padding-left: 1.4em; }
+.study-md img { max-width: 100%; height: auto; }
+.study-md .katex { font-size: 1.02em; }
+.study-md .katex-display { margin: 0.4em 0; overflow-x: auto; overflow-y: hidden; }
 /* plan */
 .study-plan-day { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-bottom: 8px; }
 .study-plan-day.today { border-color: var(--accent, #5b8abf); }
@@ -863,6 +877,18 @@ function _renderMarkdownInto(el, md) {
   });
 }
 
+// Render AI-written study text as markdown + KaTeX, so transcribed formatting
+// and formulas show faithfully. `_md` is block; `_mdInline` unwraps a single
+// outer <p> for inline spots (MCQ options, list rows). Falls back to escaped
+// text if the markdown renderer is unavailable.
+function _md(src) {
+  try { return mdToHtml(src || '', {}); }
+  catch { return esc(src || ''); }
+}
+function _mdInline(src) {
+  return _md(src).trim().replace(/^<p>([\s\S]*?)<\/p>\s*$/i, '$1');
+}
+
 // Open an uploaded file in a new browser tab (PDFs render inline there; the
 // app does not embed them — iframe embedding is blocked by the browser).
 function openFileTab(fileId) {
@@ -993,21 +1019,23 @@ function renderMaterialList() {
     return;
   }
   wrap.innerHTML = s.materials.map(m => `
-    <div class="study-row">
-      <span class="grow"><b>${esc(m.name)}</b>
-        <span class="study-subtle"> · ${m.kind} · ${(m.char_count / 1000).toFixed(1)}k chars · ${m.question_count} questions extracted</span>
+    <div class="study-row study-mat-row">
+      <span class="study-mat-name" title="${esc(m.name)}"><b>${esc(m.name)}</b>
+        <span class="study-subtle"> · ${m.kind} · ${(m.char_count / 1000).toFixed(1)}k chars · ${m.question_count} questions extracted</span></span>
+      <span class="study-row-actions">
         <select class="study-cat" data-cat="${m.id}" title="How Consult and Explain-further treat this file. Theory files are searched for the relevant content; exam/answer-key files are not.">
           <option value="theory" ${m.category === 'theory' ? 'selected' : ''}>Theory</option>
           <option value="exam" ${m.category === 'exam' ? 'selected' : ''}>Exam / answer key</option>
-        </select></span>
-      ${s.extracting.has(m.id)
-        ? '<span class="study-subtle">Extracting… (vision can take a few minutes)</span>'
-        : `${m.file_id ? `<button class="study-btn small" data-openfile="${m.id}" title="Open this file in a new browser tab">Open</button>` : ''}
-           <button class="study-btn small" data-notes="${m.id}" title="${m.has_summary ? 'View AI study notes for this material' : 'Generate AI study notes to consult while practising'}">${m.has_summary ? 'Notes' : 'Make notes'}</button>
-           <button class="study-btn small primary" data-extract="${m.id}" title="Pull the actual questions out of a past paper / problem set">Extract questions</button>
-           ${m.kind === 'pdf' ? `<button class="study-btn small" data-vextract="${m.id}" title="Renders the PDF pages as images for a vision model — use for formula-heavy or scanned exams. Also runs automatically when text extraction finds nothing.">Extract (vision)</button>` : ''}
-           <button class="study-btn small" data-author="${m.id}" title="Write new exam-style questions from notes">Author questions</button>
-           <button class="study-btn small danger" data-delmat="${m.id}">✕</button>`}
+        </select>
+        ${s.extracting.has(m.id)
+          ? '<span class="study-subtle">Extracting… (vision can take a few minutes)</span>'
+          : `${m.file_id ? `<button class="study-btn small" data-openfile="${m.id}" title="Open this file in a new browser tab">Open</button>` : ''}
+             <button class="study-btn small" data-notes="${m.id}" title="${m.has_summary ? 'View AI study notes for this material' : 'Generate AI study notes to consult while practising'}">${m.has_summary ? 'Notes' : 'Make notes'}</button>
+             <button class="study-btn small primary" data-extract="${m.id}" title="Pull the actual questions out of a past paper / problem set">Extract questions</button>
+             ${m.kind === 'pdf' ? `<button class="study-btn small" data-vextract="${m.id}" title="Renders the PDF pages as images for a vision model — use for formula-heavy or scanned exams. Also runs automatically when text extraction finds nothing.">Extract (vision)</button>` : ''}
+             <button class="study-btn small" data-author="${m.id}" title="Write new exam-style questions from notes">Author questions</button>
+             <button class="study-btn small danger" data-delmat="${m.id}">✕</button>`}
+      </span>
     </div>`).join('');
   wrap.onchange = async (e) => {
     const sel = e.target.closest('[data-cat]');
@@ -1082,7 +1110,7 @@ function renderQuestionList() {
   wrap.innerHTML = rows.slice(0, 200).map(q => `
     <div class="study-cardrow ${q.suspended ? 'suspended' : ''}">
       <span class="study-qchip ${q.qtype}">${q.qtype}</span>
-      <span class="front" style="flex:2;">${esc(q.question)}</span>
+      <span class="front study-md" style="flex:2;">${_mdInline(q.question)}</span>
       <span class="study-state">${esc(q.topic || '')}${q.topic ? ' · ' : ''}${esc(q.difficulty)}
         · ${esc(q.state)}${q.state !== 'new' ? ` · due ${fmtDue(q.due)}` : ''}${q.lapses ? ` · ${q.lapses}✗` : ''}</span>
       <button class="study-btn small" data-qsusp="${q.id}" title="${q.suspended ? 'Unsuspend' : 'Suspend'}">${q.suspended ? '▶' : '⏸'}</button>
@@ -1273,8 +1301,8 @@ async function renderReview() {
   el.innerHTML = `
     <div class="study-card-stage">
       <div class="study-progress"><i style="width:${progress}%"></i></div>
-      <div class="study-card-front">${esc(card.front)}</div>
-      ${r.revealed ? `<div class="study-card-back">${esc(card.back)}</div>
+      <div class="study-card-front study-md">${_md(card.front)}</div>
+      ${r.revealed ? `<div class="study-card-back study-md">${_md(card.back)}</div>
         ${card.notes ? `<div class="study-card-meta">${esc(card.notes)}</div>` : ''}
         <div style="margin-top:10px;"><button class="study-btn small" id="study-card-explain" title="Pull the underlying theory from your subject's material, with where to review it">Explain further</button></div>` : ''}
       <div class="study-card-meta">${r.idx + 1}/${r.queue.length} · ${esc(card.state)}${card.lapses ? ` · ${card.lapses} lapses` : ''}</div>
@@ -1405,7 +1433,7 @@ async function renderPractice() {
         <span style="flex:1;"></span>
         <span class="study-subtle">${p.idx + 1}/${p.queue.length}</span>
       </div>
-      <div class="study-card-front" style="font-size:16px;">${esc(q.question)}</div>
+      <div class="study-card-front study-md" style="font-size:16px;">${_md(q.question)}</div>
 
       ${isMcq ? `<div style="margin-top:16px;" id="study-opts">
         ${(q.options || []).map((o, i) => {
@@ -1415,18 +1443,18 @@ async function renderPractice() {
             if (i === res.correct_index) cls += ' right';
             else if (i === p.choice && !res.correct) cls += ' wrong';
           }
-          return `<button class="${cls}" data-opt="${i}" ${res ? 'disabled' : ''}>${esc(o)}</button>`;
+          return `<button class="${cls} study-md" data-opt="${i}" ${res ? 'disabled' : ''}>${_mdInline(o)}</button>`;
         }).join('')}
       </div>` : `
         <textarea class="study-textarea" id="study-prac-answer" style="margin-top:14px;min-height:110px;"
           placeholder="Answer from memory — method and result. No peeking." ${res ? 'disabled' : ''}>${esc(p.answerDraft)}</textarea>`}
 
-      ${p.hints.map((h, i) => `<div class="study-hint"><b>Hint ${i + 1}:</b> ${esc(h)}</div>`).join('')}
+      ${p.hints.map((h, i) => `<div class="study-hint study-md"><b>Hint ${i + 1}:</b> ${_mdInline(h)}</div>`).join('')}
       ${located
         ? `<div class="study-hint">📄 Relevant material: ${p.consult.locations.map(l => esc(_locLabel(l))).join(' · ')} — use “Open file”.</div>`
         : ''}
       ${p.consult && !located && p.consult.hint
-        ? `<div class="study-hint"><b>Consult hint:</b> ${esc(p.consult.hint)}</div>` : ''}
+        ? `<div class="study-hint study-md"><b>Consult hint:</b> ${_mdInline(p.consult.hint)}</div>` : ''}
 
       ${!res ? `
         <div class="study-conf">
@@ -1446,10 +1474,10 @@ async function renderPractice() {
             ? `<b class="score">${res.correct ? 'Correct' : 'Incorrect'}</b>`
             : `<b class="score">${res.score}/100</b> <b style="margin-left:8px;text-transform:capitalize;">${esc(res.grading?.verdict || '')}</b>`}
           <span class="study-subtle" style="float:right;">next: ${res.interval_days > 0 ? res.interval_days + 'd' : 'soon (relearn)'}</span>
-          ${res.grading?.feedback ? `<div style="font-size:12.5px;margin-top:8px;line-height:1.5;">${esc(res.grading.feedback)}</div>` : ''}
-          ${res.grading?.followup ? `<div style="font-size:12px;margin-top:8px;opacity:0.75;"><b>Probe:</b> ${esc(res.grading.followup)}</div>` : ''}
-          ${res.reference ? `<div style="font-size:12px;margin-top:10px;opacity:0.65;"><b>Reference:</b> ${esc(res.reference)}</div>` : ''}
-          ${p.explainText ? `<div style="font-size:12.5px;margin-top:10px;line-height:1.5;border-top:1px solid var(--border);padding-top:8px;">${esc(p.explainText)}</div>` : ''}
+          ${res.grading?.feedback ? `<div class="study-md" style="font-size:12.5px;margin-top:8px;line-height:1.5;">${_mdInline(res.grading.feedback)}</div>` : ''}
+          ${res.grading?.followup ? `<div class="study-md" style="font-size:12px;margin-top:8px;opacity:0.75;"><b>Probe:</b> ${_mdInline(res.grading.followup)}</div>` : ''}
+          ${res.reference ? `<div class="study-md" style="font-size:12px;margin-top:10px;opacity:0.65;"><b>Reference:</b> ${_mdInline(res.reference)}</div>` : ''}
+          ${p.explainText ? `<div class="study-md" style="font-size:12.5px;margin-top:10px;line-height:1.5;border-top:1px solid var(--border);padding-top:8px;">${_md(p.explainText)}</div>` : ''}
         </div>
         <div class="study-form-row" style="margin-top:12px;">
           <button class="study-btn primary" id="study-prac-next">Next →</button>

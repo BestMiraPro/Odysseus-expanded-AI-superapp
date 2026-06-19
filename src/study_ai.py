@@ -71,6 +71,16 @@ def _recover_array_objects(text: str, start: int) -> List:
     return out
 
 
+_LATEX_BACKSLASH_RE = re.compile(r"\\([a-tA-Tv-zV-Z])")
+
+
+def _escape_latex_backslashes(s: str) -> str:
+    r"""Double backslashes that begin a LaTeX command (\ + letter, except \u
+    which may be a JSON \uXXXX escape) so single-escaped LaTeX like "$\int$"
+    parses as JSON. Best-effort: misses commands starting with u (rare)."""
+    return _LATEX_BACKSLASH_RE.sub(r"\\\\\1", s)
+
+
 def parse_llm_json(raw: str):
     """Best-effort parse of an LLM reply into a JSON value.
 
@@ -82,7 +92,14 @@ def parse_llm_json(raw: str):
         raise ValueError("empty LLM reply")
     text = _strip_fences(raw)
 
-    for candidate in (text, _TRAILING_COMMA_RE.sub(r"\1", text)):
+    # LaTeX in JSON: models often write "$\frac{a}{b}$" with single backslashes,
+    # which is invalid JSON. Try a variant that escapes backslashes starting a
+    # LaTeX command (\ + letter, except \u which may be a unicode escape) — only
+    # as a fallback, after the clean parse, so valid JSON is never altered.
+    comma_fixed = _TRAILING_COMMA_RE.sub(r"\1", text)
+    for candidate in (text, comma_fixed,
+                      _escape_latex_backslashes(text),
+                      _escape_latex_backslashes(comma_fixed)):
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
@@ -473,6 +490,23 @@ def rating_from_outcome(qtype: str, *, correct: Optional[bool] = None,
 # prompts
 # ---------------------------------------------------------------------------
 
+# Faithful-formatting guidance. _MATH_JSON_NOTE for prompts whose reply is JSON
+# (the math lives in string-field values, so backslashes must be doubled);
+# _MATH_TEXT_NOTE for prompts that reply in plain Markdown.
+_MATH_JSON_NOTE = (
+    "\n- Faithful formatting: keep the source's structure and notation (bold, "
+    "lists, sub/superscripts, fractions, vectors, matrices, tables) — don't "
+    "flatten to plain text. Write ALL mathematics as LaTeX: $...$ inline, "
+    "$$...$$ display. Because the field values are inside JSON strings, every "
+    "backslash MUST be doubled — write \\\\frac, \\\\int, \\\\sqrt, \\\\alpha "
+    "(not \\frac)."
+)
+_MATH_TEXT_NOTE = (
+    "\n\nFormatting: reply in Markdown, preserving the source's structure "
+    "(bold, lists, sub/superscripts, tables). Write all mathematics as LaTeX: "
+    "$...$ inline, $$...$$ display."
+)
+
 EXTRACT_QUESTIONS_SYSTEM = """You extract practice questions from course material (past exams, problem sets, worked examples, lecture notes containing exercises).
 
 Rules:
@@ -490,7 +524,8 @@ Rules:
 Output ONLY a JSON array:
 [{"number":"1","type":"mcq","question":"...","options":["...","..."],"correct_index":0,"reference":"...","topic":"...","difficulty":"medium"},
  {"number":"2a","type":"open","question":"...","reference":"...","topic":"...","difficulty":"hard"}]
-No markdown, no commentary."""
+No markdown fences or commentary around the JSON (LaTeX inside the field values is expected)."""
+EXTRACT_QUESTIONS_SYSTEM += _MATH_JSON_NOTE
 
 DISCOVER_QUESTIONS_SYSTEM = """You locate explicit practice/exam questions in course material (pages of a PDF or plain text). This is a DISCOVERY pass only: do not solve, transcribe, merge, or invent questions.
 
@@ -519,7 +554,8 @@ Rules:
 Output ONLY a JSON array in the same schema:
 [{"type":"mcq","question":"...","options":["...","...","...","..."],"correct_index":2,"reference":"...","topic":"...","difficulty":"medium"},
  {"type":"open","question":"...","reference":"...","topic":"...","difficulty":"hard"}]
-No markdown, no commentary."""
+No markdown fences or commentary around the JSON (LaTeX inside the field values is expected)."""
+AUTHOR_QUESTIONS_SYSTEM += _MATH_JSON_NOTE
 
 HINT_SYSTEM = """You give ONE progressive hint for a practice question. The student is mid-attempt: never reveal the final answer or full solution.
 
@@ -614,3 +650,13 @@ FIGURE_CAPTION_SYSTEM = """You are shown figures extracted from course material.
 Output ONLY a JSON array, one object per image in the order given:
 [{"idx": 0, "caption": "...", "keep": true}, {"idx": 1, "caption": "...", "keep": false}]
 Set "keep": false for anything decorative or that is just text. Use the language of the material for captions."""
+
+# Faithful-formatting guidance appended to the relevant prompts. Plain-Markdown
+# replies get the text note; JSON replies whose fields hold math get the
+# JSON-escaping note.
+HINT_SYSTEM += _MATH_TEXT_NOTE
+EXPLAIN_SYSTEM += _MATH_TEXT_NOTE
+STUDY_NOTES_SYSTEM += _MATH_TEXT_NOTE
+SUBJECT_OVERVIEW_SYSTEM += _MATH_TEXT_NOTE
+GRADE_OPEN_SYSTEM += _MATH_JSON_NOTE
+EXPLAIN_FURTHER_SYSTEM += _MATH_JSON_NOTE
