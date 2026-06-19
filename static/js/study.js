@@ -945,38 +945,48 @@ async function openExplainFurther(kind, id) {
   load(false);
 }
 
-// Practice consult chooser: subject overview / chapter notes / original file.
-// When `penalize` (i.e. the answer isn't submitted yet), the first consult
-// flags the attempt so it counts like a hint — preserving retrieval effort.
-function openConsultMenu(q, penalize) {
-  const note = penalize
-    ? '<div class="study-viewer-empty" style="flex:0;padding:12px 24px 0;">Consulting now counts like a hint — this question will be scheduled sooner. Once you’ve answered, it’s free.</div>'
-    : '';
-  const inner = `${note}
-    <div class="study-viewer-body">
-      <p class="study-subtle" style="margin-top:0;">Open a resource to consult:</p>
-      <div class="study-form-row">
-        <button class="study-btn" data-consult="overview">Subject overview</button>
-        ${q.material_id ? '<button class="study-btn" data-consult="notes">Chapter notes</button>' : ''}
-        ${q.material_id ? '<button class="study-btn" data-consult="file">Original file</button>' : ''}
-      </div>
-    </div>`;
-  const v = _viewerShell('Consult', '', inner);
-  v.querySelectorAll('[data-consult]').forEach(b => b.addEventListener('click', async () => {
-    if (penalize) { S.practice.consulted = true; }
-    const what = b.dataset.consult;
-    if (what === 'overview') {
-      openSubjectOverview(q.deck_id, 'Subject');
-    } else if (what === 'notes') {
-      openMaterialNotes(q.material_id, q.topic || 'Chapter notes');
-    } else if (what === 'file') {
-      try {
-        const r = await jget(`/api/study/materials/${q.material_id}/notes`);
-        if (r.file_id) openFileViewer(r.file_id, r.name);
-        else toast('This material has no original file (pasted text).', true);
-      } catch (e) { toast(e.message, true); }
-    }
+function _locLabel(l) {
+  return (l.name || l.label || 'file') + (l.page ? `, p.${l.page}` : '');
+}
+
+// When several files are relevant, a chooser of file-name buttons (each opens
+// that file in a new tab at its page).
+function openFileChooser(locations) {
+  const inner = `<div class="study-viewer-body">
+    <p class="study-subtle" style="margin-top:0;">Relevant files — open one:</p>
+    <div class="study-form-row">
+      ${locations.map((l, i) => `<button class="study-btn" data-loc="${i}">${esc(_locLabel(l))}</button>`).join('')}
+    </div></div>`;
+  const v = _viewerShell('Open file', '', inner);
+  v.querySelectorAll('[data-loc]').forEach(b => b.addEventListener('click', () => {
+    const l = locations[parseInt(b.dataset.loc, 10)];
+    if (l) window.open(`${API}${l.url}`, '_blank', 'noopener');
   }));
+}
+
+// Consult = locate the file+page with the content to answer this question.
+// First click searches and cites; the button then becomes "Open file".
+// Consulting before answering counts like a hint (preserves retrieval effort).
+async function consultAction(q, penalize) {
+  const p = S.practice;
+  if (!p || p.consultBusy) return;
+  // Already located -> open the file(s).
+  if (p.consult && p.consult.locations && p.consult.locations.length) {
+    const locs = p.consult.locations;
+    if (locs.length === 1) window.open(`${API}${locs[0].url}`, '_blank', 'noopener');
+    else openFileChooser(locs);
+    return;
+  }
+  if (penalize) p.consulted = true;   // looking it up before answering = a hint
+  p.consultBusy = true; renderPractice();
+  try {
+    const r = await jpost(`/api/study/questions/${q.id}/locate`, {});
+    p.consult = r;
+    if (!r.locations || !r.locations.length) {
+      toast('No file in this subject covers it directly — generated a hint instead.', true);
+    }
+  } catch (e) { toast(e.message, true); }
+  p.consultBusy = false; renderPractice();
 }
 
 function renderMaterialList() {
@@ -1331,7 +1341,7 @@ async function startPractice(deckId = null, limit = 12) {
   S.practice = { queue: [], idx: 0, deckId, loading: true,
                  phase: 'answer', confidence: null, choice: null,
                  hints: [], hintBusy: false, answerDraft: '', result: null,
-                 consulted: false,
+                 consulted: false, consult: null, consultBusy: false,
                  explainText: null, explainBusy: false,
                  log: [], startTs: Date.now(), qShownTs: Date.now() };
   renderPractice();
@@ -1385,6 +1395,8 @@ async function renderPractice() {
   const progress = Math.round((p.idx / p.queue.length) * 100);
   const isMcq = q.qtype === 'mcq';
   const res = p.result;
+  const located = p.consult && p.consult.locations && p.consult.locations.length;
+  const consultLabel = p.consultBusy ? 'Locating…' : (located ? 'Open file' : 'Consult');
 
   el.innerHTML = `
     <div class="study-q-wrap">
@@ -1413,6 +1425,11 @@ async function renderPractice() {
           placeholder="Answer from memory — method and result. No peeking." ${res ? 'disabled' : ''}>${esc(p.answerDraft)}</textarea>`}
 
       ${p.hints.map((h, i) => `<div class="study-hint"><b>Hint ${i + 1}:</b> ${esc(h)}</div>`).join('')}
+      ${located
+        ? `<div class="study-hint">📄 Relevant material: ${p.consult.locations.map(l => esc(_locLabel(l))).join(' · ')} — use “Open file”.</div>`
+        : ''}
+      ${p.consult && !located && p.consult.hint
+        ? `<div class="study-hint"><b>Consult hint:</b> ${esc(p.consult.hint)}</div>` : ''}
 
       ${!res ? `
         <div class="study-conf">
@@ -1424,7 +1441,7 @@ async function renderPractice() {
           <button class="study-btn primary" id="study-prac-submit">Check answer</button>
           <button class="study-btn" id="study-prac-hint" ${p.hints.length >= 3 || p.hintBusy ? 'disabled' : ''}>
             ${p.hintBusy ? 'Thinking…' : `Hint (${p.hints.length}/3)`}</button>
-          <button class="study-btn" id="study-prac-consult" title="Open the subject overview, chapter notes, or the original file. Consulting before you answer counts like a hint.">Consult${p.consulted ? ' •' : ''}</button>
+          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>
           <button class="study-btn" id="study-prac-skip">Skip</button>
         </div>` : `
         <div class="study-grade ${res.correct === true || (res.score ?? 0) >= 85 ? 'correct' : (res.correct === false || (res.score ?? 0) < 60 ? 'incorrect' : '')}">
@@ -1441,7 +1458,7 @@ async function renderPractice() {
           <button class="study-btn primary" id="study-prac-next">Next →</button>
           ${isMcq && !p.explainText ? `<button class="study-btn" id="study-prac-explain" ${p.explainBusy ? 'disabled' : ''}>${p.explainBusy ? 'Explaining…' : 'Explain options'}</button>` : ''}
           <button class="study-btn" id="study-prac-explain-further" title="Pull the underlying theory from your material, with where to review it">Explain further</button>
-          <button class="study-btn" id="study-prac-consult" title="Open the subject overview, chapter notes, or the original file (free now that you've answered)">Consult</button>
+          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it (free now that you've answered)">${consultLabel}</button>
         </div>`}
     </div>`;
 
@@ -1474,7 +1491,7 @@ async function renderPractice() {
   });
 
   el.querySelector('#study-prac-consult')?.addEventListener('click', () => {
-    openConsultMenu(q, !p.result);  // penalize only before the answer is submitted
+    consultAction(q, !p.result);  // penalize only before the answer is submitted
   });
 
   el.querySelector('#study-prac-explain-further')?.addEventListener('click', () => {
@@ -1528,7 +1545,7 @@ function advancePractice() {
   p.idx += 1;
   p.result = null; p.choice = null; p.confidence = null;
   p.hints = []; p.answerDraft = ''; p.explainText = null;
-  p.consulted = false;
+  p.consulted = false; p.consult = null; p.consultBusy = false;
   p.qShownTs = Date.now();
   renderPractice();
 }

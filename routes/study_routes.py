@@ -52,6 +52,7 @@ from src.study_ai import (
     FIGURE_CAPTION_SYSTEM,
     GRADE_OPEN_SYSTEM,
     HINT_SYSTEM,
+    LOCATE_MATERIAL_SYSTEM,
     REPAIR_JSON_SYSTEM,
     STUDY_NOTES_SYSTEM,
     SUBJECT_OVERVIEW_SYSTEM,
@@ -496,24 +497,18 @@ def _study_figures_dir(material_id: str) -> str:
     return os.path.join(UPLOAD_DIR, ".study_figures", os.path.basename(material_id))
 
 
-def _explain_further_markdown(value: Dict, by_id: Dict[str, Dict]) -> str:
-    """Assemble the 'explain further' Markdown: the theory plus a 'Where to
-    review' footer linking to each cited theory location across the subject's
-    files (new browser tab, at the page when known) and the notes section.
+def _resolve_locations(value: Dict, by_id: Dict[str, Dict]) -> List[Dict]:
+    """Resolve a model reply's `locations` against the deck's materials.
 
-    `value` is the model reply: {explanation, summary_section, locations:[{material_id, page, label}]}.
-    `by_id` maps material_id -> {name, file_id}.
+    Returns deduped [{file_id, name, page, label, url}] — only locations whose
+    material_id maps to a real file. `value` is {..., locations:[{material_id,
+    page, label}]}; `by_id` maps material_id -> {name, file_id}.
     """
-    explanation = str((value or {}).get("explanation") or "").strip()
-    if not explanation:
-        return ""
-    section = str((value or {}).get("summary_section") or "").strip()
-
-    locations = value.get("locations")
+    locations = (value or {}).get("locations")
     if not isinstance(locations, list):
-        locations = []
+        return []
     seen = set()
-    bits = []
+    out: List[Dict] = []
     for loc in locations:
         if not isinstance(loc, dict):
             continue
@@ -529,12 +524,28 @@ def _explain_further_markdown(value: Dict, by_id: Dict[str, Dict]) -> str:
         if key in seen:
             continue
         seen.add(key)
-        label = str(loc.get("label") or "").strip() or mat.get("name") or "source"
-        if page:
-            label += f", p.{page}"
+        name = mat.get("name") or "source"
+        label = str(loc.get("label") or "").strip() or name
         url = f"/api/upload/{mat['file_id']}?inline=1" + (f"#page={page}" if page else "")
+        out.append({"file_id": mat["file_id"], "name": name, "page": page,
+                    "label": label, "url": url})
+    return out
+
+
+def _explain_further_markdown(value: Dict, by_id: Dict[str, Dict]) -> str:
+    """Assemble the 'explain further' Markdown: the theory plus a 'Where to
+    review' footer linking to each cited theory location across the subject's
+    files (new browser tab, at the page when known) and the notes section."""
+    explanation = str((value or {}).get("explanation") or "").strip()
+    if not explanation:
+        return ""
+    section = str((value or {}).get("summary_section") or "").strip()
+
+    bits = []
+    for loc in _resolve_locations(value, by_id):
+        label = loc["label"] + (f", p.{loc['page']}" if loc["page"] else "")
         # The frontend opens /api/upload links in a new tab (link post-processor).
-        bits.append(f"[{label}]({url})")
+        bits.append(f"[{label}]({loc['url']})")
     if section:
         bits.append(f"study notes → *{section}*")
     footer = ("\n\n---\n*Where to review:* " + " · ".join(bits)) if bits else ""
@@ -2405,6 +2416,58 @@ def setup_study_routes():
         finally:
             db.close()
         return {"explanation": md, "cached": False}
+
+    @router.post("/questions/{question_id}/locate")
+    async def question_locate(request: Request, question_id: str):
+        """Consult: find which of the subject's files (and page) hold the content
+        needed to answer this question. Returns {locations:[{file_id,name,page,
+        label,url}]}; when nothing covers it, generates a hint instead so the
+        learner isn't left empty-handed: {locations:[], hint:"..."}."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            row = _get_question(db, question_id, user)
+            q_text = row.question
+            options = json.loads(row.options) if row.options else None
+            reference = row.reference or ""
+            deck_id = row.deck_id
+            blocks, by_id = _deck_material_context(db, deck_id, user)
+        finally:
+            db.close()
+
+        prompt_parts = [f"QUESTION:\n{q_text}"]
+        if options:
+            prompt_parts.append("OPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options)))
+        prompt_parts.append("--- SUBJECT MATERIALS ---\n" + ("\n\n".join(blocks)
+                            if blocks else "(no materials available)"))
+        locations = []
+        if blocks:
+            try:
+                value = await _llm_json(user, LOCATE_MATERIAL_SYSTEM,
+                                        "\n\n".join(prompt_parts),
+                                        temperature=0.2, max_tokens=4000,
+                                        timeout=180, thinking_off=True)
+                if isinstance(value, dict):
+                    locations = _resolve_locations(value, by_id)
+            except HTTPException as e:
+                if e.status_code == 503:
+                    raise
+                logger.warning("study locate: %s", e.detail)
+
+        if locations:
+            return {"locations": locations, "hint": None}
+
+        # Nothing relevant found — fall back to a hint so consult is still useful.
+        opts_txt = ("\nOPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options))) \
+            if options else ""
+        hint_prompt = (f"HINT LEVEL: 1\n\nQUESTION:\n{q_text}{opts_txt}\n\n"
+                       f"REFERENCE SOLUTION (for your eyes only — do NOT reveal it):\n{reference}")
+        try:
+            hint = await _llm_text(user, HINT_SYSTEM, hint_prompt,
+                                   temperature=0.3, max_tokens=4000, timeout=120)
+        except HTTPException:
+            hint = None
+        return {"locations": [], "hint": hint}
 
     @router.post("/cards/{card_id}/explain-further")
     async def card_explain_further(request: Request, card_id: str,

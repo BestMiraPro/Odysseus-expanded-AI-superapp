@@ -540,6 +540,21 @@ Output ONLY a JSON object:
 {"explanation": "<markdown explanation>", "summary_section": "<string|null>", "locations": [{"material_id": "<id>", "page": <int|null>, "label": "<short label>"}]}
 "locations" may be empty if no material covers the theory. Use the language of the materials. No prose outside the JSON."""
 
+LOCATE_MATERIAL_SYSTEM = """You locate, in a student's own course materials, where the content needed to answer a practice question is found — so they can go read it.
+
+You receive the question and the subject's materials. Each material is under a "=== MATERIAL <id>: <name> ===" header; PDF text is annotated with "[Page N text]:" markers.
+
+Find the material(s) and page(s) that present the theory/method needed to answer the question. Rules:
+- Cite the lecture/theory material that EXPLAINS the content. Practice exams, problem sets and answer keys hold questions, not theory — never cite them.
+- Cite only genuinely relevant locations; if several materials cover it, list each.
+- "page": the 1-based page from the [Page N] markers, or null if unknown.
+- "label": a short human label for the location (the chapter/topic name).
+- If NO provided material actually covers the content, return an empty list.
+
+Output ONLY a JSON object:
+{"locations": [{"material_id": "<id>", "page": <int|null>, "label": "<short label>"}]}
+No prose outside the JSON."""
+
 STUDY_NOTES_SYSTEM = """You write a study-notes document from course material (a chapter, lecture, or paper), for a student to consult while practising problems. Be faithful to the material — summarize and organize it, never invent content.
 
 Structure it as Markdown, scaled to the material (omit empty sections):
