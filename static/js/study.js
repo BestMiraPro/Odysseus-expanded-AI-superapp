@@ -863,19 +863,11 @@ function _renderMarkdownInto(el, md) {
   });
 }
 
-// Open an uploaded file inside the app (PDF/text/image render inline; other
-// types offer a new-tab/download link). Reused by the practice Consult drawer.
-function openFileViewer(fileId, name) {
+// Open an uploaded file in a new browser tab (PDFs render inline there; the
+// app does not embed them — iframe embedding is blocked by the browser).
+function openFileTab(fileId) {
   if (!fileId) return;
-  const url = `${API}/api/upload/${encodeURIComponent(fileId)}?inline=1`;
-  const ext = (String(name || '').split('.').pop() || '').toLowerCase();
-  const viewable = ['pdf', 'txt', 'md', 'csv', 'png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext);
-  _viewerShell(
-    name || 'File',
-    `<a class="study-btn small" href="${url}" target="_blank" rel="noopener">Open in new tab</a>`,
-    viewable
-      ? `<iframe src="${url}" title="${esc(name || 'File')}"></iframe>`
-      : `<div class="study-viewer-empty">This file type can’t be previewed inline.<br>Use “Open in new tab” to view or download it.</div>`);
+  window.open(`${API}/api/upload/${encodeURIComponent(fileId)}?inline=1`, '_blank', 'noopener');
 }
 
 // Generate-if-missing then show a Markdown doc (study notes / subject overview)
@@ -1010,12 +1002,11 @@ function renderMaterialList() {
         </select></span>
       ${s.extracting.has(m.id)
         ? '<span class="study-subtle">Extracting… (vision can take a few minutes)</span>'
-        : `${m.file_id ? `<button class="study-btn small" data-view="${m.id}" title="Open this file inside the app">View</button>` : ''}
+        : `${m.file_id ? `<button class="study-btn small" data-openfile="${m.id}" title="Open this file in a new browser tab">Open</button>` : ''}
            <button class="study-btn small" data-notes="${m.id}" title="${m.has_summary ? 'View AI study notes for this material' : 'Generate AI study notes to consult while practising'}">${m.has_summary ? 'Notes' : 'Make notes'}</button>
            <button class="study-btn small primary" data-extract="${m.id}" title="Pull the actual questions out of a past paper / problem set">Extract questions</button>
            ${m.kind === 'pdf' ? `<button class="study-btn small" data-vextract="${m.id}" title="Renders the PDF pages as images for a vision model — use for formula-heavy or scanned exams. Also runs automatically when text extraction finds nothing.">Extract (vision)</button>` : ''}
            <button class="study-btn small" data-author="${m.id}" title="Write new exam-style questions from notes">Author questions</button>
-           ${m.kind !== 'text' ? `<button class="study-btn small" data-reextract="${m.id}" title="Re-read the full file text. Older uploads were capped at 15k characters — use this to pick up the rest.">↻ text</button>` : ''}
            <button class="study-btn small danger" data-delmat="${m.id}">✕</button>`}
     </div>`).join('');
   wrap.onchange = async (e) => {
@@ -1034,12 +1025,11 @@ function renderMaterialList() {
     const vx = e.target.closest('[data-vextract]')?.dataset.vextract;
     const au = e.target.closest('[data-author]')?.dataset.author;
     const del = e.target.closest('[data-delmat]')?.dataset.delmat;
-    const rx = e.target.closest('[data-reextract]')?.dataset.reextract;
-    const vw = e.target.closest('[data-view]')?.dataset.view;
+    const of = e.target.closest('[data-openfile]')?.dataset.openfile;
     const nt = e.target.closest('[data-notes]')?.dataset.notes;
-    if (vw) {
-      const m = s.materials.find(x => x.id === vw);
-      if (m) openFileViewer(m.file_id, m.name);
+    if (of) {
+      const m = s.materials.find(x => x.id === of);
+      if (m) openFileTab(m.file_id);
       return;
     }
     if (nt) {
@@ -1051,17 +1041,6 @@ function renderMaterialList() {
       if (!confirm('Remove this material? (Extracted questions stay.)')) return;
       try { await jdel(`/api/study/materials/${del}`); reloadSubject(); }
       catch (err) { toast(err.message, true); }
-      return;
-    }
-    if (rx) {
-      try {
-        const r = await jpost(`/api/study/materials/${rx}/reextract-text`, {});
-        const grew = r.char_count > r.previous;
-        toast(grew
-          ? `Re-read full text: ${(r.char_count / 1000).toFixed(1)}k chars (was ${(r.previous / 1000).toFixed(1)}k)`
-          : `Text unchanged (${(r.char_count / 1000).toFixed(1)}k chars)`);
-        reloadSubject();
-      } catch (err) { toast(err.message, true); }
       return;
     }
     const id = ex || vx || au;
