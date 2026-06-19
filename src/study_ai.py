@@ -365,6 +365,36 @@ def question_key(text: str) -> str:
     return re.sub(r"\W+", "", (text or "").lower())
 
 
+# ---------------------------------------------------------------------------
+# material category (theory vs exam/answer-key)
+# ---------------------------------------------------------------------------
+
+MATERIAL_CATEGORIES = ("theory", "exam")
+
+# A "theory" marker (chapter/lecture/notes/...) wins even when the name also
+# says "solutions", so "ch2.1_withsolutions.pdf" stays theory; a bare
+# "...RegularExam_SolutionTopics.pdf" is an exam/answer key.
+_THEORY_MARK_RE = re.compile(
+    r"(chapter|lecture|\bnotes\b|\bslides\b|\bunit\b|\bweek\b|ch\d|cap\d|aula|tema)", re.I)
+_ANSWER_KEY_RE = re.compile(
+    r"(exam|solution|resit|answer[\s_-]?key|gabarito|\bmock\b|\bquiz\b|\btest\b|past[\s_-]*paper|marking)", re.I)
+
+
+def is_answer_key_material(name: str) -> bool:
+    """True for exam / answer-key / solutions files (questions, not theory).
+    Chapter/lecture files are never answer keys, even if they bundle solutions."""
+    n = name or ""
+    if _THEORY_MARK_RE.search(n):
+        return False
+    return bool(_ANSWER_KEY_RE.search(n))
+
+
+def classify_material(name: str) -> str:
+    """Best-guess category from a filename: "exam" or "theory" (the default).
+    Used to auto-tag a material on upload; the user can override it."""
+    return "exam" if is_answer_key_material(name) else "theory"
+
+
 def dedupe_questions(questions: List[Dict]) -> List[Dict]:
     """Drop near-duplicate questions (same `question_key`)."""
     seen = set()

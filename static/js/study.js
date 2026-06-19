@@ -241,6 +241,9 @@ function injectStyles() {
 .study-histrow.ok { border-left: 2px solid var(--green, #4f9e60); }
 .study-histrow.bad { border-left: 2px solid var(--red, #e05555); }
 .study-histrow .study-state { white-space: nowrap; opacity: 0.7; font-size: 11px; }
+.study-cat { font-size: 11px; height: auto; padding: 2px 5px; margin-left: 8px;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 6px; vertical-align: middle; }
 /* plan */
 .study-plan-day { border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; margin-bottom: 8px; }
 .study-plan-day.today { border-color: var(--accent, #5b8abf); }
@@ -1000,7 +1003,11 @@ function renderMaterialList() {
   wrap.innerHTML = s.materials.map(m => `
     <div class="study-row">
       <span class="grow"><b>${esc(m.name)}</b>
-        <span class="study-subtle"> · ${m.kind} · ${(m.char_count / 1000).toFixed(1)}k chars · ${m.question_count} questions extracted</span></span>
+        <span class="study-subtle"> · ${m.kind} · ${(m.char_count / 1000).toFixed(1)}k chars · ${m.question_count} questions extracted</span>
+        <select class="study-cat" data-cat="${m.id}" title="How Consult and Explain-further treat this file. Theory files are searched for the relevant content; exam/answer-key files are not.">
+          <option value="theory" ${m.category === 'theory' ? 'selected' : ''}>Theory</option>
+          <option value="exam" ${m.category === 'exam' ? 'selected' : ''}>Exam / answer key</option>
+        </select></span>
       ${s.extracting.has(m.id)
         ? '<span class="study-subtle">Extracting… (vision can take a few minutes)</span>'
         : `${m.file_id ? `<button class="study-btn small" data-view="${m.id}" title="Open this file inside the app">View</button>` : ''}
@@ -1011,6 +1018,17 @@ function renderMaterialList() {
            ${m.kind !== 'text' ? `<button class="study-btn small" data-reextract="${m.id}" title="Re-read the full file text. Older uploads were capped at 15k characters — use this to pick up the rest.">↻ text</button>` : ''}
            <button class="study-btn small danger" data-delmat="${m.id}">✕</button>`}
     </div>`).join('');
+  wrap.onchange = async (e) => {
+    const sel = e.target.closest('[data-cat]');
+    if (!sel) return;
+    const id = sel.dataset.cat;
+    try {
+      await jput(`/api/study/materials/${id}/category`, { category: sel.value });
+      const m = s.materials.find(x => x.id === id);
+      if (m) m.category = sel.value;
+      toast(`Marked as ${sel.value === 'exam' ? 'exam / answer key' : 'theory'}`);
+    } catch (err) { toast(err.message, true); }
+  };
   wrap.onclick = async (e) => {
     const ex = e.target.closest('[data-extract]')?.dataset.extract;
     const vx = e.target.closest('[data-vextract]')?.dataset.vextract;

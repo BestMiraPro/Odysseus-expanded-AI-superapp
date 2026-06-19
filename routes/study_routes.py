@@ -53,10 +53,12 @@ from src.study_ai import (
     GRADE_OPEN_SYSTEM,
     HINT_SYSTEM,
     LOCATE_MATERIAL_SYSTEM,
+    MATERIAL_CATEGORIES,
     REPAIR_JSON_SYSTEM,
     STUDY_NOTES_SYSTEM,
     SUBJECT_OVERVIEW_SYSTEM,
     chunk_material,
+    classify_material,
     dedupe_questions,
     missing_question_numbers,
     normalize_questions,
@@ -177,6 +179,10 @@ class MaterialCreate(BaseModel):
     name: Optional[str] = None
     text: Optional[str] = None
     file_id: Optional[str] = None
+
+
+class MaterialCategoryIn(BaseModel):
+    category: str   # "theory" | "exam"
 
 
 class ExtractIn(BaseModel):
@@ -485,6 +491,7 @@ def _material_to_dict(m: StudyMaterial) -> Dict:
         "file_id": m.file_id, "char_count": m.char_count or 0,
         "question_count": m.question_count or 0,
         "has_summary": bool(m.summary),
+        "category": _material_category(m),
         "created_at": _iso(m.created_at),
     }
 
@@ -552,24 +559,10 @@ def _explain_further_markdown(value: Dict, by_id: Dict[str, Dict]) -> str:
     return explanation + footer
 
 
-# Theory vs exam/answer-key classification by filename. A "theory" marker
-# (chapter/lecture/notes/...) wins even when the name also says "solutions",
-# so a chapter like "ch2.1_withsolutions.pdf" stays theory; a bare
-# "...RegularExam_SolutionTopics.pdf" is an answer key.
-_THEORY_MARK_RE = re.compile(
-    r"(chapter|lecture|\bnotes\b|\bslides\b|\bunit\b|\bweek\b|ch\d|cap\d|aula|tema)", re.I)
-_ANSWER_KEY_RE = re.compile(
-    r"(exam|solution|resit|answer[\s_-]?key|gabarito|\bmock\b|\bquiz\b|\btest\b|past[\s_-]*paper|marking)", re.I)
-
-
-def _is_answer_key_material(name: str) -> bool:
-    """True for exam / answer-key / solutions files (which hold questions, not
-    theory). Chapter/lecture files are never treated as answer keys, even if
-    they bundle solutions."""
-    n = name or ""
-    if _THEORY_MARK_RE.search(n):
-        return False
-    return bool(_ANSWER_KEY_RE.search(n))
+def _material_category(m) -> str:
+    """Effective category for a material: the stored value, or a filename guess
+    for rows from before the column existed."""
+    return m.category if m.category in MATERIAL_CATEGORIES else classify_material(m.name)
 
 
 def _deck_material_context(db, deck_id: str, user, *, char_budget: int = 90000,
@@ -580,9 +573,10 @@ def _deck_material_context(db, deck_id: str, user, *, char_budget: int = 90000,
     "=== MATERIAL <id>: <name> ===\\n<text>" strings (text carries the PDF
     [Page N] markers), `by_id` maps id -> {name, file_id, summary}.
 
-    With ``theory_only``, exam/answer-key files are excluded from the search
-    corpus so citations point at the lecture/theory material — unless that would
-    leave nothing, in which case all materials are used (graceful fallback)."""
+    With ``theory_only``, materials categorized as exam/answer-key are excluded
+    from the search corpus so citations point at the lecture/theory material —
+    unless that would leave nothing, in which case all materials are used
+    (graceful fallback)."""
     mq = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
     if user is not None:
         mq = mq.filter(StudyMaterial.owner == user)
@@ -591,7 +585,7 @@ def _deck_material_context(db, deck_id: str, user, *, char_budget: int = 90000,
              for m in mats}
     corpus = mats
     if theory_only:
-        theory = [m for m in mats if not _is_answer_key_material(m.name)]
+        theory = [m for m in mats if _material_category(m) != "exam"]
         if theory:                      # keep all if the deck is exams-only
             corpus = theory
     blocks, budget = [], char_budget
@@ -1714,6 +1708,7 @@ def setup_study_routes():
                 id=str(uuid.uuid4()), owner=user, deck_id=deck.id,
                 name=name[:200], kind=kind, file_id=body.file_id,
                 content=text, char_count=len(text),
+                category=classify_material(name),   # auto-tag on upload; user can change it
             )
             db.add(m)
             db.commit()
@@ -1732,6 +1727,22 @@ def setup_study_routes():
             db.delete(m)
             db.commit()
             return {"ok": True}
+        finally:
+            db.close()
+
+    @router.put("/materials/{material_id}/category")
+    def set_material_category(request: Request, material_id: str, body: MaterialCategoryIn):
+        """Change a material's category (theory vs exam/answer-key). This drives
+        whether Consult / Explain-further search it as a theory source."""
+        if body.category not in MATERIAL_CATEGORIES:
+            raise HTTPException(400, f"category must be one of {MATERIAL_CATEGORIES}")
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            m = _get_material(db, material_id, user)
+            m.category = body.category
+            db.commit()
+            return {"ok": True, "category": m.category}
         finally:
             db.close()
 

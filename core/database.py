@@ -739,9 +739,21 @@ def _migrate_add_study_summary_columns():
         card_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_cards)")]
         if "deep_explanation" not in card_cols:
             conn.execute("ALTER TABLE study_cards ADD COLUMN deep_explanation TEXT")
+        if "category" not in mat_cols:
+            conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
+            # Backfill existing rows from the filename classifier (single source
+            # of truth in src.study_ai).
+            try:
+                from src.study_ai import classify_material
+                rows = conn.execute("SELECT id, name FROM study_materials").fetchall()
+                for mid, name in rows:
+                    conn.execute("UPDATE study_materials SET category = ? WHERE id = ?",
+                                 (classify_material(name or ""), mid))
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"study category backfill skipped: {e}")
         conn.commit()
         conn.close()
-        logging.getLogger(__name__).info("Migrated: study summary/overview/explanation columns")
+        logging.getLogger(__name__).info("Migrated: study summary/overview/explanation/category columns")
     except Exception as e:
         logging.getLogger(__name__).warning(f"study summary columns migration failed: {e}")
 
@@ -1625,6 +1637,7 @@ class StudyMaterial(TimestampMixin, Base):
     char_count     = Column(Integer, default=0)
     question_count = Column(Integer, default=0)        # questions extracted so far
     summary        = Column(Text, nullable=True)       # AI study notes (markdown), for consultation
+    category       = Column(String, default="theory")  # "theory" | "exam" — drives consult/explain-further search
 
 
 class StudyQuestion(TimestampMixin, Base):
