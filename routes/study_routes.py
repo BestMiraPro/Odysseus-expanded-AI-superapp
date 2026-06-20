@@ -22,6 +22,7 @@ Design notes:
   resolve_endpoint("utility") with fallback to "default", same as notes.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -600,6 +601,107 @@ def _deck_material_context(db, deck_id: str, user, *, char_budget: int = 90000,
         if budget <= 0:
             break
     return blocks, by_id
+
+
+def _read_pref(owner, key: str) -> str:
+    """Read a per-user preference (country, study_school) from the prefs store."""
+    try:
+        from routes.prefs_routes import _load_for_user
+        return str((_load_for_user(owner) or {}).get(key) or "").strip()
+    except Exception:
+        return ""
+
+
+def _web_source_links(sources, limit: int = 5) -> List[Dict]:
+    """Normalize comprehensive_web_search sources into openable links."""
+    out = []
+    for s in (sources or []):
+        if isinstance(s, str):
+            url, title = s, s
+        elif isinstance(s, dict):
+            url = s.get("url") or s.get("link") or s.get("href") or ""
+            title = s.get("title") or s.get("name") or url
+        else:
+            continue
+        if not url:
+            continue
+        out.append({"name": title, "label": title, "url": url, "page": None,
+                    "web": True})
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _web_theory(owner, concept_text: str, subject_name: str):
+    """Last resort when no course material covers a question: find the theory on
+    the web, localized to the user's school (else country, else English).
+    Returns (markdown, [links]); ('', []) on failure. Best-effort."""
+    country = _read_pref(owner, "country")
+    school = _read_pref(owner, "study_school")
+    loc_prompt = (
+        f"Subject: {subject_name}\nA student needs the theory behind this:\n"
+        f"{concept_text[:2000]}\n\n"
+        f"Student's school: {school or 'unknown'}. Country: {country or 'unknown'}.\n"
+        "Write a web search query that finds the lecture-level THEORY for this, "
+        "in the language that school teaches it in (else the country's language, "
+        "else English).\n"
+        'Output ONLY JSON: {"query": "...", "language": "..."}')
+    query, language = "", "English"
+    try:
+        q = await _llm_json(owner, "You craft one localized web search query. "
+                            "Output only the JSON object.", loc_prompt,
+                            temperature=0.2, max_tokens=400, timeout=60,
+                            thinking_off=True)
+        if isinstance(q, dict):
+            query = str(q.get("query") or "").strip()
+            language = str(q.get("language") or "English").strip() or "English"
+    except HTTPException as e:
+        logger.warning("study web theory: query gen failed: %s", e.detail)
+    if not query:
+        query = " ".join(x for x in [subject_name, concept_text[:120], school,
+                                     country, "lecture notes theory"] if x)
+
+    try:
+        from src.search import comprehensive_web_search
+        ctx, sources = await asyncio.to_thread(
+            comprehensive_web_search, query, return_sources=True)
+    except Exception as e:
+        logger.warning("study web theory: search failed: %s", e)
+        return "", []
+    if not ctx:
+        return "", []
+
+    links = _web_source_links(sources)
+    syn = (f"CONCEPT THE STUDENT IS STUCK ON:\n{concept_text[:2000]}\n\n"
+           f"WEB SEARCH RESULTS (your only source):\n{ctx[:30000]}\n\n"
+           f"Write the theory needed to understand this, in {language}, as "
+           "Markdown with LaTeX for math, grounded ONLY in the results above. "
+           "Begin with the exact line: _From the web — no matching course "
+           "material._")
+    try:
+        md = await _llm_text(owner, "You explain course theory from web results, "
+                             "faithfully and concisely.", syn, temperature=0.3,
+                             max_tokens=4000, timeout=180)
+    except HTTPException as e:
+        logger.warning("study web theory: synthesis failed: %s", e.detail)
+        md = ""
+    return md, links
+
+
+async def _append_web_theory(owner, base_md: str, concept: str,
+                             subject_name: str) -> str:
+    """Append a web-sourced theory section + source links to an explanation when
+    no course material covered it. Returns base_md unchanged on failure."""
+    web_md, links = await _web_theory(owner, concept, subject_name)
+    if not (web_md or links):
+        return base_md
+    parts = [base_md or ""]
+    if web_md:
+        parts.append(web_md)
+    if links:
+        parts.append("*Web sources:* " + " · ".join(
+            f"[{(l['name'] or 'source')[:60]}]({l['url']})" for l in links))
+    return "\n\n".join(p for p in parts if p).strip()
 
 
 async def _build_figures_section(owner, material_id: str, file_id: str,
@@ -2421,6 +2523,8 @@ def setup_study_routes():
             reference = row.reference or ""
             deck_id = row.deck_id
             own_material_id = row.material_id
+            deck = db.query(StudyDeck).filter(StudyDeck.id == deck_id).first()
+            subject_name = deck.name if deck else "this subject"
             # Search the WHOLE subject — theory lives in the lecture files, not
             # the practice exam this question was extracted from.
             blocks, by_id = _deck_material_context(db, deck_id, user, theory_only=True)
@@ -2448,6 +2552,8 @@ def setup_study_routes():
         if not isinstance(value, dict):
             raise HTTPException(502, "The model reply was not usable. Try again.")
         md = _explain_further_markdown(value, by_id)
+        if not _resolve_locations(value, by_id):
+            md = await _append_web_theory(user, md, q_text, subject_name)
         if not md:
             raise HTTPException(502, "The model did not return an explanation. Try again.")
         db = SessionLocal()
@@ -2473,43 +2579,53 @@ def setup_study_routes():
             options = json.loads(row.options) if row.options else None
             reference = row.reference or ""
             deck_id = row.deck_id
-            blocks, by_id = _deck_material_context(db, deck_id, user, theory_only=True)
+            deck = db.query(StudyDeck).filter(StudyDeck.id == deck_id).first()
+            subject_name = deck.name if deck else "this subject"
+            theory_blocks, by_id = _deck_material_context(db, deck_id, user, theory_only=True)
+            all_blocks, _ = _deck_material_context(db, deck_id, user, theory_only=False)
         finally:
             db.close()
 
-        prompt_parts = [f"QUESTION:\n{q_text}"]
-        if options:
-            prompt_parts.append("OPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options)))
-        prompt_parts.append("--- SUBJECT MATERIALS ---\n" + ("\n\n".join(blocks)
-                            if blocks else "(no materials available)"))
-        locations = []
-        if blocks:
+        opts_line = ("\nOPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options))) \
+            if options else ""
+
+        async def _locate(blocks):
+            if not blocks:
+                return []
+            prompt = (f"QUESTION:\n{q_text}{opts_line}\n\n--- SUBJECT MATERIALS ---\n"
+                      + "\n\n".join(blocks))
             try:
-                value = await _llm_json(user, LOCATE_MATERIAL_SYSTEM,
-                                        "\n\n".join(prompt_parts),
+                value = await _llm_json(user, LOCATE_MATERIAL_SYSTEM, prompt,
                                         temperature=0.2, max_tokens=4000,
                                         timeout=180, thinking_off=True)
-                if isinstance(value, dict):
-                    locations = _resolve_locations(value, by_id)
+                return _resolve_locations(value, by_id) if isinstance(value, dict) else []
             except HTTPException as e:
                 if e.status_code == 503:
                     raise
                 logger.warning("study locate: %s", e.detail)
+                return []
 
+        # Escalate: theory files first, then all files (exercises may hold it).
+        locations = await _locate(theory_blocks)
+        if not locations and len(all_blocks) > len(theory_blocks):
+            locations = await _locate(all_blocks)
         if locations:
-            return {"locations": locations, "hint": None}
+            return {"locations": locations, "hint": None, "source": "material"}
 
-        # Nothing relevant found — fall back to a hint so consult is still useful.
-        opts_txt = ("\nOPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options))) \
-            if options else ""
-        hint_prompt = (f"HINT LEVEL: 1\n\nQUESTION:\n{q_text}{opts_txt}\n\n"
+        # No course material covers it → search the web for the theory.
+        web_md, web_links = await _web_theory(user, f"{q_text}{opts_line}", subject_name)
+        if web_links or web_md:
+            return {"locations": web_links, "hint": web_md or None, "source": "web"}
+
+        # Web unavailable too — fall back to a plain hint.
+        hint_prompt = (f"HINT LEVEL: 1\n\nQUESTION:\n{q_text}{opts_line}\n\n"
                        f"REFERENCE SOLUTION (for your eyes only — do NOT reveal it):\n{reference}")
         try:
             hint = await _llm_text(user, HINT_SYSTEM, hint_prompt,
                                    temperature=0.3, max_tokens=4000, timeout=120)
         except HTTPException:
             hint = None
-        return {"locations": [], "hint": hint}
+        return {"locations": [], "hint": hint, "source": "hint"}
 
     @router.post("/cards/{card_id}/explain-further")
     async def card_explain_further(request: Request, card_id: str,
@@ -2524,6 +2640,8 @@ def setup_study_routes():
                 return {"explanation": card.deep_explanation, "cached": True}
             front, back, notes = card.front, card.back, card.notes or ""
             deck_id = card.deck_id
+            deck = db.query(StudyDeck).filter(StudyDeck.id == deck_id).first()
+            subject_name = deck.name if deck else "this subject"
             blocks, by_id = _deck_material_context(db, deck_id, user, theory_only=True)
         finally:
             db.close()
@@ -2544,6 +2662,8 @@ def setup_study_routes():
         if not isinstance(value, dict):
             raise HTTPException(502, "The model reply was not usable. Try again.")
         md = _explain_further_markdown(value, by_id)
+        if not _resolve_locations(value, by_id):
+            md = await _append_web_theory(user, md, f"{front}\n{back}", subject_name)
         if not md:
             raise HTTPException(502, "The model did not return an explanation. Try again.")
         db = SessionLocal()

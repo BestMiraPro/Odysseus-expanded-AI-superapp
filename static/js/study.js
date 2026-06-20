@@ -637,6 +637,11 @@ async function renderSubjects() {
       <button class="study-btn primary" id="study-new-deck-btn">Create subject</button>
     </div>
     <div class="study-subtle" style="margin:2px 0 10px;">A subject holds your materials (past papers, notes), the question bank the AI extracts from them, and flashcards.</div>
+    <div class="study-form-row" style="margin-bottom:10px;">
+      <label class="study-subtle" for="study-school" style="white-space:nowrap;">Your school</label>
+      <input class="study-input" id="study-school" placeholder="e.g. Nova SBE (optional)" style="flex:1;max-width:320px;"
+        title="Used to localize web searches for theory (language & sources) when a subject has no theory material. Optional.">
+    </div>
     <div id="study-deck-list"></div>
   `;
   const list = el.querySelector('#study-deck-list');
@@ -658,6 +663,15 @@ async function renderSubjects() {
     try { await jpost('/api/study/decks', { name }); inp.value = ''; renderSubjects(); }
     catch (e) { toast(e.message, true); }
   });
+
+  // Per-user school (prefs store) — localizes web-theory searches.
+  const schoolInput = el.querySelector('#study-school');
+  if (schoolInput) {
+    jget('/api/prefs/study_school').then(d => { schoolInput.value = (d && d.value) || ''; }).catch(() => {});
+    schoolInput.addEventListener('change', () => {
+      jput('/api/prefs/study_school', { value: schoolInput.value.trim() }).catch(() => {});
+    });
+  }
   list.addEventListener('click', async (e) => {
     const del = e.target.closest('[data-del]');
     if (del) {
@@ -970,18 +984,24 @@ function _locLabel(l) {
   return (l.name || l.label || 'file') + (l.page ? `, p.${l.page}` : '');
 }
 
-// When several files are relevant, a chooser of file-name buttons (each opens
-// that file in a new tab at its page).
+// Web sources are absolute URLs; material files are app-relative.
+function _openLoc(l) {
+  if (!l || !l.url) return;
+  const u = /^https?:\/\//i.test(l.url) ? l.url : `${API}${l.url}`;
+  window.open(u, '_blank', 'noopener');
+}
+
+// When several files/sources are relevant, a chooser of buttons (each opens in
+// a new tab).
 function openFileChooser(locations) {
   const inner = `<div class="study-viewer-body">
-    <p class="study-subtle" style="margin-top:0;">Relevant files — open one:</p>
+    <p class="study-subtle" style="margin-top:0;">Open one:</p>
     <div class="study-form-row">
       ${locations.map((l, i) => `<button class="study-btn" data-loc="${i}">${esc(_locLabel(l))}</button>`).join('')}
     </div></div>`;
-  const v = _viewerShell('Open file', '', inner);
+  const v = _viewerShell('Open', '', inner);
   v.querySelectorAll('[data-loc]').forEach(b => b.addEventListener('click', () => {
-    const l = locations[parseInt(b.dataset.loc, 10)];
-    if (l) window.open(`${API}${l.url}`, '_blank', 'noopener');
+    _openLoc(locations[parseInt(b.dataset.loc, 10)]);
   }));
 }
 
@@ -991,10 +1011,10 @@ function openFileChooser(locations) {
 async function consultAction(q, penalize) {
   const p = S.practice;
   if (!p || p.consultBusy) return;
-  // Already located -> open the file(s).
+  // Already located -> open the file(s)/source(s).
   if (p.consult && p.consult.locations && p.consult.locations.length) {
     const locs = p.consult.locations;
-    if (locs.length === 1) window.open(`${API}${locs[0].url}`, '_blank', 'noopener');
+    if (locs.length === 1) _openLoc(locs[0]);
     else openFileChooser(locs);
     return;
   }
@@ -1003,8 +1023,10 @@ async function consultAction(q, penalize) {
   try {
     const r = await jpost(`/api/study/questions/${q.id}/locate`, {});
     p.consult = r;
-    if (!r.locations || !r.locations.length) {
-      toast('No file in this subject covers it directly — generated a hint instead.', true);
+    if (r.source === 'web') {
+      toast('No course material covers it — found theory on the web.', true);
+    } else if (!r.locations || !r.locations.length) {
+      toast('No material covers it directly — generated a hint instead.', true);
     }
   } catch (e) { toast(e.message, true); }
   p.consultBusy = false; renderPractice();
@@ -1421,7 +1443,9 @@ async function renderPractice() {
   const isMcq = q.qtype === 'mcq';
   const res = p.result;
   const located = p.consult && p.consult.locations && p.consult.locations.length;
-  const consultLabel = p.consultBusy ? 'Locating…' : (located ? 'Open file' : 'Consult');
+  const consultWeb = p.consult && p.consult.source === 'web';
+  const consultLabel = p.consultBusy ? 'Locating…'
+    : (located ? (consultWeb ? 'Open source' : 'Open file') : 'Consult');
 
   el.innerHTML = `
     <div class="study-q-wrap">
@@ -1451,9 +1475,11 @@ async function renderPractice() {
 
       ${p.hints.map((h, i) => `<div class="study-hint study-md"><b>Hint ${i + 1}:</b> ${_mdInline(h)}</div>`).join('')}
       ${located
-        ? `<div class="study-hint">📄 Relevant material: ${p.consult.locations.map(l => esc(_locLabel(l))).join(' · ')} — use “Open file”.</div>`
+        ? `<div class="study-hint">${consultWeb ? '🌐 From the web' : '📄 Relevant material'}: ${p.consult.locations.map(l => esc(_locLabel(l))).join(' · ')} — use “${consultWeb ? 'Open source' : 'Open file'}”.</div>`
         : ''}
-      ${p.consult && !located && p.consult.hint
+      ${consultWeb && p.consult.hint
+        ? `<div class="study-hint study-md">${_md(p.consult.hint)}</div>` : ''}
+      ${p.consult && !located && !consultWeb && p.consult.hint
         ? `<div class="study-hint study-md"><b>Consult hint:</b> ${_mdInline(p.consult.hint)}</div>` : ''}
 
       ${!res ? `

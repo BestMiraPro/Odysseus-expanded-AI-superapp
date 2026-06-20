@@ -1076,7 +1076,27 @@ var _searchKeyFields = {
   tavily: 'tavily_api_key', serper: 'serper_api_key',
 };
 
+async function initUserCountrySetting() {
+  // Per-user country, stored in the generic prefs store; used by the Study app
+  // to localize web-theory searches.
+  var input = el('set-userCountry');
+  if (!input || input._wired) return;
+  input._wired = true;
+  try {
+    var r = await fetch('/api/prefs/country', { credentials: 'same-origin' });
+    if (r.ok) { var d = await r.json(); input.value = d.value || ''; }
+  } catch (e) { /* leave blank */ }
+  input.addEventListener('change', function () {
+    fetch('/api/prefs/country', {
+      method: 'PUT', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: input.value.trim() }),
+    }).catch(function () {});
+  });
+}
+
 async function initSearchSettings() {
+  initUserCountrySetting();
   var provSel = el('set-searchProvider');
   var countSel = el('set-searchResultCount');
   var countCustomInput = el('set-searchResultCountCustom');
