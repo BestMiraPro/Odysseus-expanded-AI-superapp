@@ -53,6 +53,7 @@ from src.study_ai import (
     FIGURE_CAPTION_SYSTEM,
     GRADE_OPEN_SYSTEM,
     HINT_SYSTEM,
+    LINK_PARTS_SYSTEM,
     LOCATE_MATERIAL_SYSTEM,
     MATERIAL_CATEGORIES,
     REFORMAT_SYSTEM,
@@ -816,6 +817,8 @@ def _question_to_dict(q: StudyQuestion, with_answer: bool = True) -> Dict:
         "origin": q.origin, "suspended": bool(q.suspended),
         "state": q.state or "new", "due": _iso(q.due),
         "reps": q.reps or 0, "lapses": q.lapses or 0,
+        "number": q.number,
+        "has_prereqs": bool(q.prereq_ids and q.prereq_ids != "[]"),
     }
     if with_answer:
         out["correct_index"] = q.correct_index
@@ -2263,6 +2266,7 @@ def setup_study_routes():
                     options=json.dumps(q["options"]) if q["options"] else None,
                     correct_index=q["correct_index"], reference=q["reference"],
                     topic=q["topic"], difficulty=q["difficulty"],
+                    number=q.get("number"),
                     origin="extracted" if mode == "extract" else "authored",
                     state="new", due=now,
                 )
@@ -3002,5 +3006,100 @@ def setup_study_routes():
             db.close()
         return {"questions_reformatted": q_n, "cards_reformatted": c_n,
                 "questions_scanned": len(q_items), "cards_scanned": len(c_items)}
+
+    @router.post("/decks/{deck_id}/link-parts")
+    async def link_parts(request: Request, deck_id: str):
+        """Detect multi-part ('alíneas') dependencies: per material, the AI
+        labels each question and lists, for later parts, the earlier parts whose
+        info/answer they need. Stored on number + prereq_ids."""
+        from collections import defaultdict
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            _get_deck(db, deck_id, user)
+            q = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck_id)
+            if user is not None:
+                q = q.filter(StudyQuestion.owner == user)
+            rows = q.order_by(StudyQuestion.created_at.asc()).all()
+            by_mat = defaultdict(list)
+            for r in rows:
+                by_mat[r.material_id or "none"].append(
+                    {"id": r.id, "number": r.number, "question": r.question[:600]})
+            valid_per_mat = {m: {it["id"] for it in items} for m, items in by_mat.items()}
+        finally:
+            db.close()
+
+        results: Dict[str, Dict] = {}
+        for mat_id, items in by_mat.items():
+            if len(items) < 2:               # need siblings to have prerequisites
+                continue
+            try:
+                value = await _llm_json(user, LINK_PARTS_SYSTEM,
+                                        json.dumps(items, ensure_ascii=False),
+                                        temperature=0.1, max_tokens=8000,
+                                        timeout=240, thinking_off=True)
+            except HTTPException as e:
+                if e.status_code == 503:
+                    raise
+                logger.warning("study link-parts: material %s failed: %s", mat_id, e.detail)
+                continue
+            arr = value.get("items") if isinstance(value, dict) else (
+                value if isinstance(value, list) else [])
+            valid = valid_per_mat.get(mat_id, set())
+            for it in (arr or []):
+                if not isinstance(it, dict) or it.get("id") not in valid:
+                    continue
+                pre = [p for p in (it.get("prereq_ids") or [])
+                       if p in valid and p != it["id"]]
+                results[it["id"]] = {"number": it.get("number"), "prereq_ids": pre}
+
+        linked = 0
+        db = SessionLocal()
+        try:
+            for r in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(results))).all()
+                      if results else []):
+                u = results[r.id]
+                if u.get("number") and not r.number:
+                    r.number = str(u["number"])
+                r.prereq_ids = json.dumps(u["prereq_ids"])
+                if u["prereq_ids"]:
+                    linked += 1
+            db.commit()
+        finally:
+            db.close()
+        return {"linked": linked, "analyzed": sum(len(v) for v in by_mat.values())}
+
+    @router.get("/questions/{question_id}/prereqs")
+    def question_prereqs(request: Request, question_id: str):
+        """The earlier parts this question depends on, each with its question,
+        the user's latest answer to it, and the correct answer — for the
+        'Earlier in this problem' context box during practice."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            row = _get_question(db, question_id, user)
+            ids = json.loads(row.prereq_ids) if row.prereq_ids else []
+            out = []
+            for pid in ids:
+                pq = db.query(StudyQuestion).filter(StudyQuestion.id == pid).first()
+                if not pq or (user is not None and pq.owner != user):
+                    continue
+                if pq.qtype == "mcq" and pq.options is not None and pq.correct_index is not None:
+                    opts = json.loads(pq.options)
+                    correct = opts[pq.correct_index] if 0 <= pq.correct_index < len(opts) else ""
+                else:
+                    correct = pq.reference or ""
+                att = db.query(StudyAttempt).filter(StudyAttempt.question_id == pid)
+                if user is not None:
+                    att = att.filter(StudyAttempt.owner == user)
+                att = att.order_by(StudyAttempt.attempted_at.desc()).first()
+                out.append({
+                    "id": pq.id, "number": pq.number, "question": pq.question,
+                    "your_answer": att.answer if att else None,
+                    "correct": correct,
+                })
+            return {"prereqs": out}
+        finally:
+            db.close()
 
     return router

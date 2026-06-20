@@ -739,6 +739,10 @@ def _migrate_add_study_summary_columns():
         card_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_cards)")]
         if "deep_explanation" not in card_cols:
             conn.execute("ALTER TABLE study_cards ADD COLUMN deep_explanation TEXT")
+        if "number" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN number TEXT")
+        if "prereq_ids" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN prereq_ids TEXT")
         if "category" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
             # Backfill existing rows from the filename classifier (single source
@@ -1660,6 +1664,8 @@ class StudyQuestion(TimestampMixin, Base):
     reference       = Column(Text, nullable=True)       # model answer / solution
     explanation     = Column(Text, nullable=True)       # cached AI explanation (mcq)
     deep_explanation = Column(Text, nullable=True)      # cached "explain further" (theory + location)
+    number          = Column(String, nullable=True)     # source part label ("16a"), for multi-part grouping
+    prereq_ids      = Column(Text, nullable=True)        # JSON list of earlier-part question ids this part needs
     topic           = Column(String, nullable=True, index=True)
     difficulty      = Column(String, default="medium")  # easy | medium | hard
     origin          = Column(String, default="extracted")  # "extracted" | "authored" | "user"

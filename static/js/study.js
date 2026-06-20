@@ -206,6 +206,12 @@ function injectStyles() {
 .study-conf button.sel { opacity: 1; border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); }
 .study-hint { border-left: 2px solid var(--accent, #5b8abf); padding: 6px 10px; margin: 8px 0;
   font-size: 12.5px; opacity: 0.85; background: rgba(91,138,191,0.06); border-radius: 0 6px 6px 0; }
+.study-prereq { border: 1px dashed var(--border); border-radius: 9px; padding: 8px 12px;
+  margin-bottom: 12px; background: rgba(128,128,128,0.05); }
+.study-prereq-title { font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase;
+  opacity: 0.55; margin-bottom: 6px; }
+.study-prereq-item { font-size: 12.5px; padding: 6px 0; border-top: 1px solid var(--border); }
+.study-prereq-item:first-of-type { border-top: none; }
 .study-grade { border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; margin-top: 14px; }
 .study-grade.correct { border-color: var(--green, #4f9e60); }
 .study-grade.incorrect { border-color: var(--red, #e05555); }
@@ -1389,6 +1395,7 @@ async function startPractice(deckId = null, limit = 12) {
                  phase: 'answer', confidence: null, choice: null,
                  hints: [], hintBusy: false, answerDraft: '', result: null,
                  consulted: false, consult: null, consultBusy: false,
+                 prereqs: null, prereqsFor: null, prereqsBusy: false,
                  explainText: null, explainBusy: false,
                  log: [], startTs: Date.now(), qShownTs: Date.now() };
   renderPractice();
@@ -1439,6 +1446,17 @@ async function renderPractice() {
   const q = p.queue[p.idx];
   if (!q) { return renderPracticeSummary(); }
 
+  // Lazily fetch prerequisite parts (multi-part questions) for the context box.
+  if (q.has_prereqs && p.prereqsFor !== q.id && !p.prereqsBusy) {
+    p.prereqsBusy = true;
+    jget(`/api/study/questions/${q.id}/prereqs`).then(r => {
+      p.prereqs = r.prereqs || []; p.prereqsFor = q.id; p.prereqsBusy = false;
+      const cur = S.practice && S.practice.queue[S.practice.idx];
+      if (cur && cur.id === q.id) renderPractice();
+    }).catch(() => { p.prereqsBusy = false; p.prereqsFor = q.id; });
+  }
+  const prereqs = (p.prereqsFor === q.id && p.prereqs) ? p.prereqs : [];
+
   const progress = Math.round((p.idx / p.queue.length) * 100);
   const isMcq = q.qtype === 'mcq';
   const res = p.result;
@@ -1457,6 +1475,14 @@ async function renderPractice() {
         <span style="flex:1;"></span>
         <span class="study-subtle">${p.idx + 1}/${p.queue.length}</span>
       </div>
+      ${prereqs.length ? `<div class="study-prereq">
+        <div class="study-prereq-title">Earlier in this problem</div>
+        ${prereqs.map(pr => `<div class="study-prereq-item">
+          <div class="study-md">${pr.number ? '<b>' + esc(pr.number) + '.</b> ' : ''}${_mdInline(pr.question)}</div>
+          ${pr.your_answer ? `<div class="study-subtle study-md" style="margin-top:3px;">Your answer: ${_mdInline(pr.your_answer)}</div>` : ''}
+          ${pr.correct ? `<div class="study-md" style="margin-top:3px;opacity:0.8;"><b>Answer:</b> ${_mdInline(pr.correct)}</div>` : ''}
+        </div>`).join('')}
+      </div>` : ''}
       <div class="study-card-front study-md" style="font-size:16px;">${_md(q.question)}</div>
 
       ${isMcq ? `<div style="margin-top:16px;" id="study-opts">
@@ -1597,6 +1623,7 @@ function advancePractice() {
   p.result = null; p.choice = null; p.confidence = null;
   p.hints = []; p.answerDraft = ''; p.explainText = null;
   p.consulted = false; p.consult = null; p.consultBusy = false;
+  p.prereqs = null; p.prereqsFor = null; p.prereqsBusy = false;
   p.qShownTs = Date.now();
   renderPractice();
 }

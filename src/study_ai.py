@@ -654,6 +654,15 @@ Set "keep": false for anything decorative or that is just text. Use the language
 # Faithful-formatting guidance appended to the relevant prompts. Plain-Markdown
 # replies get the text note; JSON replies whose fields hold math get the
 # JSON-escaping note.
+LINK_PARTS_SYSTEM = """You receive the questions extracted from ONE exam/material. Multi-part questions ("alíneas") were split into separate questions (e.g. 1, 2, …, 16a, 16b, 16c, 16d).
+
+For each question, using its id and text:
+- "number": its part label as it appears in the source (e.g. "3", "16a"); use null if you truly can't tell.
+- "prereq_ids": the ids of EARLIER parts of the SAME multi-part question whose result or information this part needs in order to be answered. Cross-check the alíneas: a later part (16c) often builds on earlier ones (16a, 16b). A standalone question, or the first part of a group, has an empty list. NEVER link parts of different problems, and never include the question's own id.
+
+Output ONLY JSON: {"items": [{"id": "<id>", "number": "16b", "prereq_ids": ["<id of 16a>"]}, ...]}
+No commentary."""
+
 REFORMAT_SYSTEM = """You reformat already-extracted study text so it displays well. Convert all mathematics to LaTeX ($...$ inline, $$...$$ display) and fix Markdown formatting (sub/superscripts, fractions, lists, bold).
 
 Rules:
