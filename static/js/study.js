@@ -158,6 +158,7 @@ function injectStyles() {
 .study-btn:hover { background: rgba(128,128,128,0.12); }
 .study-btn.primary { border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); font-weight: 600; }
 .study-btn.danger { color: var(--red, #e05555); }
+.study-btn.danger.armed { background: var(--red, #e05555); color: #fff; border-color: var(--red, #e05555); font-weight: 600; }
 .study-btn:disabled { opacity: 0.4; cursor: default; }
 .study-btn.small { padding: 3px 8px; font-size: 11px; }
 .study-input, .study-select, .study-textarea { background: var(--bg); color: var(--fg);
@@ -695,7 +696,7 @@ async function renderSubjects() {
 async function openSubject(deckId) {
   const deck = S.decks.find(d => d.id === deckId) || { id: deckId, name: 'Subject' };
   S.subject = { deck, cards: [], materials: [], questions: [], proposals: null,
-                qFilter: '', extracting: new Set() };
+                qFilter: '', qLimit: 40, extracting: new Set() };
   await reloadSubject();
 }
 
@@ -723,7 +724,7 @@ function renderSubjectDetail() {
     <div class="study-form-row">
       <button class="study-btn small" id="study-subj-back">← Subjects</button>
       <b style="font-size:14px;">${esc(s.deck.name)}</b>
-      <span class="study-subtle">${s.questions.length} questions · ${s.cards.length} cards</span>
+      <span class="study-subtle" id="study-subj-counts">${s.questions.length} questions · ${s.cards.length} cards</span>
       <span style="flex:1;"></span>
       <button class="study-btn small" id="study-subj-overview" title="An AI overview of the subject that ties the chapters together">Overview</button>
       <button class="study-btn small" id="study-subj-review" ${!s.cards.length ? 'disabled' : ''}>Review cards</button>
@@ -861,7 +862,7 @@ function renderSubjectDetail() {
   let searchT = null;
   el.querySelector('#study-q-search').addEventListener('input', (e) => {
     clearTimeout(searchT);
-    searchT = setTimeout(() => { s.qFilter = e.target.value.trim(); renderQuestionList(); }, 250);
+    searchT = setTimeout(() => { s.qFilter = e.target.value.trim(); s.qLimit = 40; renderQuestionList(); }, 250);
   });
 }
 
@@ -1124,6 +1125,35 @@ function renderMaterialList() {
   };
 }
 
+// Rendered-HTML cache for question rows. The markdown+KaTeX pipeline is heavy,
+// so memoize each row's HTML by id+content: re-renders (suspend, delete, search,
+// pagination) reuse the HTML instead of re-running KaTeX over the whole bank.
+// Content is part of the key, so edited text renders fresh; bounded to cap memory.
+const _qhtmlCache = new Map();
+function _qhtml(q) {
+  const key = q.id + '::' + (q.question || '');
+  let html = _qhtmlCache.get(key);
+  if (html === undefined) {
+    html = _mdInline(q.question);
+    if (_qhtmlCache.size > 800) _qhtmlCache.clear();
+    _qhtmlCache.set(key, html);
+  }
+  return html;
+}
+
+function _updateQuestionCounts() {
+  const s = S.subject;
+  const c = body()?.querySelector('#study-subj-counts');
+  if (c && s) c.textContent = `${s.questions.length} questions · ${s.cards.length} cards`;
+}
+
+function _disarmDel(btn) {
+  if (!btn) return;
+  btn.dataset.armed = '';
+  btn.classList.remove('armed');
+  btn.textContent = '✕';
+}
+
 function renderQuestionList() {
   const wrap = body()?.querySelector('#study-q-list');
   const s = S.subject;
@@ -1135,27 +1165,54 @@ function renderQuestionList() {
     wrap.innerHTML = '<div class="study-empty">No questions yet — extract some from a material above.</div>';
     return;
   }
-  wrap.innerHTML = rows.slice(0, 200).map(q => `
+  // Only render a page at a time — rendering all (often 100+) rows through
+  // markdown+KaTeX at once is what pegged CPU and bloated the DOM.
+  const limit = s.qLimit || 40;
+  const shown = rows.slice(0, limit);
+  wrap.innerHTML = shown.map(q => `
     <div class="study-cardrow ${q.suspended ? 'suspended' : ''}">
       <span class="study-qchip ${q.qtype}">${q.qtype}</span>
-      <span class="front study-md" style="flex:2;">${_mdInline(q.question)}</span>
+      <span class="front study-md" style="flex:2;">${_qhtml(q)}</span>
       <span class="study-state">${esc(q.topic || '')}${q.topic ? ' · ' : ''}${esc(q.difficulty)}
         · ${esc(q.state)}${q.state !== 'new' ? ` · due ${fmtDue(q.due)}` : ''}${q.lapses ? ` · ${q.lapses}✗` : ''}</span>
       <button class="study-btn small" data-qsusp="${q.id}" title="${q.suspended ? 'Unsuspend' : 'Suspend'}">${q.suspended ? '▶' : '⏸'}</button>
       <button class="study-btn small danger" data-qdel="${q.id}" title="Delete">✕</button>
-    </div>`).join('');
+    </div>`).join('')
+    + (rows.length > shown.length
+      ? `<div class="study-form-row" style="justify-content:center;margin-top:8px;">
+           <button class="study-btn small" id="study-q-more">Show more (${shown.length} of ${rows.length})</button>
+         </div>`
+      : '');
   wrap.onclick = async (e) => {
+    if (e.target.closest('#study-q-more')) { s.qLimit = (s.qLimit || 40) + 40; renderQuestionList(); return; }
     const su = e.target.closest('[data-qsusp]')?.dataset.qsusp;
-    const de = e.target.closest('[data-qdel]')?.dataset.qdel;
+    const delBtn = e.target.closest('[data-qdel]');
     try {
       if (su) {
         const q = s.questions.find(x => x.id === su);
         await jput(`/api/study/questions/${su}`, { suspended: !q.suspended });
-        reloadSubject();
-      } else if (de) {
-        if (!confirm('Delete this question?')) return;
-        await jdel(`/api/study/questions/${de}`);
-        reloadSubject();
+        q.suspended = !q.suspended;   // local update — avoids a full subject reload + re-render
+        renderQuestionList();
+      } else if (delBtn) {
+        const id = delBtn.dataset.qdel;
+        // Two-click confirm instead of window.confirm(): after a few native
+        // dialogs browsers offer "prevent additional dialogs", after which
+        // confirm() silently returns false and deletes appear to do nothing.
+        // First click arms this button, second click (within 3.5s) deletes.
+        if (delBtn.dataset.armed !== '1') {
+          wrap.querySelectorAll('[data-qdel].armed').forEach(_disarmDel);
+          delBtn.dataset.armed = '1';
+          delBtn.classList.add('armed');
+          delBtn.textContent = 'Delete?';
+          clearTimeout(delBtn._disarmT);
+          delBtn._disarmT = setTimeout(() => _disarmDel(delBtn), 3500);
+          return;
+        }
+        clearTimeout(delBtn._disarmT);
+        await jdel(`/api/study/questions/${id}`);
+        s.questions = s.questions.filter(x => x.id !== id);   // local removal — no heavy reload
+        renderQuestionList();
+        _updateQuestionCounts();
       }
     } catch (err) { toast(err.message, true); }
   };
