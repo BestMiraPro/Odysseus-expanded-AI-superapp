@@ -654,6 +654,15 @@ Set "keep": false for anything decorative or that is just text. Use the language
 # Faithful-formatting guidance appended to the relevant prompts. Plain-Markdown
 # replies get the text note; JSON replies whose fields hold math get the
 # JSON-escaping note.
+REFORMAT_SYSTEM = """You reformat already-extracted study text so it displays well. Convert all mathematics to LaTeX ($...$ inline, $$...$$ display) and fix Markdown formatting (sub/superscripts, fractions, lists, bold).
+
+Rules:
+- PRESERVE the content exactly: same wording, numbers, options (same count and order), and answers. Do NOT solve, rephrase, shorten, translate, or change meaning. You are only changing notation/formatting.
+- You receive a JSON array of items. Return a JSON array with the SAME items — same "id" and same keys — with the text fields reformatted.
+- Inside JSON strings double every backslash (\\\\frac, not \\frac).
+
+Output ONLY the JSON array. No markdown fences or commentary around it."""
+
 HINT_SYSTEM += _MATH_TEXT_NOTE
 EXPLAIN_SYSTEM += _MATH_TEXT_NOTE
 STUDY_NOTES_SYSTEM += _MATH_TEXT_NOTE

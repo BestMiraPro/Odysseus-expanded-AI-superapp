@@ -55,6 +55,7 @@ from src.study_ai import (
     HINT_SYSTEM,
     LOCATE_MATERIAL_SYSTEM,
     MATERIAL_CATEGORIES,
+    REFORMAT_SYSTEM,
     REPAIR_JSON_SYSTEM,
     STUDY_NOTES_SYSTEM,
     SUBJECT_OVERVIEW_SYSTEM,
@@ -702,6 +703,44 @@ async def _append_web_theory(owner, base_md: str, concept: str,
         parts.append("*Web sources:* " + " · ".join(
             f"[{(l['name'] or 'source')[:60]}]({l['url']})" for l in links))
     return "\n\n".join(p for p in parts if p).strip()
+
+
+_MATH_HINT_RE = re.compile(r"[\^_=]|\*|\\|\d\s*[+\-*/]\s*\d|\b[a-zA-Z]_[a-zA-Z0-9]")
+
+
+def _needs_reformat(*texts) -> bool:
+    """True if any text has no LaTeX ($) yet looks like it contains math/markup
+    that would render badly as plain markdown (g_y, 2*3, x^2, =)."""
+    joined = " ".join(t for t in texts if t)
+    if "$" in joined:
+        return False
+    return bool(_MATH_HINT_RE.search(joined))
+
+
+async def _reformat_items(owner, items: List[Dict]) -> Dict[str, Dict]:
+    """Reformat a list of {id, <text fields>} dicts to LaTeX via the text model,
+    in batches. Returns {id: reformatted_item}. Missing/failed items are simply
+    absent (caller keeps the original)."""
+    updates: Dict[str, Dict] = {}
+    for i in range(0, len(items), 15):
+        batch = items[i:i + 15]
+        prompt = ("Reformat these items to LaTeX, preserving content exactly:\n\n"
+                  + json.dumps(batch, ensure_ascii=False))
+        try:
+            value = await _llm_json(owner, REFORMAT_SYSTEM, prompt,
+                                    temperature=0.1, max_tokens=EXTRACTION_MAX_TOKENS,
+                                    timeout=300, thinking_off=True)
+        except HTTPException as e:
+            if e.status_code == 503:
+                raise
+            logger.warning("study reformat: batch %d failed: %s", i // 15, e.detail)
+            continue
+        arr = value if isinstance(value, list) else (
+            value.get("items") if isinstance(value, dict) else None)
+        for it in (arr or []):
+            if isinstance(it, dict) and it.get("id"):
+                updates[str(it["id"])] = it
+    return updates
 
 
 async def _build_figures_section(owner, material_id: str, file_id: str,
@@ -2894,5 +2933,74 @@ def setup_study_routes():
             return {"entries": entries[:limit]}
         finally:
             db.close()
+
+    @router.post("/reformat")
+    async def reformat_text(request: Request):
+        """One-time: reformat existing questions and cards to LaTeX (math) +
+        Markdown, preserving content. Idempotent — items already using $ are
+        skipped. Touches only text fields; answers/correct_index are untouched."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            qq = db.query(StudyQuestion)
+            cc = db.query(StudyCard)
+            if user is not None:
+                qq = qq.filter(StudyQuestion.owner == user)
+                cc = cc.filter(StudyCard.owner == user)
+            q_items, q_opts = [], {}
+            for q in qq.all():
+                opts = json.loads(q.options) if q.options else None
+                if not _needs_reformat(q.question, q.reference or "",
+                                       " ".join(opts or [])):
+                    continue
+                item = {"id": q.id, "question": q.question}
+                if opts:
+                    item["options"] = opts
+                if q.reference:
+                    item["reference"] = q.reference
+                q_items.append(item)
+                q_opts[q.id] = opts
+            c_items = []
+            for c in cc.all():
+                if not _needs_reformat(c.front, c.back):
+                    continue
+                c_items.append({"id": c.id, "front": c.front, "back": c.back})
+        finally:
+            db.close()
+
+        q_updates = await _reformat_items(user, q_items)
+        c_updates = await _reformat_items(user, c_items)
+
+        q_n = c_n = 0
+        db = SessionLocal()
+        try:
+            for q in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(q_updates)))
+                      .all() if q_updates else []):
+                u = q_updates.get(q.id) or {}
+                changed = False
+                if isinstance(u.get("question"), str) and u["question"].strip():
+                    q.question = u["question"]; changed = True
+                if "reference" in u and isinstance(u["reference"], str):
+                    q.reference = u["reference"]; changed = True
+                # Only replace options if the count matches (keeps correct_index valid).
+                orig = q_opts.get(q.id)
+                if isinstance(u.get("options"), list) and orig and len(u["options"]) == len(orig):
+                    q.options = json.dumps([str(o) for o in u["options"]]); changed = True
+                if changed:
+                    q.explanation = None  # cached MCQ explanation may be stale
+                    q_n += 1
+            for c in (db.query(StudyCard).filter(StudyCard.id.in_(list(c_updates)))
+                      .all() if c_updates else []):
+                u = c_updates.get(c.id) or {}
+                if isinstance(u.get("front"), str) and u["front"].strip():
+                    c.front = u["front"]
+                if isinstance(u.get("back"), str) and u["back"].strip():
+                    c.back = u["back"]
+                c_n += 1
+            db.commit()
+        finally:
+            db.close()
+        return {"questions_reformatted": q_n, "cards_reformatted": c_n,
+                "questions_scanned": len(q_items), "cards_scanned": len(c_items)}
 
     return router
