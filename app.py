@@ -742,6 +742,10 @@ app.include_router(setup_note_routes(task_scheduler))
 from routes.study_routes import setup_study_routes
 app.include_router(setup_study_routes())
 
+# Omnigent agent bridge
+from routes.omnigent_routes import setup_omnigent_routes
+app.include_router(setup_omnigent_routes())
+
 # Email
 from routes.email_routes import setup_email_routes
 email_router = setup_email_routes()

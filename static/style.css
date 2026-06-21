@@ -36606,3 +36606,385 @@ body.theme-frosted .modal {
    the input beside it (.confirm-btn won't stretch on its own). */
 .ask-user-other-send { flex-shrink: 0; white-space: nowrap; min-height: 39px; }
 .ask-user-other-send:disabled { opacity: 0.5; cursor: default; }
+
+/* ===== Omnigent agent bridge (ported from dev) ===== */
+.omnigent-modal-content {
+  width: min(980px, calc(100vw - 32px));
+  max-height: min(820px, calc(100vh - 28px));
+  overflow: hidden;
+}
+.omnigent-modal-header h4 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.omnigent-body {
+  padding: 0;
+  overflow: auto;
+}
+.omnigent-shell {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 14px;
+}
+.omnigent-hero {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--accent, var(--red)) 12%, transparent), transparent 58%),
+    color-mix(in srgb, var(--fg) 3%, var(--panel));
+}
+.omnigent-hero-main {
+  min-width: 0;
+}
+.omnigent-kicker {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  opacity: 0.58;
+  margin-bottom: 4px;
+}
+.omnigent-hero h3 {
+  margin: 0 0 9px;
+  font-size: 18px;
+  line-height: 1.2;
+}
+.omnigent-status-row,
+.omnigent-actions,
+.omnigent-card-actions,
+.omnigent-provider-head,
+.omnigent-provider-actions,
+.omnigent-section-head,
+.omnigent-session {
+  display: flex;
+  align-items: center;
+}
+.omnigent-status-row {
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.omnigent-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.omnigent-status.running {
+  color: var(--color-success, #50fa7b);
+  background: color-mix(in srgb, var(--color-success, #50fa7b) 14%, transparent);
+}
+.omnigent-status.idle {
+  color: var(--accent, var(--red));
+  background: color-mix(in srgb, var(--accent, var(--red)) 14%, transparent);
+}
+.omnigent-status.not-installed,
+.omnigent-provider-pill.unsupported {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+.omnigent-command,
+.omnigent-muted,
+.omnigent-empty,
+.omnigent-provider-kind {
+  font-size: 11px;
+  opacity: 0.58;
+}
+.omnigent-command {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: min(460px, 100%);
+}
+.omnigent-actions {
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-content: flex-start;
+}
+.omnigent-actions button {
+  min-height: 30px;
+}
+.omnigent-grid,
+.omnigent-provider-grid,
+.omnigent-setup-grid,
+.omnigent-worker-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+.omnigent-console {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #08090a;
+}
+.omnigent-console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 34px;
+  padding: 8px 12px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  color: color-mix(in srgb, var(--fg) 70%, transparent);
+  font-size: 11px;
+}
+.omnigent-console-head strong {
+  color: var(--fg);
+  font-weight: 700;
+}
+.omnigent-console-lines {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  color: var(--fg);
+  font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.omnigent-prompt {
+  color: var(--accent, var(--red));
+  font-weight: 700;
+}
+.omnigent-warning {
+  color: #ffd36e;
+}
+.omnigent-card,
+.omnigent-provider,
+.omnigent-section,
+.omnigent-step,
+.omnigent-worker {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+}
+.omnigent-card,
+.omnigent-provider,
+.omnigent-step,
+.omnigent-worker {
+  padding: 12px;
+}
+.omnigent-setup-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.omnigent-step {
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr);
+  gap: 10px;
+  min-height: 166px;
+}
+.omnigent-step-number {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--accent, var(--red)) 20%, transparent);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 800;
+}
+.omnigent-card-title,
+.omnigent-provider-title,
+.omnigent-section-head h4 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+.omnigent-card p,
+.omnigent-provider-note,
+.omnigent-worker p {
+  margin: 7px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.72;
+}
+.omnigent-provider-note.emphasis {
+  color: var(--accent, var(--red));
+  opacity: 0.9;
+}
+.omnigent-code {
+  margin-top: 9px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.08);
+  overflow-x: auto;
+}
+.omnigent-code code {
+  font-size: 10px;
+  white-space: nowrap;
+}
+.omnigent-card-actions {
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.omnigent-card-actions a,
+.omnigent-link-btn {
+  text-decoration: none;
+}
+.omnigent-error {
+  margin-top: 8px;
+  color: var(--red);
+  font-size: 11px;
+}
+.omnigent-section {
+  padding: 12px;
+}
+.omnigent-section-head {
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.omnigent-section-head span {
+  font-size: 11px;
+  opacity: 0.55;
+}
+.omnigent-provider-head {
+  justify-content: space-between;
+  gap: 10px;
+}
+.omnigent-provider-pill {
+  flex-shrink: 0;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 700;
+}
+.omnigent-provider-pill.supported {
+  color: var(--color-success, #50fa7b);
+  background: color-mix(in srgb, var(--color-success, #50fa7b) 14%, transparent);
+}
+.omnigent-provider-actions {
+  margin-top: 10px;
+  min-height: 30px;
+}
+.omnigent-link-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.omnigent-link-btn:hover {
+  border-color: var(--accent, var(--red));
+}
+.omnigent-session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.omnigent-session {
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 30px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+.omnigent-session span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.omnigent-session small {
+  flex-shrink: 0;
+  opacity: 0.55;
+}
+.omnigent-worker-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.omnigent-worker {
+  display: grid;
+  grid-template-rows: auto auto;
+  gap: 7px;
+  min-height: 118px;
+}
+.omnigent-worker-main {
+  display: grid;
+  gap: 2px;
+}
+.omnigent-worker-name {
+  font-size: 13px;
+  font-weight: 800;
+}
+.omnigent-worker-main small {
+  font-size: 11px;
+  opacity: 0.58;
+}
+.omnigent-worker-status {
+  justify-self: start;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 10px;
+  font-weight: 800;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+.omnigent-worker-status.ready,
+.omnigent-worker-status.linkable {
+  color: var(--color-success, #50fa7b);
+  background: color-mix(in srgb, var(--color-success, #50fa7b) 14%, transparent);
+}
+.omnigent-worker-status.missing {
+  color: #ffd36e;
+  background: color-mix(in srgb, #ffd36e 14%, transparent);
+}
+.omnigent-worker-status.note {
+  color: var(--fg);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+.omnigent-advanced {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+}
+.omnigent-advanced summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+.omnigent-advanced p {
+  margin: 8px 0 0;
+  font-size: 12px;
+  opacity: 0.72;
+}
+
+@media (max-width: 760px) {
+  .omnigent-modal-content {
+    width: calc(100vw - 14px);
+    max-height: calc(100vh - 14px);
+  }
+  .omnigent-hero,
+  .omnigent-grid,
+  .omnigent-provider-grid,
+  .omnigent-setup-grid,
+  .omnigent-worker-grid {
+    grid-template-columns: 1fr;
+  }
+  .omnigent-hero {
+    display: grid;
+  }
+  .omnigent-actions {
+    justify-content: flex-start;
+  }
+}

@@ -671,6 +671,7 @@
     <button class="icon-rail-btn" id="rail-archive" title="Library"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M9 7h6M9 11h4"/></svg></button>
     <button class="icon-rail-btn" id="rail-memory" title="Brain"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 1 0-5.997.125 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 1 0 12 18Z"/><path d="M12 5a3 3 0 1 1 5.997.125 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 1 1 12 18Z"/><path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4"/></svg></button>
     <button class="icon-rail-btn" id="rail-notes" title="Notes"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 3h10l4 4v14H5z"/><path d="M15 3v5h5"/><path d="M8 17.5 15.5 10l2.5 2.5L10.5 20H8z"/></svg></button>
+    <button class="icon-rail-btn" id="rail-omnigent" title="Omnigent"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4"/><path d="M12 17v4"/><path d="M4.9 6.9l2.8 2.8"/><path d="M16.3 16.3l2.8 2.8"/><path d="M3 12h4"/><path d="M17 12h4"/><circle cx="12" cy="12" r="5"/></svg></button>
     <button class="icon-rail-btn" id="rail-tasks" title="Tasks"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="M9 16l2 2 4-4"/></svg></button>
     <button class="icon-rail-btn" id="rail-theme" title="Theme"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 2a10 10 0 0 0 0 20 5 5 0 0 0 5-5 3 3 0 0 0-3-3h-2a3 3 0 0 1-3-3 5 5 0 0 1 5-5"/></svg></button>
     <div style="flex:1"></div>
@@ -878,6 +879,21 @@
             <svg class="list-item-plus-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px;"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             <span class="list-item-plus-label">new</span>
           </button>
+        </div>
+        <div class="tool-separator"></div>
+        <div class="list-item" id="tool-omnigent-btn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+            style="flex-shrink:0;opacity:0.5;">
+            <path d="M12 3v4"/>
+            <path d="M12 17v4"/>
+            <path d="M4.9 6.9l2.8 2.8"/>
+            <path d="M16.3 16.3l2.8 2.8"/>
+            <path d="M3 12h4"/>
+            <path d="M17 12h4"/>
+            <circle cx="12" cy="12" r="5"/>
+          </svg>
+          <span class="grow">Omnigent</span>
         </div>
         <div class="list-item" id="tool-notes-btn">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -1730,6 +1746,11 @@
                 <input type="checkbox" checked data-ui-key="tool-library"><span class="vis-switch"></span>
               </label>
               <label class="vis-row">
+                <span class="vis-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4"/><path d="M12 17v4"/><path d="M4.9 6.9l2.8 2.8"/><path d="M16.3 16.3l2.8 2.8"/><path d="M3 12h4"/><path d="M17 12h4"/><circle cx="12" cy="12" r="5"/></svg></span>
+                <span class="vis-label">Omnigent</span>
+                <input type="checkbox" checked data-ui-key="tool-omnigent"><span class="vis-switch"></span>
+              </label>
+              <label class="vis-row">
                 <span class="vis-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 7h6M9 11h6M9 15h4"/></svg></span>
                 <span class="vis-label">Notes</span>
                 <input type="checkbox" checked data-ui-key="tool-notes"><span class="vis-switch"></span>
@@ -2315,6 +2336,16 @@
 
 
 
+  <div id="omnigent-modal" class="modal hidden">
+    <div class="modal-content omnigent-modal-content" role="dialog" aria-label="Omnigent">
+      <div class="modal-header omnigent-modal-header">
+        <h4>Omnigent</h4>
+        <button class="close-btn" id="close-omnigent-modal" aria-label="Close Omnigent">x</button>
+      </div>
+      <div id="omnigent-body" class="modal-body omnigent-body"></div>
+    </div>
+  </div>
+
 <!-- Load modules in this order -->
 <script type="module" src="/static/js/storage.js"></script>
 <script type="module" src="/static/js/ui.js"></script>
@@ -2348,6 +2379,7 @@
 <script type="module" src="/static/js/settings.js"></script>
 <script type="module" src="/static/js/admin.js"></script>
 <script type="module" src="/static/js/assistant.js"></script>
+<script type="module" src="/static/js/omnigent.js"></script>
 <script type="module" src="/static/app.js"></script>  <!-- app.js must be LAST -->
 <script type="module" src="/static/js/init.js"></script>
 <script type="module" src="/static/js/a11y.js"></script>
