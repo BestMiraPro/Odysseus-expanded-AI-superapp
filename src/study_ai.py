@@ -679,14 +679,35 @@ Set "keep": false for anything decorative or that is just text. Use the language
 # Faithful-formatting guidance appended to the relevant prompts. Plain-Markdown
 # replies get the text note; JSON replies whose fields hold math get the
 # JSON-escaping note.
-LINK_PARTS_SYSTEM = """You receive the questions extracted from ONE exam/material. Multi-part questions ("alíneas") were split into separate questions (e.g. 1, 2, …, 16a, 16b, 16c, 16d).
+LINK_PARTS_SYSTEM = """You receive the questions extracted from ONE exam/material, as a JSON list of {id, number, question}. Many are parts of the SAME multi-part problem: they share a setup (the same scenario, the same defined function/data, the same "Problem P") or are sequential parts (a, b, c…).
 
-For each question, using its id and text:
-- "number": its part label as it appears in the source (e.g. "3", "16a"); use null if you truly can't tell.
-- "prereq_ids": the ids of EARLIER parts of the SAME multi-part question whose result or information this part needs in order to be answered. Cross-check the alíneas: a later part (16c) often builds on earlier ones (16a, 16b). A standalone question, or the first part of a group, has an empty list. NEVER link parts of different problems, and never include the question's own id.
+Group them into problems and order each group's parts as they appear in the exam (earliest part first).
 
-Output ONLY JSON: {"items": [{"id": "<id>", "number": "16b", "prereq_ids": ["<id of 16a>"]}, ...]}
-No commentary."""
+- Put every question belonging to the same problem into one ordered group. Use the part labels/numbers and the shared setup/scenario to decide membership and order.
+- A question that stands on its own is its own single-item group.
+- Order matters: later parts rely on earlier parts' results, so the sequence must be correct.
+- NEVER mix questions from different problems into one group.
+
+Output ONLY JSON: {"groups": [["<id of part a>", "<id of part b>", "<id of part c>"], ["<id of a standalone>"], ...]} using the exact ids given. No commentary."""
+
+
+def prereqs_from_groups(groups, valid_ids=None) -> Dict[str, List[str]]:
+    """From ordered groups of question ids (LINK_PARTS_SYSTEM output), return
+    {id: [ids of all earlier parts in the same group]}. Earlier parts are the
+    prerequisites a later part carries forward in an exam. Unknown ids (not in
+    `valid_ids`, when given) are skipped; a part's own id is never included."""
+    out: Dict[str, List[str]] = {}
+    for group in (groups or []):
+        if not isinstance(group, (list, tuple)):
+            continue
+        earlier: List[str] = []
+        for qid in group:
+            qid = str(qid)
+            if valid_ids is not None and qid not in valid_ids:
+                continue
+            out[qid] = list(earlier)
+            earlier.append(qid)
+    return out
 
 SOLUTION_AUDIT_SYSTEM = """You audit a practice-question bank and flag entries that are NOT real questions: worked-solution steps, conclusions, or instructions that already STATE the result they pretend to ask for. Those leak the answer, so they are useless for closed-book practice.
 

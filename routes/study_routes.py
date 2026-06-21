@@ -71,6 +71,7 @@ from src.study_ai import (
     parse_answer_key_pages,
     parse_llm_json,
     parse_question_manifest,
+    prereqs_from_groups,
     question_is_conclusion,
     question_key,
     rating_from_outcome,
@@ -807,6 +808,73 @@ async def _audit_solution_statements(owner, questions: List[Dict]) -> set:
             if str(qid) in valid:
                 flagged.add(str(qid))
     return flagged
+
+
+async def _link_deck_parts(owner, deck_id: str, only_material: Optional[str] = None) -> Dict:
+    """Group a deck's questions into multi-part problems (per material) and store
+    each part's prereq_ids = all earlier parts of its problem, so practice can
+    show those earlier parts + the learner's answers as exam-style context.
+
+    Re-groups from scratch (clears stale links). With ``only_material`` it
+    processes just that material — used to auto-link right after an extraction.
+    Returns {linked, analyzed}."""
+    from collections import defaultdict
+    db = SessionLocal()
+    try:
+        q = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck_id)
+        if owner is not None:
+            q = q.filter(StudyQuestion.owner == owner)
+        if only_material is not None:
+            q = q.filter(StudyQuestion.material_id == only_material)
+        rows = q.order_by(StudyQuestion.created_at.asc()).all()
+        by_mat = defaultdict(list)
+        for r in rows:
+            # Include the recovered setup: terse parts ("verify the objective is
+            # differentiable") don't name their problem, so without their context
+            # the grouper can't place them with the right problem.
+            text = (r.question or "")[:600]
+            ctx = (r.context or "").strip()
+            if ctx:
+                text += f"\n[shared setup: {ctx[:400]}]"
+            by_mat[r.material_id or "none"].append(
+                {"id": r.id, "number": r.number, "question": text})
+    finally:
+        db.close()
+
+    results: Dict[str, List[str]] = {}
+    analyzed_ids: List[str] = []
+    for mat_id, items in by_mat.items():
+        if len(items) < 2:                  # need siblings to form a problem
+            continue
+        analyzed_ids.extend(it["id"] for it in items)
+        valid = {it["id"] for it in items}
+        try:
+            value = await _llm_json(owner, LINK_PARTS_SYSTEM,
+                                    json.dumps(items, ensure_ascii=False),
+                                    temperature=0.1, max_tokens=8000,
+                                    timeout=240, thinking_off=True)
+        except HTTPException as e:
+            if e.status_code == 503:
+                raise
+            logger.warning("study link-parts: material %s failed: %s", mat_id, e.detail)
+            continue
+        groups = value.get("groups") if isinstance(value, dict) else (
+            value if isinstance(value, list) else [])
+        results.update(prereqs_from_groups(groups, valid_ids=valid))
+
+    linked = 0
+    db = SessionLocal()
+    try:
+        for r in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(analyzed_ids)).all()
+                  if analyzed_ids else []):
+            pre = [p for p in results.get(r.id, []) if p != r.id]
+            r.prereq_ids = json.dumps(pre)   # also clears stale links when empty
+            if pre:
+                linked += 1
+        db.commit()
+    finally:
+        db.close()
+    return {"linked": linked, "analyzed": len(analyzed_ids)}
 
 
 async def _build_figures_section(owner, material_id: str, file_id: str,
@@ -2343,7 +2411,7 @@ def setup_study_routes():
             if m:
                 m.question_count = (m.question_count or 0) + len(saved)
             db.commit()
-            return {
+            resp = {
                 "created": len(saved),
                 "duplicates": duplicates,
                 "chunks": len(chunks),
@@ -2352,8 +2420,19 @@ def setup_study_routes():
                 "coverage": coverage,
                 "questions": [_question_to_dict(r) for r in saved],
             }
+            created_n = len(saved)
         finally:
             db.close()
+
+        # Auto-link multi-part problems for this material so practice immediately
+        # shows earlier parts + answers as context. Best-effort — an extraction
+        # must never fail because grouping did.
+        if created_n:
+            try:
+                await _link_deck_parts(user, deck_id, only_material=material_id)
+            except Exception as e:
+                logger.warning("study: auto link-parts after extraction failed: %s", e)
+        return resp
 
     # ------------------------------------------------------------------ question bank (v2)
 
@@ -3076,65 +3155,16 @@ def setup_study_routes():
 
     @router.post("/decks/{deck_id}/link-parts")
     async def link_parts(request: Request, deck_id: str):
-        """Detect multi-part ('alíneas') dependencies: per material, the AI
-        labels each question and lists, for later parts, the earlier parts whose
-        info/answer they need. Stored on number + prereq_ids."""
-        from collections import defaultdict
+        """Group multi-part problems (per material) and store each part's
+        prerequisites — the earlier parts of the same problem. Practice then
+        shows those earlier parts + your answers as exam-style context."""
         user = _owner(request)
         db = SessionLocal()
         try:
             _get_deck(db, deck_id, user)
-            q = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck_id)
-            if user is not None:
-                q = q.filter(StudyQuestion.owner == user)
-            rows = q.order_by(StudyQuestion.created_at.asc()).all()
-            by_mat = defaultdict(list)
-            for r in rows:
-                by_mat[r.material_id or "none"].append(
-                    {"id": r.id, "number": r.number, "question": r.question[:600]})
-            valid_per_mat = {m: {it["id"] for it in items} for m, items in by_mat.items()}
         finally:
             db.close()
-
-        results: Dict[str, Dict] = {}
-        for mat_id, items in by_mat.items():
-            if len(items) < 2:               # need siblings to have prerequisites
-                continue
-            try:
-                value = await _llm_json(user, LINK_PARTS_SYSTEM,
-                                        json.dumps(items, ensure_ascii=False),
-                                        temperature=0.1, max_tokens=8000,
-                                        timeout=240, thinking_off=True)
-            except HTTPException as e:
-                if e.status_code == 503:
-                    raise
-                logger.warning("study link-parts: material %s failed: %s", mat_id, e.detail)
-                continue
-            arr = value.get("items") if isinstance(value, dict) else (
-                value if isinstance(value, list) else [])
-            valid = valid_per_mat.get(mat_id, set())
-            for it in (arr or []):
-                if not isinstance(it, dict) or it.get("id") not in valid:
-                    continue
-                pre = [p for p in (it.get("prereq_ids") or [])
-                       if p in valid and p != it["id"]]
-                results[it["id"]] = {"number": it.get("number"), "prereq_ids": pre}
-
-        linked = 0
-        db = SessionLocal()
-        try:
-            for r in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(results))).all()
-                      if results else []):
-                u = results[r.id]
-                if u.get("number") and not r.number:
-                    r.number = str(u["number"])
-                r.prereq_ids = json.dumps(u["prereq_ids"])
-                if u["prereq_ids"]:
-                    linked += 1
-            db.commit()
-        finally:
-            db.close()
-        return {"linked": linked, "analyzed": sum(len(v) for v in by_mat.values())}
+        return await _link_deck_parts(user, deck_id)
 
     @router.post("/backfill-context")
     async def backfill_context(request: Request):
@@ -3244,6 +3274,10 @@ def setup_study_routes():
         try:
             row = _get_question(db, question_id, user)
             ids = json.loads(row.prereq_ids) if row.prereq_ids else []
+            # Cap to the most recent earlier parts so a large problem (e.g. a
+            # 20-part exam question) doesn't render a wall; the shared setup for
+            # parts that lack it is carried separately by the `context` box.
+            ids = ids[-10:]
             out = []
             for pid in ids:
                 pq = db.query(StudyQuestion).filter(StudyQuestion.id == pid).first()

@@ -13,6 +13,7 @@ from src.study_ai import (
     parse_answer_key_pages,
     parse_llm_json,
     parse_question_manifest,
+    prereqs_from_groups,
     question_is_conclusion,
     question_key,
     rating_from_outcome,
@@ -399,6 +400,22 @@ def test_mcq_never_flagged_as_conclusion():
     q = dict(_mcq(), question="Conclude that which option is true?")
     q["qtype"] = "mcq"
     assert not question_is_conclusion(q)
+
+
+# --- prereqs_from_groups (multi-part grouping → earlier-part prerequisites) ----
+
+def test_prereqs_from_groups_orders_earlier_parts():
+    groups = [["a", "b", "c"], ["x"]]
+    out = prereqs_from_groups(groups)
+    assert out["a"] == []
+    assert out["b"] == ["a"]
+    assert out["c"] == ["a", "b"]   # all earlier parts, in order
+    assert out["x"] == []           # standalone has no prerequisites
+
+
+def test_prereqs_from_groups_filters_unknown_ids():
+    out = prereqs_from_groups([["a", "ghost", "b"]], valid_ids={"a", "b"})
+    assert out == {"a": [], "b": ["a"]}   # unknown id dropped, not a prereq
 
 
 # --- question_key (shared by in-run and cross-run dedupe) -----------------------
