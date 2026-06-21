@@ -53,6 +53,27 @@ class _FakeManager:
     def sessions(self):
         return {"sessions": [{"id": "conv_1", "title": "Plan launch", "status": "idle"}]}
 
+    def workers(self):
+        return {
+            "recommended_prompt": "start claude and codex",
+            "workers": [
+                {
+                    "id": "claude_code",
+                    "label": "Claude",
+                    "status": "ready",
+                    "available": True,
+                    "source": "subscription",
+                },
+                {
+                    "id": "codex",
+                    "label": "Codex",
+                    "status": "ready",
+                    "available": True,
+                    "source": "subscription",
+                },
+            ],
+        }
+
 
 def test_status_route_includes_install_guidance():
     from routes.omnigent_routes import setup_omnigent_routes
@@ -61,8 +82,8 @@ def test_status_route_includes_install_guidance():
 
     assert status["installed"] is True
     assert status["command"] == "omnigent"
-    assert status["install"]["recommended"] == "uv tool install omnigent"
-    assert "pip install omnigent" in status["install"]["alternatives"]
+    assert "install_oss.sh" in status["install"]["recommended"]
+    assert "uv tool install omnigent" in status["install"]["alternatives"]
 
 
 def test_start_and_stop_routes_delegate_to_manager(monkeypatch):
@@ -134,3 +155,13 @@ def test_sessions_route_proxies_manager_sessions():
     result = _handler(setup_omnigent_routes(_FakeManager()), "GET", "/api/omnigent/sessions")()
 
     assert result["sessions"][0]["id"] == "conv_1"
+
+
+def test_workers_route_reports_original_omnigent_roster_shape():
+    from routes.omnigent_routes import setup_omnigent_routes
+
+    result = _handler(setup_omnigent_routes(_FakeManager()), "GET", "/api/omnigent/workers")()
+
+    assert result["recommended_prompt"] == "start claude and codex"
+    assert [worker["id"] for worker in result["workers"]] == ["claude_code", "codex"]
+    assert all("status" in worker for worker in result["workers"])

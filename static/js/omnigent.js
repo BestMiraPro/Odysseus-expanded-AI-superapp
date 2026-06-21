@@ -9,6 +9,8 @@ let _state = {
   status: null,
   providers: [],
   sessions: [],
+  workers: [],
+  workerPrompt: 'start claude and codex',
   error: '',
 };
 
@@ -72,14 +74,25 @@ function ensureModal() {
 }
 
 function statusLabel(status) {
-  if (!status?.installed) return ['not-installed', 'Not installed'];
-  if (status.running) return ['running', 'Running'];
-  return ['idle', 'Installed'];
+  if (!status?.installed) return ['not-installed', 'Needs Omnigent CLI'];
+  if (status.running) return ['running', 'Workspace running'];
+  return ['idle', 'Ready to start'];
+}
+
+function installCommand(status) {
+  return status?.install?.recommended || 'curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh';
+}
+
+function bridgeCommand() {
+  return `ODYSSEUS_URL=${location.origin} ODYSSEUS_API_TOKEN=... omnigent run odysseus/config.yaml`;
 }
 
 function providerAction(provider) {
   if (provider.id === 'chatgpt-subscription') {
     return '<button class="omnigent-link-btn" data-omnigent-action="link-chatgpt">Link ChatGPT</button>';
+  }
+  if (provider.id === 'claude-subscription') {
+    return '<button class="omnigent-link-btn" data-omnigent-action="copy-install">Copy install command</button>';
   }
   if (provider.id === 'api-endpoint') {
     return '<button class="omnigent-link-btn" data-omnigent-action="models">Open endpoints</button>';
@@ -110,6 +123,26 @@ function renderProvider(provider) {
     </div>`;
 }
 
+function workerStatusLabel(worker) {
+  if (worker.status === 'ready') return 'Ready';
+  if (worker.status === 'linkable') return 'Link';
+  if (worker.status === 'note') return 'Note';
+  return 'Missing';
+}
+
+function renderWorker(worker) {
+  const status = worker.status || (worker.available ? 'ready' : 'missing');
+  return `
+    <div class="omnigent-worker" data-worker-id="${esc(worker.id)}">
+      <div class="omnigent-worker-main">
+        <span class="omnigent-worker-name">${esc(worker.label || worker.id)}</span>
+        <small>${esc(worker.source || '')}</small>
+      </div>
+      <span class="omnigent-worker-status ${esc(status)}">${esc(workerStatusLabel({ ...worker, status }))}</span>
+      <p>${esc(worker.hint || '')}</p>
+    </div>`;
+}
+
 function renderSessions(sessions) {
   if (!sessions.length) {
     return '<div class="omnigent-empty">No active Omnigent sessions reported.</div>';
@@ -127,15 +160,26 @@ function render() {
   if (!body) return;
   const status = _state.status || {};
   const [statusClass, label] = statusLabel(status);
-  const install = status.install || {};
   const command = status.command ? String(status.command).replace(/\\/g, '/') : '';
+  const install = installCommand(status);
+  const bridge = bridgeCommand();
+  const workerPrompt = _state.workerPrompt || 'start claude and codex';
+  const startDisabled = status.running ? 'disabled' : '';
+  const consoleState = status.running
+    ? 'Omnigent is running. Your Odysseus tools are available through the bridge.'
+    : status.installed
+      ? 'Ready. Start the workspace, then ask Omnigent for the crew you want.'
+      : 'Omnigent is not available in this runtime yet. Install it where the workers run, then return here.';
+  const dockerHint = !status.installed
+    ? 'Docker note: this container cannot see host Claude or Codex logins unless you install them in the container or run Omnigent on the host with the bridge.'
+    : '';
 
   body.innerHTML = `
     <div class="omnigent-shell">
       <section class="omnigent-hero">
         <div class="omnigent-hero-main">
           <div class="omnigent-kicker">AI agent workspace</div>
-          <h3>Omnigent inside Odysseus</h3>
+          <h3>Start an Omnigent crew</h3>
           <div class="omnigent-status-row">
             <span class="omnigent-status ${statusClass}">${label}</span>
             ${command ? `<span class="omnigent-command">${esc(command)}</span>` : ''}
@@ -143,29 +187,73 @@ function render() {
         </div>
         <div class="omnigent-actions">
           <button class="admin-btn-sm" data-omnigent-action="refresh">Refresh</button>
-          <button class="admin-btn-add" data-omnigent-action="start" ${status.running ? 'disabled' : ''}>Start</button>
+          <button class="admin-btn-add" data-omnigent-action="start" ${startDisabled}>Start Claude + Codex</button>
           <button class="admin-btn-delete" data-omnigent-action="stop" ${!status.running ? 'disabled' : ''}>Stop</button>
         </div>
       </section>
 
-      <section class="omnigent-grid">
-        <div class="omnigent-card">
-          <div class="omnigent-card-title">Bridge bundle</div>
-          <p>Download the Odysseus agent bundle, then run it with an Odysseus token in Omnigent.</p>
-          <div class="omnigent-code">
-            <code>ODYSSEUS_URL=${esc(location.origin)} ODYSSEUS_API_TOKEN=... omnigent run odysseus/config.yaml</code>
+      <section class="omnigent-console">
+        <div class="omnigent-console-head">
+          <span>Omnigent prompt</span>
+          <strong>${esc(workerPrompt)}</strong>
+        </div>
+        <div class="omnigent-console-lines">
+          <div><span class="omnigent-prompt">&gt;</span> ${esc(workerPrompt)}</div>
+          <div>${esc(consoleState)}</div>
+          ${dockerHint ? `<div class="omnigent-warning">${esc(dockerHint)}</div>` : ''}
+          ${status.error ? `<div class="omnigent-error">${esc(status.error)}</div>` : ''}
+        </div>
+      </section>
+
+      <section class="omnigent-section">
+        <div class="omnigent-section-head">
+          <h4>Easy setup</h4>
+        </div>
+        <div class="omnigent-setup-grid">
+          <div class="omnigent-step">
+            <div class="omnigent-step-number">1</div>
+            <div>
+              <div class="omnigent-card-title">Choose accounts</div>
+              <p>Use your ChatGPT subscription, local Claude/Codex login, an Odysseus API endpoint, or the GLM website note.</p>
+              <div class="omnigent-card-actions">
+                <button class="omnigent-link-btn" data-omnigent-action="link-chatgpt">Link ChatGPT</button>
+                <button class="omnigent-link-btn" data-omnigent-action="models">Open endpoints</button>
+                <a class="omnigent-link-btn" href="https://chat.z.ai/" target="_blank" rel="noopener">Open GLM</a>
+              </div>
+            </div>
           </div>
-          <div class="omnigent-card-actions">
-            <a class="admin-btn-add" href="/api/omnigent/bundle.tar.gz" download="odysseus-omnigent-bundle.tar.gz">Download bundle</a>
-            <button class="admin-btn-sm" data-omnigent-action="integrations">Create token</button>
+          <div class="omnigent-step">
+            <div class="omnigent-step-number">2</div>
+            <div>
+              <div class="omnigent-card-title">Prepare Omnigent</div>
+              <p>Install Omnigent in the same place that can access your worker logins.</p>
+              <div class="omnigent-code"><code>${esc(install)}</code></div>
+              <div class="omnigent-card-actions">
+                <button class="omnigent-link-btn" data-omnigent-action="copy-install">Copy command</button>
+              </div>
+            </div>
+          </div>
+          <div class="omnigent-step">
+            <div class="omnigent-step-number">3</div>
+            <div>
+              <div class="omnigent-card-title">Launch the crew</div>
+              <p>Start Omnigent, then use the prompt shown above: ${esc(workerPrompt)}.</p>
+              <div class="omnigent-card-actions">
+                <button class="admin-btn-add" data-omnigent-action="start" ${startDisabled}>Start Claude + Codex</button>
+                <button class="admin-btn-sm" data-omnigent-action="refresh">Check status</button>
+              </div>
+            </div>
           </div>
         </div>
+      </section>
 
-        <div class="omnigent-card">
-          <div class="omnigent-card-title">Install</div>
-          <p>${esc(install.recommended || 'uv tool install omnigent')}</p>
-          <div class="omnigent-muted">${esc((install.alternatives || []).join(' | '))}</div>
-          ${status.error ? `<div class="omnigent-error">${esc(status.error)}</div>` : ''}
+      <section class="omnigent-section">
+        <div class="omnigent-section-head">
+          <h4>Worker roster</h4>
+          <span>${esc(String(_state.workers.length))}</span>
+        </div>
+        <div class="omnigent-worker-grid">
+          ${_state.workers.map(renderWorker).join('') || '<div class="omnigent-empty">No workers reported yet.</div>'}
         </div>
       </section>
 
@@ -176,6 +264,16 @@ function render() {
         <div class="omnigent-provider-grid">
           ${_state.providers.map(renderProvider).join('')}
         </div>
+        <details class="omnigent-advanced">
+          <summary>Advanced bridge</summary>
+          <p>Use this when Omnigent runs outside the Odysseus container and needs scoped Odysseus tools.</p>
+          <div class="omnigent-code"><code>${esc(bridge)}</code></div>
+          <div class="omnigent-card-actions">
+            <a class="admin-btn-add" href="/api/omnigent/bundle.tar.gz" download="odysseus-omnigent-bundle.tar.gz">Download bundle</a>
+            <button class="admin-btn-sm" data-omnigent-action="integrations">Create token</button>
+            <button class="omnigent-link-btn" data-omnigent-action="copy-bridge">Copy bridge command</button>
+          </div>
+        </details>
       </section>
 
       <section class="omnigent-section">
@@ -192,14 +290,17 @@ function render() {
 
 async function refresh() {
   _state.error = '';
-  const [status, providerPayload, sessionPayload] = await Promise.all([
+  const [status, providerPayload, sessionPayload, workerPayload] = await Promise.all([
     fetchJson('/api/omnigent/status', {}),
     fetchJson('/api/omnigent/providers', { providers: [] }),
     fetchJson('/api/omnigent/sessions', { sessions: [] }),
+    fetchJson('/api/omnigent/workers', { workers: [], recommended_prompt: 'start claude and codex' }),
   ]);
   _state.status = status;
   _state.providers = Array.isArray(providerPayload.providers) ? providerPayload.providers : [];
   _state.sessions = Array.isArray(sessionPayload.sessions) ? sessionPayload.sessions : [];
+  _state.workers = Array.isArray(workerPayload.workers) ? workerPayload.workers : [];
+  _state.workerPrompt = workerPayload.recommended_prompt || 'start claude and codex';
   _loaded = true;
   render();
 }
@@ -207,6 +308,10 @@ async function refresh() {
 async function postServer(action) {
   const toast = window.uiModule?.showToast;
   try {
+    if (action === 'start' && !_state.status?.installed) {
+      toast?.('Install Omnigent where the workers run, then press Start again');
+      return;
+    }
     const res = await fetch(`/api/omnigent/server/${action}`, { method: 'POST', credentials: 'same-origin' });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.detail || 'Omnigent server request failed');
@@ -216,6 +321,27 @@ async function postServer(action) {
     toast?.(err?.message || 'Omnigent request failed');
   }
   await refresh();
+}
+
+async function copyText(text, label) {
+  const toast = window.uiModule?.showToast;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const input = document.createElement('textarea');
+      input.value = text;
+      input.style.position = 'fixed';
+      input.style.opacity = '0';
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand('copy');
+      input.remove();
+    }
+    toast?.(`${label} copied`);
+  } catch (err) {
+    toast?.(`Could not copy ${label.toLowerCase()}`);
+  }
 }
 
 async function linkChatGPTSubscription() {
@@ -251,6 +377,8 @@ function wireActions(root) {
       if (action === 'refresh') await refresh();
       else if (action === 'start') await postServer('start');
       else if (action === 'stop') await postServer('stop');
+      else if (action === 'copy-install') await copyText(installCommand(_state.status || {}), 'Install command');
+      else if (action === 'copy-bridge') await copyText(bridgeCommand(), 'Bridge command');
       else if (action === 'link-chatgpt') await linkChatGPTSubscription();
       else if (action === 'settings' || action === 'integrations') openSettings();
       else if (action === 'models') {

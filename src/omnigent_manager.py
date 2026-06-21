@@ -12,8 +12,13 @@ from typing import Any
 
 
 INSTALL_GUIDANCE = {
-    "recommended": "uv tool install omnigent",
-    "alternatives": ["pip install omnigent", "pipx install omnigent"],
+    "recommended": "curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | sh",
+    "alternatives": [
+        "uv tool install omnigent",
+        'pip install "omnigent"',
+        "brew install omnigent-ai/tap/omnigent",
+        "uv tool install -q --python 3.12 git+https://github.com/omnigent-ai/omnigent.git",
+    ],
     "source": "https://github.com/omnigent-ai/omnigent",
 }
 
@@ -40,6 +45,25 @@ class OmnigentManager:
             if resolved:
                 return resolved
         return None
+
+    def _cli_worker(
+        self,
+        worker_id: str,
+        label: str,
+        source: str,
+        commands: tuple[str, ...],
+        missing_hint: str,
+    ) -> dict[str, Any]:
+        command = next((resolved for name in commands if (resolved := shutil.which(name))), None)
+        return {
+            "id": worker_id,
+            "label": label,
+            "source": source,
+            "available": bool(command),
+            "status": "ready" if command else "missing",
+            "command": command,
+            "hint": "Ready to launch from Omnigent." if command else missing_hint,
+        }
 
     def _run(self, args: list[str], timeout: float | None = None) -> OmnigentCommandResult:
         proc = subprocess.run(
@@ -166,3 +190,49 @@ class OmnigentManager:
             data.setdefault("url", url)
             return data
         return {"sessions": data if isinstance(data, list) else [], "running": True, "url": url}
+
+    def workers(self) -> dict[str, Any]:
+        """Report the worker roster Omnigent can use from this runtime."""
+        return {
+            "recommended_prompt": "start claude and codex",
+            "workers": [
+                self._cli_worker(
+                    "claude_code",
+                    "Claude",
+                    "subscription",
+                    ("claude", "claude-code"),
+                    "Install or log in to Claude Code where Omnigent runs.",
+                ),
+                self._cli_worker(
+                    "codex",
+                    "Codex",
+                    "subscription",
+                    ("codex",),
+                    "Install or log in to Codex where Omnigent runs.",
+                ),
+                {
+                    "id": "chatgpt_subscription",
+                    "label": "ChatGPT",
+                    "source": "Odysseus account",
+                    "available": True,
+                    "status": "linkable",
+                    "hint": "Link your ChatGPT subscription through Odysseus.",
+                },
+                {
+                    "id": "api_endpoint",
+                    "label": "API endpoint",
+                    "source": "Odysseus models",
+                    "available": True,
+                    "status": "ready",
+                    "hint": "Use any model endpoint already configured in Odysseus.",
+                },
+                {
+                    "id": "glm_free_web",
+                    "label": "GLM website",
+                    "source": "free web",
+                    "available": False,
+                    "status": "note",
+                    "hint": "Open the free GLM website separately; it is not an API connector.",
+                },
+            ],
+        }

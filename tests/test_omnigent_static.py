@@ -37,3 +37,13 @@ def test_omnigent_module_mentions_free_glm_website_as_unsupported_note():
     assert "glm-free-web" in module
     assert "free website" in module.lower()
     assert "not an API connector" in module
+
+
+def test_omnigent_module_prioritizes_easy_setup_and_worker_roster():
+    module = (_REPO / "static" / "js" / "omnigent.js").read_text(encoding="utf-8")
+
+    assert "Start Claude + Codex" in module
+    assert "Easy setup" in module
+    assert "/api/omnigent/workers" in module
+    assert "Worker roster" in module
+    assert "Advanced bridge" in module

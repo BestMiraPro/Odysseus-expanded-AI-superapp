@@ -95,6 +95,10 @@ def setup_omnigent_routes(manager: OmnigentManager | None = None) -> APIRouter:
     def sessions():
         return manager.sessions()
 
+    @router.get("/workers")
+    def workers():
+        return manager.workers()
+
     @router.get("/providers")
     def providers():
         return {"providers": _providers()}
