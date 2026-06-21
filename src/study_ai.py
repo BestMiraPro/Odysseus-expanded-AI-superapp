@@ -397,13 +397,28 @@ def question_is_conclusion(q: Dict) -> bool:
     return bool(_CONCLUSION_RE.match(q.get("question") or ""))
 
 
+# Formatting-only LaTeX commands: they change how math looks, not what it says,
+# so two extractions of the same question (one plain "P"/"ln", one LaTeX
+# "\mathbb{P}"/"\ln") must key equal. We drop these commands, then drop every
+# remaining backslash so "\ln"->"ln" matches the plain spelling.
+_LATEX_FMT_RE = re.compile(
+    r"\\(?:mathbb|mathbf|mathrm|mathcal|mathsf|mathit|boldsymbol|operatorname|"
+    r"text|textbf|textit|left|right|displaystyle|big|bigg|Big|Bigg|quad|qquad)\b")
+
+
 def question_key(text: str) -> str:
     """Normalized full-text identity used for duplicate detection.
 
     Full text, not a prefix: multi-part exam questions legitimately share a
     long problem preamble, and a prefix key would collapse them into one.
+
+    Notation-insensitive: the same question extracted twice — once in plain text,
+    once in LaTeX — must collapse to one key, so cross-run dedupe catches it.
     """
-    return re.sub(r"\W+", "", (text or "").lower())
+    s = (text or "").lower()
+    s = _LATEX_FMT_RE.sub("", s)   # drop formatting-only commands (\mathbb, ...)
+    s = s.replace("\\", "")        # \ln -> ln, \alpha -> alpha, etc.
+    return re.sub(r"[^a-z0-9]", "", s)
 
 
 # ---------------------------------------------------------------------------
@@ -691,22 +706,45 @@ Group them into problems and order each group's parts as they appear in the exam
 Output ONLY JSON: {"groups": [["<id of part a>", "<id of part b>", "<id of part c>"], ["<id of a standalone>"], ...]} using the exact ids given. No commentary."""
 
 
-def prereqs_from_groups(groups, valid_ids=None) -> Dict[str, List[str]]:
+def _num_order_key(num):
+    """Sort key for a part label: '16a'->(16,'a'), '16'->(16,''), 'Q2.'->(2,'').
+    Returns None when there's no usable numeric label."""
+    if not num:
+        return None
+    s = re.sub(r"[^0-9a-z]", "", str(num).strip().lower())
+    m = re.match(r"(\d+)([a-z]*)", s)
+    if not m:
+        return None
+    return (int(m.group(1)), m.group(2))
+
+
+def prereqs_from_groups(groups, valid_ids=None, number_by_id=None) -> Dict[str, List[str]]:
     """From ordered groups of question ids (LINK_PARTS_SYSTEM output), return
-    {id: [ids of all earlier parts in the same group]}. Earlier parts are the
-    prerequisites a later part carries forward in an exam. Unknown ids (not in
-    `valid_ids`, when given) are skipped; a part's own id is never included."""
+    {id: [earlier-part ids]} — the prerequisites a later part carries forward.
+
+    Ordering:
+    - A part WITH a numeric label ("16b") takes only same-group parts whose label
+      is strictly smaller ("16a"). It deliberately ignores unnumbered siblings:
+      their position relative to a labelled part can't be trusted, and a labelled
+      exam part must NEVER inherit a later part (the bug this fixes).
+    - A part WITHOUT a label takes the parts before it in the group's given
+      (model) order.
+    Unknown ids (not in `valid_ids`) are skipped; a part never includes itself."""
+    number_by_id = number_by_id or {}
     out: Dict[str, List[str]] = {}
     for group in (groups or []):
         if not isinstance(group, (list, tuple)):
             continue
-        earlier: List[str] = []
-        for qid in group:
-            qid = str(qid)
-            if valid_ids is not None and qid not in valid_ids:
-                continue
-            out[qid] = list(earlier)
-            earlier.append(qid)
+        ids = [str(q) for q in group
+               if valid_ids is None or str(q) in valid_ids]
+        keys = {qid: _num_order_key(number_by_id.get(qid)) for qid in ids}
+        for idx, qid in enumerate(ids):
+            k = keys[qid]
+            if k is not None:
+                out[qid] = [o for o in ids
+                            if o != qid and keys[o] is not None and keys[o] < k]
+            else:
+                out[qid] = [o for o in ids[:idx] if o != qid]
     return out
 
 SOLUTION_AUDIT_SYSTEM = """You audit a practice-question bank and flag entries that are NOT real questions: worked-solution steps, conclusions, or instructions that already STATE the result they pretend to ask for. Those leak the answer, so they are useless for closed-book practice.

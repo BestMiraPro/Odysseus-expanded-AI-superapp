@@ -418,6 +418,30 @@ def test_prereqs_from_groups_filters_unknown_ids():
     assert out == {"a": [], "b": ["a"]}   # unknown id dropped, not a prereq
 
 
+def test_prereqs_numbered_parts_only_take_smaller_labels():
+    # Even if the model lists the numbered parts out of order, a labelled part
+    # must only inherit strictly-smaller labels (16b never gets 16c/16d).
+    groups = [["d", "b", "a", "c"]]
+    nums = {"a": "16a", "b": "16b", "c": "16c", "d": "16d"}
+    out = prereqs_from_groups(groups, number_by_id=nums)
+    assert out["a"] == []
+    assert sorted(out["b"]) == ["a"]
+    assert sorted(out["c"]) == ["a", "b"]
+    assert sorted(out["d"]) == ["a", "b", "c"]
+
+
+def test_prereqs_numbered_part_ignores_unnumbered_siblings():
+    # A numbered part must not inherit unnumbered siblings (the 16a-with-18-
+    # prereqs bug): only smaller numbers count.
+    groups = [["u1", "u2", "16a", "16b"]]
+    nums = {"16a": "16a", "16b": "16b"}        # u1/u2 unnumbered
+    out = prereqs_from_groups(groups, number_by_id=nums)
+    assert out["16a"] == []                    # not [u1, u2]
+    assert out["16b"] == ["16a"]
+    # Unnumbered parts still fall back to positional order.
+    assert out["u1"] == [] and out["u2"] == ["u1"]
+
+
 # --- question_key (shared by in-run and cross-run dedupe) -----------------------
 
 def test_question_key_normalizes_punctuation_and_case():
@@ -428,3 +452,11 @@ def test_question_key_distinguishes_shared_preambles():
     a = "Consider problem P (long shared preamble). " * 5 + "Part a) formalize P."
     b = "Consider problem P (long shared preamble). " * 5 + "Part d) solve KKT."
     assert question_key(a) != question_key(b)
+
+
+def test_question_key_collapses_plain_vs_latex_notation():
+    # The same question extracted twice — once plain, once in LaTeX — must key
+    # equal so cross-run dedupe catches it.
+    plain = "Formalize P, maximizing f(x,y) = 40 ln(x) + 2y."
+    latex = r"Formalize $\mathbb{P}$, maximizing $f(x,y) = 40 \ln(x) + 2y$."
+    assert question_key(plain) == question_key(latex)

@@ -828,7 +828,9 @@ async def _link_deck_parts(owner, deck_id: str, only_material: Optional[str] = N
             q = q.filter(StudyQuestion.material_id == only_material)
         rows = q.order_by(StudyQuestion.created_at.asc()).all()
         by_mat = defaultdict(list)
+        number_by_id: Dict[str, str] = {}
         for r in rows:
+            number_by_id[r.id] = r.number
             # Include the recovered setup: terse parts ("verify the objective is
             # differentiable") don't name their problem, so without their context
             # the grouper can't place them with the right problem.
@@ -860,7 +862,8 @@ async def _link_deck_parts(owner, deck_id: str, only_material: Optional[str] = N
             continue
         groups = value.get("groups") if isinstance(value, dict) else (
             value if isinstance(value, list) else [])
-        results.update(prereqs_from_groups(groups, valid_ids=valid))
+        results.update(prereqs_from_groups(groups, valid_ids=valid,
+                                           number_by_id=number_by_id))
 
     linked = 0
     db = SessionLocal()
@@ -875,6 +878,39 @@ async def _link_deck_parts(owner, deck_id: str, only_material: Optional[str] = N
     finally:
         db.close()
     return {"linked": linked, "analyzed": len(analyzed_ids)}
+
+
+def _dedup_deck_questions(db, deck_id: str, owner) -> int:
+    """Remove duplicate questions in a deck (same notation-insensitive
+    question_key) — e.g. the same exam part extracted twice, once plain and once
+    in LaTeX. Keeps the best copy of each cluster and deletes the rest; returns
+    the number deleted. 'Best' = has a part number (canonical for ordering), then
+    most attempts (preserve progress), then longest text."""
+    from collections import defaultdict
+    q = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck_id)
+    if owner is not None:
+        q = q.filter(StudyQuestion.owner == owner)
+    rows = q.all()
+    clusters: Dict[str, list] = defaultdict(list)
+    for r in rows:
+        clusters[question_key(r.question or "")].append(r)
+
+    deleted = 0
+    for key, group in clusters.items():
+        if len(group) < 2:
+            continue
+        att = {
+            r.id: db.query(StudyAttempt).filter(StudyAttempt.question_id == r.id).count()
+            for r in group
+        }
+        group.sort(key=lambda r: (1 if r.number else 0, att[r.id], len(r.question or "")),
+                   reverse=True)
+        for dup in group[1:]:                 # keep group[0], drop the rest
+            db.delete(dup)
+            deleted += 1
+    if deleted:
+        db.commit()
+    return deleted
 
 
 async def _build_figures_section(owner, material_id: str, file_id: str,
@@ -3165,6 +3201,30 @@ def setup_study_routes():
         finally:
             db.close()
         return await _link_deck_parts(user, deck_id)
+
+    @router.post("/dedup")
+    def dedup_questions_route(request: Request):
+        """Remove duplicate questions across the caller's decks — the same exam
+        part extracted twice (e.g. once plain, once in LaTeX) that older
+        cross-run dedupe missed. Keeps the best copy of each cluster. Returns the
+        number deleted per deck."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            dq = db.query(StudyDeck)
+            if user is not None:
+                dq = dq.filter(StudyDeck.owner == user)
+            deck_ids = [d.id for d in dq.all()]
+            out = {}
+            total = 0
+            for did in deck_ids:
+                n = _dedup_deck_questions(db, did, user)
+                if n:
+                    out[did] = n
+                    total += n
+        finally:
+            db.close()
+        return {"deleted": total, "by_deck": out}
 
     @router.post("/backfill-context")
     async def backfill_context(request: Request):
