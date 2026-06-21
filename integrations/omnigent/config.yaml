@@ -1,0 +1,114 @@
+spec_version: 1
+name: odysseus
+description: >-
+  An Omnigent agent bridge for Odysseus. It connects an Omnigent run to the
+  user's scoped Odysseus tools through ODYSSEUS_URL and ODYSSEUS_API_TOKEN.
+
+executor:
+  type: omnigent
+  config:
+    harness: claude-sdk
+
+prompt: |
+  You are Odysseus running inside Omnigent.
+
+  You can inspect and use the user's Odysseus tools through Python function
+  tools. These tools call the local Odysseus HTTP bridge with the scoped bearer
+  token supplied by the user.
+
+  Required environment variables:
+  - ODYSSEUS_URL: the base URL of the user's Odysseus instance.
+  - ODYSSEUS_API_TOKEN: an Odysseus API token with only the scopes this agent
+    should use.
+
+  Before taking action, call odysseus_capabilities to learn which scoped tools
+  are available. Treat email sending, destructive changes, and cookbook launch
+  commands as high-impact actions that require explicit user confirmation.
+
+tools:
+  odysseus_capabilities:
+    type: function
+    description: Inspect which Odysseus tools and scopes are available.
+    callable: tools.odysseus_api.capabilities
+    parameters:
+      type: object
+      properties: {}
+  odysseus_todos:
+    type: function
+    description: Read or manage Odysseus notes, todos, and checklist items.
+    callable: tools.odysseus_api.todos
+    parameters:
+      type: object
+      properties:
+        action:
+          type: string
+        title:
+          type: string
+        text:
+          type: string
+        note_id:
+          type: string
+        archived:
+          type: boolean
+  odysseus_email_search:
+    type: function
+    description: Search/list Odysseus email messages without sending.
+    callable: tools.odysseus_api.email_search
+    parameters:
+      type: object
+      properties:
+        folder:
+          type: string
+        limit:
+          type: integer
+        filter:
+          type: string
+        account_id:
+          type: string
+  odysseus_memory:
+    type: function
+    description: List or add Odysseus memories.
+    callable: tools.odysseus_api.memory
+    parameters:
+      type: object
+      properties:
+        action:
+          type: string
+        text:
+          type: string
+        category:
+          type: string
+        source:
+          type: string
+  odysseus_calendar_events:
+    type: function
+    description: List Odysseus calendar events in a date range.
+    callable: tools.odysseus_api.calendar_events
+    parameters:
+      type: object
+      properties:
+        start:
+          type: string
+        end:
+          type: string
+        calendar:
+          type: string
+      required: [start, end]
+  odysseus_documents:
+    type: function
+    description: Search/list Odysseus documents.
+    callable: tools.odysseus_api.documents
+    parameters:
+      type: object
+      properties:
+        search:
+          type: string
+        limit:
+          type: integer
+  odysseus_cookbook_tasks:
+    type: function
+    description: List Odysseus cookbook tasks available to this token.
+    callable: tools.odysseus_api.cookbook_tasks
+    parameters:
+      type: object
+      properties: {}
