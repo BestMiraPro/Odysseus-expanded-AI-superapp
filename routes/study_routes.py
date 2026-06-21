@@ -60,6 +60,7 @@ from src.study_ai import (
     MATERIAL_CATEGORIES,
     REFORMAT_SYSTEM,
     REPAIR_JSON_SYSTEM,
+    SOLUTION_AUDIT_SYSTEM,
     STUDY_NOTES_SYSTEM,
     SUBJECT_OVERVIEW_SYSTEM,
     chunk_material,
@@ -780,6 +781,32 @@ async def _backfill_context_items(owner, material_text: str,
                 if ctx and not context_is_redundant(qtext.get(str(it["id"]), ""), ctx):
                     out[str(it["id"])] = ctx
     return out
+
+
+async def _audit_solution_statements(owner, questions: List[Dict]) -> set:
+    """Flag open questions that state their own answer/conclusion (worked-
+    solution steps leaked into the bank). `questions` are {id, question} dicts.
+    Returns the set of flagged ids. Best-effort: failed batches are skipped."""
+    flagged: set = set()
+    valid = {str(q["id"]) for q in questions}
+    for i in range(0, len(questions), 25):
+        batch = questions[i:i + 25]
+        try:
+            value = await _llm_json(owner, SOLUTION_AUDIT_SYSTEM,
+                                    json.dumps(batch, ensure_ascii=False),
+                                    temperature=0.0, max_tokens=4000,
+                                    timeout=240, thinking_off=True)
+        except HTTPException as e:
+            if e.status_code == 503:
+                raise
+            logger.warning("study audit: batch %d failed: %s", i // 25, e.detail)
+            continue
+        ids = value.get("flag") if isinstance(value, dict) else (
+            value if isinstance(value, list) else [])
+        for qid in (ids or []):
+            if str(qid) in valid:
+                flagged.add(str(qid))
+    return flagged
 
 
 async def _build_figures_section(owner, material_id: str, file_id: str,
@@ -3166,6 +3193,46 @@ def setup_study_routes():
         finally:
             db.close()
         return {"filled": filled, "scanned": scanned}
+
+    @router.post("/audit-questions")
+    async def audit_questions(request: Request):
+        """Audit the bank for 'questions' that actually state their own answer
+        (worked-solution steps / conclusions leaked at extraction) and SUSPEND
+        them so they drop out of practice. Reversible — unsuspend (or delete) in
+        the question bank. Combines an AI judgment with the deterministic
+        conclusion detector; only open, not-already-suspended questions are
+        checked, across every deck the caller owns."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            qq = db.query(StudyQuestion).filter(StudyQuestion.qtype == "open")
+            if user is not None:
+                qq = qq.filter(StudyQuestion.owner == user)
+            rows = [r for r in qq.all() if not r.suspended]
+            items = [{"id": r.id, "question": (r.question or "")[:600]} for r in rows]
+            # Deterministic layer: obvious conclusion openers, caught for free.
+            deterministic = {
+                r.id for r in rows
+                if question_is_conclusion({"qtype": "open", "question": r.question or ""})
+            }
+        finally:
+            db.close()
+
+        flagged = await _audit_solution_statements(user, items)
+        flagged |= deterministic
+
+        suspended = 0
+        db = SessionLocal()
+        try:
+            for r in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(flagged))).all()
+                      if flagged else []):
+                if not r.suspended:
+                    r.suspended = True
+                    suspended += 1
+            db.commit()
+        finally:
+            db.close()
+        return {"flagged": len(flagged), "suspended": suspended, "scanned": len(items)}
 
     @router.get("/questions/{question_id}/prereqs")
     def question_prereqs(request: Request, question_id: str):

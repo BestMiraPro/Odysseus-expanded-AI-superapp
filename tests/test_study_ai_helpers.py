@@ -374,6 +374,13 @@ def test_conclusion_questions_flagged():
         "Conclude that (x,y) = (3,3) is a solution to P."))
     assert question_is_conclusion(_open("Therefore, the maximum is 80."))
     assert question_is_conclusion(_open("We conclude that f is concave."))
+    # Newly covered high-precision openers.
+    assert question_is_conclusion(_open(
+        "Conclude, in particular, that the constraints are concave."))
+    assert question_is_conclusion(_open(
+        "It follows that the Hessian is negative definite."))
+    assert question_is_conclusion(_open("Hence, the point (3,3) is optimal."))
+    assert question_is_conclusion(_open("We deduce that f attains its maximum."))
 
 
 def test_real_questions_not_flagged():
@@ -381,6 +388,11 @@ def test_real_questions_not_flagged():
     assert not question_is_conclusion(_open(
         "Having solved KKT, what can you conclude about the solutions of P?"))
     assert not question_is_conclusion(_open("Why does the theorem apply?"))
+    # Legitimate prove/verify exam tasks must NOT be flagged by the regex layer
+    # (the AI audit handles value-leaking variants).
+    assert not question_is_conclusion(_open("Prove that the objective of P is concave."))
+    assert not question_is_conclusion(_open(
+        "Verify that the objective and constraints are differentiable."))
 
 
 def test_mcq_never_flagged_as_conclusion():

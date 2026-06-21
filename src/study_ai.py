@@ -370,9 +370,18 @@ def parse_answer_key_pages(value) -> List[int]:
     return sorted(out)
 
 
+# High-precision openers that mark a worked-solution step / conclusion rather
+# than a question. Deliberately conservative: "prove/show/verify that X" is a
+# legitimate exam task, so those are NOT here — only phrasings that state a
+# result instead of asking for one. The AI audit (SOLUTION_AUDIT_SYSTEM) is the
+# nuance layer for "show that <quantity> is <value>"-style answer leaks.
 _CONCLUSION_RE = re.compile(
-    r"^\s*(conclude that|we conclude|in conclusion|hence[, ]|therefore[, ]|thus[, ])",
-    re.IGNORECASE)
+    r"^\s*("
+    r"conclude(\s+that|,|\s+in\s+particular)|we\s+(can\s+)?conclude|in\s+conclusion|"
+    r"hence[, ]|therefore[, ]|thus[, ]|so\s+we\s+conclude|"
+    r"it\s+follows\s+that|we\s+(have\s+)?(thus\s+|therefore\s+)?(shown|deduce|deduced|obtain(ed)?)|"
+    r"as\s+(we\s+have\s+)?shown|from\s+the\s+above|this\s+(shows|proves|confirms)\s+that"
+    r")", re.IGNORECASE)
 
 
 def question_is_conclusion(q: Dict) -> bool:
@@ -533,7 +542,7 @@ Rules:
 - "topic": a short topic label (2-4 words). "difficulty": "easy"|"medium"|"hard" judged against a typical exam.
 - "number": the question's visible label in the source ("3", "16a"); null if unnumbered.
 - Skip pure definitions of administrative text (deadlines, grading policy, etc.).
-- The QUESTION text must ask something the learner has to work out. NEVER emit a worked-solution step, a conclusion, or an instruction-to-verify as a question (e.g. "Conclude that (3,3) is the solution", "Verify that the gradient is …", "Show that the system is equivalent to (3,3,2,6,0)"). When the source is a solution walkthrough, recover the underlying QUESTION it answers and put the walkthrough in "reference"; never put the answer in the question text.
+- The QUESTION text must ask something the learner has to work out, and must NOT state the answer. "Prove that f is concave", "Show that g is continuous", "Verify that the constraints are differentiable" are fine (they ask for the work). But NEVER emit a question that already gives away its own result: a conclusion ("Conclude that (3,3) is the solution", "Therefore the point is optimal"), or a verify/show/compute instruction that names the specific result ("Verify that the gradient is $(-4(x-6),-4(y-4))$", "Show that the Hessian is $-4I$, hence concave", "Solve the system to get (3,3,2,6,0)"). When the source is a solution walkthrough, recover the underlying QUESTION it answers and move the result + steps into "reference"; never leave the answer in the question text.
 - Use the language of the source material.
 
 Output ONLY a JSON array:
@@ -678,6 +687,22 @@ For each question, using its id and text:
 
 Output ONLY JSON: {"items": [{"id": "<id>", "number": "16b", "prereq_ids": ["<id of 16a>"]}, ...]}
 No commentary."""
+
+SOLUTION_AUDIT_SYSTEM = """You audit a practice-question bank and flag entries that are NOT real questions: worked-solution steps, conclusions, or instructions that already STATE the result they pretend to ask for. Those leak the answer, so they are useless for closed-book practice.
+
+You receive a JSON list of questions (each with an "id" and its text). For EACH, decide whether it is a genuine QUESTION the learner must work out, or a SOLUTION STATEMENT that hands over its own answer.
+
+KEEP (genuine questions) — even when phrased as prove/show/verify/check:
+- "Prove that f is concave", "Show that g is continuous", "Verify that the constraints are differentiable", "Find/Compute/Solve/Determine…". These ask the learner to produce the work and do NOT state the specific result.
+
+FLAG (solution statements):
+- It states the specific result/value/expression it asks to reach, e.g. "Verify that the gradient is $(-4(x-6),-4(y-4))$", "Show that the Hessian is $-4I$, hence f is concave", "Solve the system to get $(3,3)$".
+- It is a pure conclusion: "Conclude that (3,3) is the solution", "Therefore the point is optimal", "Conclude that the Sufficiency Theorem applies to P".
+- It is a narrated solution step rather than a prompt ("We compute the gradient and obtain …").
+
+When unsure, KEEP it — only flag entries that clearly give away their own answer.
+
+Output ONLY JSON: {"flag": ["<id>", ...]} — the ids of the solution statements. Empty list if all are genuine. No commentary."""
 
 ADD_CONTEXT_SYSTEM = """You restore the shared SETUP that multi-part exam questions lost when they were split into separate questions.
 
