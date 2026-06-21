@@ -213,6 +213,10 @@ function injectStyles() {
   opacity: 0.55; margin-bottom: 6px; }
 .study-prereq-item { font-size: 12.5px; padding: 6px 0; border-top: 1px solid var(--border); }
 .study-prereq-item:first-of-type { border-top: none; }
+.study-context { border-left: 3px solid var(--accent, #5b8abf); border-radius: 0 8px 8px 0;
+  padding: 8px 12px; margin-bottom: 12px; background: rgba(91,138,191,0.07); font-size: 13.5px; }
+.study-context-title { font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase;
+  opacity: 0.6; margin-bottom: 4px; }
 .study-grade { border: 1px solid var(--border); border-radius: 9px; padding: 12px 14px; margin-top: 14px; }
 .study-grade.correct { border-color: var(--green, #4f9e60); }
 .study-grade.incorrect { border-color: var(--red, #e05555); }
@@ -1539,6 +1543,10 @@ async function renderPractice() {
           ${pr.your_answer ? `<div class="study-subtle study-md" style="margin-top:3px;">Your answer: ${_mdInline(pr.your_answer)}</div>` : ''}
           ${pr.correct ? `<div class="study-md" style="margin-top:3px;opacity:0.8;"><b>Answer:</b> ${_mdInline(pr.correct)}</div>` : ''}
         </div>`).join('')}
+      </div>` : ''}
+      ${q.context ? `<div class="study-context">
+        <div class="study-context-title">Problem setup</div>
+        <div class="study-md">${_md(q.context)}</div>
       </div>` : ''}
       <div class="study-card-front study-md" style="font-size:16px;">${_md(q.question)}</div>
 

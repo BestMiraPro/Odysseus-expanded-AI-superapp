@@ -743,6 +743,8 @@ def _migrate_add_study_summary_columns():
             conn.execute("ALTER TABLE study_questions ADD COLUMN number TEXT")
         if "prereq_ids" not in q_cols:
             conn.execute("ALTER TABLE study_questions ADD COLUMN prereq_ids TEXT")
+        if "context" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN context TEXT")
         if "category" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
             # Backfill existing rows from the filename classifier (single source
@@ -1659,6 +1661,7 @@ class StudyQuestion(TimestampMixin, Base):
     material_id     = Column(String, nullable=True, index=True)
     qtype           = Column(String, default="open")    # "mcq" | "open"
     question        = Column(Text, nullable=False)
+    context         = Column(Text, nullable=True)       # shared problem setup (multi-part stem), shown above the question
     options         = Column(Text, nullable=True)       # JSON list (mcq)
     correct_index   = Column(Integer, nullable=True)    # mcq answer
     reference       = Column(Text, nullable=True)       # model answer / solution

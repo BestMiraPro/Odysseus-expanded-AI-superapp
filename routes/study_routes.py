@@ -45,9 +45,11 @@ from core.database import (
     StudyReview,
 )
 from src.study_ai import (
+    ADD_CONTEXT_SYSTEM,
     AUTHOR_QUESTIONS_SYSTEM,
     DISCOVER_QUESTIONS_SYSTEM,
     EXPLAIN_FURTHER_SYSTEM,
+    context_is_redundant,
     EXPLAIN_SYSTEM,
     EXTRACT_QUESTIONS_SYSTEM,
     FIGURE_CAPTION_SYSTEM,
@@ -744,6 +746,42 @@ async def _reformat_items(owner, items: List[Dict]) -> Dict[str, Dict]:
     return updates
 
 
+async def _backfill_context_items(owner, material_text: str,
+                                  questions: List[Dict]) -> Dict[str, str]:
+    """Recover the shared problem setup for split multi-part questions via the
+    text model. `material_text` is the source material; `questions` are
+    {id, number, question} dicts. Returns {id: context} for the questions that
+    need it (others omitted). Best-effort: failed batches are skipped."""
+    out: Dict[str, str] = {}
+    mat = (material_text or "")[:50000]
+    qtext = {str(q["id"]): q.get("question", "") for q in questions}
+    for i in range(0, len(questions), 20):
+        batch = questions[i:i + 20]
+        prompt = ("MATERIAL:\n" + mat
+                  + "\n\nQUESTIONS (id + text):\n"
+                  + json.dumps(batch, ensure_ascii=False)
+                  + "\n\nReturn the shared setup only for the questions that need it.")
+        try:
+            value = await _llm_json(owner, ADD_CONTEXT_SYSTEM, prompt,
+                                    temperature=0.1, max_tokens=EXTRACTION_MAX_TOKENS,
+                                    timeout=300, thinking_off=True)
+        except HTTPException as e:
+            if e.status_code == 503:
+                raise
+            logger.warning("study backfill-context: batch %d failed: %s", i // 20, e.detail)
+            continue
+        arr = value.get("items") if isinstance(value, dict) else (
+            value if isinstance(value, list) else [])
+        for it in (arr or []):
+            if isinstance(it, dict) and it.get("id"):
+                ctx = str(it.get("context") or "").strip()
+                # Drop context that just repeats the question (the model
+                # sometimes adds setup to already self-contained questions).
+                if ctx and not context_is_redundant(qtext.get(str(it["id"]), ""), ctx):
+                    out[str(it["id"])] = ctx
+    return out
+
+
 async def _build_figures_section(owner, material_id: str, file_id: str,
                                  pdf_path: str) -> str:
     """Extract raster figures from a PDF, caption/keep the substantive ones via
@@ -812,6 +850,7 @@ def _question_to_dict(q: StudyQuestion, with_answer: bool = True) -> Dict:
     out = {
         "id": q.id, "deck_id": q.deck_id, "material_id": q.material_id,
         "qtype": q.qtype, "question": q.question,
+        "context": q.context,
         "options": json.loads(q.options) if q.options else None,
         "topic": q.topic, "difficulty": q.difficulty,
         "origin": q.origin, "suspended": bool(q.suspended),
@@ -2263,6 +2302,7 @@ def setup_study_routes():
                     id=str(uuid.uuid4()), owner=user, deck_id=deck_id,
                     material_id=material_id, qtype=q["qtype"],
                     question=q["question"],
+                    context=q.get("context"),
                     options=json.dumps(q["options"]) if q["options"] else None,
                     correct_index=q["correct_index"], reference=q["reference"],
                     topic=q["topic"], difficulty=q["difficulty"],
@@ -3068,6 +3108,64 @@ def setup_study_routes():
         finally:
             db.close()
         return {"linked": linked, "analyzed": sum(len(v) for v in by_mat.values())}
+
+    @router.post("/backfill-context")
+    async def backfill_context(request: Request):
+        """One-time: recover the shared problem setup for multi-part questions
+        that were split at extraction (their text references an objective / data
+        / figure defined once for the whole problem). Per material, the AI reads
+        the stored material text and fills each dependent question's `context`.
+        Idempotent — questions that already have context are skipped; answers and
+        all other fields are never touched. Covers every deck the caller owns."""
+        from collections import defaultdict
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            qq = db.query(StudyQuestion)
+            if user is not None:
+                qq = qq.filter(StudyQuestion.owner == user)
+            rows = qq.order_by(StudyQuestion.created_at.asc()).all()
+            by_mat = defaultdict(list)
+            for r in rows:
+                if (r.context or "").strip():       # idempotent
+                    continue
+                if not r.material_id:               # no source to recover from
+                    continue
+                by_mat[r.material_id].append(
+                    {"id": r.id, "number": r.number, "question": r.question[:600]})
+            mats: Dict[str, str] = {}
+            if by_mat:
+                for m in db.query(StudyMaterial).filter(
+                        StudyMaterial.id.in_(list(by_mat))).all():
+                    mats[m.id] = m.content or ""
+            valid = {r.id for r in rows}
+        finally:
+            db.close()
+
+        results: Dict[str, str] = {}
+        scanned = 0
+        for mat_id, items in by_mat.items():
+            mat_text = mats.get(mat_id, "")
+            if not mat_text.strip():
+                continue
+            scanned += len(items)
+            updates = await _backfill_context_items(user, mat_text, items)
+            for qid, ctx in updates.items():
+                if qid in valid:
+                    results[qid] = ctx
+
+        filled = 0
+        db = SessionLocal()
+        try:
+            for r in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(results))).all()
+                      if results else []):
+                if not (r.context or "").strip():
+                    r.context = results[r.id]
+                    filled += 1
+            db.commit()
+        finally:
+            db.close()
+        return {"filled": filled, "scanned": scanned}
 
     @router.get("/questions/{question_id}/prereqs")
     def question_prereqs(request: Request, question_id: str):

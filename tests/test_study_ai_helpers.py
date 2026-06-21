@@ -99,6 +99,29 @@ def test_mcq_without_answer_is_dropped():
     assert out == []
 
 
+def test_context_carried_through_when_present():
+    out = normalize_questions([
+        {"type": "open", "question": "Verify f is differentiable.",
+         "context": "f(x,y)=100-2(x-6)^2; constraints 3-x, 5-y.", "reference": "polynomial"},
+    ])
+    assert out and out[0]["context"] == "f(x,y)=100-2(x-6)^2; constraints 3-x, 5-y."
+
+
+def test_context_defaults_to_none_when_absent_or_blank():
+    out = normalize_questions([_mcq(), _mcq(context="   ")])
+    assert out[0]["context"] is None and out[1]["context"] is None
+
+
+def test_redundant_context_already_in_question_is_dropped():
+    # The setup is already stated in the question — context must not repeat it.
+    out = normalize_questions([
+        {"type": "open",
+         "question": "A firm has cost C(q)=2q^2. Find the marginal cost.",
+         "context": "A firm has cost C(q) = 2q^2."},
+    ])
+    assert out and out[0]["context"] is None
+
+
 def test_mcq_textual_answer_matched_to_option():
     out = normalize_questions([_mcq(correct_index=None, answer="c")])
     assert out and out[0]["correct_index"] == 2

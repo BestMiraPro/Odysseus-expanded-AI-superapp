@@ -210,6 +210,16 @@ def _resolve_mcq_answer(item: Dict, options: List[str]) -> Optional[int]:
     return None
 
 
+def context_is_redundant(question: str, context: str) -> bool:
+    """True when a question's `context` adds nothing because the setup already
+    sits verbatim inside the question text — showing it would just repeat the
+    question. Compared on case-folded, alphanumeric-only text so formatting and
+    whitespace differences don't matter."""
+    nq = re.sub(r"[^a-z0-9]", "", (question or "").lower())
+    nc = re.sub(r"[^a-z0-9]", "", (context or "").lower())
+    return bool(nc) and nc in nq
+
+
 def normalize_questions(value) -> List[Dict]:
     """Validate/clean raw LLM question objects into a uniform shape.
 
@@ -261,6 +271,10 @@ def normalize_questions(value) -> List[Dict]:
         raw_number = item.get("number")
         number = str(raw_number).strip() if raw_number is not None else ""
 
+        ctx = str(item.get("context") or item.get("setup") or "").strip() or None
+        if ctx and context_is_redundant(question, ctx):
+            ctx = None  # the setup is already in the question — don't repeat it
+
         out.append({
             "qtype": qtype,
             "question": question,
@@ -270,6 +284,7 @@ def normalize_questions(value) -> List[Dict]:
             "topic": (str(item.get("topic") or "").strip() or None),
             "difficulty": difficulty,
             "number": number or None,
+            "context": ctx,
         })
     return out
 
@@ -512,7 +527,7 @@ EXTRACT_QUESTIONS_SYSTEM = """You extract practice questions from course materia
 Rules:
 - Extract questions FAITHFULLY: keep the original wording, numbers, and all answer options. Do not invent easier paraphrases.
 - If the material includes the solution or answer key, use it for "correct_index"/"reference". If it does not, derive the correct answer yourself and write a complete reference solution.
-- For multi-part questions (a, b, c…), emit each part as its own question with enough context to stand alone.
+- For multi-part questions, emit each part as its own question. When several parts share a common setup (a problem statement, given data/values, a defined function or model, a figure), do NOT cram it into every question's wording — put that shared setup in a separate "context" field on each part. "context" holds everything needed to understand the part on its own (the statement, the given values, the meaning of the symbols it uses, a short description of any figure) but NEVER the solution or answer. Omit "context" (or use null) for questions that already stand alone.
 - "type": "mcq" when the material gives answer options; otherwise "open".
 - "reference" for open questions must be a complete model answer (the steps + the result), concise enough to grade against.
 - "topic": a short topic label (2-4 words). "difficulty": "easy"|"medium"|"hard" judged against a typical exam.
@@ -523,7 +538,7 @@ Rules:
 
 Output ONLY a JSON array:
 [{"number":"1","type":"mcq","question":"...","options":["...","..."],"correct_index":0,"reference":"...","topic":"...","difficulty":"medium"},
- {"number":"2a","type":"open","question":"...","reference":"...","topic":"...","difficulty":"hard"}]
+ {"number":"2a","type":"open","question":"...","context":"...","reference":"...","topic":"...","difficulty":"hard"}]
 No markdown fences or commentary around the JSON (LaTeX inside the field values is expected)."""
 EXTRACT_QUESTIONS_SYSTEM += _MATH_JSON_NOTE
 
@@ -549,11 +564,12 @@ Rules:
 - Every "open" question gets a complete "reference" model answer; every "mcq" gets "correct_index" plus a "reference" stating why that option is right.
 - "topic": short label. "difficulty": "easy"|"medium"|"hard".
 - Cover the material broadly rather than clustering on one section.
+- If a question relies on a scenario, data, or definitions you set up, put that setup in a separate "context" field (the question text stays the task; never put the answer in "context"). Omit it for self-contained questions.
 - Use the language of the source material.
 
 Output ONLY a JSON array in the same schema:
 [{"type":"mcq","question":"...","options":["...","...","...","..."],"correct_index":2,"reference":"...","topic":"...","difficulty":"medium"},
- {"type":"open","question":"...","reference":"...","topic":"...","difficulty":"hard"}]
+ {"type":"open","question":"...","context":"...","reference":"...","topic":"...","difficulty":"hard"}]
 No markdown fences or commentary around the JSON (LaTeX inside the field values is expected)."""
 AUTHOR_QUESTIONS_SYSTEM += _MATH_JSON_NOTE
 
@@ -662,6 +678,20 @@ For each question, using its id and text:
 
 Output ONLY JSON: {"items": [{"id": "<id>", "number": "16b", "prereq_ids": ["<id of 16a>"]}, ...]}
 No commentary."""
+
+ADD_CONTEXT_SYSTEM = """You restore the shared SETUP that multi-part exam questions lost when they were split into separate questions.
+
+You receive ONE material's text (a past exam / problem set; PDF text is annotated with "[Page N text]:" markers) and a list of questions extracted from it (each with an "id" and its text). Many questions are a single part of a larger problem and silently depend on a setup that the source states once for the whole problem — a problem statement, given data/values, a defined function or model, a figure, or an earlier part's result (signalled by phrases like "the objective function", "the function above", "the system", "using the previous result", "the same data").
+
+For EACH question that cannot be fully understood on its own, write a concise "context": the shared setup it needs, recovered FAITHFULLY from the material — the problem statement, the given values, the meaning of the symbols it mentions, a short description of any figure.
+
+Rules:
+- Include ONLY the setup needed to understand and attempt the question. NEVER include the solution, the final answer, or steps toward it.
+- Do not repeat the question itself inside "context".
+- If a question already stands alone, OMIT it from the output — do not invent context.
+- Use the material's language.
+
+Output ONLY JSON: {"items": [{"id": "<id>", "context": "<setup>"}, ...]} — include only the questions that need context. No commentary."""
 
 REFORMAT_SYSTEM = """You reformat already-extracted study text so it displays well. Convert all mathematics to LaTeX ($...$ inline, $$...$$ display) and fix Markdown formatting (sub/superscripts, fractions, lists, bold).
 
