@@ -1,56 +1,49 @@
-# Deploying Odysseus cleanly (build-from-`main`)
+# Deploying Odysseus cleanly (build-from-branch)
 
 The app is usually hot-patched by copying files into the running container. That's
-fine for quick fixes on **one** branch, but the moment two branches exist
-(e.g. `main` = study work, `dev` = a new feature) and you deploy by copying
-whatever is checked out, the container becomes an inconsistent mix whose breakage
-only shows up on the **next restart** (the running process masks it in memory).
+fine for quick fixes on **one** branch, but the moment two branches diverge (e.g.
+`main` = Study work, `dev` = a new feature) and you deploy by copying whatever is
+checked out, the container becomes an inconsistent mix whose breakage only shows
+up on the **next restart**.
 
-`deploy-main.ps1` removes that trap: it always **builds the image from a dedicated
-`main` worktree** and recreates only the `odysseus` container from that image,
-**reusing your real data** — without touching your editing checkout.
+`deploy.ps1` removes that trap: it always **builds the image from a dedicated
+build worktree checked out to `origin/<Branch>`** and recreates only the
+`odysseus` container from that image, **reusing your real data** — without
+touching your editing checkout.
 
 ## Usage
 
 ```powershell
-# Deploy exactly what's on origin/main (fetch + reset the build tree first):
-pwsh .\deploy-main.ps1 -Pull
+# Build & deploy origin/dev (the combined branch: Study + Omnigent + mainline):
+pwsh .\deploy.ps1
 
-# Deploy the build tree as-is (no fetch):
-pwsh .\deploy-main.ps1
+# Deploy a different branch:
+pwsh .\deploy.ps1 -Branch main
 
-# Just show the resolved paths (build context + ./data mount), change nothing:
-pwsh .\deploy-main.ps1 -DryRun
+# Show the resolved paths (build context + ./data mount), change nothing:
+pwsh .\deploy.ps1 -DryRun
 ```
 
-The script lives on `main`, so the canonical copy is always at
-`<build-worktree>\deploy-main.ps1` after a `-Pull`.
+`dev` is the default and the canonical "everything" branch. Push your work to
+`dev`, then `deploy.ps1` rebuilds from it.
 
 ## How it keeps your data
 
 `docker-compose.yml` mounts `./data` and `./logs` **relative to the project
 directory**. The script:
 
-- **Builds** with the project directory = the `main` build worktree, so the build
-  context (`build: .`) is `main`'s source.
-- **Runs** with `--project-directory` = your canonical repo
-  (`C:\Users\Dinis Mira~\odysseus` by default, auto-detected as git's primary
-  worktree), so `./data`, `./logs`, and `.env` resolve to your **real** DB and
-  settings, and `--no-build` reuses the image just built.
+- **Builds** with the project directory = the build worktree (detached on
+  `origin/<Branch>`), so the build context (`build: .`) is that branch's source.
+- **Runs** with `--project-directory` = your canonical repo (auto-detected as
+  git's primary worktree), so `./data`, `./logs`, and `.env` resolve to your
+  **real** DB and settings, and `--no-build` reuses the image just built.
 
-So the *build source* and the *runtime data* are decoupled: deploys no longer
-depend on which branch is checked out.
-
-## Promoting a feature
-
-When a feature on `dev` (or any branch) is ready, **merge it into `main`** and
-deploy with `-Pull`. Don't run features by copying files into the live container —
-that's the workflow that caused the drift this script exists to prevent.
+The build worktree uses a **detached HEAD**, so it never clashes with the same
+branch being checked out in your working tree.
 
 ## Notes
 
 - First build is a full image build (minutes); later builds reuse layer cache.
 - Only the `odysseus` service is recreated; `chromadb`/`searxng`/`ntfy` keep
-  running.
-- A bash port is trivial if you deploy from Linux/macOS — the same two
-  `docker compose` invocations apply.
+  running, and your data is untouched.
+- A bash port is trivial (the same two `docker compose` invocations).
