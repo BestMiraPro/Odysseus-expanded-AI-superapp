@@ -61,7 +61,7 @@ def _has_fts(db):
     )
 
 
-def test_session_search_uses_fts_and_returns_context():
+def test_session_search_uses_fts_and_returns_previous_context_only():
     db = _db(with_fts=True)
     try:
         base = datetime(2026, 1, 1, 12, 0, 0)
@@ -76,8 +76,34 @@ def test_session_search_uses_fts_and_returns_context():
         assert [r.message_id for r in results] == ["m2"]
         assert results[0].session_name == "Jazz planning"
         assert results[0].context_before[0]["message_id"] == "m1"
-        assert results[0].context_after[0]["message_id"] == "m3"
+        assert results[0].context_after == []
         assert "modal" in results[0].content_snippet.lower()
+    finally:
+        db.close()
+
+
+def test_session_search_does_not_return_following_question_answers():
+    db = _db(with_fts=True)
+    try:
+        base = datetime(2026, 1, 1, 12, 0, 0)
+        _add_session(db, "s1", owner="alice", name="Exam practice")
+        _add_message(db, "s1", "m1", "assistant", "Answer to the previous question", base)
+        _add_message(db, "s1", "m2", "user", "Question: derive the KKT conditions", base + timedelta(minutes=1))
+        _add_message(db, "s1", "m3", "assistant", "Leaked answer to the matched question", base + timedelta(minutes=2))
+        _add_message(db, "s1", "m4", "user", "Question: solve the next part", base + timedelta(minutes=3))
+        _add_message(db, "s1", "m5", "assistant", "Leaked answer to the next question", base + timedelta(minutes=4))
+        db.commit()
+
+        results = search_session_messages(
+            "derive KKT",
+            owner="alice",
+            context_messages=3,
+            db=db,
+        )
+
+        assert [r.message_id for r in results] == ["m2"]
+        assert [m["message_id"] for m in results[0].context_before] == ["m1"]
+        assert results[0].context_after == []
     finally:
         db.close()
 
@@ -295,4 +321,4 @@ def test_search_chats_formats_shared_results(monkeypatch):
     assert "Design notes" in out["results"]
     assert "Match (assistant): We discussed session search." in out["results"]
     assert "Before (user): Can you find old chats?" in out["results"]
-    assert "After (user): That helps." in out["results"]
+    assert "After (user): That helps." not in out["results"]

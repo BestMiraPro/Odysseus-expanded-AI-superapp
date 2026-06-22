@@ -88,9 +88,6 @@ async def do_search_chats(query: str, limit: int = 20, owner: str | None = None)
             if result.context_before:
                 before = result.context_before[-1]
                 lines.append(f"  Before ({before['role']}): {before['content'][:180]}")
-            if result.context_after:
-                after = result.context_after[0]
-                lines.append(f"  After ({after['role']}): {after['content'][:180]}")
             lines.append("")
 
         return {"results": "\n".join(lines)}
