@@ -829,8 +829,10 @@ async def _link_deck_parts(owner, deck_id: str, only_material: Optional[str] = N
         rows = q.order_by(StudyQuestion.created_at.asc()).all()
         by_mat = defaultdict(list)
         number_by_id: Dict[str, str] = {}
+        question_by_id: Dict[str, StudyQuestion] = {}
         for r in rows:
             number_by_id[r.id] = r.number
+            question_by_id[r.id] = r
             # Include the recovered setup: terse parts ("verify the objective is
             # differentiable") don't name their problem, so without their context
             # the grouper can't place them with the right problem.
@@ -870,7 +872,14 @@ async def _link_deck_parts(owner, deck_id: str, only_material: Optional[str] = N
     try:
         for r in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(analyzed_ids)).all()
                   if analyzed_ids else []):
-            pre = [p for p in results.get(r.id, []) if p != r.id]
+            pre = [
+                p for p in results.get(r.id, [])
+                if (
+                    p != r.id
+                    and not _same_study_question(r, question_by_id.get(p))
+                    and not _same_or_later_study_part(r, question_by_id.get(p))
+                )
+            ]
             r.prereq_ids = json.dumps(pre)   # also clears stale links when empty
             if pre:
                 linked += 1
@@ -995,6 +1004,32 @@ def _question_to_dict(q: StudyQuestion, with_answer: bool = True) -> Dict:
         out["reference"] = q.reference
         out["explanation"] = q.explanation
     return out
+
+
+def _same_study_question(a, b) -> bool:
+    """True when two stored rows are duplicate copies of the same prompt."""
+    ak = question_key(getattr(a, "question", "") or "")
+    bk = question_key(getattr(b, "question", "") or "")
+    return bool(ak and ak == bk)
+
+
+def _study_part_order_key(q):
+    label = getattr(q, "number", None)
+    if not label:
+        return None
+    s = re.sub(r"[^0-9a-z]", "", str(label).strip().lower())
+    m = re.match(r"(\d+)([a-z]*)", s)
+    if not m:
+        return None
+    return (int(m.group(1)), m.group(2))
+
+
+def _same_or_later_study_part(current, candidate) -> bool:
+    current_key = _study_part_order_key(current)
+    if current_key is None:
+        return False
+    candidate_key = _study_part_order_key(candidate)
+    return candidate_key is None or candidate_key >= current_key
 
 
 def _resolve_uploaded_file(file_id: str) -> str:
@@ -3326,7 +3361,7 @@ def setup_study_routes():
 
     @router.get("/questions/{question_id}/prereqs")
     def question_prereqs(request: Request, question_id: str):
-        """The earlier parts this question depends on, each with its question,
+        """The previous part this question depends on, with its question,
         the user's latest answer to it, and the correct answer — for the
         'Earlier in this problem' context box during practice."""
         user = _owner(request)
@@ -3334,14 +3369,14 @@ def setup_study_routes():
         try:
             row = _get_question(db, question_id, user)
             ids = json.loads(row.prereq_ids) if row.prereq_ids else []
-            # Cap to the most recent earlier parts so a large problem (e.g. a
-            # 20-part exam question) doesn't render a wall; the shared setup for
-            # parts that lack it is carried separately by the `context` box.
-            ids = ids[-10:]
             out = []
-            for pid in ids:
+            for pid in reversed(ids):
                 pq = db.query(StudyQuestion).filter(StudyQuestion.id == pid).first()
                 if not pq or (user is not None and pq.owner != user):
+                    continue
+                if _same_study_question(row, pq):
+                    continue
+                if _same_or_later_study_part(row, pq):
                     continue
                 if pq.qtype == "mcq" and pq.options is not None and pq.correct_index is not None:
                     opts = json.loads(pq.options)
@@ -3357,6 +3392,7 @@ def setup_study_routes():
                     "your_answer": att.answer if att else None,
                     "correct": correct,
                 })
+                break
             return {"prereqs": out}
         finally:
             db.close()
