@@ -8,8 +8,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
+from core.database import ModelEndpoint, SessionLocal
 from core.middleware import require_admin
-from src.auth_helpers import require_authenticated_request
+from src.auth_helpers import get_current_user, owner_filter, require_authenticated_request
+from src.omnigent_native import NativeOmnigentManager
 from src.omnigent_manager import INSTALL_GUIDANCE, OmnigentManager
 
 
@@ -61,14 +63,33 @@ def _bundle_bytes(root: Path) -> bytes:
     return buf.getvalue()
 
 
-def setup_omnigent_routes(manager: OmnigentManager | None = None) -> APIRouter:
+def _has_visible_model_endpoint(request: Request | None = None) -> bool:
+    user = get_current_user(request) if request is not None else None
+    db = SessionLocal()
+    try:
+        q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)  # noqa: E712
+        if user:
+            q = owner_filter(q, ModelEndpoint, user)
+        return q.first() is not None
+    except Exception:
+        return False
+    finally:
+        db.close()
+
+
+def setup_omnigent_routes(
+    manager: OmnigentManager | None = None,
+    native_manager: NativeOmnigentManager | None = None,
+) -> APIRouter:
     router = APIRouter(prefix="/api/omnigent", tags=["omnigent"])
     manager = manager or OmnigentManager()
+    native_manager = native_manager or NativeOmnigentManager()
 
     @router.get("/status")
-    def status():
+    def status(request: Request):
         data = manager.status()
         data["install"] = INSTALL_GUIDANCE
+        data["native"] = native_manager.status(model_ready=_has_visible_model_endpoint(request))
         return data
 
     @router.post("/server/start")
@@ -92,12 +113,23 @@ def setup_omnigent_routes(manager: OmnigentManager | None = None) -> APIRouter:
         return data
 
     @router.get("/sessions")
-    def sessions():
+    def sessions(request: Request):
+        user = get_current_user(request)
+        native_sessions = native_manager.sessions(user)
+        if native_sessions.get("sessions"):
+            external = manager.sessions()
+            native_sessions["external_sessions"] = external.get("sessions", [])
+            native_sessions["running"] = external.get("running")
+            native_sessions["url"] = external.get("url")
+            return native_sessions
         return manager.sessions()
 
     @router.get("/workers")
     def workers():
-        return manager.workers()
+        data = manager.workers()
+        data["native_workers"] = native_manager.worker_roster()
+        data["presets"] = list(native_manager.presets().values())
+        return data
 
     @router.get("/providers")
     def providers():
@@ -108,6 +140,7 @@ def setup_omnigent_routes(manager: OmnigentManager | None = None) -> APIRouter:
         token_scopes = sorted(set(getattr(request.state, "api_token_scopes", []) or []))
         return {
             "integration": "omnigent",
+            "native": native_manager.status(model_ready=_has_visible_model_endpoint(request)),
             "token_scopes": token_scopes,
             "providers": _providers(),
             "bridge": {
@@ -125,6 +158,47 @@ def setup_omnigent_routes(manager: OmnigentManager | None = None) -> APIRouter:
                 "odysseus_cookbook_tasks",
             ],
         }
+
+    @router.post("/runs")
+    async def create_run(request: Request):
+        require_authenticated_request(request)
+        user = get_current_user(request)
+        data = await request.json()
+        try:
+            return native_manager.create_run(
+                owner=user,
+                goal=data.get("goal", ""),
+                preset=data.get("preset", "balanced"),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @router.get("/runs/{run_id}")
+    def get_run(request: Request, run_id: str):
+        require_authenticated_request(request)
+        user = get_current_user(request)
+        run = native_manager.get_run(run_id, owner=user)
+        if not run:
+            raise HTTPException(404, "Crew run not found")
+        return run
+
+    @router.post("/runs/{run_id}/start")
+    def start_run(request: Request, run_id: str):
+        require_authenticated_request(request)
+        user = get_current_user(request)
+        run = native_manager.start_run(run_id, owner=user)
+        if not run:
+            raise HTTPException(404, "Crew run not found")
+        return run
+
+    @router.post("/runs/{run_id}/cancel")
+    def cancel_run(request: Request, run_id: str):
+        require_authenticated_request(request)
+        user = get_current_user(request)
+        run = native_manager.cancel_run(run_id, owner=user)
+        if not run:
+            raise HTTPException(404, "Crew run not found")
+        return run
 
     @router.get("/bundle.tar.gz")
     def bundle(request: Request):

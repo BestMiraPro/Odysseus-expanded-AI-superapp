@@ -39,11 +39,14 @@ def test_omnigent_module_mentions_free_glm_website_as_unsupported_note():
     assert "not an API connector" in module
 
 
-def test_omnigent_module_prioritizes_easy_setup_and_worker_roster():
+def test_omnigent_module_prioritizes_native_crew_workspace():
     module = (_REPO / "static" / "js" / "omnigent.js").read_text(encoding="utf-8")
 
-    assert "Start Claude + Codex" in module
-    assert "Easy setup" in module
+    assert "Native crew" in module
+    assert "omnigent-goal-input" in module
+    assert 'data-omnigent-action="create-run"' in module
+    assert "/api/omnigent/runs" in module
+    assert "Crew timeline" in module
     assert "/api/omnigent/workers" in module
     assert "Worker roster" in module
     assert "Advanced bridge" in module

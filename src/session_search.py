@@ -149,20 +149,8 @@ def _context_for_message(db, msg: DBChatMessage, count: int) -> tuple[list[dict[
         .limit(count)
         .all()
     )
-    after_rows = (
-        db.query(DBChatMessage)
-        .filter(
-            DBChatMessage.session_id == msg.session_id,
-            DBChatMessage.role.in_(SEARCH_ROLES),
-            DBChatMessage.timestamp > msg.timestamp,
-        )
-        .order_by(DBChatMessage.timestamp.asc())
-        .limit(count)
-        .all()
-    )
     before = [_message_to_context(row) for row in reversed(before_rows)]
-    after = [_message_to_context(row) for row in after_rows]
-    return before, after
+    return before, []
 
 
 def _rows_to_results(db, rows: Iterable[tuple[DBChatMessage, str, str]], query: str, context_messages: int) -> list[SessionSearchResult]:
