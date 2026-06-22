@@ -50,3 +50,16 @@ def test_omnigent_module_prioritizes_native_crew_workspace():
     assert "/api/omnigent/workers" in module
     assert "Worker roster" in module
     assert "Advanced bridge" in module
+
+
+def test_app_shell_binds_omnigent_button_once():
+    app = (_REPO / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert app.count("const toolOmnigentBtn = el('tool-omnigent-btn');") == 1
+
+
+def test_app_shell_opens_omnigent_directly():
+    app = (_REPO / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "omnigentModule.open();" in app
+    assert "Modals.toggle('omnigent-modal')" not in app

@@ -856,9 +856,11 @@ function initializeEventListeners() {
   if (toolOmnigentBtn) {
     toolOmnigentBtn.addEventListener('click', async () => {
       const Modals = await import('./js/modalManager.js');
-      if (!Modals.toggle('omnigent-modal')) {
-        omnigentModule.open();
+      if (Modals.isMinimized && Modals.isMinimized('omnigent-modal')) {
+        Modals.restore('omnigent-modal');
+        return;
       }
+      omnigentModule.open();
     });
   }
 
@@ -941,16 +943,6 @@ function initializeEventListeners() {
     });
   }
 
-  // Omnigent tool button
-  const toolOmnigentBtn = el('tool-omnigent-btn');
-  if (toolOmnigentBtn) {
-    toolOmnigentBtn.addEventListener('click', async () => {
-      const Modals = await import('./js/modalManager.js');
-      if (!Modals.toggle('omnigent-modal')) {
-        omnigentModule.open();
-      }
-    });
-  }
   // Refresh notes due-reminder badge on load and every 5 minutes
   if (notesModule && notesModule.refreshDueBadge) {
     notesModule.refreshDueBadge();
