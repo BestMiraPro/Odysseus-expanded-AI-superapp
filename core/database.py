@@ -723,6 +723,52 @@ def _migrate_add_last_message_at_column():
         except Exception:
             pass
 
+def _migrate_add_study_summary_columns():
+    """Add AI-summary columns to study tables: study_materials.summary (per-
+    chapter notes) and study_decks.overview (subject overview). Idempotent."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    try:
+        conn = sqlite3.connect(db_path)
+        mat_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_materials)")]
+        if "summary" not in mat_cols:
+            conn.execute("ALTER TABLE study_materials ADD COLUMN summary TEXT")
+        deck_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_decks)")]
+        if "overview" not in deck_cols:
+            conn.execute("ALTER TABLE study_decks ADD COLUMN overview TEXT")
+        q_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_questions)")]
+        if "deep_explanation" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN deep_explanation TEXT")
+        card_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_cards)")]
+        if "deep_explanation" not in card_cols:
+            conn.execute("ALTER TABLE study_cards ADD COLUMN deep_explanation TEXT")
+        if "number" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN number TEXT")
+        if "prereq_ids" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN prereq_ids TEXT")
+        if "context" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN context TEXT")
+        if "category" not in mat_cols:
+            conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
+            # Backfill existing rows from the filename classifier (single source
+            # of truth in src.study_ai).
+            try:
+                from src.study_ai import classify_material
+                rows = conn.execute("SELECT id, name FROM study_materials").fetchall()
+                for mid, name in rows:
+                    conn.execute("UPDATE study_materials SET category = ? WHERE id = ?",
+                                 (classify_material(name or ""), mid))
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"study category backfill skipped: {e}")
+        conn.commit()
+        conn.close()
+        logging.getLogger(__name__).info("Migrated: study summary/overview/explanation/category columns")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"study summary columns migration failed: {e}")
+
+
 def _migrate_add_document_archived_column():
     """Add `archived` to documents (soft-archive flag). Guarded + idempotent."""
     import sqlite3
@@ -1589,6 +1635,174 @@ class Note(TimestampMixin, Base):
     agent_session_id  = Column(String, nullable=True)
 
 
+# ---------------------------------------------------------------------------
+# Study module — flashcards (FSRS spaced repetition), exams/plans, focus log.
+# Scheduling math lives in src/fsrs.py; plan generation in src/study_plan.py.
+# ---------------------------------------------------------------------------
+
+class StudyDeck(TimestampMixin, Base):
+    """A flashcard deck (usually one subject or exam)."""
+    __tablename__ = "study_decks"
+
+    id          = Column(String, primary_key=True, index=True)
+    owner       = Column(String, nullable=True, index=True)
+    name        = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    color       = Column(String, nullable=True)
+    archived    = Column(Boolean, default=False)
+    new_per_day = Column(Integer, default=15)      # cap on new cards introduced per day
+    retention   = Column(String, default="0.9")    # desired FSRS retention (stored as str for SQLite portability)
+    overview    = Column(Text, nullable=True)       # AI subject overview (markdown), for consultation
+
+    cards = relationship("StudyCard", back_populates="deck", cascade="all, delete-orphan")
+
+
+class StudyCard(TimestampMixin, Base):
+    """One flashcard with its FSRS memory state."""
+    __tablename__ = "study_cards"
+
+    id          = Column(String, primary_key=True, index=True)
+    owner       = Column(String, nullable=True, index=True)
+    deck_id     = Column(String, ForeignKey("study_decks.id"), nullable=False, index=True)
+    front       = Column(Text, nullable=False)
+    back        = Column(Text, nullable=False)
+    notes       = Column(Text, nullable=True)       # optional extra context / source
+    tags        = Column(Text, nullable=True)       # JSON list of strings
+    suspended   = Column(Boolean, default=False)
+    source      = Column(String, default="user")    # "user" or "ai"
+    deep_explanation = Column(Text, nullable=True)  # cached "explain further" (theory + location)
+    # FSRS state
+    state       = Column(String, default="new", index=True)  # new/learning/review/relearning
+    stability   = Column(String, default="0")       # float as str (SQLite-safe, lossless)
+    difficulty  = Column(String, default="0")
+    due         = Column(DateTime, nullable=True, index=True)
+    last_review = Column(DateTime, nullable=True)
+    reps        = Column(Integer, default=0)
+    lapses      = Column(Integer, default=0)
+
+    deck = relationship("StudyDeck", back_populates="cards")
+
+
+class StudyReview(TimestampMixin, Base):
+    """Append-only log of every card review (stats, streaks, calibration)."""
+    __tablename__ = "study_reviews"
+
+    id            = Column(String, primary_key=True, index=True)
+    owner         = Column(String, nullable=True, index=True)
+    card_id       = Column(String, index=True, nullable=False)
+    deck_id       = Column(String, index=True, nullable=True)
+    rating        = Column(Integer, nullable=False)   # 1=Again 2=Hard 3=Good 4=Easy
+    state_before  = Column(String, nullable=True)
+    interval_days = Column(Integer, default=0)
+    duration_ms   = Column(Integer, nullable=True)
+    reviewed_at   = Column(DateTime, default=utcnow_naive, index=True)
+
+
+class StudyExam(TimestampMixin, Base):
+    """An exam/goal with its topic grid and generated spaced study plan."""
+    __tablename__ = "study_exams"
+
+    id             = Column(String, primary_key=True, index=True)
+    owner          = Column(String, nullable=True, index=True)
+    title          = Column(String, nullable=False)
+    exam_date      = Column(String, nullable=False)   # ISO date (date-only)
+    exam_format    = Column(String, nullable=True)    # e.g. "MCQ + problem set"
+    hours_per_week = Column(String, default="7")
+    rest_days      = Column(Text, nullable=True)      # JSON list of weekday ints
+    topics         = Column(Text, nullable=True)      # JSON [{name, importance, mastery}]
+    plan           = Column(Text, nullable=True)      # JSON output of generate_plan()
+    done_blocks    = Column(Text, nullable=True)      # JSON list of "date:idx" checked off
+    archived       = Column(Boolean, default=False)
+
+
+class StudyFocusSession(TimestampMixin, Base):
+    """A single focus (deep work) timer session."""
+    __tablename__ = "study_focus_sessions"
+
+    id          = Column(String, primary_key=True, index=True)
+    owner       = Column(String, nullable=True, index=True)
+    label       = Column(String, nullable=True)       # what was studied
+    planned_min = Column(Integer, default=25)
+    actual_min  = Column(Integer, nullable=True)
+    started_at  = Column(DateTime, default=utcnow_naive, index=True)
+    ended_at    = Column(DateTime, nullable=True)
+    completed   = Column(Boolean, default=False)
+
+
+class StudyMaterial(TimestampMixin, Base):
+    """Uploaded/pasted source material attached to a deck (subject)."""
+    __tablename__ = "study_materials"
+
+    id             = Column(String, primary_key=True, index=True)
+    owner          = Column(String, nullable=True, index=True)
+    deck_id        = Column(String, ForeignKey("study_decks.id"), nullable=False, index=True)
+    name           = Column(String, nullable=False)
+    kind           = Column(String, default="text")    # "text" | "pdf" | "file"
+    file_id        = Column(String, nullable=True)     # upload id when kind != text
+    content        = Column(Text, nullable=True)       # extracted text
+    char_count     = Column(Integer, default=0)
+    question_count = Column(Integer, default=0)        # questions extracted so far
+    summary        = Column(Text, nullable=True)       # AI study notes (markdown), for consultation
+    category       = Column(String, default="theory")  # "theory" | "exam" — drives consult/explain-further search
+
+
+class StudyQuestion(TimestampMixin, Base):
+    """A practice question (MCQ or open-ended) in a deck's question bank.
+
+    Carries its own FSRS state so practice questions are spaced like cards.
+    `difficulty` is the human label (easy/medium/hard); the FSRS difficulty
+    lives in `fsrs_difficulty`.
+    """
+    __tablename__ = "study_questions"
+
+    id              = Column(String, primary_key=True, index=True)
+    owner           = Column(String, nullable=True, index=True)
+    deck_id         = Column(String, ForeignKey("study_decks.id"), nullable=False, index=True)
+    material_id     = Column(String, nullable=True, index=True)
+    qtype           = Column(String, default="open")    # "mcq" | "open"
+    question        = Column(Text, nullable=False)
+    context         = Column(Text, nullable=True)       # shared problem setup (multi-part stem), shown above the question
+    options         = Column(Text, nullable=True)       # JSON list (mcq)
+    correct_index   = Column(Integer, nullable=True)    # mcq answer
+    reference       = Column(Text, nullable=True)       # model answer / solution
+    explanation     = Column(Text, nullable=True)       # cached AI explanation (mcq)
+    deep_explanation = Column(Text, nullable=True)      # cached "explain further" (theory + location)
+    number          = Column(String, nullable=True)     # source part label ("16a"), for multi-part grouping
+    prereq_ids      = Column(Text, nullable=True)        # JSON list of earlier-part question ids this part needs
+    topic           = Column(String, nullable=True, index=True)
+    difficulty      = Column(String, default="medium")  # easy | medium | hard
+    origin          = Column(String, default="extracted")  # "extracted" | "authored" | "user"
+    suspended       = Column(Boolean, default=False)
+    # FSRS state (same scheme as StudyCard)
+    state           = Column(String, default="new", index=True)
+    stability       = Column(String, default="0")
+    fsrs_difficulty = Column(String, default="0")
+    due             = Column(DateTime, nullable=True, index=True)
+    last_review     = Column(DateTime, nullable=True)
+    reps            = Column(Integer, default=0)
+    lapses          = Column(Integer, default=0)
+
+
+class StudyAttempt(TimestampMixin, Base):
+    """Append-only log of practice-question attempts (stats + calibration)."""
+    __tablename__ = "study_attempts"
+
+    id           = Column(String, primary_key=True, index=True)
+    owner        = Column(String, nullable=True, index=True)
+    question_id  = Column(String, index=True, nullable=False)
+    deck_id      = Column(String, index=True, nullable=True)
+    qtype        = Column(String, nullable=True)
+    answer       = Column(Text, nullable=True)        # chosen option text or free answer
+    correct      = Column(Boolean, nullable=True)     # mcq
+    score        = Column(Integer, nullable=True)     # open (0-100)
+    rating       = Column(Integer, nullable=True)     # FSRS rating applied
+    confidence   = Column(String, nullable=True)      # "sure" | "unsure" | "guess"
+    hints_used   = Column(Integer, default=0)
+    grading      = Column(Text, nullable=True)        # JSON grade payload (open)
+    duration_ms  = Column(Integer, nullable=True)
+    attempted_at = Column(DateTime, default=utcnow_naive, index=True)
+
+
 class CalendarCal(TimestampMixin, Base):
     """A calendar (e.g. 'Personal', 'TimeTree')."""
     __tablename__ = "calendars"
@@ -1742,6 +1956,7 @@ def init_db():
     _migrate_add_task_run_model_column()
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()
+    _migrate_add_study_summary_columns()
     _migrate_add_last_message_at_column()
     _migrate_add_folder_column()
     _migrate_add_token_columns()

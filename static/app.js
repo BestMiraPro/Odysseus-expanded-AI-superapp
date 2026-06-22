@@ -25,6 +25,7 @@ import galleryModule from './js/gallery.js';
 import tasksModule from './js/tasks.js';
 import calendarModule from './js/calendar.js';
 import notesModule from './js/notes.js';
+import studyModule from './js/study.js';
 import adminModule from './js/admin.js';
 import settingsModule from './js/settings.js';
 import omnigentModule from './js/omnigent.js';
@@ -926,6 +927,27 @@ function initializeEventListeners() {
     toolNotesBtn.addEventListener('click', () => {
       if (notesModule) {
         notesModule.togglePanel();
+      }
+    });
+  }
+
+  // Study tool button
+  const toolStudyBtn = el('tool-study-btn');
+  if (toolStudyBtn) {
+    toolStudyBtn.addEventListener('click', () => {
+      if (studyModule) {
+        studyModule.togglePanel();
+      }
+    });
+  }
+
+  // Omnigent tool button
+  const toolOmnigentBtn = el('tool-omnigent-btn');
+  if (toolOmnigentBtn) {
+    toolOmnigentBtn.addEventListener('click', async () => {
+      const Modals = await import('./js/modalManager.js');
+      if (!Modals.toggle('omnigent-modal')) {
+        omnigentModule.open();
       }
     });
   }
@@ -2424,6 +2446,7 @@ function initializeEventListeners() {
     'tool-memory':         '#tool-memory-btn',
     'tool-notes':          '#tool-notes-btn',
     'tool-omnigent':       '#tool-omnigent-btn',
+    'tool-study':          '#tool-study-btn',
     'tool-tasks':          '#tool-tasks-btn',
     'tool-theme':          '#tool-theme-btn',
     'user-bar':            '#user-bar-profile',

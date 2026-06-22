@@ -144,7 +144,13 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             value=token,
             httponly=True,
             samesite="lax",
-            secure=os.getenv("SECURE_COOKIES", "false").lower() == "true",
+            # Mark the cookie Secure when the request is HTTPS (e.g. behind a
+            # Cloudflare tunnel / reverse proxy — see the X-Forwarded-Proto
+            # middleware in app.py), so the session token is never sent over
+            # plaintext. SECURE_COOKIES=true forces it on regardless. We don't
+            # force it unconditionally so plain-HTTP LAN access still works.
+            secure=(os.getenv("SECURE_COOKIES", "false").lower() == "true"
+                    or request.url.scheme == "https"),
             path="/",
         )
         if body.remember:

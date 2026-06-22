@@ -119,10 +119,13 @@ def setup_upload_routes(upload_handler):
             raise HTTPException(500, "Failed to get upload statistics")
 
     @router.get("/{file_id}")
-    async def download_file(request: Request, file_id: str, thumb: int = 0):
+    async def download_file(request: Request, file_id: str, thumb: int = 0,
+                            inline: int = 0):
         """Serve an uploaded file by its ID. `?thumb=1` returns a small cached
         JPEG thumbnail for images (used by chat attachment previews) so the
-        client isn't downloading the full-resolution photo just to show it tiny."""
+        client isn't downloading the full-resolution photo just to show it tiny.
+        `?inline=1` serves with an inline content-disposition so PDFs/images
+        render in the browser (the Study file viewer) instead of downloading."""
         if not upload_handler.validate_upload_id(file_id):
             raise HTTPException(400, "Invalid file ID")
         import mimetypes as _mt
@@ -177,6 +180,7 @@ def setup_upload_routes(upload_handler):
             media_type=mime,
             filename=original_name,
             headers=UPLOAD_RESPONSE_HEADERS,
+            content_disposition_type="inline" if inline else "attachment",
         )
 
     def _load_upload_info(file_id: str):

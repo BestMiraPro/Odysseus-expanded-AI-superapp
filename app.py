@@ -140,6 +140,9 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/cookbook/setup",  # remote pacman/apt installs
     "/api/upload",          # large files
     "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
+    "/api/study/materials", # AI question extraction — chunked LLM calls, minutes on long PDFs
+    "/api/study/ai",        # AI card generation
+    "/api/study/questions", # attempt grading, hints, explanations — LLM-backed
 )
 
 
@@ -389,6 +392,39 @@ if AUTH_ENABLED:
     logger.info("Auth middleware enabled (AUTH_ENABLED=true)")
 else:
     logger.info("Auth middleware disabled (set AUTH_ENABLED=true to enable)")
+
+
+# ========= TRUST PROXY SCHEME (CLOUDFLARE TUNNEL / REVERSE PROXY) =========
+# Behind a tunnel/reverse proxy the browser speaks HTTPS to the edge, but the
+# proxy connects to us over plain HTTP — so request.url.scheme reads "http".
+# That makes the app mis-decide Secure cookies and build http:// absolute URLs.
+# Honor the standard X-Forwarded-Proto (and Cloudflare's CF-Visitor) so the
+# request scheme reflects what the client actually used.
+#
+# Safe to trust here: the published port binds 127.0.0.1, so the only network
+# ingress is loopback (reached via the tunnel). It also cannot widen access —
+# auth's _is_trusted_loopback already refuses local trust to any request that
+# carries forwarding headers, so a spoofed scheme grants nothing. Added last so
+# it is the OUTERMOST middleware and the scheme is corrected before auth, the
+# login cookie logic, and every route handler runs.
+class _ForwardedProtoMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http":
+            headers = dict(scope.get("headers") or [])
+            proto = headers.get(b"x-forwarded-proto")
+            if proto:
+                proto = proto.split(b",")[0].strip().lower()
+            elif headers.get(b"cf-visitor", b"").replace(b" ", b"").find(b'"scheme":"https"') >= 0:
+                proto = b"https"
+            if proto in (b"https", b"http"):
+                scope["scheme"] = proto.decode()
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_ForwardedProtoMiddleware)
 
 # ========= STATIC FILES =========
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -733,6 +769,10 @@ logger.info("Webhook & API token routes initialized")
 # Notes (Google Keep-style notes/todos)
 from routes.note_routes import setup_note_routes
 app.include_router(setup_note_routes(task_scheduler))
+
+# Study (FSRS flashcards, AI quiz/grading, exam plans, focus timer)
+from routes.study_routes import setup_study_routes
+app.include_router(setup_study_routes())
 
 # Email
 from routes.email_routes import setup_email_routes

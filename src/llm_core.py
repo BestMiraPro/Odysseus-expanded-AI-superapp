@@ -25,22 +25,49 @@ class LLMConfig:
 
 
 # Cache for LLM responses
-def _get_cache_key(url: str, model: str, messages: List[Dict], 
-                   temperature: float, max_tokens: int) -> str:
+def _get_cache_key(url: str, model: str, messages: List[Dict],
+                   temperature: float, max_tokens: int,
+                   extra: Optional[Dict] = None) -> str:
     """Generate cache key for LLM requests."""
     hashable_messages = []
     for msg in messages:
         sorted_items = tuple(sorted(msg.items()))
         hashable_messages.append(sorted_items)
-    
+
     content = json.dumps({
         'url': url,
-        'model': model, 
+        'model': model,
         'messages': hashable_messages,
         'temp': temperature,
-        'max_tokens': max_tokens
-    }, sort_keys=True)
+        'max_tokens': max_tokens,
+        'extra': extra,
+    }, sort_keys=True, default=str)
     return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _openai_message_text(msg) -> str:
+    """Final text of an OpenAI-format chat completion message.
+
+    `content` is the canonical answer field, but reasoning models on
+    OpenAI-compatible providers put chain-of-thought in a side field whose
+    name varies (vLLM/NIM: `reasoning_content` or `reasoning`, W&B
+    Inference: `reasoning`, some Ollama builds: `thinking`) — and when the
+    completion budget runs out mid-think, `content` comes back empty. Fall
+    back through the known names so callers see what the model said instead
+    of an empty string (the streaming path already does this).
+    """
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, list):  # content-block replies from some providers
+        content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+    if isinstance(content, str) and content.strip():
+        return content
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = msg.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
 
 _response_cache = {}
 
@@ -1258,8 +1285,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         elif provider == "ollama":
             response = _parse_ollama_response(data)
         else:
-            msg = data["choices"][0]["message"]
-            response = msg.get("content") or msg.get("reasoning_content") or ""
+            response = _openai_message_text(data["choices"][0]["message"])
         _set_cached_response(cache_key, response)
         return response
     except Exception:
@@ -1342,6 +1368,7 @@ async def llm_call_async(
     max_retries: int = LLMConfig.MAX_RETRIES,
     prompt_type: Optional[str] = None,
     session_id: Optional[str] = None,
+    extra_body: Optional[Dict] = None,
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
@@ -1360,7 +1387,8 @@ async def llm_call_async(
     else:
         messages_copy = non_sys
 
-    cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens)
+    cache_key = _get_cache_key(url, model, messages_copy, temperature, max_tokens,
+                               extra=extra_body)
     cached_response = _get_cached_response(cache_key)
     if cached_response:
         logger.debug(f"Returning cached response for key: {cache_key}")
@@ -1442,6 +1470,10 @@ async def llm_call_async(
         if _is_ollama_openai_compat_url(url) and _supports_thinking(model):
             payload["think"] = False
         _apply_local_cache_affinity(payload, url, session_id)
+        if extra_body:
+            # Caller-supplied provider hints (e.g. thinking toggles for
+            # reasoning models). OpenAI-compatible servers ignore unknown fields.
+            payload.update(extra_body)
 
     if _is_host_dead(target_url):
         raise HTTPException(503, f"Upstream {_host_key(target_url)} marked unreachable (cooldown active)")
@@ -1475,8 +1507,7 @@ async def llm_call_async(
                 elif provider == "ollama":
                     response = _parse_ollama_response(data)
                 else:
-                    msg = data["choices"][0]["message"]
-                    response = msg.get("content") or msg.get("reasoning_content") or ""
+                    response = _openai_message_text(data["choices"][0]["message"])
                 _set_cached_response(cache_key, response)
                 return response
             except Exception:
