@@ -287,6 +287,16 @@
     <button type="submit" id="submitBtn">Sign In</button>
   </form>
 
+  <div id="googleArea" style="display:none">
+    <div style="display:flex;align-items:center;gap:12px;margin:16px 0 8px;color:var(--muted,#888);font-size:12px;">
+      <span style="flex:1;height:1px;background:var(--border,#ddd);"></span>or<span style="flex:1;height:1px;background:var(--border,#ddd);"></span>
+    </div>
+    <a id="googleBtn" href="/api/auth/google/login" style="display:flex;align-items:center;justify-content:center;gap:10px;width:100%;box-sizing:border-box;padding:11px 14px;border:1px solid #dadce0;border-radius:8px;background:#fff;color:#3c4043;font-weight:600;font-size:14px;line-height:1;text-decoration:none;font-family:inherit;">
+      <svg width="18" height="18" viewBox="0 0 48 48" aria-hidden="true" focusable="false"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+      <span>Sign in with Google</span>
+    </a>
+  </div>
+
   <div class="toggle" id="toggleArea" style="display:none">
     <span id="toggleText">Don't have an account? </span>
     <a id="toggleLink" href="#">Sign up</a>
@@ -322,15 +332,18 @@
   const toggleArea = document.getElementById('toggleArea');
   const toggleLink = document.getElementById('toggleLink');
   const toggleText = document.getElementById('toggleText');
+  const googleArea = document.getElementById('googleArea');
 
   let mode = 'login'; // 'login' | 'signup' | 'setup'
   let signupAllowed = false;
+  let googleEnabled = false;
 
   const rememberToggle = document.getElementById('rememberToggle');
 
   function setMode(m) {
     mode = m;
     errEl.style.display = 'none';
+    googleArea.style.display = 'none';
     if (m === 'setup') {
       setupNote.textContent = 'First-time setup — create your admin account';
       setupNote.style.display = 'block';
@@ -354,8 +367,16 @@
       toggleText.textContent = "Don't have an account? ";
       toggleLink.textContent = 'Sign up';
       rememberToggle.style.display = '';
+      googleArea.style.display = googleEnabled ? 'block' : 'none';
     }
   }
+
+  // Is Google sign-in configured on the server? (sets googleEnabled before
+  // setMode runs, so the button shows in login mode)
+  try {
+    const oc = await fetch('/api/auth/oauth/config', { credentials: 'same-origin' });
+    if (oc.ok) googleEnabled = !!(await oc.json()).google;
+  } catch (e) {}
 
   // Check auth status
   try {
@@ -374,6 +395,17 @@
   } catch (e) {
     setMode('login');
   }
+
+  // Surface any error handed back by the Google OAuth callback redirect
+  // (?error=...). Done after setMode so its error-reset doesn't clear it.
+  try {
+    const qErr = new URLSearchParams(location.search).get('error');
+    if (qErr) {
+      errEl.textContent = qErr;
+      errEl.style.display = 'block';
+      history.replaceState(null, '', location.pathname);
+    }
+  } catch (e) {}
 
   toggleLink.addEventListener('click', (e) => {
     e.preventDefault();

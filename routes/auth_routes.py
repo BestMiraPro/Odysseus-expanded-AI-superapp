@@ -1,15 +1,20 @@
 """Authentication routes — login, logout, signup, status, user management."""
 
 from fastapi import APIRouter, Request, Response, HTTPException
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import Optional
 import asyncio
 import logging
 import os
+import secrets
 
 import json
 import re
+from urllib.parse import urlencode, quote
 from pathlib import Path
+
+import httpx
 
 from core.atomic_io import atomic_write_json, atomic_write_text
 from core.auth import AuthManager
@@ -154,7 +159,9 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             path="/",
         )
         if body.remember:
-            cookie_kwargs["max_age"] = 60 * 60 * 24 * 7  # 7 days
+            # Match the server session TTL so "remember me" actually persists
+            # (default 1 year) — log in once, stay in. Override via SESSION_TTL_DAYS.
+            cookie_kwargs["max_age"] = int(os.getenv("SESSION_TTL_DAYS", "365")) * 60 * 60 * 24
         response.set_cookie(**cookie_kwargs)
         return {"ok": True, "username": username}
 
@@ -165,6 +172,131 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             auth_manager.revoke_token(token)
         response.delete_cookie(SESSION_COOKIE, path="/")
         return {"ok": True}
+
+    # ---- Google sign-in (optional) ---------------------------------------
+    # Enabled only when GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET +
+    # GOOGLE_ALLOWED_EMAILS are set in the environment. A verified Google
+    # account whose email is in the allowlist is signed in as the local
+    # GOOGLE_LOGIN_AS user (default "admin"). No password to remember.
+    GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+    GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+    GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
+    OAUTH_STATE_COOKIE = "odysseus_oauth_state"
+    OAUTH_STATE_PATH = "/api/auth/google"
+
+    def _google_cfg():
+        cid = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+        csec = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+        allowed = {e.strip().lower()
+                   for e in os.getenv("GOOGLE_ALLOWED_EMAILS", "").split(",")
+                   if e.strip()}
+        login_as = (os.getenv("GOOGLE_LOGIN_AS", "admin").strip().lower() or "admin")
+        return cid, csec, allowed, login_as
+
+    def _google_enabled() -> bool:
+        cid, csec, allowed, _ = _google_cfg()
+        return bool(cid and csec and allowed)
+
+    def _secure_cookie(request: Request) -> bool:
+        return (os.getenv("SECURE_COOKIES", "false").lower() == "true"
+                or request.url.scheme == "https")
+
+    def _oauth_redirect_uri(request: Request) -> str:
+        # Google requires an exact match against a registered redirect URI.
+        # Default: derive from the request host (works for both localhost and
+        # a Cloudflare-tunnel host, as long as both are registered). Override
+        # with OAUTH_REDIRECT_BASE if you want a single fixed public URL.
+        base = os.getenv("OAUTH_REDIRECT_BASE", "").strip().rstrip("/")
+        if not base:
+            base = str(request.base_url).rstrip("/")
+        return base + "/api/auth/google/callback"
+
+    @router.get("/oauth/config")
+    async def oauth_config():
+        # Lets the login page decide whether to show the Google button.
+        return {"google": _google_enabled()}
+
+    @router.get("/google/login")
+    async def google_login(request: Request):
+        cid, csec, allowed, _ = _google_cfg()
+        if not (cid and csec and allowed):
+            return RedirectResponse(
+                "/login?error=" + quote("Google sign-in is not configured"),
+                status_code=303)
+        state = secrets.token_urlsafe(24)
+        params = urlencode({
+            "client_id": cid,
+            "redirect_uri": _oauth_redirect_uri(request),
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "access_type": "online",
+            "prompt": "select_account",
+        })
+        resp = RedirectResponse(f"{GOOGLE_AUTH_URL}?{params}", status_code=303)
+        resp.set_cookie(
+            key=OAUTH_STATE_COOKIE, value=state, max_age=600,
+            httponly=True, samesite="lax", secure=_secure_cookie(request),
+            path=OAUTH_STATE_PATH,
+        )
+        return resp
+
+    @router.get("/google/callback")
+    async def google_callback(request: Request, code: str = "",
+                              state: str = "", error: str = ""):
+        def _fail(msg: str):
+            r = RedirectResponse("/login?error=" + quote(msg), status_code=303)
+            r.delete_cookie(OAUTH_STATE_COOKIE, path=OAUTH_STATE_PATH)
+            return r
+
+        if error:
+            return _fail("Google sign-in was cancelled")
+        cid, csec, allowed, login_as = _google_cfg()
+        if not (cid and csec and allowed):
+            return _fail("Google sign-in is not configured")
+        saved = request.cookies.get(OAUTH_STATE_COOKIE) or ""
+        if not (state and saved and secrets.compare_digest(state, saved)):
+            return _fail("Sign-in session expired — please try again")
+        if not code:
+            return _fail("Google sign-in failed — no authorization code")
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                tok = await client.post(GOOGLE_TOKEN_URL, data={
+                    "code": code,
+                    "client_id": cid,
+                    "client_secret": csec,
+                    "redirect_uri": _oauth_redirect_uri(request),
+                    "grant_type": "authorization_code",
+                })
+                tok.raise_for_status()
+                access = tok.json().get("access_token")
+                if not access:
+                    return _fail("Google sign-in failed — no access token")
+                ui = await client.get(
+                    GOOGLE_USERINFO_URL,
+                    headers={"Authorization": f"Bearer {access}"})
+                ui.raise_for_status()
+                info = ui.json()
+        except Exception:
+            logger.warning("Google OAuth exchange failed", exc_info=True)
+            return _fail("Could not reach Google — please try again")
+        email = str(info.get("email", "")).strip().lower()
+        if not email or not info.get("email_verified"):
+            return _fail("Your Google email is not verified")
+        if email not in allowed:
+            return _fail("This Google account is not allowed to sign in")
+        if login_as not in auth_manager.users:
+            return _fail(f"Login user '{login_as}' does not exist — set GOOGLE_LOGIN_AS")
+        token = auth_manager.create_session_trusted(login_as)
+        resp = RedirectResponse("/", status_code=303)
+        resp.set_cookie(
+            key=SESSION_COOKIE, value=token, httponly=True, samesite="lax",
+            secure=_secure_cookie(request), path="/",
+            max_age=int(os.getenv("SESSION_TTL_DAYS", "365")) * 60 * 60 * 24,
+        )
+        resp.delete_cookie(OAUTH_STATE_COOKIE, path=OAUTH_STATE_PATH)
+        logger.info("Google sign-in: %s -> %s", email, login_as)
+        return resp
 
     @router.get("/status")
     async def auth_status(request: Request):

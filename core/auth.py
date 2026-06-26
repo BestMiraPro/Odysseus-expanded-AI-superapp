@@ -48,7 +48,7 @@ ADMIN_PRIVILEGES["block_all_models"] = False
 
 from src.constants import AUTH_FILE
 DEFAULT_AUTH_PATH = AUTH_FILE
-TOKEN_TTL = 60 * 60 * 24 * 7  # 7 days
+TOKEN_TTL = int(os.getenv("SESSION_TTL_DAYS", "365")) * 60 * 60 * 24  # default 1 year
 
 # Usernames the auth + middleware layer reserve as internal "synthetic owner"
 # sentinels; they must never belong to a real account. The most dangerous is
