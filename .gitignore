@@ -17,6 +17,10 @@ venv/
 # Secrets that must never be committed (e.g. downloaded OAuth client JSON)
 client_secret_*.json
 *.apps.googleusercontent.com.json
+
+# Unrelated downloaded repos / archives kept out of the Odysseus tree
+/OmniGen2/
+/OmniGen2-main.zip
 !.env.example
 
 # Data — all user data stays local
