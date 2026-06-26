@@ -6,6 +6,7 @@ httpx
 pydantic>=2.0
 pydantic-settings>=2.0
 SQLAlchemy
+PyYAML
 pypdf
 pypdfium2
 beautifulsoup4

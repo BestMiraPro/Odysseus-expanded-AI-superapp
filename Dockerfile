@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tmux \
     openssh-client \
     gosu \
+    socat \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,6 +29,18 @@ ARG INSTALL_OPTIONAL=false
 COPY requirements.txt requirements-optional.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
     && if [ "$INSTALL_OPTIONAL" = "true" ]; then pip install --no-cache-dir -r requirements-optional.txt; fi
+
+# Bundle the Omnigent agent CLI in its OWN isolated venv — its deps conflict
+# with Odysseus's if installed in the same environment. Installed world-readable
+# (UV_TOOL_BIN_DIR on PATH, venv under /opt) so the dropped PUID/PGID runtime
+# user can launch it. The Launch button starts its server; socat (see the
+# entrypoint) bridges its loopback-only web UI to the published :6868.
+ENV UV_TOOL_DIR=/opt/uv/tools \
+    UV_TOOL_BIN_DIR=/usr/local/bin
+RUN pip install --no-cache-dir uv \
+    && uv tool install omnigent \
+    && chmod -R a+rX /opt/uv \
+    && rm -rf /root/.cache
 
 # Copy app code
 COPY . .

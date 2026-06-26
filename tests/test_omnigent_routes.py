@@ -205,27 +205,70 @@ def test_workers_route_includes_native_roster(tmp_path):
     assert result["presets"][0]["id"] == "balanced"
 
 
-def test_native_run_routes_create_start_cancel_and_list_sessions(tmp_path, monkeypatch):
+def test_sessions_route_uses_external_omnigent_only():
+    from routes.omnigent_routes import setup_omnigent_routes
+
+    result = _handler(setup_omnigent_routes(_FakeManager()), "GET", "/api/omnigent/sessions")(_JsonRequest())
+
+    # native goal-run sessions were removed; only the external server is proxied
+    assert result["sessions"][0]["id"] == "conv_1"
+
+
+def test_native_run_routes_are_removed():
+    from routes.omnigent_routes import setup_omnigent_routes
+
+    paths = {getattr(r, "path", "") for r in setup_omnigent_routes(_FakeManager()).routes}
+    assert "/api/omnigent/runs" not in paths
+    assert "/api/omnigent/runs/{run_id}/start" not in paths
+    assert "/api/omnigent/runs/{run_id}/cancel" not in paths
+
+
+def test_agents_crud_routes_owner_scoped(tmp_path, monkeypatch):
+    import asyncio
     import routes.omnigent_routes as omnigent_routes
     from routes.omnigent_routes import setup_omnigent_routes
-    from src.omnigent_native import NativeOmnigentManager
+    from src.omnigent_agents import OmnigentAgentStore
 
-    monkeypatch.setattr(omnigent_routes, "require_authenticated_request", lambda request: None)
+    monkeypatch.setattr(omnigent_routes, "require_authenticated_request", lambda request: "alice")
     monkeypatch.setattr(omnigent_routes, "get_current_user", lambda request: "alice")
-    native = NativeOmnigentManager(state_path=tmp_path / "runs.json")
-    router = setup_omnigent_routes(_FakeManager(), native)
+    store = OmnigentAgentStore(state_path=tmp_path / "agents.json")
+    router = setup_omnigent_routes(_FakeManager(), agent_store=store)
 
-    created = asyncio.run(
-        _handler(router, "POST", "/api/omnigent/runs")(
-            _JsonRequest({"goal": "Ship the native crew", "preset": "build"})
-        )
-    )
-    started = _handler(router, "POST", "/api/omnigent/runs/{run_id}/start")(_JsonRequest(), created["id"])
-    sessions = _handler(router, "GET", "/api/omnigent/sessions")(_JsonRequest())
-    cancelled = _handler(router, "POST", "/api/omnigent/runs/{run_id}/cancel")(_JsonRequest(), created["id"])
+    created = asyncio.run(_handler(router, "POST", "/api/omnigent/agents")(
+        _JsonRequest({"name": "Researcher", "role": "Find context.", "backend": "claude-subscription"})
+    ))
+    listed = _handler(router, "GET", "/api/omnigent/agents")(_JsonRequest())
+    updated = asyncio.run(_handler(router, "PUT", "/api/omnigent/agents/{agent_id}")(
+        _JsonRequest({"enabled": False}), created["id"]
+    ))
+    deleted = _handler(router, "DELETE", "/api/omnigent/agents/{agent_id}")(_JsonRequest(), created["id"])
 
-    assert created["status"] == "draft"
-    assert started["status"] == "completed"
-    assert sessions["sessions"][0]["id"] == created["id"]
-    assert sessions["sessions"][0]["native"] is True
-    assert cancelled["status"] == "cancelled"
+    assert created["name"] == "Researcher"
+    assert listed["agents"][0]["id"] == created["id"]
+    assert updated["enabled"] is False
+    assert deleted["ok"] is True
+
+
+def test_orchestrator_and_compile_routes(tmp_path, monkeypatch):
+    import asyncio
+    import yaml
+    import routes.omnigent_routes as omnigent_routes
+    from routes.omnigent_routes import setup_omnigent_routes
+    from src.omnigent_agents import OmnigentAgentStore
+
+    monkeypatch.setattr(omnigent_routes, "require_authenticated_request", lambda request: "alice")
+    store = OmnigentAgentStore(state_path=tmp_path / "agents.json")
+    store.create_agent(owner="alice", name="Coder", role="Build.", backend="claude-subscription")
+    router = setup_omnigent_routes(_FakeManager(), agent_store=store)
+
+    got = _handler(router, "GET", "/api/omnigent/orchestrator")(_JsonRequest())
+    saved = asyncio.run(_handler(router, "PUT", "/api/omnigent/orchestrator")(
+        _JsonRequest({"backend": "chatgpt-subscription"})
+    ))
+    compiled = _handler(router, "GET", "/api/omnigent/agents/compile")(_JsonRequest())
+
+    assert got["backend"] == "claude-subscription"   # default
+    assert saved["backend"] == "chatgpt-subscription"
+    spec = yaml.safe_load(compiled["yaml"])
+    assert spec["executor"]["config"]["harness"] == "codex"
+    assert spec["agents"][0]["name"] == "Coder"

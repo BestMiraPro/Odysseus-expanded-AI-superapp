@@ -13,6 +13,8 @@ from core.middleware import require_admin
 from src.auth_helpers import get_current_user, owner_filter, require_authenticated_request
 from src.omnigent_native import NativeOmnigentManager
 from src.omnigent_manager import INSTALL_GUIDANCE, OmnigentManager
+from src.omnigent_agents import OmnigentAgentStore, compile_config
+from src.constants import DATA_DIR
 
 
 def _providers() -> list[dict]:
@@ -80,10 +82,12 @@ def _has_visible_model_endpoint(request: Request | None = None) -> bool:
 def setup_omnigent_routes(
     manager: OmnigentManager | None = None,
     native_manager: NativeOmnigentManager | None = None,
+    agent_store: OmnigentAgentStore | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/omnigent", tags=["omnigent"])
     manager = manager or OmnigentManager()
     native_manager = native_manager or NativeOmnigentManager()
+    agent_store = agent_store or OmnigentAgentStore()
 
     @router.get("/status")
     def status(request: Request):
@@ -114,14 +118,7 @@ def setup_omnigent_routes(
 
     @router.get("/sessions")
     def sessions(request: Request):
-        user = get_current_user(request)
-        native_sessions = native_manager.sessions(user)
-        if native_sessions.get("sessions"):
-            external = manager.sessions()
-            native_sessions["external_sessions"] = external.get("sessions", [])
-            native_sessions["running"] = external.get("running")
-            native_sessions["url"] = external.get("url")
-            return native_sessions
+        # Conversational sessions live in the external Omnigent server.
         return manager.sessions()
 
     @router.get("/workers")
@@ -159,52 +156,128 @@ def setup_omnigent_routes(
             ],
         }
 
-    @router.post("/runs")
-    async def create_run(request: Request):
-        require_authenticated_request(request)
-        user = get_current_user(request)
-        data = await request.json()
-        try:
-            return native_manager.create_run(
-                owner=user,
-                goal=data.get("goal", ""),
-                preset=data.get("preset", "balanced"),
-            )
-        except ValueError as exc:
-            raise HTTPException(400, str(exc))
-
-    @router.get("/runs/{run_id}")
-    def get_run(request: Request, run_id: str):
-        require_authenticated_request(request)
-        user = get_current_user(request)
-        run = native_manager.get_run(run_id, owner=user)
-        if not run:
-            raise HTTPException(404, "Crew run not found")
-        return run
-
-    @router.post("/runs/{run_id}/start")
-    def start_run(request: Request, run_id: str):
-        require_authenticated_request(request)
-        user = get_current_user(request)
-        run = native_manager.start_run(run_id, owner=user)
-        if not run:
-            raise HTTPException(404, "Crew run not found")
-        return run
-
-    @router.post("/runs/{run_id}/cancel")
-    def cancel_run(request: Request, run_id: str):
-        require_authenticated_request(request)
-        user = get_current_user(request)
-        run = native_manager.cancel_run(run_id, owner=user)
-        if not run:
-            raise HTTPException(404, "Crew run not found")
-        return run
-
     @router.get("/bundle.tar.gz")
     def bundle(request: Request):
         require_authenticated_request(request)
         root = Path(__file__).resolve().parent.parent / "integrations" / "omnigent"
         headers = {"Content-Disposition": 'attachment; filename="odysseus-omnigent-bundle.tar.gz"'}
         return Response(content=_bundle_bytes(root), media_type="application/gzip", headers=headers)
+
+    # ---- custom agents (owner-scoped) -----------------------------------
+    @router.get("/agents")
+    def list_agents(request: Request):
+        user = require_authenticated_request(request)
+        return {"agents": agent_store.list_agents(user)}
+
+    @router.post("/agents")
+    async def create_agent(request: Request):
+        user = require_authenticated_request(request)
+        data = await request.json()
+        try:
+            return agent_store.create_agent(
+                owner=user,
+                name=data.get("name", ""),
+                role=data.get("role", ""),
+                backend=data.get("backend", ""),
+                model=data.get("model"),
+                enabled=data.get("enabled", True),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @router.put("/agents/{agent_id}")
+    async def update_agent(request: Request, agent_id: str):
+        user = require_authenticated_request(request)
+        data = await request.json()
+        try:
+            agent = agent_store.update_agent(agent_id, owner=user, **data)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not agent:
+            raise HTTPException(404, "Agent not found")
+        return agent
+
+    @router.delete("/agents/{agent_id}")
+    def delete_agent(request: Request, agent_id: str):
+        user = require_authenticated_request(request)
+        if not agent_store.delete_agent(agent_id, owner=user):
+            raise HTTPException(404, "Agent not found")
+        return {"ok": True}
+
+    # ---- orchestrator + compile + model options -------------------------
+    @router.get("/orchestrator")
+    def get_orchestrator(request: Request):
+        user = require_authenticated_request(request)
+        return agent_store.get_orchestrator(user)
+
+    @router.put("/orchestrator")
+    async def set_orchestrator(request: Request):
+        user = require_authenticated_request(request)
+        data = await request.json()
+        try:
+            return agent_store.set_orchestrator(
+                user,
+                backend=data.get("backend", ""),
+                model=data.get("model"),
+                workspace=data.get("workspace", ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @router.get("/agents/compile")
+    def compile_agents(request: Request):
+        user = require_authenticated_request(request)
+        text = compile_config(agent_store.list_agents(user), agent_store.get_orchestrator(user))
+        return {"yaml": text, "filename": "config.yaml"}
+
+    @router.get("/model-options")
+    def model_options(request: Request):
+        import json as _json
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)  # noqa: E712
+            if user:
+                q = owner_filter(q, ModelEndpoint, user)
+            out = []
+            for ep in q.all():
+                if (ep.model_type or "llm") != "llm":
+                    continue
+                models = []
+                for raw in (ep.cached_models, ep.pinned_models):
+                    try:
+                        models += _json.loads(raw or "[]")
+                    except Exception:
+                        pass
+                seen, uniq = set(), []
+                for m in models:
+                    mid = m.get("id") if isinstance(m, dict) else m
+                    if mid and mid not in seen:
+                        seen.add(mid)
+                        uniq.append(mid)
+                out.append({"id": ep.id, "name": ep.name, "models": uniq})
+            return {"endpoints": out}
+        finally:
+            db.close()
+
+    @router.post("/launch")
+    def launch(request: Request):
+        # One-click: compile + save the crew config, then boot the local
+        # Omnigent server (which serves Omnigent's own chat web UI). Degrades
+        # gracefully when the Omnigent CLI isn't installed where Odysseus runs.
+        user = require_authenticated_request(request)
+        text = compile_config(agent_store.list_agents(user), agent_store.get_orchestrator(user))
+        cfg_dir = Path(DATA_DIR) / "omnigent"
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = cfg_dir / f"{(user or 'crew')}.yaml"
+        cfg_path.write_text(text, encoding="utf-8")
+        try:
+            data = manager.start()
+        except Exception as exc:
+            data = manager.status()
+            data["error"] = str(exc)
+        data["config_path"] = str(cfg_path)
+        data["install"] = INSTALL_GUIDANCE
+        return data
 
     return router

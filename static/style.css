@@ -36925,6 +36925,174 @@ body.theme-frosted .modal {
 .omnigent-link-btn {
   text-decoration: none;
 }
+/* --- custom agents + orchestrator controls --- */
+.omnigent-section-head > div {
+  display: flex;
+  gap: 8px;
+}
+.omnigent-input,
+.omnigent-select {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+}
+.omnigent-input:focus,
+.omnigent-select:focus {
+  outline: none;
+  border-color: var(--accent, var(--red));
+}
+.omnigent-orch-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.omnigent-orch-row .omnigent-select,
+.omnigent-orch-row .omnigent-input {
+  flex: 1 1 160px;
+  width: auto;
+}
+.omnigent-orch-row button {
+  flex: 0 0 auto;
+}
+.omnigent-agent-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+.omnigent-agent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+}
+.omnigent-agent-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.omnigent-agent-name {
+  font-size: 13px;
+  font-weight: 700;
+}
+.omnigent-agent-main small {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  opacity: 0.7;
+}
+.omnigent-agent-main p {
+  margin: 6px 0 0;
+  font-size: 12px;
+  line-height: 1.4;
+  opacity: 0.72;
+}
+.omnigent-agent-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+.omnigent-agent-form {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 4%, transparent);
+}
+.omnigent-claude-help {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.omnigent-claude-help p {
+  margin: 7px 0 0;
+  opacity: 0.78;
+}
+.omnigent-claude-steps {
+  margin: 8px 0 0 18px;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+}
+.omnigent-claude-help code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.18);
+  font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
+  font-size: 11px;
+}
+/* --- two-column (OmniGen2-style) layout: inputs left, output right --- */
+.omnigent-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 14px;
+  margin-top: 12px;
+}
+.omnigent-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+.omnigent-build-btn,
+.omnigent-launch-btn {
+  width: 100%;
+}
+.omnigent-launch-btn {
+  padding: 13px;
+  font-size: 14px;
+  font-weight: 700;
+}
+.omnigent-launch-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.omnigent-col-output {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+  padding: 12px;
+}
+.omnigent-output-head {
+  margin: 4px 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  opacity: 0.8;
+}
+.omnigent-output {
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.18);
+  font-family: var(--font-mono, "SFMono-Regular", Consolas, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+@media (max-width: 720px) {
+  .omnigent-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
 .omnigent-error {
   margin-top: 8px;
   color: var(--red);

@@ -85,6 +85,14 @@ export PATH="/app/.local/bin:$PATH"
 # || true so a setup failure never prevents the container from starting.
 gosu "$PUID:$PGID" python /app/setup.py || true
 
+# Bridge Omnigent's loopback-only web UI to a publishable port. The Launch
+# button runs `omnigent server start`, which binds 127.0.0.1:6767 inside the
+# container; this forwards the published :6868 to it so the host browser can
+# reach Omnigent's chat UI. No-op (connection refused) until Omnigent starts.
+if command -v socat >/dev/null 2>&1; then
+    socat TCP-LISTEN:6868,fork,reuseaddr TCP:127.0.0.1:6767 >/dev/null 2>&1 &
+fi
+
 # Drop root and run the actual app. `gosu` is preferred over `su` /
 # `sudo` because it cleans up the process tree (no extra shell layer)
 # so signals (SIGTERM from `docker stop`) reach uvicorn directly.

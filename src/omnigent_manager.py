@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import subprocess
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+from src.constants import DATA_DIR
 
 
 INSTALL_GUIDANCE = {
@@ -36,6 +41,14 @@ class OmnigentManager:
     def __init__(self, command: str | None = None, timeout: float = 8.0):
         self._command = command
         self.timeout = timeout
+        # Omnigent writes state to ~/.omnigent. The container drops to a
+        # non-root user whose HOME (/root, inherited) isn't writable, so point
+        # it at the persisted, writable data volume instead.
+        self._home = Path(DATA_DIR) / "omnigent-home"
+        # Omnigent's server binds this loopback URL (default 6767). We probe it
+        # directly for liveness instead of the slow/unreliable `server status`.
+        self._ui_url = "http://127.0.0.1:6767"
+        self._version_cache: str | None = None
 
     def _resolve_command(self) -> str | None:
         if self._command:
@@ -66,50 +79,54 @@ class OmnigentManager:
         }
 
     def _run(self, args: list[str], timeout: float | None = None) -> OmnigentCommandResult:
+        env = dict(os.environ)
+        try:
+            self._home.mkdir(parents=True, exist_ok=True)
+            env["HOME"] = str(self._home)
+        except Exception:
+            pass
         proc = subprocess.run(
             args,
             capture_output=True,
             text=True,
             timeout=timeout or self.timeout,
             check=False,
+            env=env,
         )
         return OmnigentCommandResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
     def _version(self, command: str) -> str | None:
-        for args in ([command, "version"], [command, "--version"]):
+        # Version is static for the life of the process; cache it so repeated
+        # status() calls (every modal refresh) don't re-spawn the CLI.
+        if self._version_cache is not None:
+            return self._version_cache or None
+        found = ""
+        for args in ([command, "--version"], [command, "version"]):
             try:
                 result = self._run(args, timeout=4)
             except Exception:
                 continue
             text = (result.stdout or result.stderr or "").strip()
             if result.exit_code == 0 and text:
-                return text.splitlines()[0].strip()
-        return None
+                found = text.splitlines()[0].strip()
+                break
+        self._version_cache = found
+        return found or None
 
     def _server_status(self, command: str) -> dict[str, Any]:
+        # `omnigent server status` is slow (~3-5s) and reports the server as
+        # not-running once it's orphaned from the short-lived subprocess that
+        # started it (daemon_attached: false), even while it answers HTTP fine.
+        # A direct HTTP probe of the loopback server is fast and accurate.
+        url = self._ui_url
         try:
-            result = self._run([command, "server", "status", "--json"], timeout=5)
-        except subprocess.TimeoutExpired:
-            return {"running": False, "error": "Omnigent status timed out"}
-        except Exception as exc:
-            return {"running": False, "error": str(exc)}
-
-        raw = (result.stdout or "").strip()
-        if raw:
-            try:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    return data
-            except json.JSONDecodeError:
-                pass
-
-        text = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
-        lower = text.lower()
-        return {
-            "running": result.exit_code == 0 and ("running" in lower or "http://" in lower or "https://" in lower),
-            "error": None if result.exit_code == 0 else (text or f"exit {result.exit_code}"),
-            "raw": text,
-        }
+            with urllib.request.urlopen(url, timeout=3) as resp:
+                running = (getattr(resp, "status", 200) or 200) < 500
+        except urllib.error.HTTPError as exc:
+            running = exc.code < 500  # a 4xx still means the server is up
+        except Exception:
+            running = False
+        return {"running": running, "url": url if running else None}
 
     def status(self) -> dict[str, Any]:
         command = self._resolve_command()
@@ -142,7 +159,12 @@ class OmnigentManager:
         command = self._resolve_command()
         if not command:
             raise RuntimeError("Omnigent CLI not found on PATH")
-        result = self._run([command, "server", "start"], timeout=15)
+        result = self._run([command, "server", "start"], timeout=30)
+        # Learn the URL Omnigent actually bound (it prints e.g. "Started
+        # background server at http://127.0.0.1:6767") so the probe matches.
+        match = re.search(r"https?://127\.0\.0\.1:\d+", f"{result.stdout}\n{result.stderr}")
+        if match:
+            self._ui_url = match.group(0)
         status = self.status()
         status.update({
             "last_command": "omnigent server start",
