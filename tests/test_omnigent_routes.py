@@ -233,3 +233,20 @@ def test_agent_config_routes_are_removed():
     # the launcher endpoints stay
     assert "/api/omnigent/launch" in paths
     assert "/api/omnigent/status" in paths
+
+
+def test_install_helpers_shape_api_gateways():
+    from routes.omnigent_routes import _provider_slug, _pick_default_model, _endpoint_model_ids
+
+    assert _provider_slug("api.inference.wandb.ai") == "api-inference-wandb-ai"
+    assert _provider_slug("") == "api"
+    # a reasoning-capable general model is preferred as the default
+    assert _pick_default_model(["Qwen/Qwen3-235B", "zai-org/GLM-5.2", "x"]) == "zai-org/GLM-5.2"
+    assert _pick_default_model(["only/thing"]) == "only/thing"
+    assert _pick_default_model([]) is None
+
+    class _Ep:
+        pinned_models = '[{"id": "a"}, {"id": "b"}]'
+        cached_models = '["b", "c"]'
+
+    assert _endpoint_model_ids(_Ep()) == ["a", "b", "c"]

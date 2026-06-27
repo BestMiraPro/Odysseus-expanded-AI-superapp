@@ -105,9 +105,14 @@ async function launchCrew() {
   try {
     const data = await postJson('/api/omnigent/launch', {});
     _state.status = { ...(_state.status || {}), ...data };
-    if (data.running) toast?.('Omnigent ready — click Open Omnigent');
-    else if (data.installed === false) toast?.('Omnigent not available — check setup');
-    else toast?.(data.error || 'Launch attempted — check Omnigent');
+    if (data.running) {
+      const n = data.api_models?.models || 0;
+      toast?.(n ? `Omnigent ready — ${n} API models installed` : 'Omnigent ready — click Open Omnigent');
+    } else if (data.installed === false) {
+      toast?.('Omnigent not available — check setup');
+    } else {
+      toast?.(data.error || 'Launch attempted — check Omnigent');
+    }
   } catch (err) {
     toast?.(err?.message || 'Launch failed');
   } finally {
@@ -141,10 +146,11 @@ function render() {
         ? `<a class="admin-btn-add omnigent-launch-btn" href="${omnigentUiUrl()}" target="_blank" rel="noopener">Open Omnigent ↗</a>`
         : `<button class="admin-btn-add omnigent-launch-btn" data-omnigent-action="launch" ${(installed && !_state.launching) ? '' : 'disabled'}>${_state.launching ? 'Launching… (first boot ~30s)' : 'Launch Omnigent'}</button>`}
 
+      ${s.api_models?.models ? `<p style="margin-top:10px;color:#3ba55d;font-weight:600;">✓ ${esc(String(s.api_models.models))} API model${s.api_models.models === 1 ? '' : 's'} installed${s.api_models.default_model ? ` · default <code>${esc(s.api_models.default_model)}</code>` : ''}</p>` : ''}
+
       <p class="omnigent-provider-note" style="margin-top:14px;line-height:1.55;">
-        This boots Omnigent and opens its own chat UI, where you pick agents and run tasks.
-        Configure your models inside Omnigent (<code>omni setup</code>) — they don't carry over from Odysseus.
-        For your <strong>Claude/ChatGPT subscriptions</strong> and working on <strong>your own files</strong>, run <code>omni</code> in WSL2.
+        Launch installs your Odysseus <strong>API models</strong> into Omnigent (marked as API) and opens its chat UI.
+        Your <strong>Claude/ChatGPT subscriptions</strong> still need <code>omni</code> in WSL2 (to log in + work on your own files).
       </p>
 
       ${installed ? '' : `
