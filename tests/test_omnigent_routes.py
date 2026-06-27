@@ -223,52 +223,13 @@ def test_native_run_routes_are_removed():
     assert "/api/omnigent/runs/{run_id}/cancel" not in paths
 
 
-def test_agents_crud_routes_owner_scoped(tmp_path, monkeypatch):
-    import asyncio
-    import routes.omnigent_routes as omnigent_routes
+def test_agent_config_routes_are_removed():
     from routes.omnigent_routes import setup_omnigent_routes
-    from src.omnigent_agents import OmnigentAgentStore
 
-    monkeypatch.setattr(omnigent_routes, "require_authenticated_request", lambda request: "alice")
-    monkeypatch.setattr(omnigent_routes, "get_current_user", lambda request: "alice")
-    store = OmnigentAgentStore(state_path=tmp_path / "agents.json")
-    router = setup_omnigent_routes(_FakeManager(), agent_store=store)
-
-    created = asyncio.run(_handler(router, "POST", "/api/omnigent/agents")(
-        _JsonRequest({"name": "Researcher", "role": "Find context.", "backend": "claude-subscription"})
-    ))
-    listed = _handler(router, "GET", "/api/omnigent/agents")(_JsonRequest())
-    updated = asyncio.run(_handler(router, "PUT", "/api/omnigent/agents/{agent_id}")(
-        _JsonRequest({"enabled": False}), created["id"]
-    ))
-    deleted = _handler(router, "DELETE", "/api/omnigent/agents/{agent_id}")(_JsonRequest(), created["id"])
-
-    assert created["name"] == "Researcher"
-    assert listed["agents"][0]["id"] == created["id"]
-    assert updated["enabled"] is False
-    assert deleted["ok"] is True
-
-
-def test_orchestrator_and_compile_routes(tmp_path, monkeypatch):
-    import asyncio
-    import yaml
-    import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import setup_omnigent_routes
-    from src.omnigent_agents import OmnigentAgentStore
-
-    monkeypatch.setattr(omnigent_routes, "require_authenticated_request", lambda request: "alice")
-    store = OmnigentAgentStore(state_path=tmp_path / "agents.json")
-    store.create_agent(owner="alice", name="Coder", role="Build.", backend="claude-subscription")
-    router = setup_omnigent_routes(_FakeManager(), agent_store=store)
-
-    got = _handler(router, "GET", "/api/omnigent/orchestrator")(_JsonRequest())
-    saved = asyncio.run(_handler(router, "PUT", "/api/omnigent/orchestrator")(
-        _JsonRequest({"backend": "chatgpt-subscription"})
-    ))
-    compiled = _handler(router, "GET", "/api/omnigent/agents/compile")(_JsonRequest())
-
-    assert got["backend"] == "claude-subscription"   # default
-    assert saved["backend"] == "chatgpt-subscription"
-    spec = yaml.safe_load(compiled["yaml"])
-    assert spec["executor"]["config"]["harness"] == "codex"
-    assert spec["agents"][0]["name"] == "Coder"
+    paths = {getattr(r, "path", "") for r in setup_omnigent_routes(_FakeManager()).routes}
+    for gone in ("/api/omnigent/agents", "/api/omnigent/orchestrator",
+                 "/api/omnigent/agents/compile", "/api/omnigent/model-options"):
+        assert gone not in paths, f"{gone} should be removed"
+    # the launcher endpoints stay
+    assert "/api/omnigent/launch" in paths
+    assert "/api/omnigent/status" in paths
