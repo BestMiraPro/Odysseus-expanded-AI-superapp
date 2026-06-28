@@ -250,3 +250,14 @@ def test_install_helpers_shape_api_gateways():
         cached_models = '["b", "c"]'
 
     assert _endpoint_model_ids(_Ep()) == ["a", "b", "c"]
+
+
+def test_model_slug_for_worker_dirs():
+    from routes.omnigent_routes import _model_slug, _generate_crew
+
+    # worker dir names derive from the model id's tail, lowercased + dash-safe
+    assert _model_slug("zai-org/GLM-5.2") == "glm-5-2"
+    assert _model_slug("deepseek-ai/DeepSeek-V3.1") == "deepseek-v3-1"
+    assert _model_slug("") == "model"
+    # no models -> no crew written, no crash
+    assert _generate_crew([], None) == 0

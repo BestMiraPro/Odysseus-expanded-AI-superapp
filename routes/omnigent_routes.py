@@ -50,6 +50,69 @@ def _pick_default_model(ids: list[str]) -> str | None:
     return ids[0] if ids else None
 
 
+def _model_slug(model_id: str) -> str:
+    tail = (model_id or "").split("/")[-1].lower()
+    slug = "".join(c if c.isalnum() else "-" for c in tail).strip("-")
+    return slug or "model"
+
+
+def _generate_crew(model_ids: list[str], default_model: str | None) -> int:
+    """Write a ``crew`` orchestrator + one worker per API model under the bundled
+    Omnigent's ``~/.omnigent/agents/`` so the gateway models are delegatable
+    sub-agents.
+
+    The model id MUST sit at ``executor.model`` — Omnigent ignores
+    ``executor.config.model`` and silently falls back to a catalog default
+    (``gpt-5.5``), which the W&B gateway 404s. That placement was the real cause
+    of the "gateway model" failures. Workers carry no auth: they resolve the
+    default ``openai`` gateway provider written to ``config.yaml``.
+    """
+    ids: list[str] = []
+    for mid in model_ids:
+        if mid and mid not in ids:
+            ids.append(mid)
+    ids = ids[:12]  # keep the roster usable
+    if not ids:
+        return 0
+    crew = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents" / "crew"
+    wroot = crew / "agents"
+    slugs: list[str] = []
+    used: set[str] = set()
+    for mid in ids:
+        slug = _model_slug(mid)
+        while slug in used:
+            slug += "-x"
+        used.add(slug)
+        wdir = wroot / slug
+        wdir.mkdir(parents=True, exist_ok=True)
+        (wdir / "config.yaml").write_text(yaml.safe_dump({
+            "spec_version": 1,
+            "name": slug,
+            "description": f"{mid} worker (API model via the W&B gateway).",
+            "executor": {"type": "omnigent", "model": mid, "config": {"harness": "openai-agents"}},
+            "prompt": (
+                f"You are {slug}, an API worker running on {mid}. Do the one scoped task you are "
+                "given — concisely and correctly, without wandering beyond it."
+            ),
+        }, sort_keys=False))
+        slugs.append(slug)
+    crew.mkdir(parents=True, exist_ok=True)
+    (crew / "config.yaml").write_text(yaml.safe_dump({
+        "spec_version": 1,
+        "name": "crew",
+        "description": "API-model crew — an orchestrator that delegates to your W&B model workers.",
+        "executor": {"type": "omnigent", "model": default_model, "config": {"harness": "openai-agents"}},
+        "spawn": True,
+        "prompt": (
+            "You are the crew orchestrator. Break the goal into scoped tasks and delegate each to the "
+            "right worker via sys_session_send, then synthesize their results. Your workers each run a "
+            "different API model: " + ", ".join(slugs) + "."
+        ),
+        "tools": {"agents": slugs},
+    }, sort_keys=False))
+    return len(slugs)
+
+
 def _install_api_models(user: str | None) -> dict:
     """Write every enabled Odysseus API endpoint into the bundled Omnigent as an
     OpenAI-compatible ``gateway`` provider (so all their models are available and
@@ -72,6 +135,7 @@ def _install_api_models(user: str | None) -> dict:
         providers: dict[str, dict] = {}
         default_model: str | None = None
         model_count = 0
+        all_model_ids: list[str] = []
         used: set[str] = set()
         for idx, ep in enumerate(endpoints):
             slug = _provider_slug(ep.name or ep.base_url)
@@ -80,6 +144,7 @@ def _install_api_models(user: str | None) -> dict:
             used.add(slug)
             ids = _endpoint_model_ids(ep)
             model_count += len(ids)
+            all_model_ids.extend(ids)
             pick = _pick_default_model(ids)
             if default_model is None and pick:
                 default_model = pick
@@ -112,7 +177,13 @@ def _install_api_models(user: str | None) -> dict:
         os.chmod(cfg_path, 0o600)
     except Exception:
         pass
-    return {"endpoints": len(providers), "models": model_count, "default_model": default_model}
+    workers = _generate_crew(all_model_ids, default_model)
+    return {
+        "endpoints": len(providers),
+        "models": model_count,
+        "default_model": default_model,
+        "workers": workers,
+    }
 
 
 def _providers() -> list[dict]:

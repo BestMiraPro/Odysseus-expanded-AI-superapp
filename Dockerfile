@@ -42,6 +42,11 @@ RUN pip install --no-cache-dir uv \
     && chmod -R a+rX /opt/uv \
     && rm -rf /root/.cache
 
+# Claude Code + Codex CLIs so their native harnesses are available as Omnigent
+# sub-agents alongside the API-model workers. Each still needs a one-time
+# interactive subscription login (the API/W&B workers need no login).
+RUN npm install -g @anthropic-ai/claude-code @openai/codex
+
 # Copy app code
 COPY . .
 
