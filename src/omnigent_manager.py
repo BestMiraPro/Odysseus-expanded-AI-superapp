@@ -78,13 +78,20 @@ class OmnigentManager:
             "hint": "Ready to launch from Omnigent." if command else missing_hint,
         }
 
-    def _run(self, args: list[str], timeout: float | None = None) -> OmnigentCommandResult:
+    def _run(
+        self,
+        args: list[str],
+        timeout: float | None = None,
+        env_extra: dict[str, str] | None = None,
+    ) -> OmnigentCommandResult:
         env = dict(os.environ)
         try:
             self._home.mkdir(parents=True, exist_ok=True)
             env["HOME"] = str(self._home)
         except Exception:
             pass
+        if env_extra:
+            env.update({k: str(v) for k, v in env_extra.items() if v})
         proc = subprocess.run(
             args,
             capture_output=True,
@@ -155,11 +162,20 @@ class OmnigentManager:
             "error": server.get("error"),
         }
 
-    def start(self) -> dict[str, Any]:
+    def restart(self, env_extra: dict[str, str] | None = None) -> dict[str, Any]:
+        # Built-in agents (the UI picker) seed only at server startup, so a
+        # config/agent change needs a fresh start to take effect.
+        try:
+            self.stop()
+        except Exception:
+            pass
+        return self.start(env_extra=env_extra)
+
+    def start(self, env_extra: dict[str, str] | None = None) -> dict[str, Any]:
         command = self._resolve_command()
         if not command:
             raise RuntimeError("Omnigent CLI not found on PATH")
-        result = self._run([command, "server", "start"], timeout=30)
+        result = self._run([command, "server", "start"], timeout=30, env_extra=env_extra)
         # Learn the URL Omnigent actually bound (it prints e.g. "Started
         # background server at http://127.0.0.1:6767") so the probe matches.
         match = re.search(r"https?://127\.0\.0\.1:\d+", f"{result.stdout}\n{result.stderr}")

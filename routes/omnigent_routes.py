@@ -113,6 +113,21 @@ def _generate_crew(model_ids: list[str], default_model: str | None) -> int:
     return len(slugs)
 
 
+def _builtin_agent_env() -> dict[str, str] | None:
+    """Env that registers the generated crew + per-model workers as Omnigent
+    built-in agents (the UI picker only lists built-ins, not ~/.omnigent/agents).
+    `OMNIGENT_BUILTIN_AGENT_DIRS` is os.pathsep-separated and read at server
+    startup."""
+    crew = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents" / "crew"
+    if not (crew / "config.yaml").exists():
+        return None
+    dirs = [str(crew)]
+    for w in sorted((crew / "agents").glob("*")):
+        if (w / "config.yaml").exists():
+            dirs.append(str(w))
+    return {"OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(dirs)}
+
+
 def _install_api_models(user: str | None) -> dict:
     """Write every enabled Odysseus API endpoint into the bundled Omnigent as an
     OpenAI-compatible ``gateway`` provider (so all their models are available and
@@ -342,8 +357,10 @@ def setup_omnigent_routes(
             api = _install_api_models(user)
         except Exception as exc:
             api = {"endpoints": 0, "models": 0, "error": str(exc)}
+        # Restart so the freshly-generated crew + workers seed as built-in
+        # agents (the picker only shows built-ins; they seed at startup).
         try:
-            data = manager.start()
+            data = manager.restart(env_extra=_builtin_agent_env())
         except Exception as exc:
             data = manager.status()
             data["error"] = str(exc)
