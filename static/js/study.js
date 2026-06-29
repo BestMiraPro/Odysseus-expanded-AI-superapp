@@ -158,6 +158,7 @@ function injectStyles() {
 .study-badge.q { color: var(--green, #4f9e60); border-color: currentColor; }
 .study-btn { background: none; border: 1px solid var(--border); color: var(--fg);
   border-radius: 7px; padding: 6px 12px; cursor: pointer; font-size: 12px; }
+a.study-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .study-btn:hover { background: rgba(128,128,128,0.12); }
 .study-btn.primary { border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); font-weight: 600; }
 .study-btn.danger { color: var(--red, #e05555); }
@@ -213,6 +214,14 @@ function injectStyles() {
 .study-conf button.sel { opacity: 1; border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); }
 .study-hint { border-left: 2px solid var(--accent, #5b8abf); padding: 6px 10px; margin: 8px 0;
   font-size: 12.5px; opacity: 0.85; background: rgba(91,138,191,0.06); border-radius: 0 6px 6px 0; }
+.study-ask { border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; margin-top: 14px;
+  background: rgba(91,138,191,0.04); }
+.study-ask-head { font-size: 11px; opacity: 0.7; margin-bottom: 6px; }
+.study-ask-thread { display: flex; flex-direction: column; gap: 6px; max-height: 260px;
+  overflow-y: auto; margin-bottom: 6px; }
+.study-ask-msg { font-size: 12.5px; line-height: 1.5; padding: 5px 8px; border-radius: 7px; }
+.study-ask-msg.student { background: rgba(128,128,128,0.10); align-self: flex-end; max-width: 85%; }
+.study-ask-msg.ai { background: rgba(91,138,191,0.10); align-self: flex-start; max-width: 92%; }
 .study-prereq { border: 1px dashed var(--border); border-radius: 9px; padding: 8px 12px;
   margin-bottom: 12px; background: rgba(128,128,128,0.05); }
 .study-prereq-title { font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase;
@@ -684,6 +693,14 @@ async function renderSubjects() {
       <input class="study-input" id="study-school" placeholder="e.g. Nova SBE (optional)" style="flex:1;max-width:320px;"
         title="Used to localize web searches for theory (language & sources) when a subject has no theory material. Optional.">
     </div>
+    <div class="study-form-row" style="margin-bottom:10px;">
+      <label class="study-subtle" for="study-order" style="white-space:nowrap;">Practice order</label>
+      <select class="study-input" id="study-order" style="flex:1;max-width:320px;"
+        title="How practice questions and card reviews are ordered.">
+        <option value="completed">New first — answered ones go last (default)</option>
+        <option value="review">Due reviews first (immediate review)</option>
+      </select>
+    </div>
     <div id="study-deck-list"></div>
   `;
   const list = el.querySelector('#study-deck-list');
@@ -712,6 +729,18 @@ async function renderSubjects() {
     jget('/api/prefs/study_school').then(d => { schoolInput.value = (d && d.value) || ''; }).catch(() => {});
     schoolInput.addEventListener('change', () => {
       jput('/api/prefs/study_school', { value: schoolInput.value.trim() }).catch(() => {});
+    });
+  }
+
+  // Per-user practice ordering (prefs store). "completed" sinks already-answered
+  // questions and cards behind every new/unseen one; default reviews due first.
+  const orderSel = el.querySelector('#study-order');
+  if (orderSel) {
+    jget('/api/prefs/study_order')
+      .then(d => { orderSel.value = (d && d.value) === 'review' ? 'review' : 'completed'; })
+      .catch(() => {});
+    orderSel.addEventListener('change', () => {
+      jput('/api/prefs/study_order', { value: orderSel.value }).catch(() => {});
     });
   }
   list.addEventListener('click', async (e) => {
@@ -978,33 +1007,17 @@ function openFileTab(fileId) {
   window.open(`${API}/api/upload/${encodeURIComponent(fileId)}?inline=1`, '_blank', 'noopener');
 }
 
-// The material file route serves PDFs and images only (a framed HTML upload
-// would run on our own origin), so everything else keeps opening in a tab.
-function _previewable(m) {
-  return !!m && !!m.file_id &&
-    (m.kind === 'pdf' || /\.(pdf|png|jpe?g|gif|webp|bmp|svg)$/i.test(m.name || ''));
+function _originalQuestionButton(q, small = false) {
+  const url = q?.original?.url;
+  if (!url) return '';
+  const title = q.original.page
+    ? `Open the original question on page ${q.original.page} in a new tab`
+    : 'Open the original question file in a new tab';
+  return `<a class="study-btn${small ? ' small' : ''}" href="${esc(url)}" target="_blank" rel="noopener" title="${esc(title)}">See original question</a>`;
 }
 
-// In-pane material viewer. PDFs and images are framed from the material's own
-// route, which is the one upload path allowed to be framed same-origin (see
-// SecurityHeadersMiddleware); the browser's built-in PDF viewer honours #page=N.
-// Anything it cannot render (or a blocked frame) falls back to a new tab.
-function openMaterialViewer(materialId, page, title) {
-  if (!materialId) return;
-  const src = `${API}/api/study/materials/${encodeURIComponent(materialId)}/file`
-    + (page ? `#page=${page}` : '');
-  const actions = `<button class="study-btn small" id="study-view-tab">Open in a tab</button>`;
-  const v = _viewerShell(title || 'Material', actions, `
-    <iframe id="study-view-frame" src="${esc(src)}" title="${esc(title || 'Material')}"
-      style="width:100%;height:min(78vh,900px);border:0;background:#fff;"></iframe>`);
-  v.querySelector('#study-view-tab').addEventListener('click', () => {
-    window.open(src, '_blank', 'noopener');
-  });
-}
-
-// Show a Markdown doc (study notes / subject overview) in the viewer, with a
-// Regenerate action. When none exists yet the viewer offers a Generate button
-// (no window.confirm — browsers may suppress it). `kind` is 'material' or 'deck'.
+// Generate-if-missing then show a Markdown doc (study notes / subject overview)
+// in the viewer, with a Regenerate action. `kind` is 'material' or 'deck'.
 async function _openMarkdownDoc({ title, getPath, postPath, field, confirmMsg, busyMsg }) {
   let r;
   try { r = await jget(getPath); }
@@ -1311,6 +1324,7 @@ function renderQuestionList() {
       <span class="front study-md" style="flex:2;">${_qhtml(q)}</span>
       <span class="study-state">${esc(q.topic || '')}${q.topic ? ' · ' : ''}${esc(q.difficulty)}
         · ${esc(q.state)}${q.state !== 'new' ? ` · due ${fmtDue(q.due)}` : ''}${q.lapses ? ` · ${q.lapses}✗` : ''}</span>
+      ${_originalQuestionButton(q, true)}
       <button class="study-btn small" data-qsusp="${q.id}" title="${q.suspended ? 'Unsuspend' : 'Suspend'}">${q.suspended ? '▶' : '⏸'}</button>
       <button class="study-btn small danger" data-qdel="${q.id}" title="Delete">✕</button>
     </div>`).join('')
@@ -1684,6 +1698,7 @@ async function startPractice(deckId = null, limit = 12, scope = null, mock = nul
                  consulted: false, consult: null, consultBusy: false,
                  prereqs: null, prereqsFor: null, prereqsBusy: false,
                  explainText: null, explainBusy: false,
+                 ask: [], askBusy: false,
                  log: [], startTs: Date.now(), qShownTs: Date.now() };
   renderPractice();
   try {
@@ -1868,7 +1883,8 @@ async function renderPractice() {
           ${p.mock ? '' : `
           <button class="study-btn" id="study-prac-hint" ${p.hints.length >= 3 || p.hintBusy ? 'disabled' : ''}>
             ${p.hintBusy ? 'Thinking…' : `Hint (${p.hints.length}/3)`}</button>
-          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>`}
+          ${_originalQuestionButton(q)}
+          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>
           <button class="study-btn" id="study-prac-skip">Skip</button>
           ${p.mock ? `<span style="flex:1;"></span><button class="study-btn" id="study-prac-endmock" title="Stop answering and predict your score">Finish early</button>` : ''}
         </div>` : `
@@ -1886,9 +1902,23 @@ async function renderPractice() {
           <button class="study-btn primary" id="study-prac-next">Next →</button>
           ${isMcq && !p.explainText ? `<button class="study-btn" id="study-prac-explain" ${p.explainBusy ? 'disabled' : ''}>${p.explainBusy ? 'Explaining…' : 'Explain options'}</button>` : ''}
           <button class="study-btn" id="study-prac-explain-further" title="Pull the underlying theory from your material, with where to review it">Explain further</button>
+          ${_originalQuestionButton(q)}
           <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it (free now that you've answered)">${consultLabel}</button>
           <button class="study-btn" id="study-prac-ask" title="Discuss this question with the Study agent (tutor grounded in your materials)">Ask the tutor</button>
         </div>`}
+
+      <div class="study-ask">
+        <div class="study-ask-head">${res
+          ? '💬 Ask AI — anything about this question'
+          : '💬 Ask AI — stuck? I’ll nudge you toward the answer (I won’t give it away)'}</div>
+        ${p.ask.length ? `<div class="study-ask-thread">${p.ask.map(m => `
+          <div class="study-ask-msg ${m.role} study-md">${m.role === 'student' ? esc(m.content) : _md(m.content)}</div>`).join('')}</div>` : ''}
+        <div class="study-form-row">
+          <input class="study-input" id="study-ask-input" style="flex:1;" ${p.askBusy ? 'disabled' : ''}
+            placeholder="${res ? 'Ask why, go deeper, clear a doubt…' : 'Ask for a hint or to clarify the question…'}">
+          <button class="study-btn" id="study-ask-send" ${p.askBusy ? 'disabled' : ''}>${p.askBusy ? '…' : 'Ask'}</button>
+        </div>
+      </div>
     </div>`;
 
   // handlers
@@ -1912,6 +1942,28 @@ async function renderPractice() {
       p.hints.push(h.hint);
     } catch (e) { toast(e.message, true); }
     p.hintBusy = false; renderPractice();
+  });
+
+  // Ask AI — Socratic coach before submit (never reveals the answer), full
+  // tutor after submit. Conversation lives in p.ask, reset per question.
+  const askInput = el.querySelector('#study-ask-input');
+  const doAsk = async () => {
+    const msg = (askInput?.value || '').trim();
+    if (!msg || p.askBusy) return;
+    const prior = p.ask.map(m => ({ role: m.role, content: m.content }));
+    p.ask.push({ role: 'student', content: msg });
+    p.askBusy = true; renderPractice();
+    try {
+      const r = await jpost(`/api/study/questions/${q.id}/ask`, {
+        message: msg, history: prior, answered: !!p.result, draft: p.answerDraft || '',
+      });
+      p.ask.push({ role: 'ai', content: r.reply || '(no reply)' });
+    } catch (e) { p.ask.push({ role: 'ai', content: '⚠️ ' + e.message }); }
+    p.askBusy = false; renderPractice();
+  };
+  el.querySelector('#study-ask-send')?.addEventListener('click', doAsk);
+  askInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doAsk(); }
   });
 
   el.querySelector('#study-prac-skip')?.addEventListener('click', () => {
@@ -1997,6 +2049,7 @@ function advancePractice() {
   p.hints = []; p.answerDraft = ''; p.explainText = null;
   p.consulted = false; p.consult = null; p.consultBusy = false;
   p.prereqs = null; p.prereqsFor = null; p.prereqsBusy = false;
+  p.ask = []; p.askBusy = false;
   p.qShownTs = Date.now();
   renderPractice();
 }

@@ -750,11 +750,8 @@ def _migrate_add_study_summary_columns():
             conn.execute("ALTER TABLE study_questions ADD COLUMN prereq_ids TEXT")
         if "context" not in q_cols:
             conn.execute("ALTER TABLE study_questions ADD COLUMN context TEXT")
-        if "page_count" not in mat_cols:
-            conn.execute("ALTER TABLE study_materials ADD COLUMN page_count INTEGER")
-        exam_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_exams)")]
-        if exam_cols and "deck_id" not in exam_cols:
-            conn.execute("ALTER TABLE study_exams ADD COLUMN deck_id TEXT")
+        if "source_page" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN source_page INTEGER")
         if "category" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
             # Backfill existing rows from the filename classifier (single source
@@ -1775,6 +1772,7 @@ class StudyQuestion(TimestampMixin, Base):
     explanation     = Column(Text, nullable=True)       # cached AI explanation (mcq)
     deep_explanation = Column(Text, nullable=True)      # cached "explain further" (theory + location)
     number          = Column(String, nullable=True)     # source part label ("16a"), for multi-part grouping
+    source_page     = Column(Integer, nullable=True)    # page of the original extracted question, when known
     prereq_ids      = Column(Text, nullable=True)        # JSON list of earlier-part question ids this part needs
     topic           = Column(String, nullable=True, index=True)
     difficulty      = Column(String, default="medium")  # easy | medium | hard

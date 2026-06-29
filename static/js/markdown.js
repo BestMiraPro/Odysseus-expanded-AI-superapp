@@ -142,6 +142,11 @@ function sanitizeAllowedHtml(html) {
   return out;
 }
 
+function renderSafeKatex(raw, displayMode) {
+  const html = katex.renderToString(raw.trim(), { displayMode, throwOnError: false });
+  return sanitizeAllowedHtml(html);
+}
+
 /**
  * Check if text has unclosed think tag
  */
@@ -594,7 +599,7 @@ export function mdToHtml(src, opts) {
       try {
         const raw = math.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
         const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
-        mathBlocks.push(katex.renderToString(raw.trim(), { displayMode: true, throwOnError: false }));
+        mathBlocks.push(renderSafeKatex(raw, true));
         return placeholder;
       } catch (e) { return match; }
     });
@@ -604,7 +609,7 @@ export function mdToHtml(src, opts) {
       try {
         const raw = math.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
         const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
-        mathBlocks.push(katex.renderToString(raw.trim(), { displayMode: false, throwOnError: false }));
+        mathBlocks.push(renderSafeKatex(raw, false));
         return placeholder;
       } catch (e) { return match; }
     });
@@ -613,7 +618,7 @@ export function mdToHtml(src, opts) {
       try {
         const raw = math.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
         const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
-        mathBlocks.push(katex.renderToString(raw.trim(), { displayMode: true, throwOnError: false }));
+        mathBlocks.push(renderSafeKatex(raw, true));
         return placeholder;
       } catch (e) { return match; }
     });
@@ -622,7 +627,7 @@ export function mdToHtml(src, opts) {
       try {
         const raw = math.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
         const placeholder = `___MATH_BLOCK_${mathBlocks.length}___`;
-        mathBlocks.push(katex.renderToString(raw.trim(), { displayMode: false, throwOnError: false }));
+        mathBlocks.push(renderSafeKatex(raw, false));
         return placeholder;
       } catch (e) { return match; }
     });

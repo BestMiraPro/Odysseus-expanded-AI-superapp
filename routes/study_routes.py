@@ -54,6 +54,8 @@ from core.database import (
 )
 from src.study_ai import (
     ADD_CONTEXT_SYSTEM,
+    ASK_COACH_SYSTEM,
+    ASK_TUTOR_SYSTEM,
     AUTHOR_QUESTIONS_SYSTEM,
     DISCOVER_QUESTIONS_SYSTEM,
     EXPLAIN_FURTHER_SYSTEM,
@@ -75,6 +77,7 @@ from src.study_ai import (
     canonical_qnum,
     chunk_material,
     classify_material,
+    canonical_qnum,
     dedupe_questions,
     missing_question_numbers,
     normalize_questions,
@@ -91,6 +94,8 @@ from src.study_ai import (
 from src.study_vision import text_layer_is_thin
 from src.auth_helpers import get_current_user
 from src import fsrs
+from src import study_service
+from src.study_source import build_original_question_link, infer_source_page
 from src.study_plan import generate_plan
 
 logger = logging.getLogger(__name__)
@@ -224,6 +229,13 @@ class AttemptIn(BaseModel):
 
 class HintIn(BaseModel):
     level: int = 1
+
+
+class AskIn(BaseModel):
+    message: str
+    history: List[Dict] = []      # [{role: "student"|"ai", content: str}, ...]
+    answered: bool = False        # have they submitted/checked yet?
+    draft: Optional[str] = None   # their current/submitted answer text
 
 
 # ---------------------------------------------------------------------------
@@ -1019,7 +1031,8 @@ def _question_fsrs_dict(q: StudyQuestion) -> Dict:
     }
 
 
-def _question_to_dict(q: StudyQuestion, with_answer: bool = True) -> Dict:
+def _question_to_dict(q: StudyQuestion, with_answer: bool = True,
+                      original: Optional[Dict] = None) -> Dict:
     out = {
         "id": q.id, "deck_id": q.deck_id, "material_id": q.material_id,
         "qtype": q.qtype, "question": q.question,
@@ -1030,6 +1043,8 @@ def _question_to_dict(q: StudyQuestion, with_answer: bool = True) -> Dict:
         "state": q.state or "new", "due": _iso(q.due),
         "reps": q.reps or 0, "lapses": q.lapses or 0,
         "number": q.number,
+        "source_page": q.source_page,
+        "original": original,
         "has_prereqs": bool(q.prereq_ids and q.prereq_ids != "[]"),
     }
     if with_answer:
@@ -1037,6 +1052,27 @@ def _question_to_dict(q: StudyQuestion, with_answer: bool = True) -> Dict:
         out["reference"] = q.reference
         out["explanation"] = q.explanation
     return out
+
+
+def _question_original_link(q: StudyQuestion,
+                            material: Optional[StudyMaterial]) -> Optional[Dict]:
+    if not material or not material.file_id or q.origin != "extracted":
+        return None
+    page = q.source_page
+    if not page and material.content:
+        page = infer_source_page(material.content, number=q.number, question=q.question)
+    return build_original_question_link(material.file_id, page=page, name=material.name)
+
+
+def _question_original_links(db, rows: List[StudyQuestion]) -> Dict[str, Optional[Dict]]:
+    material_ids = sorted({r.material_id for r in rows if r.material_id})
+    if not material_ids:
+        return {}
+    materials = {
+        m.id: m for m in
+        db.query(StudyMaterial).filter(StudyMaterial.id.in_(material_ids)).all()
+    }
+    return {r.id: _question_original_link(r, materials.get(r.material_id)) for r in rows}
 
 
 def _same_study_question(a, b) -> bool:
@@ -1316,6 +1352,24 @@ def _coverage_report(manifest: List[Dict], collected: List[Dict]) -> Optional[Di
             "missing": [m["number"] for m in missing]}
 
 
+def _manifest_page_map(manifest: List[Dict]) -> Dict[str, int]:
+    return {canonical_qnum(m.get("number")): m.get("page")
+            for m in (manifest or []) if canonical_qnum(m.get("number"))}
+
+
+def _attach_source_pages(items: List[Dict], page_by_number: Dict[str, int],
+                         *, fallback_page: Optional[int] = None) -> List[Dict]:
+    for q in items:
+        if q.get("source_page"):
+            continue
+        page = page_by_number.get(canonical_qnum(q.get("number"))) if q.get("number") else None
+        if not page and fallback_page:
+            page = fallback_page
+        if page:
+            q["source_page"] = page
+    return items
+
+
 async def _extract_questions_vision(owner, mode: str, types: List[str],
                                     pdf_path: str) -> tuple:
     """Render PDF pages and extract questions via a vision model.
@@ -1352,6 +1406,7 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
 
     manifest, answer_key_pages = await _discover_questions_vision(owner, page_urls) \
         if mode == "extract" else ([], [])
+    page_by_number = _manifest_page_map(manifest)
     n_pages = len(page_urls)
     key_set = {p for p in answer_key_pages if 1 <= p <= n_pages}
 
@@ -1398,7 +1453,13 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
                 raw_count += len(value)
             elif isinstance(value, dict):
                 raw_count += len(value.get("questions") or [value])
-            collected.extend(normalize_questions(value))
+            fresh = normalize_questions(value)
+            _attach_source_pages(
+                fresh,
+                page_by_number,
+                fallback_page=nums[0] if len(nums) == 1 else None,
+            )
+            collected.extend(fresh)
 
     # Coverage pass: re-request exactly the questions the manifest says were
     # missed, attaching each one's start page (plus the next, for spillover)
@@ -1423,6 +1484,7 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
             try:
                 value = await _llm_json_vision(owner, system, instruction, urls)
                 fresh = normalize_questions(value)
+                _attach_source_pages(fresh, page_by_number, fallback_page=page_num)
                 raw_count += len(fresh)
                 collected.extend(fresh)
             except HTTPException as e:
@@ -2725,6 +2787,42 @@ def setup_study_routes():
     def _owner(request: Request) -> Optional[str]:
         return get_current_user(request)
 
+    def _new_introduced_today(db, user, deck_id: str) -> int:
+        day_start = _utcnow_naive().replace(hour=0, minute=0, second=0, microsecond=0)
+        q = db.query(StudyReview).filter(
+            StudyReview.deck_id == deck_id,
+            StudyReview.state_before == "new",
+            StudyReview.reviewed_at >= day_start,
+        )
+        if user is not None:
+            q = q.filter(StudyReview.owner == user)
+        return q.count()
+
+    def _deck_counts(db, user, deck: StudyDeck) -> Dict:
+        now = _utcnow_naive()
+        base = db.query(StudyCard).filter(
+            StudyCard.deck_id == deck.id, StudyCard.suspended == False)  # noqa: E712
+        if user is not None:
+            base = base.filter(StudyCard.owner == user)
+        due = base.filter(StudyCard.state != "new", StudyCard.due <= now).count()
+        new_total = base.filter(StudyCard.state == "new").count()
+        cap = max(0, (deck.new_per_day or 0) - _new_introduced_today(db, user, deck.id))
+        qbase = db.query(StudyQuestion).filter(
+            StudyQuestion.deck_id == deck.id,
+            StudyQuestion.suspended == False)  # noqa: E712
+        if user is not None:
+            qbase = qbase.filter(StudyQuestion.owner == user)
+        return {
+            "due_count": due,
+            "new_available": min(new_total, cap),
+            "new_total": new_total,
+            "total": base.count(),
+            "q_total": qbase.count(),
+            "q_due": qbase.filter(StudyQuestion.state != "new",
+                                  StudyQuestion.due <= now).count(),
+            "q_new": qbase.filter(StudyQuestion.state == "new").count(),
+        }
+
     # ------------------------------------------------------------------ decks
 
     @router.get("/decks")
@@ -2773,7 +2871,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            deck = _get_deck(db, deck_id, user)
+            deck = study_service.get_deck(db, deck_id, user)
             if body.name is not None:
                 deck.name = body.name.strip() or deck.name
             if body.description is not None:
@@ -2796,7 +2894,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            deck = _get_deck(db, deck_id, user)
+            deck = study_service.get_deck(db, deck_id, user)
             db.query(StudyReview).filter(StudyReview.deck_id == deck.id).delete()
             db.query(StudyAttempt).filter(StudyAttempt.deck_id == deck.id).delete()
             db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck.id).delete()
@@ -2814,7 +2912,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            deck = _get_deck(db, deck_id, user)
+            deck = study_service.get_deck(db, deck_id, user)
             query = db.query(StudyCard).filter(StudyCard.deck_id == deck.id)
             if user is not None:
                 query = query.filter(StudyCard.owner == user)
@@ -2832,7 +2930,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            deck = _get_deck(db, deck_id, user)
+            deck = study_service.get_deck(db, deck_id, user)
             created = []
             now = _utcnow_naive()
             for c in body.cards:
@@ -2858,7 +2956,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            card = _get_card(db, card_id, user)
+            card = study_service.get_card(db, card_id, user)
             if body.front is not None:
                 card.front = body.front.strip() or card.front
             if body.back is not None:
@@ -2870,7 +2968,7 @@ def setup_study_routes():
             if body.suspended is not None:
                 card.suspended = body.suspended
             if body.deck_id is not None:
-                _get_deck(db, body.deck_id, user)  # ownership check
+                study_service.get_deck(db, body.deck_id, user)  # ownership check
                 card.deck_id = body.deck_id
             db.commit()
             return _card_to_dict(card)
@@ -2882,7 +2980,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            card = _get_card(db, card_id, user)
+            card = study_service.get_card(db, card_id, user)
             db.delete(card)
             db.commit()
             return {"ok": True}
@@ -2899,7 +2997,7 @@ def setup_study_routes():
         db = SessionLocal()
         try:
             now = _utcnow_naive()
-            decks = ([_get_deck(db, deck_id, user)] if deck_id else
+            decks = ([study_service.get_deck(db, deck_id, user)] if deck_id else
                      db.query(StudyDeck).filter(
                          StudyDeck.archived == False,  # noqa: E712
                          *( [StudyDeck.owner == user] if user is not None else [] )
@@ -2922,9 +3020,13 @@ def setup_study_routes():
                     .order_by(StudyCard.created_at.asc()).limit(cap).all() if cap else []
                 for c in learning + review + new:
                     queue.append(_card_to_dict(c, with_preview=True))
-            # Stable global order: learning/relearning, review, new — already
-            # per-deck; interleave decks by sorting on (phase, due).
-            phase_rank = {"learning": 0, "relearning": 0, "review": 1, "new": 2}
+            # Default: already-seen cards (learning/review) sink behind new ones.
+            # The per-user `study_order` pref = "review" restores the classic
+            # spaced-repetition order (due reviews first, then new).
+            if _read_pref(user, "study_order") == "review":
+                phase_rank = {"learning": 0, "relearning": 0, "review": 1, "new": 2}
+            else:
+                phase_rank = {"new": 0, "learning": 1, "relearning": 1, "review": 2}
             queue.sort(key=lambda c: (phase_rank.get(c["state"], 3), c["due"] or ""))
             return {"queue": queue[:limit], "total": len(queue)}
         finally:
@@ -2937,8 +3039,8 @@ def setup_study_routes():
             raise HTTPException(400, "rating must be 1-4")
         db = SessionLocal()
         try:
-            card = _get_card(db, card_id, user)
-            deck = _get_deck(db, card.deck_id, user)
+            card = study_service.get_card(db, card_id, user)
+            deck = study_service.get_deck(db, card.deck_id, user)
             state_before = card.state or "new"
             result = fsrs.schedule(
                 _card_fsrs_dict(card), body.rating,
@@ -2995,7 +3097,94 @@ def setup_study_routes():
                               "back": str(item["back"]).strip()})
         if not cards:
             raise HTTPException(502, "No usable cards in model reply. Try again.")
-        return {"cards": cards, "source": source}
+        return {"cards": cards}
+
+    @router.post("/ai/quiz")
+    async def ai_quiz(request: Request, body: QuizIn):
+        """Free-recall quiz: from a deck (no LLM needed) or from pasted text (LLM)."""
+        user = _owner(request)
+        count = max(1, min(20, body.count))
+        if body.deck_id:
+            db = SessionLocal()
+            try:
+                deck = study_service.get_deck(db, body.deck_id, user)
+                q = db.query(StudyCard).filter(
+                    StudyCard.deck_id == deck.id,
+                    StudyCard.suspended == False)  # noqa: E712
+                if user is not None:
+                    q = q.filter(StudyCard.owner == user)
+                # Prioritize due/lapsed cards — quiz the weak spots first.
+                now = _utcnow_naive()
+                due = q.filter(StudyCard.state != "new", StudyCard.due <= now) \
+                    .order_by(StudyCard.due.asc()).limit(count).all()
+                rest_needed = count - len(due)
+                rest = []
+                if rest_needed > 0:
+                    exclude = [c.id for c in due]
+                    rq = q
+                    if exclude:
+                        rq = rq.filter(~StudyCard.id.in_(exclude))
+                    rest = rq.order_by(StudyCard.lapses.desc(),
+                                       StudyCard.created_at.desc()) \
+                        .limit(rest_needed).all()
+                cards = due + rest
+                if not cards:
+                    raise HTTPException(400, "Deck has no cards to quiz from.")
+                return {"questions": [
+                    {"question": c.front, "reference": c.back, "card_id": c.id}
+                    for c in cards
+                ], "source": "deck"}
+            finally:
+                db.close()
+        text = (body.text or "").strip()
+        if len(text) < 30:
+            raise HTTPException(400, "Pick a deck or paste source material.")
+        prompt = (f"Write {count} free-recall questions from this material.\n\n"
+                  f"--- MATERIAL ---\n{text[:24000]}")
+        value = await _llm_json(user, QUIZ_AUTHOR_SYSTEM, prompt,
+                                temperature=0.5, max_tokens=12000,
+                                timeout=180, thinking_off=True)
+        if isinstance(value, dict):
+            value = value.get("questions") or [value]
+        questions = []
+        for item in (value if isinstance(value, list) else []):
+            if isinstance(item, dict) and item.get("question") and item.get("reference"):
+                questions.append({"question": str(item["question"]).strip(),
+                                  "reference": str(item["reference"]).strip(),
+                                  "card_id": None})
+        if not questions:
+            raise HTTPException(502, "No usable questions in model reply. Try again.")
+        return {"questions": questions, "source": "ai"}
+
+    @router.post("/ai/grade")
+    async def ai_grade(request: Request, body: GradeIn):
+        user = _owner(request)
+        if not body.answer.strip():
+            return {"score": 0, "verdict": "incorrect",
+                    "feedback": "No answer given. Attempt a recall before checking — "
+                                "even a wrong attempt strengthens the memory more than peeking.",
+                    "followup": None}
+        prompt = (f"QUESTION:\n{body.question.strip()}\n\n"
+                  f"REFERENCE ANSWER:\n{body.reference.strip()}\n\n"
+                  f"LEARNER'S ANSWER:\n{body.answer.strip()[:8000]}")
+        # Thinking stays ON for grading — careful rubric comparison benefits
+        # from reasoning; the budget covers the hidden tokens plus the JSON.
+        value = await _llm_json(user, GRADER_SYSTEM, prompt,
+                                temperature=0.2, max_tokens=8000, timeout=120)
+        if not isinstance(value, dict):
+            raise HTTPException(502, "Model reply was not a grade object. Try again.")
+        score = value.get("score")
+        try:
+            score = max(0, min(100, int(score)))
+        except (TypeError, ValueError):
+            score = 0
+        verdict = value.get("verdict")
+        if verdict not in ("correct", "partial", "incorrect"):
+            verdict = "correct" if score >= 85 else ("partial" if score >= 40 else "incorrect")
+        return {"score": score, "verdict": verdict,
+                "feedback": str(value.get("feedback") or "").strip(),
+                "followup": (str(value.get("followup")).strip()
+                             if value.get("followup") else None)}
 
     # ------------------------------------------------------------------ exams / plans
 
@@ -3042,7 +3231,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            exam = _get_exam(db, exam_id, user)
+            exam = study_service.get_exam(db, exam_id, user)
             if body.title is not None:
                 exam.title = body.title.strip() or exam.title
             if body.exam_date is not None:
@@ -3073,7 +3262,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            exam = _get_exam(db, exam_id, user)
+            exam = study_service.get_exam(db, exam_id, user)
             db.delete(exam)
             db.commit()
             return {"ok": True}
@@ -3085,7 +3274,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            exam = _get_exam(db, exam_id, user)
+            exam = study_service.get_exam(db, exam_id, user)
             topics = json.loads(exam.topics) if exam.topics else []
             try:
                 plan = generate_plan(
@@ -3108,7 +3297,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            exam = _get_exam(db, exam_id, user)
+            exam = study_service.get_exam(db, exam_id, user)
             done = set(json.loads(exam.done_blocks) if exam.done_blocks else [])
             if body.key in done:
                 done.discard(body.key)
@@ -3176,23 +3365,58 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            deck = _get_deck(db, deck_id, user)
-            return {"materials": material_rows_with_counts(db, deck.id, user)}
+            deck = study_service.get_deck(db, deck_id, user)
+            q = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck.id)
+            if user is not None:
+                q = q.filter(StudyMaterial.owner == user)
+            return {"materials": [_material_to_dict(m) for m in
+                                  q.order_by(StudyMaterial.created_at.desc()).all()]}
         finally:
             db.close()
 
     @router.post("/decks/{deck_id}/materials")
     def create_material(request: Request, deck_id: str, body: MaterialCreate):
         """Attach source material: pasted text or a previously uploaded file."""
-        return create_material_record(_owner(request), deck_id, name=body.name,
-                                      text=body.text, file_id=body.file_id)
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            deck = study_service.get_deck(db, deck_id, user)
+            if body.file_id:
+                kind = "pdf" if body.file_id.lower().endswith(".pdf") else "file"
+                name = (body.name or body.file_id).strip()
+                try:
+                    text = _extract_file_text(body.file_id, user)
+                except HTTPException as e:
+                    # Scanned/image-only PDFs have no text layer - keep the
+                    # material anyway; vision extraction reads the pages.
+                    if kind == "pdf" and e.status_code == 422:
+                        text = ""
+                    else:
+                        raise
+            else:
+                text = (body.text or "").strip()
+                kind = "text"
+                name = (body.name or "").strip() or (text[:48] + "…" if len(text) > 48 else text[:48])
+            if len(text) < 30 and kind != "pdf":
+                raise HTTPException(400, "Provide more material (at least a paragraph).")
+            m = StudyMaterial(
+                id=str(uuid.uuid4()), owner=user, deck_id=deck.id,
+                name=name[:200], kind=kind, file_id=body.file_id,
+                content=text, char_count=len(text),
+                category=classify_material(name),   # auto-tag on upload; user can change it
+            )
+            db.add(m)
+            db.commit()
+            return _material_to_dict(m)
+        finally:
+            db.close()
 
     @router.delete("/materials/{material_id}")
     def delete_material(request: Request, material_id: str, with_questions: bool = False):
         user = _owner(request)
         db = SessionLocal()
         try:
-            m = _get_material(db, material_id, user)
+            m = study_service.get_material(db, material_id, user)
             if with_questions:
                 db.query(StudyQuestion).filter(StudyQuestion.material_id == m.id).delete()
             db.delete(m)
@@ -3210,7 +3434,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            m = _get_material(db, material_id, user)
+            m = study_service.get_material(db, material_id, user)
             m.category = body.category
             db.commit()
             return {"ok": True, "category": m.category}
@@ -3227,7 +3451,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            m = _get_material(db, material_id, user)
+            m = study_service.get_material(db, material_id, user)
             if not m.file_id:
                 raise HTTPException(400, "This material is pasted text, not a file.")
             file_id = m.file_id
@@ -3236,7 +3460,7 @@ def setup_study_routes():
         text = _extract_file_text(file_id, user)  # max_chars=None -> full text
         db = SessionLocal()
         try:
-            m = _get_material(db, material_id, user)
+            m = study_service.get_material(db, material_id, user)
             before = m.char_count or 0
             m.content = text
             m.char_count = len(text)
@@ -3260,7 +3484,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            _get_material(db, material_id, user)  # ownership check
+            study_service.get_material(db, material_id, user)  # ownership check
         finally:
             db.close()
         path = os.path.join(_study_figures_dir(material_id), f"{int(idx)}.jpg")
@@ -3275,34 +3499,376 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            m = _get_material(db, material_id, user)
+            m = study_service.get_material(db, material_id, user)
             return {"summary": m.summary or "", "name": m.name, "file_id": m.file_id}
         finally:
             db.close()
 
     @router.post("/materials/{material_id}/notes")
     async def generate_material_notes(request: Request, material_id: str):
-        return await run_generate_notes(_owner(request), material_id)
+        """Generate (or regenerate) consultable study notes for one material:
+        a Markdown summary from the full text, plus a Key-figures section with
+        figures pulled from the source PDF and cited to their page."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            m = study_service.get_material(db, material_id, user)
+            content = (m.content or "").strip()
+            name, file_id, kind = m.name, m.file_id, m.kind
+        finally:
+            db.close()
+        if len(content) < 200:
+            raise HTTPException(400, "Not enough text in this material to write "
+                                     "notes. If it is a scanned PDF, run vision "
+                                     "extraction or re-extract its text first.")
+        notes = await _llm_text(
+            user, STUDY_NOTES_SYSTEM,
+            f"Material name: {name}\n\n--- MATERIAL ---\n{content[:120000]}",
+            temperature=0.3, max_tokens=8000, timeout=240)
+
+        figures_md = ""
+        pdf_path = None
+        if file_id and (kind == "pdf" or str(file_id).lower().endswith(".pdf")):
+            try:
+                pdf_path = _resolve_uploaded_file(file_id)
+            except HTTPException:
+                pdf_path = None
+        if pdf_path:
+            figures_md = await _build_figures_section(user, material_id, file_id, pdf_path)
+
+        full = notes.strip() + figures_md
+        db = SessionLocal()
+        try:
+            m = study_service.get_material(db, material_id, user)
+            m.summary = full
+            db.commit()
+        finally:
+            db.close()
+        return {"summary": full, "has_figures": bool(figures_md)}
 
     @router.get("/decks/{deck_id}/overview")
     def get_deck_overview(request: Request, deck_id: str):
         user = _owner(request)
         db = SessionLocal()
         try:
-            deck = _get_deck(db, deck_id, user)
+            deck = study_service.get_deck(db, deck_id, user)
             return {"overview": deck.overview or ""}
         finally:
             db.close()
 
     @router.post("/decks/{deck_id}/overview")
     async def generate_deck_overview(request: Request, deck_id: str):
-        return await run_generate_overview(_owner(request), deck_id)
+        """Generate a short subject overview from the chapter notes (preferred)
+        or raw material text, tying the chapters together."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            deck = study_service.get_deck(db, deck_id, user)
+            deck_name = deck.name
+            q = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
+            if user is not None:
+                q = q.filter(StudyMaterial.owner == user)
+            parts = []
+            for m in q.order_by(StudyMaterial.created_at.asc()).all():
+                src = (m.summary or m.content or "")[:4000].strip()
+                if src:
+                    parts.append(f"### {m.name}\n{src}")
+        finally:
+            db.close()
+        if not parts:
+            raise HTTPException(400, "Add materials (and ideally generate chapter "
+                                     "notes) before generating a subject overview.")
+        prompt = (f"Subject: {deck_name}\n\n" + "\n\n".join(parts))[:60000]
+        overview = await _llm_text(user, SUBJECT_OVERVIEW_SYSTEM, prompt,
+                                   temperature=0.3, max_tokens=4000, timeout=180)
+        db = SessionLocal()
+        try:
+            deck = study_service.get_deck(db, deck_id, user)
+            deck.overview = overview
+            db.commit()
+        finally:
+            db.close()
+        return {"overview": overview}
 
     @router.post("/materials/{material_id}/extract")
     async def extract_questions(request: Request, material_id: str, body: ExtractIn):
-        """AI question extraction (see run_extraction)."""
-        return await run_extraction(_owner(request), material_id, mode=body.mode,
-                                    types=body.types, count=body.count, vision=body.vision)
+        """AI question extraction: material text -> saved question bank items.
+
+        mode "extract": pull the actual questions out of past papers/problem
+        sets, faithfully. mode "author": write new exam-style questions from
+        notes. Long materials are chunked; partial results are kept (JSON
+        repair recovers complete objects from malformed replies).
+        """
+        user = _owner(request)
+        mode = body.mode if body.mode in ("extract", "author") else "extract"
+        types = [t for t in (body.types or ["mcq", "open"]) if t in ("mcq", "open")] or ["mcq", "open"]
+        db = SessionLocal()
+        try:
+            m = study_service.get_material(db, material_id, user)
+            deck_id = m.deck_id
+            content = m.content or ""
+            file_id = m.file_id
+            kind = m.kind
+        finally:
+            db.close()
+
+        # Locate the original PDF (vision mode and the auto-fallback need it).
+        pdf_path = None
+        if file_id and (kind == "pdf" or str(file_id).lower().endswith(".pdf")):
+            try:
+                pdf_path = _resolve_uploaded_file(file_id)
+            except HTTPException:
+                pdf_path = None
+
+        # Thin text layer (formula images / scans): go vision-first instead of
+        # wasting a text pass on cover-page scraps.
+        auto_vision = False
+        if pdf_path and not body.vision:
+            try:
+                from src.study_vision import pdf_page_count, text_layer_is_thin
+                auto_vision = text_layer_is_thin(len(content), pdf_page_count(pdf_path))
+            except Exception:
+                auto_vision = False
+
+        system = EXTRACT_QUESTIONS_SYSTEM if mode == "extract" else AUTHOR_QUESTIONS_SYSTEM
+        type_note = ("Only produce questions of type: " + ", ".join(types) + ".") \
+            if len(types) == 1 else ""
+
+        async def _run_text_pass(text_chunks: List[str]) -> tuple:
+            """Per-chunk text extraction. Returns (collected, raw_count, errors)."""
+            per_chunk = (max(3, min(40, body.count) // len(text_chunks) + 1)
+                         if mode == "author" else None)
+            t_collected: List[Dict] = []
+            t_raw = 0
+            t_errors = 0
+            for i, chunk in enumerate(text_chunks):
+                if mode == "author":
+                    instruction = (f"Write about {per_chunk} questions from this material "
+                                   f"(part {i + 1}/{len(text_chunks)}). {type_note}")
+                else:
+                    instruction = (f"Extract every practice question from this material "
+                                   f"(part {i + 1}/{len(text_chunks)}). {type_note}")
+                value = None
+                for attempt in range(2):
+                    strict = "" if attempt == 0 else (
+                        "\n\nIMPORTANT: your previous reply was not valid JSON. Reply with "
+                        "ONLY the JSON array - it must start with [ and end with ]. "
+                        "No prose, no markdown, no explanations.")
+                    try:
+                        value = await _llm_json(user, system,
+                                                f"{instruction}{strict}\n\n--- MATERIAL ---\n{chunk}",
+                                                temperature=0.2 if mode == "extract" else 0.5,
+                                                max_tokens=EXTRACTION_MAX_TOKENS,
+                                                timeout=300, thinking_off=True)
+                        break
+                    except HTTPException as e:
+                        if e.status_code == 503:
+                            raise  # no model configured — fail loudly, not partially
+                        logger.warning("study extract: chunk %d attempt %d failed: %s",
+                                       i, attempt + 1, e.detail)
+                        if attempt == 1:
+                            t_errors += 1
+                if value is not None:
+                    if isinstance(value, list):
+                        t_raw += len(value)
+                    elif isinstance(value, dict):
+                        t_raw += len(value.get("questions") or [value])
+                    t_collected.extend(normalize_questions(value))
+            return t_collected, t_raw, t_errors
+
+        def _finalize(items: List[Dict]) -> List[Dict]:
+            """Type-filter, de-duplicate, and (in extract mode) drop conclusion-
+            style 'questions' that leak their own answer."""
+            qs = dedupe_questions([q for q in items if q["qtype"] in types])
+            if mode == "extract":
+                qs = [q for q in qs if not question_is_conclusion(q)]
+            return qs
+
+        used_vision = False
+        coverage = None
+        if body.vision or auto_vision:
+            if not pdf_path:
+                raise HTTPException(400, "Vision extraction needs the original PDF "
+                                         "file. Re-upload the PDF to this subject.")
+            collected, raw_count, n_batches, errors, coverage = \
+                await _extract_questions_vision(user, mode, types, pdf_path)
+            used_vision = True
+            chunks = [None] * n_batches  # for the response chunk count
+        else:
+            chunks = chunk_material(content)
+            if not chunks and pdf_path:
+                # No text layer at all - skip straight to vision.
+                collected, raw_count, n_batches, errors, coverage = \
+                    await _extract_questions_vision(user, mode, types, pdf_path)
+                used_vision = True
+                chunks = [None] * n_batches
+            elif not chunks:
+                raise HTTPException(400, "Material has no text to extract from.")
+            else:
+                collected, raw_count, errors = await _run_text_pass(chunks)
+                # Coverage pass (text): compare against a discovery manifest
+                # and re-request anything missed in one targeted call.
+                if mode == "extract" and collected:
+                    manifest = await _discover_questions_text(user, content)
+                    page_by_number = _manifest_page_map(manifest)
+                    _attach_source_pages(collected, page_by_number)
+                    coverage = _coverage_report(manifest, collected)
+                    if coverage and coverage["missing"]:
+                        nums = ", ".join(coverage["missing"])
+                        logger.info("study coverage: re-requesting question(s) %s "
+                                    "(text)", nums)
+                        try:
+                            value = await _llm_json(
+                                user, system,
+                                f"A previous pass missed some questions. Extract "
+                                f"ONLY question(s) {nums} from this material, "
+                                f"faithfully and completely. {type_note}\n\n"
+                                f"--- MATERIAL ---\n{content[:40000]}",
+                                temperature=0.2, max_tokens=EXTRACTION_MAX_TOKENS,
+                                timeout=300, thinking_off=True)
+                            fresh = normalize_questions(value)
+                            _attach_source_pages(fresh, page_by_number)
+                            raw_count += len(fresh)
+                            collected.extend(fresh)
+                            coverage = _coverage_report(manifest, collected)
+                        except HTTPException as e:
+                            if e.status_code == 503:
+                                raise
+                            logger.warning("study coverage: targeted text pass "
+                                           "failed: %s", e.detail)
+
+        questions = _finalize(collected)
+
+        # Auto-fallback: text extraction found nothing usable but we have the
+        # original PDF — its text layer is probably thin (formula images,
+        # scans). Try vision before giving up.
+        if not questions and not used_vision and pdf_path:
+            logger.info("study extract: text pass empty for material %s — "
+                        "falling back to vision extraction", material_id)
+            try:
+                v_collected, v_raw, v_batches, v_errors, v_coverage = \
+                    await _extract_questions_vision(user, mode, types, pdf_path)
+                if v_collected:
+                    collected, raw_count, errors = v_collected, v_raw, v_errors
+                    chunks = [None] * v_batches
+                    used_vision = True
+                    coverage = v_coverage
+                    questions = _finalize(collected)
+            except HTTPException as e:
+                logger.warning("study extract: vision fallback unavailable: %s", e.detail)
+
+        # Mirror fallback: vision found nothing usable but the material HAS a
+        # text layer (e.g. the vision model can't read images, or the user hit
+        # "Extract (vision)" on a text-rich PDF). Try text before giving up.
+        if not questions and used_vision:
+            text_chunks = chunk_material(content)
+            if text_chunks:
+                logger.info("study extract: vision pass empty for material %s — "
+                            "falling back to text extraction", material_id)
+                try:
+                    t_collected, t_raw, t_errors = await _run_text_pass(text_chunks)
+                    if t_collected:
+                        collected, raw_count, errors = t_collected, t_raw, t_errors
+                        chunks = text_chunks
+                        used_vision = False
+                        coverage = None  # manifest came from the failed pass
+                        questions = _finalize(collected)
+                except HTTPException as e:
+                    logger.warning("study extract: text fallback failed: %s", e.detail)
+
+        if mode == "extract" and questions:
+            for q in questions:
+                if not q.get("source_page"):
+                    page = infer_source_page(
+                        content,
+                        number=q.get("number"),
+                        question=q.get("question"),
+                    )
+                    if page:
+                        q["source_page"] = page
+
+        if not questions:
+            if errors >= len(chunks):
+                detail = ("Every chunk failed: the model's replies were empty or "
+                          "not parseable as JSON (the server log has the raw "
+                          "replies). Empty replies usually mean the reply was "
+                          "truncated mid-reasoning; retry, or switch the Study "
+                          "model (the model selector in the top bar).")
+            elif raw_count == 0:
+                detail = ("The model returned valid JSON but found no questions in "
+                          "this material. If it is notes rather than an exam, use "
+                          "'Author questions' instead of 'Extract questions'.")
+            elif types != ["mcq", "open"]:
+                detail = (f"{raw_count} question(s) were found but none matched the "
+                          f"requested type filter ({', '.join(types)}).")
+            else:
+                detail = (f"The model found {raw_count} question(s) but none were "
+                          "usable (e.g. MCQs whose correct answer could not be "
+                          "identified). Try again or switch the Study model.")
+            raise HTTPException(502, detail)
+
+        db = SessionLocal()
+        try:
+            now = _utcnow_naive()
+            # Cross-run dedupe: never re-add a question already in this deck, so
+            # re-running extraction (or extracting overlapping materials) tops up
+            # the bank instead of duplicating it.
+            existing_keys = {
+                question_key(text) for (text,) in
+                db.query(StudyQuestion.question)
+                  .filter(StudyQuestion.deck_id == deck_id).all()
+            }
+            saved = []
+            duplicates = 0
+            for q in questions:
+                key = question_key(q["question"])
+                if key in existing_keys:
+                    duplicates += 1
+                    continue
+                existing_keys.add(key)
+                row = StudyQuestion(
+                    id=str(uuid.uuid4()), owner=user, deck_id=deck_id,
+                    material_id=material_id, qtype=q["qtype"],
+                    question=q["question"],
+                    context=q.get("context"),
+                    options=json.dumps(q["options"]) if q["options"] else None,
+                    correct_index=q["correct_index"], reference=q["reference"],
+                    topic=q["topic"], difficulty=q["difficulty"],
+                    number=q.get("number"),
+                    source_page=q.get("source_page"),
+                    origin="extracted" if mode == "extract" else "authored",
+                    state="new", due=now,
+                )
+                db.add(row)
+                saved.append(row)
+            m = db.query(StudyMaterial).filter(StudyMaterial.id == material_id).first()
+            if m:
+                m.question_count = (m.question_count or 0) + len(saved)
+            db.commit()
+            original_links = _question_original_links(db, saved)
+            resp = {
+                "created": len(saved),
+                "duplicates": duplicates,
+                "chunks": len(chunks),
+                "chunk_errors": errors,
+                "vision": used_vision,
+                "coverage": coverage,
+                "questions": [_question_to_dict(r, original=original_links.get(r.id))
+                              for r in saved],
+            }
+            created_n = len(saved)
+        finally:
+            db.close()
+
+        # Auto-link multi-part problems for this material so practice immediately
+        # shows earlier parts + answers as context. Best-effort — an extraction
+        # must never fail because grouping did.
+        if created_n:
+            try:
+                await _link_deck_parts(user, deck_id, only_material=material_id)
+            except Exception as e:
+                logger.warning("study: auto link-parts after extraction failed: %s", e)
+        return resp
 
     # ------------------------------------------------------------------ question bank (v2)
 
@@ -3312,7 +3878,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            deck = _get_deck(db, deck_id, user)
+            deck = study_service.get_deck(db, deck_id, user)
             query = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck.id)
             if user is not None:
                 query = query.filter(StudyQuestion.owner == user)
@@ -3323,7 +3889,9 @@ def setup_study_routes():
             if q:
                 query = query.filter(StudyQuestion.question.ilike(f"%{q}%"))
             rows = query.order_by(StudyQuestion.created_at.desc()).all()
-            return {"questions": [_question_to_dict(r) for r in rows]}
+            original_links = _question_original_links(db, rows)
+            return {"questions": [_question_to_dict(r, original=original_links.get(r.id))
+                                  for r in rows]}
         finally:
             db.close()
 
@@ -3332,7 +3900,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             if body.question is not None:
                 row.question = body.question.strip() or row.question
             if body.options is not None:
@@ -3356,7 +3924,9 @@ def setup_study_routes():
             row.explanation = None if body.options is not None or body.reference is not None \
                 else row.explanation
             db.commit()
-            return _question_to_dict(row)
+            material = db.query(StudyMaterial).filter(StudyMaterial.id == row.material_id).first() \
+                if row.material_id else None
+            return _question_to_dict(row, original=_question_original_link(row, material))
         finally:
             db.close()
 
@@ -3365,7 +3935,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             db.query(StudyAttempt).filter(StudyAttempt.question_id == row.id).delete()
             db.delete(row)
             db.commit()
@@ -3380,13 +3950,54 @@ def setup_study_routes():
                        material_id: Optional[str] = None, topics: Optional[str] = None,
                        limit: int = 20, mock: bool = False):
         """Due questions first (spaced retrieval), then new ones interleaved
-        across topics. Optional scope: one material, and/or a comma-separated
-        topic list (substring match; falls back to the whole scope when no
-        question matches). ``mock=true`` draws a fixed-size paper across the
-        whole scope regardless of the schedule (timed mock exams)."""
-        return practice_queue_payload(_owner(request), deck_id=deck_id,
-                                      material_id=material_id, topics=topics,
-                                      limit=limit, mock=mock)
+        across topics (round-robin) instead of blocked by topic."""
+        user = _owner(request)
+        limit = max(1, min(100, limit))
+        db = SessionLocal()
+        try:
+            now = _utcnow_naive()
+            base = db.query(StudyQuestion).filter(
+                StudyQuestion.suspended == False)  # noqa: E712
+            if deck_id:
+                study_service.get_deck(db, deck_id, user)
+                base = base.filter(StudyQuestion.deck_id == deck_id)
+            if user is not None:
+                base = base.filter(StudyQuestion.owner == user)
+            due = base.filter(StudyQuestion.state != "new",
+                              StudyQuestion.due <= now) \
+                .order_by(StudyQuestion.due.asc()).limit(limit).all()
+            new_rows = base.filter(StudyQuestion.state == "new") \
+                .order_by(StudyQuestion.created_at.asc()).limit(limit * 3).all()
+            # Interleave new questions across topics: round-robin over topic groups.
+            groups: Dict[str, List[StudyQuestion]] = {}
+            for r in new_rows:
+                groups.setdefault(r.topic or "general", []).append(r)
+            interleaved: List[StudyQuestion] = []
+            while groups and len(interleaved) < limit:
+                for key in list(groups.keys()):
+                    if groups[key]:
+                        interleaved.append(groups[key].pop(0))
+                    if not groups[key]:
+                        del groups[key]
+            # Ordering mode (per-user pref `study_order`):
+            #   default / "completed" → already-answered (due/review) questions
+            #                 sink behind every new/unseen one (clear new first).
+            #   "review"  → due reviews first (immediate spaced retrieval).
+            if _read_pref(user, "study_order") == "review":
+                queue = due + interleaved
+            else:
+                queue = interleaved + due
+            rows = queue[:limit]
+            original_links = _question_original_links(db, rows)
+            return {"queue": [_question_to_dict(
+                                r,
+                                with_answer=False,
+                                original=original_links.get(r.id),
+                              )
+                              for r in rows],
+                    "due": len(due), "total": len(queue)}
+        finally:
+            db.close()
 
     @router.post("/questions/{question_id}/attempt")
     async def attempt_question(request: Request, question_id: str, body: AttemptIn):
@@ -3395,7 +4006,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             qtype = row.qtype
             options = json.loads(row.options) if row.options else []
             question_text = row.question
@@ -3452,7 +4063,7 @@ def setup_study_routes():
 
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             result = fsrs.schedule({
                 "state": row.state or "new",
                 "stability": _flt(row.stability),
@@ -3497,7 +4108,7 @@ def setup_study_routes():
         level = max(1, min(3, body.level))
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             question_text = row.question
             options = json.loads(row.options) if row.options else None
             reference = row.reference or ""
@@ -3511,13 +4122,67 @@ def setup_study_routes():
                                temperature=0.3, max_tokens=4000, timeout=120)
         return {"level": level, "hint": hint}
 
+    @router.post("/questions/{question_id}/ask")
+    async def question_ask(request: Request, question_id: str, body: AskIn):
+        """Conversational 'Ask AI' for a practice question. Before the student
+        submits (answered=False) it runs in Socratic COACH mode — guidance/hints
+        only, never the answer. After they submit it runs in TUTOR mode — full
+        explanation. Grounded in the question + reference (for-eyes-only while
+        coaching)."""
+        user = _owner(request)
+        msg = (body.message or "").strip()
+        if not msg:
+            raise HTTPException(400, "Empty message")
+        db = SessionLocal()
+        try:
+            row = study_service.get_question(db, question_id, user)
+            question_text = row.question
+            ctx = (row.context or "").strip()
+            options = json.loads(row.options) if row.options else None
+            reference = row.reference or ""
+            correct_index = row.correct_index
+        finally:
+            db.close()
+
+        opts_txt = ("\nOPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options))) if options else ""
+        ctx_txt = f"\nPROBLEM SETUP:\n{ctx}" if ctx else ""
+        draft = (body.draft or "").strip()
+        if body.answered:
+            system = ASK_TUTOR_SYSTEM
+            ans = ""
+            if options is not None and correct_index is not None:
+                ans += f"\nCORRECT OPTION INDEX: {correct_index}"
+            if reference:
+                ans += f"\nREFERENCE SOLUTION:\n{reference}"
+            if draft:
+                ans += f"\n\nSTUDENT'S SUBMITTED ANSWER:\n{draft}"
+        else:
+            system = ASK_COACH_SYSTEM
+            ans = f"\nREFERENCE SOLUTION (FOR YOUR EYES ONLY — never reveal):\n{reference}" if reference else ""
+            if draft:
+                ans += f"\n\nStudent's current draft (NOT submitted):\n{draft}"
+
+        convo = ""
+        for t in (body.history or [])[-12:]:
+            if not isinstance(t, dict):
+                continue
+            who = "Student" if t.get("role") == "student" else "AI"
+            convo += f"{who}: {str(t.get('content', '')).strip()}\n"
+
+        prompt = (f"QUESTION:\n{question_text}{opts_txt}{ctx_txt}{ans}\n\n"
+                  f"CONVERSATION SO FAR:\n{convo}Student: {msg}\n\n"
+                  f"Reply to the student's latest message.")
+        reply = await _llm_text(user, system, prompt,
+                                temperature=0.3, max_tokens=4000, timeout=120)
+        return {"reply": reply, "mode": "tutor" if body.answered else "coach"}
+
     @router.post("/questions/{question_id}/explain")
     async def question_explain(request: Request, question_id: str):
         """Post-attempt explanation for an MCQ (cached on the question)."""
         user = _owner(request)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             if row.explanation:
                 return {"explanation": row.explanation, "cached": True}
             if row.qtype != "mcq":
@@ -3536,7 +4201,7 @@ def setup_study_routes():
                                       temperature=0.2, max_tokens=6000, timeout=120)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             row.explanation = explanation
             db.commit()
         finally:
@@ -3551,7 +4216,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             if row.deep_explanation and not refresh:
                 return {"explanation": row.deep_explanation, "cached": True}
             q_text, options = row.question, json.loads(row.options) if row.options else None
@@ -3593,7 +4258,7 @@ def setup_study_routes():
             raise HTTPException(502, "The model did not return an explanation. Try again.")
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             row.deep_explanation = md
             db.commit()
         finally:
@@ -3609,7 +4274,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             q_text = row.question
             options = json.loads(row.options) if row.options else None
             reference = row.reference or ""
@@ -3670,7 +4335,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            card = _get_card(db, card_id, user)
+            card = study_service.get_card(db, card_id, user)
             if card.deep_explanation and not refresh:
                 return {"explanation": card.deep_explanation, "cached": True}
             front, back, notes = card.front, card.back, card.notes or ""
@@ -3703,7 +4368,7 @@ def setup_study_routes():
             raise HTTPException(502, "The model did not return an explanation. Try again.")
         db = SessionLocal()
         try:
-            card = _get_card(db, card_id, user)
+            card = study_service.get_card(db, card_id, user)
             card.deep_explanation = md
             db.commit()
         finally:
@@ -3777,7 +4442,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            _get_deck(db, deck_id, user)
+            study_service.get_deck(db, deck_id, user)
         finally:
             db.close()
         return await _link_deck_parts(user, deck_id)
@@ -3804,7 +4469,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            row = _get_question(db, question_id, user)
+            row = study_service.get_question(db, question_id, user)
             ids = json.loads(row.prereq_ids) if row.prereq_ids else []
             out = []
             for pid in reversed(ids):

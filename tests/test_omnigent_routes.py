@@ -252,6 +252,22 @@ def test_install_helpers_shape_api_gateways():
     assert _endpoint_model_ids(_Ep()) == ["a", "b", "c"]
 
 
+def test_credentials_env_for_imports_gateway_key_for_spawned_workers():
+    from routes.omnigent_routes import _credentials_env_for
+
+    env = _credentials_env_for("https://api.inference.wandb.ai/v1/", "wandb_key")
+    # spawned openai-agents workers read ambient OPENAI_* + the harness vars
+    assert env["OPENAI_BASE_URL"] == "https://api.inference.wandb.ai/v1"  # trailing slash trimmed
+    assert env["OPENAI_API_KEY"] == "wandb_key"
+    assert env["HARNESS_OPENAI_AGENTS_GATEWAY_BASE_URL"] == "https://api.inference.wandb.ai/v1"
+    assert env["HARNESS_OPENAI_AGENTS_API_KEY"] == "wandb_key"
+    # W&B is chat-only — force Chat Completions so the Responses API doesn't 404
+    assert env["HARNESS_OPENAI_AGENTS_USE_RESPONSES"] == "false"
+    # no usable creds -> no env (nothing partial leaks)
+    assert _credentials_env_for("", "wandb_key") is None
+    assert _credentials_env_for("https://x", "") is None
+
+
 def test_model_slug_for_worker_dirs():
     from routes.omnigent_routes import _model_slug, _generate_crew
 
@@ -260,4 +276,26 @@ def test_model_slug_for_worker_dirs():
     assert _model_slug("deepseek-ai/DeepSeek-V3.1") == "deepseek-v3-1"
     assert _model_slug("") == "model"
     # no models -> no crew written, no crash
-    assert _generate_crew([], None) == 0
+    assert _generate_crew({}, None) == 0
+
+
+def test_executor_block_bakes_inline_api_key_auth():
+    from routes.omnigent_routes import _executor_block
+
+    # the model id must sit at executor.model (not config.model)
+    block = _executor_block("zai-org/GLM-5.2", ("https://api.inference.wandb.ai/v1/", "wandb_key"))
+    assert block["model"] == "zai-org/GLM-5.2"
+    assert block["config"]["harness"] == "openai-agents"
+    # chat-only gateways 404 the Responses API, so force Chat Completions.
+    # Omnigent str()-coerces config scalars, so only "" stays falsy and yields
+    # HARNESS_OPENAI_AGENTS_USE_RESPONSES=false (a bool would become "False").
+    assert block["config"]["use_responses"] == ""
+    # creds are baked inline so they resolve regardless of the daemon's HOME
+    assert block["auth"] == {
+        "type": "api_key",
+        "api_key": "wandb_key",
+        "base_url": "https://api.inference.wandb.ai/v1",  # trailing slash trimmed
+    }
+    # no creds -> no auth key (falls back to the providers: gateway path)
+    assert "auth" not in _executor_block("x/y", None)
+    assert "auth" not in _executor_block("x/y", ("https://x", ""))

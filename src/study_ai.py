@@ -270,6 +270,10 @@ def normalize_questions(value) -> List[Dict]:
 
         raw_number = item.get("number")
         number = str(raw_number).strip() if raw_number is not None else ""
+        try:
+            source_page = max(1, int(item.get("source_page") or item.get("page")))
+        except (TypeError, ValueError):
+            source_page = None
 
         ctx = str(item.get("context") or item.get("setup") or "").strip() or None
         if ctx and context_is_redundant(question, ctx):
@@ -284,6 +288,7 @@ def normalize_questions(value) -> List[Dict]:
             "topic": (str(item.get("topic") or "").strip() or None),
             "difficulty": difficulty,
             "number": number or None,
+            "source_page": source_page,
             "context": ctx,
         })
     return out
@@ -625,6 +630,25 @@ Hint levels:
 
 Reply with the hint text only — plain text, 1-3 sentences (level 3 may use a short displayed step). No preamble like "Sure" or "Here's a hint", no reasoning narration, no answer."""
 
+ASK_COACH_SYSTEM = """You are a Socratic study coach. The student is in the MIDDLE of answering a practice question — they have NOT submitted yet — and is asking you for help so they can write a better answer themselves.
+
+Your job is to make them THINK and recall. You must NOT do the work for them.
+
+Hard rules:
+- NEVER reveal the answer, the correct option, the final result/value, or any step that hands the answer over. NEVER write their answer for them.
+- If they ask "what's the answer" / "just tell me", warmly refuse and instead give the smallest nudge that moves them forward.
+- What you MAY do: restate/clarify what the question is really asking; name the relevant concept, definition, theorem, or method; ask a guiding question; point to what they should recall; or react to their reasoning so far (confirm a good direction, gently flag a wrong turn — without giving the fix outright).
+- Keep replies short (1-4 sentences), warm, and aimed at getting THEM to produce the answer.
+
+You are given the question and a reference solution FOR YOUR EYES ONLY — use it to steer accurately, but never disclose it. Reply in the student's language."""
+
+ASK_TUTOR_SYSTEM = """You are a study tutor. The student has ALREADY submitted their answer to this practice question and now wants to understand it. Help them fully.
+
+- Answer their question directly. You MAY use the correct answer and the reference solution now.
+- Explain WHY the correct answer is right, clear up the specific misconception their attempt shows, go deeper on the underlying concept, and connect it to related ideas when useful.
+- Stay grounded in the provided question and reference; don't invent facts they don't support. Be concise but complete; a short worked step or example is welcome.
+- Reply in the student's language."""
+
 EXPLAIN_SYSTEM = """You explain a multiple-choice question after the student answered. Be brief and exacting.
 
 Structure (plain text, no markdown headers):
@@ -817,6 +841,8 @@ Rules:
 Output ONLY the JSON array. No markdown fences or commentary around it."""
 
 HINT_SYSTEM += _MATH_TEXT_NOTE
+ASK_COACH_SYSTEM += _MATH_TEXT_NOTE
+ASK_TUTOR_SYSTEM += _MATH_TEXT_NOTE
 EXPLAIN_SYSTEM += _MATH_TEXT_NOTE
 STUDY_NOTES_SYSTEM += _MATH_TEXT_NOTE
 SUBJECT_OVERVIEW_SYSTEM += _MATH_TEXT_NOTE

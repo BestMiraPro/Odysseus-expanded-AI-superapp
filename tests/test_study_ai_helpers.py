@@ -343,11 +343,13 @@ def test_missing_numbers_all_covered_or_empty_manifest():
 
 def test_normalize_questions_preserves_source_number():
     out = normalize_questions([
-        _mcq(number="7"),
+        _mcq(number="7", source_page=4),
         {"type": "open", "question": "Why?", "reference": "Because."},
     ])
     assert out[0]["number"] == "7"
+    assert out[0]["source_page"] == 4
     assert out[1]["number"] is None
+    assert out[1]["source_page"] is None
 
 
 # --- answer-key pages (use solutions for references, never as questions) -------
