@@ -952,6 +952,37 @@ def _migrate_add_provider_auth_id_column():
             pass
 
 
+def _migrate_add_study_composite_indexes():
+    """Add composite indexes (owner, reviewed_at) on StudyReview and
+    (owner, attempted_at) on StudyAttempt.  Idempotent — uses IF NOT EXISTS."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_study_reviews_owner_reviewed_at "
+            "ON study_reviews(owner, reviewed_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_study_attempts_owner_attempted_at "
+            "ON study_attempts(owner, attempted_at)"
+        )
+        conn.commit()
+        logging.getLogger(__name__).info(
+            "Migrated: added composite owner+time indexes to study_reviews / study_attempts"
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"study composite index migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _migrate_add_study_idempotency_keys():
     """Add nullable idempotency keys plus UNIQUE indexes to study logs."""
     import sqlite3
@@ -2084,6 +2115,7 @@ def init_db():
     _migrate_encrypt_endpoint_keys()
     _migrate_add_study_idempotency_keys()
     _migrate_backfill_task_folders()
+    _migrate_add_study_composite_indexes()
 
 
 def _migrate_backfill_task_folders():

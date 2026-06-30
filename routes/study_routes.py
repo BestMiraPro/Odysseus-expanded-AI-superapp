@@ -99,6 +99,7 @@ from src import fsrs
 from src import study_service
 from src.study_source import build_original_question_link, infer_source_page
 from src.study_plan import generate_plan
+from src.study_stats import get_stats as _get_stats
 
 logger = logging.getLogger(__name__)
 
@@ -957,10 +958,14 @@ def _dedup_deck_questions(db, deck_id: str, owner) -> int:
     for key, group in clusters.items():
         if len(group) < 2:
             continue
-        att = {
-            r.id: db.query(StudyAttempt).filter(StudyAttempt.question_id == r.id).count()
-            for r in group
-        }
+        qids = [r.id for r in group]
+        att_raw = db.query(StudyAttempt.question_id).filter(
+            StudyAttempt.question_id.in_(qids)
+        ).all()
+        counts = {}
+        for qid in att_raw:
+            counts[qid[0]] = counts.get(qid[0], 0) + 1
+        att = {r.id: counts.get(r.id, 0) for r in group}
         group.sort(key=lambda r: (1 if r.number else 0, att[r.id], len(r.question or "")),
                    reverse=True)
         for dup in group[1:]:                 # keep group[0], drop the rest
@@ -4484,8 +4489,7 @@ def setup_study_routes():
         user = _owner(request)
         db = SessionLocal()
         try:
-            m = _get_material(db, material_id, user)
-            file_id, name = m.file_id, m.name
+            return _get_stats(db, user, days=days, now=_utcnow_naive())
         finally:
             db.close()
         if not file_id:
