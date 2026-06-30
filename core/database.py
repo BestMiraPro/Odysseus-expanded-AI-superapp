@@ -771,6 +771,36 @@ def _migrate_add_study_summary_columns():
         logging.getLogger(__name__).warning(f"study summary columns migration failed: {e}")
 
 
+def _migrate_study_attempt_confidence_to_numeric():
+    """Migrate StudyAttempt.confidence from string labels to numeric 0-100.
+
+    SQLite type affinity means no ALTER is needed for the type change — the
+    column already accepts both. We optionally backfill legacy string values
+    to pinned numerics so calibration queries can AVG(confidence) directly.
+    Idempotent.
+    """
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        # Backfill legacy string values (idempotent: re-running finds no 'sure'/'unsure'/'guess' rows).
+        conn.execute("UPDATE study_attempts SET confidence = 85 WHERE confidence = 'sure'")
+        conn.execute("UPDATE study_attempts SET confidence = 55 WHERE confidence = 'unsure'")
+        conn.execute("UPDATE study_attempts SET confidence = 25 WHERE confidence = 'guess'")
+        conn.commit()
+        logging.getLogger(__name__).info("Migrated: backfilled StudyAttempt.confidence string labels to numeric")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"study_attempt.confidence numeric migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _migrate_add_document_archived_column():
     """Add `archived` to documents (soft-archive flag). Guarded + idempotent."""
     import sqlite3
@@ -1833,7 +1863,10 @@ class StudyAttempt(TimestampMixin, Base):
     correct      = Column(Boolean, nullable=True)     # mcq
     score        = Column(Integer, nullable=True)     # open (0-100)
     rating       = Column(Integer, nullable=True)     # FSRS rating applied
-    confidence   = Column(String, nullable=True)      # "sure" | "unsure" | "guess"
+    # Numeric confidence 0-100. Legacy rows store the old string labels and are
+    # converted on read via confidence_to_numeric() (see src/study_ai.py).
+    # Pinned enum→number mapping: sure→85, unsure→55, guess→25.
+    confidence   = Column(Integer, nullable=True)
     hints_used   = Column(Integer, default=0)
     grading      = Column(Text, nullable=True)        # JSON grade payload (open)
     duration_ms  = Column(Integer, nullable=True)
@@ -2019,6 +2052,7 @@ def init_db():
     _migrate_add_owner_column()
     _migrate_add_document_archived_column()
     _migrate_add_study_summary_columns()
+    _migrate_study_attempt_confidence_to_numeric()
     _migrate_add_last_message_at_column()
     _migrate_add_folder_column()
     _migrate_add_token_columns()

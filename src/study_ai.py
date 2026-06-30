@@ -523,30 +523,57 @@ def chunk_material(text: str, chunk_chars: int = 12000, max_chunks: int = 4) -> 
 # outcome → FSRS rating
 # ---------------------------------------------------------------------------
 
+CONFIDENCE_ENUM_TO_NUMERIC = {
+    "sure": 85,
+    "unsure": 55,
+    "guess": 25,
+}
+
+CONFIDENCE_EASY_THRESHOLD = 85  # numeric gate for Easy rating; equals pinned "sure"
+
+
+def confidence_to_numeric(confidence):
+    """Map a confidence value (legacy string or numeric) to a 0-100 int.
+
+    - Legacy string labels ("sure"/"unsure"/"guess") → pinned numeric via CONFIDENCE_ENUM_TO_NUMERIC.
+    - Numeric input (post-0.3 slider, int/float) → clamped to [0, 100], rounded to int.
+    - None / unknown → None (preserves nullable semantics for old rows and skipped questions).
+    """
+    if confidence is None:
+        return None
+    if isinstance(confidence, str):
+        return CONFIDENCE_ENUM_TO_NUMERIC.get(confidence)  # None if unrecognized
+    try:
+        return max(0, min(100, int(round(float(confidence)))))
+    except (TypeError, ValueError):
+        return None
+
+
 def rating_from_outcome(qtype: str, *, correct: Optional[bool] = None,
                         score: Optional[int] = None, hints_used: int = 0,
-                        confidence: Optional[str] = None) -> int:
+                        confidence=None) -> int:
     """Map a practice outcome to an FSRS rating (1 Again … 4 Easy).
 
     - failure is Again regardless of anything else
     - success that needed hints is Hard (assisted retrieval)
     - clean success is Good
-    - Easy only for clean, confident ('sure'), high-quality success
+    - Easy only for clean, confident (>= CONFIDENCE_EASY_THRESHOLD), high-quality success
     """
+    conf_num = confidence_to_numeric(confidence)
     hinted = (hints_used or 0) > 0
     if qtype == "mcq":
         if not correct:
             return 1
         if hinted:
             return 2
-        return 4 if confidence == "sure" else 3
+        return 4 if (conf_num is not None and conf_num >= CONFIDENCE_EASY_THRESHOLD) else 3
     # open-ended
     s = score or 0
     if s < 60:
         return 1
     if s < 85 or hinted:
         return 2
-    return 4 if (s >= 95 and confidence == "sure") else 3
+    return 4 if (s >= 95 and conf_num is not None and conf_num >= CONFIDENCE_EASY_THRESHOLD) else 3
 
 
 # ---------------------------------------------------------------------------

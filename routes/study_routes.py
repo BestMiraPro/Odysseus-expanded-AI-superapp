@@ -79,6 +79,7 @@ from src.study_ai import (
     chunk_material,
     classify_material,
     canonical_qnum,
+    confidence_to_numeric,
     dedupe_questions,
     missing_question_numbers,
     normalize_questions,
@@ -224,7 +225,7 @@ class QuestionUpdate(BaseModel):
 class AttemptIn(BaseModel):
     choice_index: Optional[int] = None   # mcq
     answer: Optional[str] = None         # open
-    confidence: Optional[str] = None     # "sure" | "unsure" | "guess"
+    confidence: Optional[int | str] = None  # 0-100 numeric, or legacy label ("sure"/"unsure"/"guess")
     hints_used: int = 0
     duration_ms: Optional[int] = None
     idempotency_key: Optional[str] = None
@@ -4101,7 +4102,7 @@ def setup_study_routes():
                            "followup": (str(value.get("followup")).strip()
                                         if value.get("followup") else None)}
 
-        confidence = body.confidence if body.confidence in ("sure", "unsure", "guess") else None
+        confidence = confidence_to_numeric(body.confidence)
         rating = rating_from_outcome(qtype, correct=correct, score=score,
                                      hints_used=body.hints_used or 0,
                                      confidence=confidence)

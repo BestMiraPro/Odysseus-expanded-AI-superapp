@@ -325,10 +325,13 @@ a.study-btn { display: inline-flex; align-items: center; text-decoration: none; 
 .study-opt.sel { border-color: var(--accent, #5b8abf); background: rgba(91,138,191,0.1); }
 .study-opt.right { border-color: var(--green, #4f9e60); }
 .study-opt.wrong { border-color: var(--red, #e05555); }
-.study-conf { display: flex; gap: 6px; align-items: center; margin: 14px 0 4px; }
-.study-conf button { font-size: 11px; padding: 4px 10px; border-radius: 99px;
+.study-conf { display: flex; flex-direction: column; gap: 8px; margin: 14px 0 4px; }
+.study-conf .study-subtle { display: flex; gap: 6px; align-items: center; }
+.study-conf-slider { width: 100%; height: 6px; cursor: pointer; }
+.study-conf-quick { display: flex; gap: 6px; align-items: center; }
+.study-conf-quick button { font-size: 11px; padding: 4px 10px; border-radius: 99px;
   border: 1px solid var(--border); background: none; color: var(--fg); cursor: pointer; opacity: 0.7; }
-.study-conf button.sel { opacity: 1; border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); }
+.study-conf-quick button.sel { opacity: 1; border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); }
 .study-hint { border-left: 2px solid var(--accent, #5b8abf); padding: 6px 10px; margin: 8px 0;
   font-size: 12.5px; opacity: 0.85; background: rgba(91,138,191,0.06); border-radius: 0 6px 6px 0; }
 .study-ask { border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; margin-top: 14px;
@@ -664,7 +667,7 @@ function renderHistoryEntry(e) {
   const outcome = e.qtype === 'mcq'
     ? (e.correct ? '✓ correct' : '✗ wrong')
     : (e.score != null ? `${e.score}/100` : '');
-  const conf = e.confidence ? ` · ${esc(e.confidence)}` : '';
+  const conf = e.confidence != null ? ` · ${esc(String(e.confidence))}` : '';
   return `<div class="study-histrow ${ok ? 'ok' : 'bad'}">
     <span class="study-qchip ${e.qtype || ''}">${esc(e.qtype || 'q')}</span>
     <div class="grow">
@@ -1997,9 +2000,19 @@ async function renderPractice() {
 
       ${!res ? `
         <div class="study-conf">
-          <span class="study-subtle">Before you check — how confident?</span>
-          ${['sure', 'unsure', 'guess'].map(cv => `
-            <button data-conf="${cv}" class="${p.confidence === cv ? 'sel' : ''}">${cv}</button>`).join('')}
+          <span class="study-subtle">Before you check — how confident? <b id="study-conf-val">${p.confidence != null ? p.confidence + '%' : '—'}</b></span>
+          <input type="range" min="0" max="100" value="${p.confidence != null ? p.confidence : 50}" id="study-conf-slider"
+                 class="study-conf-slider" list="study-conf-ticks">
+          <datalist id="study-conf-ticks">
+            <option value="25"></option>
+            <option value="55"></option>
+            <option value="85"></option>
+          </datalist>
+          <div class="study-conf-quick">
+            <button data-conf="25" class="${p.confidence === 25 ? 'sel' : ''}">guess</button>
+            <button data-conf="55" class="${p.confidence === 55 ? 'sel' : ''}">unsure</button>
+            <button data-conf="85" class="${p.confidence === 85 ? 'sel' : ''}">sure</button>
+          </div>
         </div>
         <div class="study-form-row" style="margin-top:10px;">
           <button class="study-btn primary" id="study-prac-submit">${p.mock ? 'Submit →' : 'Check answer'}</button>
@@ -2051,9 +2064,20 @@ async function renderPractice() {
     renderPractice();
   }));
   el.querySelectorAll('[data-conf]').forEach(b => b.addEventListener('click', () => {
-    p.confidence = p.confidence === b.dataset.conf ? null : b.dataset.conf;
+    const val = parseInt(b.dataset.conf, 10);
+    p.confidence = p.confidence === val ? null : val;
+    const slider = el.querySelector('#study-conf-slider');
+    if (slider) slider.value = p.confidence != null ? p.confidence : 50;
     renderPractice();
   }));
+  const confSlider = el.querySelector('#study-conf-slider');
+  if (confSlider) {
+    confSlider.addEventListener('input', () => {
+      p.confidence = parseInt(confSlider.value, 10);
+      const valLabel = el.querySelector('#study-conf-val');
+      if (valLabel) valLabel.textContent = p.confidence + '%';
+    });
+  }
   const ta = el.querySelector('#study-prac-answer');
   if (ta) ta.addEventListener('input', () => { p.answerDraft = ta.value; });
 
@@ -2226,9 +2250,11 @@ function renderPracticeSummary() {
   stopMockTimer();
   const answered = p.log.filter(l => l.result);
   const ok = answered.filter(l => l.result.correct === true || (l.result.score ?? 0) >= 60);
-  const sureWrong = answered.filter(l => l.confidence === 'sure' &&
+  // Pinned enum→number mapping (must match src/study_ai.py CONFIDENCE_ENUM_TO_NUMERIC)
+  const CONF_SURE = 85, CONF_GUESS = 25;
+  const sureWrong = answered.filter(l => l.confidence === CONF_SURE &&
     !(l.result.correct === true || (l.result.score ?? 0) >= 60));
-  const guessRight = answered.filter(l => l.confidence === 'guess' &&
+  const guessRight = answered.filter(l => l.confidence === CONF_GUESS &&
     (l.result.correct === true || (l.result.score ?? 0) >= 60));
   const hintsTotal = answered.reduce((a, l) => a + (l.hints || 0), 0);
   const mins = Math.max(1, Math.round((Date.now() - p.startTs) / 60000));
