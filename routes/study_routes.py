@@ -40,6 +40,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 
 from core.database import (
     SessionLocal,
@@ -146,6 +147,7 @@ class CardUpdate(BaseModel):
 class ReviewIn(BaseModel):
     rating: int  # 1=Again 2=Hard 3=Good 4=Easy
     duration_ms: Optional[int] = None
+    idempotency_key: Optional[str] = None
 
 
 class GenerateCardsIn(BaseModel):
@@ -225,6 +227,7 @@ class AttemptIn(BaseModel):
     confidence: Optional[str] = None     # "sure" | "unsure" | "guess"
     hints_used: int = 0
     duration_ms: Optional[int] = None
+    idempotency_key: Optional[str] = None
 
 
 class HintIn(BaseModel):
@@ -3041,6 +3044,16 @@ def setup_study_routes():
         try:
             card = study_service.get_card(db, card_id, user)
             deck = study_service.get_deck(db, card.deck_id, user)
+            if body.idempotency_key:
+                prior = db.query(StudyReview).filter(
+                    StudyReview.owner == user,
+                    StudyReview.idempotency_key == body.idempotency_key,
+                ).first()
+                if prior is not None:
+                    return {
+                        "card": _card_to_dict(card),
+                        "interval_days": prior.interval_days,
+                    }
             state_before = card.state or "new"
             result = fsrs.schedule(
                 _card_fsrs_dict(card), body.rating,
@@ -3053,15 +3066,30 @@ def setup_study_routes():
             card.last_review = _to_naive_utc(result["last_review"])
             card.reps = result["reps"]
             card.lapses = result["lapses"]
-            db.add(StudyReview(
-                id=str(uuid.uuid4()), owner=user, card_id=card.id,
-                deck_id=card.deck_id, rating=body.rating,
-                state_before=state_before,
-                interval_days=result["interval_days"],
-                duration_ms=body.duration_ms,
-                reviewed_at=_utcnow_naive(),
-            ))
-            db.commit()
+            try:
+                db.add(StudyReview(
+                    id=str(uuid.uuid4()), owner=user, card_id=card.id,
+                    deck_id=card.deck_id, rating=body.rating,
+                    state_before=state_before,
+                    interval_days=result["interval_days"],
+                    duration_ms=body.duration_ms,
+                    reviewed_at=_utcnow_naive(),
+                    idempotency_key=body.idempotency_key,
+                ))
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                card = study_service.get_card(db, card_id, user)
+                prior = db.query(StudyReview).filter(
+                    StudyReview.owner == user,
+                    StudyReview.idempotency_key == body.idempotency_key,
+                ).first()
+                if prior is not None:
+                    return {
+                        "card": _card_to_dict(card),
+                        "interval_days": prior.interval_days,
+                    }
+                raise
             return {"card": _card_to_dict(card), "interval_days": result["interval_days"]}
         finally:
             db.close()
@@ -4012,6 +4040,23 @@ def setup_study_routes():
             question_text = row.question
             reference = row.reference or ""
             correct_index = row.correct_index
+            if body.idempotency_key:
+                prior = db.query(StudyAttempt).filter(
+                    StudyAttempt.owner == user,
+                    StudyAttempt.idempotency_key == body.idempotency_key,
+                ).first()
+                if prior is not None:
+                    return {
+                        "qtype": prior.qtype,
+                        "correct": prior.correct,
+                        "score": prior.score,
+                        "grading": json.loads(prior.grading) if prior.grading else None,
+                        "correct_index": correct_index if prior.qtype == "mcq" else None,
+                        "reference": reference,
+                        "rating": prior.rating,
+                        "interval_days": None,
+                        "next_due": _iso(row.due),
+                    }
         finally:
             db.close()
 
@@ -4064,6 +4109,23 @@ def setup_study_routes():
         db = SessionLocal()
         try:
             row = study_service.get_question(db, question_id, user)
+            if body.idempotency_key:
+                prior = db.query(StudyAttempt).filter(
+                    StudyAttempt.owner == user,
+                    StudyAttempt.idempotency_key == body.idempotency_key,
+                ).first()
+                if prior is not None:
+                    return {
+                        "qtype": prior.qtype,
+                        "correct": prior.correct,
+                        "score": prior.score,
+                        "grading": json.loads(prior.grading) if prior.grading else None,
+                        "correct_index": correct_index if prior.qtype == "mcq" else None,
+                        "reference": reference,
+                        "rating": prior.rating,
+                        "interval_days": None,
+                        "next_due": _iso(row.due),
+                    }
             result = fsrs.schedule({
                 "state": row.state or "new",
                 "stability": _flt(row.stability),
@@ -4079,15 +4141,38 @@ def setup_study_routes():
             row.last_review = _to_naive_utc(result["last_review"])
             row.reps = result["reps"]
             row.lapses = result["lapses"]
-            db.add(StudyAttempt(
-                id=str(uuid.uuid4()), owner=user, question_id=row.id,
-                deck_id=row.deck_id, qtype=qtype, answer=answer_text[:4000],
-                correct=correct, score=score, rating=rating,
-                confidence=confidence, hints_used=body.hints_used or 0,
-                grading=json.dumps(grading) if grading else None,
-                duration_ms=body.duration_ms, attempted_at=_utcnow_naive(),
-            ))
-            db.commit()
+            try:
+                db.add(StudyAttempt(
+                    id=str(uuid.uuid4()), owner=user, question_id=row.id,
+                    deck_id=row.deck_id, qtype=qtype, answer=answer_text[:4000],
+                    correct=correct, score=score, rating=rating,
+                    confidence=confidence, hints_used=body.hints_used or 0,
+                    grading=json.dumps(grading) if grading else None,
+                    duration_ms=body.duration_ms, attempted_at=_utcnow_naive(),
+                    idempotency_key=body.idempotency_key,
+                ))
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                row = study_service.get_question(db, question_id, user)
+                prior = db.query(StudyAttempt).filter(
+                    StudyAttempt.owner == user,
+                    StudyAttempt.idempotency_key == body.idempotency_key,
+                ).first()
+                if prior is not None:
+                    prior_grading = json.loads(prior.grading) if prior.grading else None
+                    return {
+                        "qtype": prior.qtype,
+                        "correct": prior.correct,
+                        "score": prior.score,
+                        "grading": prior_grading,
+                        "correct_index": correct_index if prior.qtype == "mcq" else None,
+                        "reference": reference,
+                        "rating": prior.rating,
+                        "interval_days": None,
+                        "next_due": _iso(row.due),
+                    }
+                raise
             return {
                 "qtype": qtype,
                 "correct": correct,

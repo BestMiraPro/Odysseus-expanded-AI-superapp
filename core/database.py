@@ -922,6 +922,37 @@ def _migrate_add_provider_auth_id_column():
             pass
 
 
+def _migrate_add_study_idempotency_keys():
+    """Add nullable idempotency keys plus UNIQUE indexes to study logs."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        for table_name in ("study_reviews", "study_attempts"):
+            cursor = conn.execute(f"PRAGMA table_info({table_name})")
+            columns = [row[1] for row in cursor.fetchall()]
+            if columns and "idempotency_key" not in columns:
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN idempotency_key VARCHAR")
+            conn.execute(
+                f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{table_name}_idempotency_key "
+                f"ON {table_name}(idempotency_key)"
+            )
+        conn.commit()
+        logging.getLogger(__name__).info(
+            "Migrated: added idempotency_key column + UNIQUE index to study logs"
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"study idempotency_key migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _migrate_add_model_type_column():
     """Add model_type column to model_endpoints if it doesn't exist."""
     import sqlite3
@@ -1698,6 +1729,7 @@ class StudyReview(TimestampMixin, Base):
     interval_days = Column(Integer, default=0)
     duration_ms   = Column(Integer, nullable=True)
     reviewed_at   = Column(DateTime, default=utcnow_naive, index=True)
+    idempotency_key = Column(String, nullable=True, index=True)
 
 
 class StudyExam(TimestampMixin, Base):
@@ -1806,6 +1838,7 @@ class StudyAttempt(TimestampMixin, Base):
     grading      = Column(Text, nullable=True)        # JSON grade payload (open)
     duration_ms  = Column(Integer, nullable=True)
     attempted_at = Column(DateTime, default=utcnow_naive, index=True)
+    idempotency_key = Column(String, nullable=True, index=True)
 
 
 class StudyAgentThread(TimestampMixin, Base):
@@ -2015,6 +2048,7 @@ def init_db():
     _migrate_encrypt_email_passwords()
     _migrate_encrypt_signatures()
     _migrate_encrypt_endpoint_keys()
+    _migrate_add_study_idempotency_keys()
     _migrate_backfill_task_folders()
 
 

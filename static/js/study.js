@@ -87,6 +87,123 @@ const jpost = (p, body) => jfetch(p, { method: 'POST', body: JSON.stringify(body
 const jput = (p, body) => jfetch(p, { method: 'PUT', body: JSON.stringify(body || {}) });
 const jdel = (p) => jfetch(p, { method: 'DELETE' });
 
+const RETRY_QUEUE_KEY = 'study:durable-posts:v1';
+let _retryTimer = null;
+let _retryFlushing = false;
+
+function loadRetryQueue() {
+  try {
+    const raw = localStorage.getItem(RETRY_QUEUE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveRetryQueue(queue) {
+  try {
+    if (queue.length) localStorage.setItem(RETRY_QUEUE_KEY, JSON.stringify(queue));
+    else localStorage.removeItem(RETRY_QUEUE_KEY);
+  } catch {
+    /* best effort */
+  }
+}
+
+function makeIdempotencyKey(prefix, entityId) {
+  const nonce = crypto?.randomUUID ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+  return `${prefix}:${String(entityId).slice(0, 64)}:${nonce}`.slice(0, 128);
+}
+
+function retryDelayMs(attempts) {
+  return Math.min(60000, 1000 * (2 ** Math.min(attempts, 6)));
+}
+
+function enqueueDurablePost(kind, path, payload, keyPrefix, entityId) {
+  const idempotencyKey = makeIdempotencyKey(keyPrefix, entityId);
+  const item = {
+    id: idempotencyKey,
+    kind,
+    path,
+    payload: { ...(payload || {}), idempotency_key: idempotencyKey },
+    attempts: 0,
+    next_try: 0,
+    created_at: Date.now(),
+  };
+  const queue = loadRetryQueue();
+  queue.push(item);
+  saveRetryQueue(queue);
+  return item;
+}
+
+function removeRetryItem(id) {
+  saveRetryQueue(loadRetryQueue().filter(item => item.id !== id));
+}
+
+function updateRetryItem(id, patch) {
+  const queue = loadRetryQueue();
+  const item = queue.find(x => x.id === id);
+  if (!item) return;
+  Object.assign(item, patch);
+  saveRetryQueue(queue);
+}
+
+async function postDurably(kind, path, payload, keyPrefix, entityId) {
+  const item = enqueueDurablePost(kind, path, payload, keyPrefix, entityId);
+  try {
+    const result = await jpost(item.path, item.payload);
+    removeRetryItem(item.id);
+    scheduleRetryFlush();
+    return result;
+  } catch (err) {
+    const attempts = item.attempts + 1;
+    updateRetryItem(item.id, {
+      attempts,
+      next_try: Date.now() + retryDelayMs(attempts),
+      last_error: err.message,
+    });
+    scheduleRetryFlush();
+    throw err;
+  }
+}
+
+function scheduleRetryFlush(delay = 1500) {
+  if (_retryTimer) return;
+  _retryTimer = setTimeout(() => {
+    _retryTimer = null;
+    flushRetryQueue();
+  }, delay);
+}
+
+async function flushRetryQueue() {
+  if (_retryFlushing || navigator.onLine === false) return;
+  _retryFlushing = true;
+  try {
+    const now = Date.now();
+    const due = loadRetryQueue().filter(item => !item.next_try || item.next_try <= now);
+    for (const item of due) {
+      try {
+        await jpost(item.path, item.payload);
+        removeRetryItem(item.id);
+      } catch (err) {
+        const attempts = (item.attempts || 0) + 1;
+        updateRetryItem(item.id, {
+          attempts,
+          next_try: Date.now() + retryDelayMs(attempts),
+          last_error: err.message,
+        });
+      }
+    }
+  } finally {
+    _retryFlushing = false;
+  }
+  if (loadRetryQueue().length) scheduleRetryFlush(5000);
+}
+
+window.addEventListener('online', () => scheduleRetryFlush(250));
+scheduleRetryFlush(1000);
+
 function toast(msg, isError = false) {
   const t = document.createElement('div');
   t.className = 'study-toast' + (isError ? ' study-toast-err' : '');
@@ -1640,7 +1757,13 @@ async function rateCard(rating) {
   r.idx += 1;
   renderReview();
   try {
-    await jpost(`/api/study/cards/${card.id}/review`, { rating, duration_ms: duration });
+    await postDurably(
+      'review',
+      `/api/study/cards/${card.id}/review`,
+      { rating, duration_ms: duration },
+      'rv',
+      card.id,
+    );
   } catch (e) { toast(`Review not saved: ${e.message}`, true); }
 }
 
@@ -2004,14 +2127,20 @@ async function renderPractice() {
     const btn = el.querySelector('#study-prac-submit');
     btn.disabled = true; btn.textContent = isMcq ? 'Checking…' : 'Grading…';
     try {
-      p.result = await jpost(`/api/study/questions/${q.id}/attempt`, {
-        choice_index: isMcq ? p.choice : null,
-        answer: isMcq ? null : p.answerDraft,
-        confidence: p.confidence,
-        // Consulting before answering counts like a hint (retrieval was assisted).
-        hints_used: p.hints.length + (p.consulted ? 1 : 0),
-        duration_ms: Date.now() - p.qShownTs,
-      });
+      p.result = await postDurably(
+        'attempt',
+        `/api/study/questions/${q.id}/attempt`,
+        {
+          choice_index: isMcq ? p.choice : null,
+          answer: isMcq ? null : p.answerDraft,
+          confidence: p.confidence,
+          // Consulting before answering counts like a hint (retrieval was assisted).
+          hints_used: p.hints.length + (p.consulted ? 1 : 0),
+          duration_ms: Date.now() - p.qShownTs,
+        },
+        'att',
+        q.id,
+      );
       p.log.push({ q, result: p.result, confidence: p.confidence, hints: p.hints.length });
       // Closed book: the marking is graded server-side but stays hidden until
       // the prediction is in.
@@ -2529,7 +2658,13 @@ async function finishFocus(completed) {
   const actual = completed ? Math.min(elapsedMin, f.plannedMin) || f.plannedMin : elapsedMin;
   S.focus = null;
   try {
-    await jpost(`/api/study/focus/${f.id}/finish`, { actual_min: actual, completed });
+    await postDurably(
+      'focus_finish',
+      `/api/study/focus/${f.id}/finish`,
+      { actual_min: actual, completed },
+      'ff',
+      f.id,
+    );
     if (completed) toast(`Focus session logged: ${actual} min`);
   } catch (e) { toast(e.message, true); }
   if (_open && _tab === 'focus') renderFocus();
