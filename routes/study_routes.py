@@ -101,7 +101,7 @@ from src import fsrs
 from src import fsrs_optimizer
 from src import study_service
 from src.study_source import build_original_question_link, infer_source_page
-from src.study_plan import generate_plan
+from src.study_plan import generate_plan, compute_mastery_scores, migrate_done_blocks
 from src.study_stats import get_stats as _get_stats, get_calibration_curve
 
 logger = logging.getLogger(__name__)
@@ -3337,17 +3337,53 @@ def setup_study_routes():
         try:
             exam = study_service.get_exam(db, exam_id, user)
             topics = json.loads(exam.topics) if exam.topics else []
+            topic_names = [str(t.get("name") or "").strip() for t in topics]
+            topic_names = [n for n in topic_names if n]
+
+            # --- FSRS mastery injection ---
+            mastery_scores: Dict[str, float] = {}
+            if topic_names:
+                # Gather cards for this user (no deck filter: topics may span decks).
+                card_rows = db.query(StudyCard).filter(
+                    StudyCard.owner == user,
+                    StudyCard.suspended == False,
+                ).all()
+                card_dicts: List[Dict] = []
+                for c in card_rows:
+                    card_dicts.append(_card_to_dict(c))
+
+                q_rows = db.query(StudyQuestion).filter(
+                    StudyQuestion.owner == user,
+                    StudyQuestion.suspended == False,
+                ).all()
+                q_dicts: List[Dict] = []
+                for q in q_rows:
+                    # use lightweight dict with only fields compute_mastery_scores needs
+                    q_dicts.append({
+                        "state": q.state or "new",
+                        "stability": _flt(q.stability),
+                        "topic": q.topic,
+                    })
+                mastery_scores = compute_mastery_scores(topic_names, card_dicts, q_dicts)
+
             try:
                 plan = generate_plan(
                     date.fromisoformat(exam.exam_date),
                     topics,
                     hours_per_week=_flt(exam.hours_per_week, 7.0),
                     rest_days=json.loads(exam.rest_days) if exam.rest_days else None,
+                    mastery_scores=mastery_scores or None,
                 )
             except ValueError as e:
                 raise HTTPException(400, str(e))
             exam.plan = json.dumps(plan)
-            exam.done_blocks = json.dumps([])  # plan changed; reset checkmarks
+
+            # --- done_blocks preservation on regen ---
+            old_done = json.loads(exam.done_blocks) if exam.done_blocks else []
+            if isinstance(old_done, list):
+                exam.done_blocks = json.dumps(migrate_done_blocks(old_done, plan))
+            else:
+                exam.done_blocks = json.dumps([])
             db.commit()
             return _exam_to_dict(exam)
         finally:

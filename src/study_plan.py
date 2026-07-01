@@ -28,11 +28,106 @@ MIN_SESSION_MIN = 20
 MOCK_MIN = 60
 
 
-def _priority(topic: Dict) -> float:
+def _priority(topic: Dict, mastery_scores: Optional[Dict[str, float]] = None) -> float:
     """importance (1-5) x knowledge gap (1-5). Drives time allocation."""
     importance = max(1, min(5, int(topic.get("importance") or 3)))
     mastery = max(1, min(5, int(topic.get("mastery") or 2)))
+    if mastery_scores:
+        name = (topic.get("name") or "").strip()
+        if name in mastery_scores:
+            # lower stability -> lower mastery -> higher priority (more study needed)
+            mastery = max(1, min(5, float(mastery_scores[name])))
     return importance * (6 - mastery)
+
+
+STABILITY_THRESHOLDS = (1.0, 3.0, 7.0, 14.0)  # ASC sorted
+
+
+def _stability_to_mastery(stability: float) -> int:
+    """Map FSRS stability (days) to a 1–5 mastery scale.
+
+    Deterministic: thresholds are constants.
+    """
+    s = max(0.0, float(stability))
+    for i, th in enumerate(STABILITY_THRESHOLDS):
+        if s < th:
+            return i + 1
+    return 5
+
+
+def compute_mastery_scores(
+    topic_names: List[str],
+    cards: List[Dict],
+    questions: Optional[List[Dict]] = None,
+) -> Dict[str, float]:
+    """Return {topic_name: mastery_float 1-5} derived from FSRS state.
+
+    - Matches a card when any tag contains the topic name (case-insensitive).
+    - Matches a question when its topic equals the topic name (case-insensitive).
+    - For each topic, average stabilities across matched items, map to 1-5.
+    - Topics with no matches are omitted (caller falls back to declared mastery).
+    """
+    questions = questions or []
+    lowered_map = {t.lower().strip(): t for t in topic_names}
+    stabs: Dict[str, List[float]] = {t: [] for t in topic_names}
+
+    for c in cards:
+        if c.get("state") == "new":
+            continue
+        stab = float(c.get("stability") or 0)
+        if stab <= 0:
+            continue
+        tags = c.get("tags") or []
+        if isinstance(tags, str):
+            try:
+                import json as _json
+                tags = _json.loads(tags)
+            except Exception:
+                tags = []
+        for tag in tags:
+            tag_l = str(tag).lower().strip()
+            for topic_lower, topic_orig in lowered_map.items():
+                if topic_lower in tag_l:
+                    stabs[topic_orig].append(stab)
+
+    for q in questions:
+        if q.get("state") == "new":
+            continue
+        stab = float(q.get("stability") or q.get("stability") or 0)
+        if stab <= 0:
+            continue
+        qt = str(q.get("topic") or "").lower().strip()
+        if qt in lowered_map:
+            stabs[lowered_map[qt]].append(stab)
+
+    out: Dict[str, float] = {}
+    for t in topic_names:
+        vals = stabs[t]
+        if vals:
+            avg = sum(vals) / len(vals)
+            out[t] = _stability_to_mastery(avg)
+    return out
+
+
+def _plan_valid_keys(plan: Dict) -> set:
+    """All 'date:idx' keys that exist in a generated plan."""
+    valid: set = set()
+    for day in plan.get("days", []):
+        d = day.get("date", "")
+        for i in range(len(day.get("blocks", []))):
+            valid.add(f"{d}:{i}")
+    return valid
+
+
+def migrate_done_blocks(old_done: List[str], new_plan: Dict) -> List[str]:
+    """Preserve done-block checkmarks across plan regeneration.
+
+    Rule: keep a key ``date:idx`` iff that day+index still exists in the new
+    plan.  If the index is now out of bounds or the date vanished, drop it.
+    Ambiguous cases (same position, new content) are preserved.
+    """
+    valid = _plan_valid_keys(new_plan)
+    return sorted([k for k in old_done if k in valid])
 
 
 def _compress_offsets(days_until: int) -> List[int]:
@@ -56,6 +151,7 @@ def generate_plan(
     start_date: Optional[date] = None,
     hours_per_week: float = 7.0,
     rest_days: Optional[List[int]] = None,  # weekday() ints, e.g. [6] = Sunday
+    mastery_scores: Optional[Dict[str, float]] = None,
 ) -> Dict:
     """Return {days: [{date, blocks: [...]}, ...], meta: {...}}.
 
@@ -73,7 +169,7 @@ def generate_plan(
     rest = set(rest_days or [])
     daily_min = max(MIN_SESSION_MIN, round(hours_per_week * 60 / 7 / 5) * 5)
 
-    ranked = sorted(topics, key=_priority, reverse=True)
+    ranked = sorted(topics, key=lambda t: _priority(t, mastery_scores), reverse=True)
     names = [t["name"] for t in ranked]
 
     # study days = every day from start to the day before the exam, minus rest
