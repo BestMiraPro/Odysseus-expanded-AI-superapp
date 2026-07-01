@@ -669,6 +669,15 @@ Hard rules:
 
 You are given the question and a reference solution FOR YOUR EYES ONLY — use it to steer accurately, but never disclose it. Reply in the student's language."""
 
+ASK_ELABORATE_SYSTEM = """You are a study coach. The student has just answered (or attempted) a practice question. Ask them ONE short elaborative-interrogation question — a "why" or "how" probe — that deepens their understanding of the underlying principle.
+
+Rules:
+- Do NOT reveal the answer, the correct option, or any part of the solution.
+- Do NOT ask them to compute a specific numerical result.
+- DO ask them to explain why something is true, how a step works, or how the concept connects to a related idea.
+- Keep the probe short (1-3 sentences), warm, and specific to the question.
+- Reply with the probe text only. No preamble like "Sure" or "Here it is"."""
+
 ASK_TUTOR_SYSTEM = """You are a study tutor. The student has ALREADY submitted their answer to this practice question and now wants to understand it. Help them fully.
 
 - Answer their question directly. You MAY use the correct answer and the reference solution now.
@@ -869,6 +878,7 @@ Output ONLY the JSON array. No markdown fences or commentary around it."""
 
 HINT_SYSTEM += _MATH_TEXT_NOTE
 ASK_COACH_SYSTEM += _MATH_TEXT_NOTE
+ASK_ELABORATE_SYSTEM += _MATH_TEXT_NOTE
 ASK_TUTOR_SYSTEM += _MATH_TEXT_NOTE
 EXPLAIN_SYSTEM += _MATH_TEXT_NOTE
 STUDY_NOTES_SYSTEM += _MATH_TEXT_NOTE

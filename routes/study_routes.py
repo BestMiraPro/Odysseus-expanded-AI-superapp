@@ -57,6 +57,7 @@ from core.database import (
 from src.study_ai import (
     ADD_CONTEXT_SYSTEM,
     ASK_COACH_SYSTEM,
+    ASK_ELABORATE_SYSTEM,
     ASK_TUTOR_SYSTEM,
     AUTHOR_QUESTIONS_SYSTEM,
     DISCOVER_QUESTIONS_SYSTEM,
@@ -244,6 +245,7 @@ class AskIn(BaseModel):
     history: List[Dict] = []      # [{role: "student"|"ai", content: str}, ...]
     answered: bool = False        # have they submitted/checked yet?
     draft: Optional[str] = None   # their current/submitted answer text
+    elaborate: bool = False       # opt-in: generate a why/how elaboration probe
 
 
 # ---------------------------------------------------------------------------
@@ -4315,7 +4317,12 @@ def setup_study_routes():
         ctx_txt = f"\nPROBLEM SETUP:\n{ctx}" if ctx else ""
         draft = (body.draft or "").strip()
         if body.answered:
-            system = ASK_TUTOR_SYSTEM
+            if body.elaborate:
+                system = ASK_ELABORATE_SYSTEM
+                mode = "elaborate"
+            else:
+                system = ASK_TUTOR_SYSTEM
+                mode = "tutor"
             ans = ""
             if options is not None and correct_index is not None:
                 ans += f"\nCORRECT OPTION INDEX: {correct_index}"
@@ -4325,6 +4332,7 @@ def setup_study_routes():
                 ans += f"\n\nSTUDENT'S SUBMITTED ANSWER:\n{draft}"
         else:
             system = ASK_COACH_SYSTEM
+            mode = "coach"
             ans = f"\nREFERENCE SOLUTION (FOR YOUR EYES ONLY — never reveal):\n{reference}" if reference else ""
             if draft:
                 ans += f"\n\nStudent's current draft (NOT submitted):\n{draft}"
@@ -4341,7 +4349,7 @@ def setup_study_routes():
                   f"Reply to the student's latest message.")
         reply = await _llm_text(user, system, prompt,
                                 temperature=0.3, max_tokens=4000, timeout=120)
-        return {"reply": reply, "mode": "tutor" if body.answered else "coach"}
+        return {"reply": reply, "mode": mode}
 
     @router.post("/questions/{question_id}/explain")
     async def question_explain(request: Request, question_id: str):
