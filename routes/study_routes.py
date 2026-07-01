@@ -95,6 +95,7 @@ from src.study_ai import (
 )
 from src.study_vision import text_layer_is_thin
 from src.auth_helpers import get_current_user
+from src.rate_limiter import RateLimiter
 from src import fsrs
 from src import study_service
 from src.study_source import build_original_question_link, infer_source_page
@@ -2793,6 +2794,8 @@ async def run_audit_questions(user, deck_id: Optional[str] = None) -> Dict:
 def setup_study_routes():
     router = APIRouter(prefix="/api/study", tags=["study"])
 
+    _ai_limiter = RateLimiter(max_requests=20, window_seconds=60)
+
     def _owner(request: Request) -> Optional[str]:
         return get_current_user(request)
 
@@ -3105,6 +3108,8 @@ def setup_study_routes():
     @router.post("/ai/generate-cards")
     async def ai_generate_cards(request: Request, body: GenerateCardsIn):
         """Source text -> proposed cards. Returns proposals; nothing is saved."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         text = (body.text or "").strip()
         source = "text"
@@ -3136,6 +3141,8 @@ def setup_study_routes():
     @router.post("/ai/quiz")
     async def ai_quiz(request: Request, body: QuizIn):
         """Free-recall quiz: from a deck (no LLM needed) or from pasted text (LLM)."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         count = max(1, min(20, body.count))
         if body.deck_id:
@@ -3192,6 +3199,8 @@ def setup_study_routes():
 
     @router.post("/ai/grade")
     async def ai_grade(request: Request, body: GradeIn):
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         if not body.answer.strip():
             return {"score": 0, "verdict": "incorrect",
@@ -3543,6 +3552,8 @@ def setup_study_routes():
         """Generate (or regenerate) consultable study notes for one material:
         a Markdown summary from the full text, plus a Key-figures section with
         figures pulled from the source PDF and cited to their page."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = SessionLocal()
         try:
@@ -3594,6 +3605,8 @@ def setup_study_routes():
     async def generate_deck_overview(request: Request, deck_id: str):
         """Generate a short subject overview from the chapter notes (preferred)
         or raw material text, tying the chapters together."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = SessionLocal()
         try:
@@ -3633,6 +3646,8 @@ def setup_study_routes():
         notes. Long materials are chunked; partial results are kept (JSON
         repair recovers complete objects from malformed replies).
         """
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         mode = body.mode if body.mode in ("extract", "author") else "extract"
         types = [t for t in (body.types or ["mcq", "open"]) if t in ("mcq", "open")] or ["mcq", "open"]
@@ -4037,6 +4052,8 @@ def setup_study_routes():
     async def attempt_question(request: Request, question_id: str, body: AttemptIn):
         """Submit an answer. MCQ is checked locally; open answers are AI-graded.
         The outcome maps to an FSRS rating so practice is spaced automatically."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = SessionLocal()
         try:
@@ -4195,6 +4212,8 @@ def setup_study_routes():
 
     @router.post("/questions/{question_id}/hint")
     async def question_hint(request: Request, question_id: str, body: HintIn):
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         level = max(1, min(3, body.level))
         db = SessionLocal()
@@ -4220,6 +4239,8 @@ def setup_study_routes():
         only, never the answer. After they submit it runs in TUTOR mode — full
         explanation. Grounded in the question + reference (for-eyes-only while
         coaching)."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         msg = (body.message or "").strip()
         if not msg:
@@ -4270,6 +4291,8 @@ def setup_study_routes():
     @router.post("/questions/{question_id}/explain")
     async def question_explain(request: Request, question_id: str):
         """Post-attempt explanation for an MCQ (cached on the question)."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = SessionLocal()
         try:
@@ -4304,6 +4327,8 @@ def setup_study_routes():
                                        refresh: bool = False):
         """Material-grounded theory for a question + where to review it.
         Cached on the question; ?refresh=1 regenerates."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = SessionLocal()
         try:
@@ -4362,6 +4387,8 @@ def setup_study_routes():
         needed to answer this question. Returns {locations:[{file_id,name,page,
         label,url}]}; when nothing covers it, generates a hint instead so the
         learner isn't left empty-handed: {locations:[], hint:"..."}."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = SessionLocal()
         try:
@@ -4423,6 +4450,8 @@ def setup_study_routes():
                                    refresh: bool = False):
         """Material-grounded theory for a flashcard. Searches all of the deck's
         materials (theory lives in the lecture files). Cached; ?refresh=1 regenerates."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = SessionLocal()
         try:
