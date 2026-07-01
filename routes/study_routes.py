@@ -4052,10 +4052,15 @@ def setup_study_routes():
 
     @router.get("/practice/queue")
     def practice_queue(request: Request, deck_id: Optional[str] = None,
-                       material_id: Optional[str] = None, topics: Optional[str] = None,
-                       limit: int = 20, mock: bool = False):
+                       limit: int = 20, mode: Optional[str] = None):
         """Due questions first (spaced retrieval), then new ones interleaved
-        across topics (round-robin) instead of blocked by topic."""
+        across topics (round-robin) instead of blocked by topic.
+
+        When ``mode=pretest`` is set, one *unseen* (new, reps==0) question per
+        topic is lifted ahead of the rest as a pretest item (errorful-generation
+        effect, d~0.35).  Pretest items are marked with ``"pretest": true`` in
+        the response so the frontend can label them.  No new schema, no DB
+        writes — pure queue ordering over existing questions."""
         user = _owner(request)
         limit = max(1, min(100, limit))
         db = SessionLocal()
@@ -4093,14 +4098,43 @@ def setup_study_routes():
             else:
                 queue = interleaved + due
             rows = queue[:limit]
+            pretest_ids: set = set()
+            if mode == "pretest":
+                # Pick one new, truly-unseen (reps==0) question per topic.
+                # Exclude already-seen (reps>0) and non-new (due, review, etc).
+                unseen: Dict[str, List[StudyQuestion]] = {}
+                for r in new_rows:
+                    if (r.state == "new") and (r.reps == 0):
+                        unseen.setdefault(r.topic or "general", []).append(r)
+                pretest: List[StudyQuestion] = []
+                for _topic, items in unseen.items():
+                    # oldest first (smallest created_at) for stability
+                    items.sort(key=lambda x: x.created_at or now)
+                    pick = items[0]
+                    pretest.append(pick)
+                # Remove pretest picks from rows so they don't duplicate.
+                pretest_ids = {r.id for r in pretest}
+                rows = [r for r in rows if r.id not in pretest_ids]
+                # Pretests always come first, then the normal queue order.
+                rows = pretest + rows
+                rows = rows[:limit]
             original_links = _question_original_links(db, rows)
-            return {"queue": [_question_to_dict(
-                                r,
-                                with_answer=False,
-                                original=original_links.get(r.id),
-                              )
-                              for r in rows],
-                    "due": len(due), "total": len(queue)}
+            out = []
+            for r in rows:
+                d = _question_to_dict(
+                    r,
+                    with_answer=False,
+                    original=original_links.get(r.id),
+                )
+                if mode == "pretest" and r.id in pretest_ids:
+                    d["pretest"] = True
+                out.append(d)
+            # pretest count = how many of the *limited* rows are pretests
+            actual_pretest = sum(1 for r in rows if r.id in pretest_ids)
+            return {"queue": out,
+                    "due": len(due),
+                    "total": len(queue),
+                    "pretest": actual_pretest}
         finally:
             db.close()
 
