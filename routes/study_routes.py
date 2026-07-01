@@ -103,7 +103,13 @@ from src import fsrs_optimizer
 from src import study_service
 from src.study_source import build_original_question_link, infer_source_page
 from src.study_plan import generate_plan, compute_mastery_scores, migrate_done_blocks
-from src.study_stats import get_stats as _get_stats, get_calibration_curve
+from src.study_stats import (
+    get_stats as _get_stats,
+    get_calibration_curve,
+    get_weak_question_signals,
+    get_question_stability_signal,
+    adaptive_question_priority as _adaptive_question_priority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -4052,7 +4058,8 @@ def setup_study_routes():
 
     @router.get("/practice/queue")
     def practice_queue(request: Request, deck_id: Optional[str] = None,
-                       limit: int = 20, mode: Optional[str] = None):
+                       limit: int = 20, mode: Optional[str] = None,
+                       adaptive: bool = False):
         """Due questions first (spaced retrieval), then new ones interleaved
         across topics (round-robin) instead of blocked by topic.
 
@@ -4097,7 +4104,35 @@ def setup_study_routes():
                 queue = due + interleaved
             else:
                 queue = interleaved + due
-            rows = queue[:limit]
+            # --- adaptive weak-area weighting (Phase 2.4) ---
+            weak_area_weights: Optional[List[Dict]] = None
+            if adaptive:
+                since = now - timedelta(days=42)
+                candidate_ids = [r.id for r in queue]
+                signals = get_weak_question_signals(db, user, since, question_ids=candidate_ids)
+                stab_map = get_question_stability_signal(db, user, question_ids=candidate_ids)
+                queue = _adaptive_question_priority(
+                    queue,
+                    signals["by_question"],
+                    signals["by_topic"],
+                    stab_map,
+                )
+                rows = queue[:limit]
+                # expose transparent weights for returned rows
+                weak_area_weights = []
+                for r in rows:
+                    qid = r.id
+                    topic = getattr(r, "topic", None) or "general"
+                    weak_area_weights.append({
+                        "question_id": qid,
+                        "topic": topic,
+                        "accuracy": signals["by_question"].get(qid, {}).get("accuracy"),
+                        "topic_accuracy": signals["by_topic"].get(topic, {}).get("accuracy"),
+                        "stability": stab_map.get(qid),
+                    })
+            else:
+                rows = queue[:limit]
+                weak_area_weights = None
             pretest_ids: set = set()
             if mode == "pretest":
                 # Pick one new, truly-unseen (reps==0) question per topic.
@@ -4131,10 +4166,15 @@ def setup_study_routes():
                 out.append(d)
             # pretest count = how many of the *limited* rows are pretests
             actual_pretest = sum(1 for r in rows if r.id in pretest_ids)
-            return {"queue": out,
-                    "due": len(due),
-                    "total": len(queue),
-                    "pretest": actual_pretest}
+            resp: Dict[str, Any] = {
+                "queue": out,
+                "due": len(due),
+                "total": len(queue),
+                "pretest": actual_pretest,
+            }
+            if adaptive:
+                resp["adaptive_weights"] = weak_area_weights
+            return resp
         finally:
             db.close()
 
