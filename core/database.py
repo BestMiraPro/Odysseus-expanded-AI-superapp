@@ -1905,28 +1905,18 @@ class StudyAttempt(TimestampMixin, Base):
     idempotency_key = Column(String, nullable=True, index=True)
 
 
-class StudyAgentThread(TimestampMixin, Base):
-    """A conversation with the in-app Study agent (one per chat thread)."""
-    __tablename__ = "study_agent_threads"
+class StudyUserParams(TimestampMixin, Base):
+    """Per-user fitted FSRS weights (w) and model metadata.
 
-    id       = Column(String, primary_key=True, index=True)
-    owner    = Column(String, nullable=True, index=True)
-    title    = Column(String, nullable=True)
-    deck_id  = Column(String, nullable=True, index=True)   # subject the thread is scoped to
-
-
-class StudyAgentMessage(TimestampMixin, Base):
-    """One message of a Study-agent thread (user / assistant / tool)."""
-    __tablename__ = "study_agent_messages"
+    One row per user (owner).  NULL w_json means no fit yet.
+    """
+    __tablename__ = "study_user_params"
 
     id           = Column(String, primary_key=True, index=True)
     owner        = Column(String, nullable=True, index=True)
-    thread_id    = Column(String, index=True, nullable=False)
-    role         = Column(String, nullable=False)          # user | assistant | tool
-    content      = Column(Text, nullable=True)
-    tool_calls   = Column(Text, nullable=True)             # JSON list (assistant turns that called tools)
-    tool_call_id = Column(String, nullable=True)           # tool turns: the call they answer
-    name         = Column(String, nullable=True)           # tool turns: tool name
+    w_json       = Column(Text, nullable=True)       # JSON list of 17 floats
+    review_count = Column(Integer, default=0)         # count used during last fit
+    fitted_at    = Column(DateTime, nullable=True, index=True)
 
 
 class CalendarCal(TimestampMixin, Base):
@@ -2116,6 +2106,7 @@ def init_db():
     _migrate_add_study_idempotency_keys()
     _migrate_backfill_task_folders()
     _migrate_add_study_composite_indexes()
+    _migrate_add_study_user_params()
 
 
 def _migrate_backfill_task_folders():
@@ -2436,6 +2427,45 @@ def _migrate_add_calendar_metadata():
             conn.close()
         except Exception:
             pass
+
+def _migrate_add_study_user_params():
+    """Create study_user_params table if it doesn't exist (idempotent)."""
+    import sqlite3
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='study_user_params'"
+        )
+        if cursor.fetchone() is None:
+            conn.execute(
+                "CREATE TABLE study_user_params ("
+                "id TEXT PRIMARY KEY, "
+                "owner TEXT, "
+                "w_json TEXT, "
+                "review_count INTEGER DEFAULT 0, "
+                "fitted_at DATETIME, "
+                "created_at TIMESTAMP, "
+                "updated_at TIMESTAMP)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_study_user_params_owner ON study_user_params(owner)"
+            )
+            conn.commit()
+            logging.getLogger(__name__).info("Migrated: created study_user_params table")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"study_user_params migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def get_db():
     """

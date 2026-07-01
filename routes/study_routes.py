@@ -52,6 +52,7 @@ from core.database import (
     StudyMaterial,
     StudyQuestion,
     StudyReview,
+    StudyUserParams,
 )
 from src.study_ai import (
     ADD_CONTEXT_SYSTEM,
@@ -97,6 +98,7 @@ from src.study_vision import text_layer_is_thin
 from src.auth_helpers import get_current_user
 from src.rate_limiter import RateLimiter
 from src import fsrs
+from src import fsrs_optimizer
 from src import study_service
 from src.study_source import build_original_question_link, infer_source_page
 from src.study_plan import generate_plan
@@ -2799,6 +2801,20 @@ def setup_study_routes():
     def _owner(request: Request) -> Optional[str]:
         return get_current_user(request)
 
+    def _cached_w(db, user: Optional[str]) -> Optional[List[float]]:
+        """Return fitted per-user w, if any."""
+        if user is None:
+            return None
+        row = db.query(StudyUserParams).filter(
+            StudyUserParams.owner == user,
+        ).first()
+        if row and row.w_json:
+            try:
+                return json.loads(row.w_json)
+            except Exception:
+                pass
+        return None
+
     def _new_introduced_today(db, user, deck_id: str) -> int:
         day_start = _utcnow_naive().replace(hour=0, minute=0, second=0, microsecond=0)
         q = db.query(StudyReview).filter(
@@ -3064,9 +3080,11 @@ def setup_study_routes():
                         "interval_days": prior.interval_days,
                     }
             state_before = card.state or "new"
+            user_w = _cached_w(db, user)
             result = fsrs.schedule(
                 _card_fsrs_dict(card), body.rating,
                 desired_retention=_flt(deck.retention, 0.9),
+                w=(user_w if user_w is not None else fsrs.DEFAULT_W),
             )
             card.state = result["state"]
             card.stability = str(result["stability"])
@@ -4149,6 +4167,7 @@ def setup_study_routes():
                         "interval_days": None,
                         "next_due": _iso(row.due),
                     }
+            user_w = _cached_w(db, user)
             result = fsrs.schedule({
                 "state": row.state or "new",
                 "stability": _flt(row.stability),
@@ -4156,7 +4175,7 @@ def setup_study_routes():
                 "last_review": row.last_review,
                 "reps": row.reps or 0,
                 "lapses": row.lapses or 0,
-            }, rating)
+            }, rating, w=(user_w if user_w is not None else fsrs.DEFAULT_W))
             row.state = result["state"]
             row.stability = str(result["stability"])
             row.fsrs_difficulty = str(result["difficulty"])
@@ -4615,6 +4634,62 @@ def setup_study_routes():
                 })
                 break
             return {"prereqs": out}
+        finally:
+            db.close()
+
+    @router.post("/optimize")
+    def optimize_weights(request: Request):
+        """Trigger per-user FSRS weight fitting (A6)."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            # ----- load this user's review history -----
+            # Need cards owned by user for initial snapshots.
+            cards = db.query(StudyCard).filter(StudyCard.owner == user).all() if user else []
+            snapshots = []
+            for c in cards:
+                snapshots.append({
+                    "id": c.id,
+                    "state": c.state,
+                    "stability": c.stability,
+                    "difficulty": c.difficulty,
+                    "last_review": _iso(c.last_review),
+                    "reps": c.reps,
+                    "lapses": c.lapses,
+                })
+            reviews_q = db.query(StudyReview).filter(StudyReview.owner == user)
+            reviews = []
+            for r in reviews_q.order_by(StudyReview.reviewed_at.asc()).all():
+                reviews.append({
+                    "id": r.id,
+                    "card_id": r.card_id,
+                    "rating": r.rating,
+                    "interval_days": r.interval_days,
+                    "state_before": r.state_before,
+                    "reviewed_at": _iso(r.reviewed_at),
+                })
+            # Gate / fit
+            fitted = fsrs_optimizer.fit_w(snapshots, reviews, seed=42)
+            if fitted is None:
+                return {"status": "insufficient_data",
+                        "reviews": len(reviews),
+                        "min_required": fsrs_optimizer.MIN_REVIEWS}
+            # Persist
+            row = db.query(StudyUserParams).filter(StudyUserParams.owner == user).first()
+            now = _utcnow_naive()
+            if row is None:
+                db.add(StudyUserParams(
+                    id=str(uuid.uuid4()), owner=user,
+                    w_json=json.dumps(fitted),
+                    review_count=len(reviews),
+                    fitted_at=now,
+                ))
+            else:
+                row.w_json = json.dumps(fitted)
+                row.review_count = len(reviews)
+                row.fitted_at = now
+            db.commit()
+            return {"status": "ok", "reviews": len(reviews), "w": fitted}
         finally:
             db.close()
 
