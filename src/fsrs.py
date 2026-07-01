@@ -25,7 +25,9 @@ Card states:
 
 from __future__ import annotations
 
+import hashlib
 import math
+import struct
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 
@@ -53,9 +55,79 @@ MIN_STABILITY = 0.05
 MIN_DIFFICULTY = 1.0
 MAX_DIFFICULTY = 10.0
 
+# --- Anti-clustering interval fuzz (Phase 2.1 / A7) -------------------------
+# Reviews otherwise clump on the same calendar day because every card at a
+# given (stability, retention) maps to the same integer day interval. The fuzz
+# is an opt-in, flag-gated, *seeded* ±FUZZ_FRACTION perturbation of the
+# computed review-state interval. It is:
+#   * DEFAULT OFF (FUZZ_DEFAULT = False) — golden/structural tests stay exact.
+#   * SEEDED & DETERMINISTIC — the same (card, seed) always yields the same
+#     jittered interval; no wall-clock RNG, no Python's randomized hash().
+#   * REVIEW-STATE ONLY — never applied to learning/relearning fixed steps
+#     (interval_days == 0); only to graduated day-scale intervals.
+#   * CLAMPED — fuzzed intervals stay within [1, maximum_interval].
+FUZZ_DEFAULT = False     # gate: callers must opt in via schedule(fuzz=True)
+FUZZ_FRACTION = 0.25     # ±25% of the base interval
+
 
 def _clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
+
+
+def _seeded_jitter(seed: int) -> float:
+    """Return a deterministic float in [-1.0, 1.0) from a 32-bit integer seed.
+
+    Uses a stable SHA-256 derivation so the value is reproducible across
+    processes/machines (Python's builtin `hash()` is randomized by default
+    under PYTHONHASHSEED and is not portable). A fresh hash is taken for each
+    successive seed so the sequence is uncorrelated with the input magnitude.
+    """
+    digest = hashlib.sha256(b"fsrs-fuzz\x00" + struct.pack(">I", seed & 0xFFFFFFFF)).digest()
+    # First 4 bytes as unsigned int → [0, 2**32), mapped to [-1.0, 1.0).
+    u = struct.unpack(">I", digest[:4])[0]
+    return (u / float(1 << 32)) * 2.0 - 1.0
+
+
+def _fuzz_interval(base_days: int, seed: int, fraction: float = FUZZ_FRACTION) -> int:
+    """Apply seeded ±`fraction` jitter to a review-state day interval.
+
+    Pure function of (base_days, seed, fraction); deterministic and seeded.
+    Caller is responsible for only invoking this on review-state intervals
+    (base_days >= 1) and for clamping the result to [1, maximum_interval].
+    """
+    j = _seeded_jitter(seed)
+    return int(round(base_days * (1.0 + j * fraction)))
+
+
+def _derive_fuzz_seed(card: Dict) -> Optional[int]:
+    """Derive a stable fuzz seed from a card's stable fields.
+
+    Falls back to None if no card id is present, in which case the caller
+    treats `fuzz_seed=None` as 'no fuzz even if fuzz=True'. Fields used:
+    card id (string preferred) and the last review timestamp (so the same
+    card reviewed at different times still varies). Hashed via SHA-256 for
+    portability (not Python's randomized builtin hash).
+    """
+    card_id = card.get("id")
+    if card_id is None:
+        return None
+    if isinstance(card_id, int):
+        card_id = str(card_id)
+    if not isinstance(card_id, str):
+        # Anything coercible → stringify; otherwise bail out deterministically.
+        try:
+            card_id = str(card_id)
+        except Exception:
+            return None
+    parts = [str(card_id).encode("utf-8", "replace")]
+    last_review = card.get("last_review")
+    if isinstance(last_review, str):
+        parts.append(last_review.encode("utf-8", "replace"))
+    elif isinstance(last_review, datetime):
+        parts.append(last_review.astimezone(timezone.utc)
+                     .strftime("%Y%m%dT%H%M%SZ").encode("ascii"))
+    digest = hashlib.sha256(b"\x00".join(parts)).digest()
+    return struct.unpack(">I", digest[:4])[0]
 
 
 def utcnow() -> datetime:
@@ -135,10 +207,37 @@ def _next_interval_days(stability: float, retention: float,
     return int(_clamp(days, 1, maximum_interval))
 
 
+def _next_interval_days_fuzzed(stability: float, retention: float,
+                               maximum_interval: int,
+                               fuzz: bool, fuzz_seed: Optional[int]) -> int:
+    """Compute the next review-state interval, applying gated seeded fuzz.
+
+    `fuzz=False` (the default) is byte-identical to `_next_interval_days` —
+    no jitter, no seed lookup, so golden/structural tests stay exact. When
+    `fuzz=True` a seeded ±FUZZ_FRACTION perturbation is applied, derived from
+    `fuzz_seed` (an explicit int) or, when None, from the card's stable
+    fields via `_derive_fuzz_seed`. If fuzz is on but no seed can be derived
+    (no card id) the interval is returned unfuzzed (deterministic, safe).
+    Result is clamped to [1, maximum_interval].
+    """
+    base = _next_interval_days(stability, retention, maximum_interval)
+    if not fuzz:
+        return base
+    seed = fuzz_seed
+    if seed is None:
+        # Without a derivable seed we cannot fuzz deterministically; return
+        # the unfuzzed interval rather than fall back to wall-clock RNG.
+        return base
+    fuzzed = _fuzz_interval(base, seed)
+    return int(_clamp(fuzzed, 1, maximum_interval))
+
+
 def schedule(card: Dict, rating: int, now: Optional[datetime] = None, *,
              desired_retention: float = DEFAULT_RETENTION,
              maximum_interval: int = DEFAULT_MAX_INTERVAL,
-             w=DEFAULT_W) -> Dict:
+             w=DEFAULT_W,
+             fuzz: bool = FUZZ_DEFAULT,
+             fuzz_seed: Optional[int] = None) -> Dict:
     """Apply one review to a card; return the updated scheduling fields.
 
     `card` needs: state, stability, difficulty, last_review (datetime|None),
@@ -147,6 +246,19 @@ def schedule(card: Dict, rating: int, now: Optional[datetime] = None, *,
      interval_days, elapsed_days}
     where `interval_days` is the day-scale interval granted (0 for same-day
     learning steps) and `due` is an aware UTC datetime.
+
+    Anti-clustering fuzz (Phase 2.1 / A7):
+    - `fuzz` defaults to False (FUZZ_DEFAULT) so callers that don't opt in
+      get byte-identical intervals to the pre-fuzz scheduler. Golden and
+      structural test suites are therefore unchanged.
+    - When `fuzz=True`, the *review-state* day-scale interval (established
+      review card, rating Hard/Good/Easy) gets a seeded ±FUZZ_FRACTION
+      perturbation. Learning/relearning steps (interval_days==0) and the
+      graduation interval (new/learning → Good/Easy) are NEVER fuzzed.
+    - `fuzz_seed` may be supplied explicitly; if None and fuzz is on, a seed
+      is derived from the card's stable fields (card id + last_review) via
+      `_derive_fuzz_seed`. If no seed can be derived, the interval is
+      returned unfuzzed (deterministic; no wall-clock RNG).
     """
     if rating not in (AGAIN, HARD, GOOD, EASY):
         raise ValueError(f"rating must be 1-4, got {rating!r}")
@@ -207,10 +319,19 @@ def schedule(card: Dict, rating: int, now: Optional[datetime] = None, *,
         if rating == AGAIN:
             new_state = "relearning"
             lapses += 1
-            due = now + timedelta(minutes=LEARN_AGAIN_MIN)
+            due = now + timedelta(minutes=LEARN_AGAIN_MIN)  # NOT fuzzed (learning step)
         else:
             new_state = "review"
-            interval_days = _next_interval_days(stability, desired_retention, maximum_interval)
+            # Review-state day-scale interval: the ONLY path eligible for
+            # anti-clustering fuzz. The graduation path above (new/learning/
+            # relearning Good/Easy) intentionally uses the unfuzzed
+            # _next_interval_days — fuzz is review-state only per the A7 spec.
+            if fuzz:
+                seed = fuzz_seed if fuzz_seed is not None else _derive_fuzz_seed(card)
+            else:
+                seed = None
+            interval_days = _next_interval_days_fuzzed(
+                stability, desired_retention, maximum_interval, fuzz, seed)
             due = now + timedelta(days=interval_days)
 
     return {
