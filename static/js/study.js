@@ -2614,17 +2614,36 @@ async function renderFocus() {
 
   const last14 = stats.daily.slice(-14);
   const maxMin = Math.max(30, ...last14.map(d => d.focus_min));
-  // Retrievals = card reviews + practice answers. Practice is where most
-  // retrieval happens, so a chart of card reviews alone under-reports the work.
-  const retr = last14.map(d => (d.reviews || 0) + (d.attempts || 0));
-  const maxRetr = Math.max(5, ...retr);
-  const t = stats.totals || {};
-  const okPct = (t.success_rate === null || t.success_rate === undefined)
-    ? null : Math.round(t.success_rate * 100);
-  const calibHtml = _calibrationHtml(calib);
+  const calCurve = (stats.calibration_curve || []).filter(b => b.n > 0);
+  const calSvg = ((data) => {
+    if (!data.length) return '';
+    const W = 520, H = 150, PL = 32, PB = 22;
+    const cw = W - PL, ch = H - PB;
+    const bars = data.map(b => {
+      const x = PL + (b.predicted / 100) * cw - 7;
+      const h = b.accuracy != null ? Math.round(b.accuracy * ch) : 0;
+      const y = H - PB - h;
+      const o = b.low_n ? '0.35' : '0.85';
+      return `<rect x="${x}" y="${y}" width="14" height="${h}" rx="2" fill="var(--accent)" opacity="${o}"/>`;
+    }).join('');
+    // diagonal perfect-calibration line
+    const diag = `<line x1="${PL}" y1="${H - PB}" x2="${W}" y2="${PB}" stroke="var(--text-muted)" stroke-dasharray="3,3" opacity="0.4"/>`;
+    // axis labels
+    const xLabs = [0, 25, 50, 75, 100].map(v =>
+      `<text x="${PL + (v / 100) * cw}" y="${H - 4}" font-size="10" fill="var(--text-muted)" text-anchor="middle">${v}</text>`
+    ).join('');
+    const yLabs = [0, 0.5, 1].map(v =>
+      `<text x="${PL - 4}" y="${H - PB - (v * ch) + 3}" font-size="10" fill="var(--text-muted)" text-anchor="end">${Math.round(v * 100)}</text>`
+    ).join('');
+    return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;overflow:visible;">${diag}${bars}${xLabs}${yLabs}</svg>`;
+  })(calCurve);
   el.innerHTML = `
     <div style="max-width:560px;">
-      <div class="study-section-title">Start a focus session</div>
+      <div class="study-section-title">Confidence calibration</div>
+      ${calCurve.length ? calSvg : '<div class="study-empty">Not enough data yet — answer more questions with confidence.</div>'}
+      ${calCurve.length ? `<div style="font-size:11px;opacity:0.6;margin-top:4px;text-align:right;">dashed = perfect calibration · dim = low sample</div>` : ''}
+
+      <div class="study-section-title" style="margin-top:26px;">Start a focus session</div>
       <div class="study-form-row">
         <input class="study-input" id="study-focus-label" placeholder="What are you working on?" style="flex:1;">
       </div>

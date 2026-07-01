@@ -102,7 +102,7 @@ from src import fsrs_optimizer
 from src import study_service
 from src.study_source import build_original_question_link, infer_source_page
 from src.study_plan import generate_plan
-from src.study_stats import get_stats as _get_stats
+from src.study_stats import get_stats as _get_stats, get_calibration_curve
 
 logger = logging.getLogger(__name__)
 
@@ -4557,6 +4557,21 @@ def setup_study_routes():
         """Confidence calibration: Brier score, per-bucket stated vs actual
         accuracy, and the sure-but-wrong rate per subject."""
         return calibration_payload(_owner(request), days=days)
+
+    @router.get("/calibration")
+    def calibration(request: Request, days: int = 42):
+        """Persistent, owner-scoped calibration curve (numeric confidence 0-100).
+
+        Returns {curve: [...]} where each item has predicted, accuracy, total, low_n.
+        """
+        user = _owner(request)
+        days = max(7, min(180, days))
+        db = SessionLocal()
+        try:
+            since = _utcnow_naive() - timedelta(days=days)
+            return {"curve": get_calibration_curve(db, user, since)}
+        finally:
+            db.close()
 
     @router.get("/history")
     def history(request: Request, limit: int = 100):

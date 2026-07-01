@@ -45,9 +45,11 @@ def get_question_accuracy(db: Session, owner: Optional[str], since: datetime) ->
 def get_calibration(
     db: Session, owner: Optional[str], since: datetime
 ) -> List[Dict[str, Any]]:
-    """Return confidence buckets for calibration curve.
+    """Return confidence buckets for calibration curve (20-point bands).
 
-    Buckets are 20 %-point bands: 0-19, 20-39, 40-59, 60-79, 80-100.
+    Buckets: 0-19, 20-39, 40-59, 60-79, 80-100.
+    Kept for backwards compatibility — get_calibration_curve() provides
+    the finer-grained decile view.
     """
     q = db.query(StudyAttempt).filter(
         StudyAttempt.attempted_at >= since,
@@ -75,6 +77,66 @@ def get_calibration(
         d = buckets[b]
         d["accuracy"] = round(d["correct"] / d["total"], 3) if d["total"] else None
         result.append(d)
+    return result
+
+
+def get_calibration_curve(
+    db: Session,
+    owner: Optional[str],
+    since: datetime,
+    *,
+    min_bin_n: int = 3,
+) -> List[Dict[str, Any]]:
+    """Return persistent, owner-scoped calibration curve on numeric confidence.
+
+    Bins are deciles (0-9, 10-19, …, 90-100) using the NUMERIC 0-100
+    confidence column.  Each bin reports:
+      - predicted: midpoint confidence of the bin (e.g. 5 for 0-9)
+      - accuracy:  actual fraction correct in that bin
+      - total / n: number of attempts
+      - low_n:     True when n < min_bin_n (caller may dim/hide)
+
+    Empty data returns [].  Deterministic — bins ordered ascending.
+    """
+    q = db.query(StudyAttempt).filter(
+        StudyAttempt.attempted_at >= since,
+        StudyAttempt.confidence.isnot(None),
+    )
+    if owner is not None:
+        q = q.filter(StudyAttempt.owner == owner)
+    rows = q.all()
+    raw: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        conf = r.confidence or 0
+        # clamp to valid range, cap at max bin=9 (90-99) except 100 goes to bin 9
+        conf = max(0, min(100, conf))
+        bucket = min(conf // 10, 9)  # 0..9
+        if bucket not in raw:
+            start = bucket * 10
+            end = start + 9 if bucket < 9 else 100
+            raw[bucket] = {
+                "predicted": start + 5,
+                "label": f"{start}-{end}",
+                "total": 0,
+                "correct": 0,
+            }
+        raw[bucket]["total"] += 1
+        if r.correct:
+            raw[bucket]["correct"] += 1
+
+    result: List[Dict[str, Any]] = []
+    for b in sorted(raw):
+        d = raw[b]
+        n = d["total"]
+        accuracy = round(d["correct"] / n, 3) if n else None
+        result.append({
+            "predicted": d["predicted"],
+            "label": d["label"],
+            "accuracy": accuracy,
+            "total": n,
+            "n": n,
+            "low_n": n < min_bin_n,
+        })
     return result
 
 
@@ -146,7 +208,8 @@ def get_stats(
     Returns a dict with:
       - daily: per-day breakdown (reviews, again, focus_min, attempts, attempts_correct)
       - totals: rollup (reviews, success_rate, cards, focus_min, attempts, accuracy, avg_score)
-      - calibration: confidence buckets
+      - calibration: legacy 20-point confidence buckets
+      - calibration_curve: decile-based persistent calibration
     """
     days = max(7, min(180, days))
     if now is None:
@@ -164,6 +227,7 @@ def get_stats(
 
     accuracy = get_question_accuracy(db, owner, since)
     calibration = get_calibration(db, owner, since)
+    calibration_curve = get_calibration_curve(db, owner, since)
 
     return {
         "daily": daily,
@@ -179,4 +243,5 @@ def get_stats(
             "avg_score": accuracy["avg_score"],
         },
         "calibration": calibration,
+        "calibration_curve": calibration_curve,
     }
