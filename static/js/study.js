@@ -483,11 +483,13 @@ export function openPanel() {
   _pane = document.createElement('div');
   _pane.id = 'study-pane';
   _pane.className = 'study-pane';
+  _pane.setAttribute('role', 'dialog');
+  _pane.setAttribute('aria-label', 'Study panel');
   _pane.innerHTML = `
     <div class="study-header">
       <span class="study-title">${ICON} Study</span>
-      <div class="study-tabs" id="study-tabs">
-        ${TABS.map(([k, label]) => `<button class="study-tab" data-tab="${k}">${label}</button>`).join('')}
+      <div class="study-tabs" id="study-tabs" role="tablist">
+        ${TABS.map(([k, label]) => `<button class="study-tab" data-tab="${k}" role="tab" aria-selected="${_tab === k}">${label}</button>`).join('')}
       </div>
       <span class="study-header-spacer"></span>
       <span class="study-model-wrap" id="study-model-wrap" title="Model used for extraction, grading and hints. 'Same as chat' falls back to the utility/default model.">
@@ -524,7 +526,7 @@ export function openPanel() {
       return;
     }
     if (_tab === 'review') reviewKeydown(e);
-    else if (_tab === 'practice') practiceKeydown(e);
+    if (_tab === 'practice') practiceKeydown(e);
   };
   document.addEventListener('keydown', _keyHandler);
 
@@ -628,8 +630,11 @@ function setTab(tab) {
   _tab = tab;
   const b = body();
   if (b) b.onclick = null; // per-tab delegated handlers are reassigned below
-  _pane.querySelectorAll('.study-tab').forEach(btn =>
-    btn.classList.toggle('active', btn.dataset.tab === tab));
+  _pane.querySelectorAll('.study-tab').forEach(btn => {
+    const active = btn.dataset.tab === tab;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
   const render = {
     today: renderToday, subjects: renderSubjects, review: renderReview,
     practice: renderPractice, plan: renderPlan, focus: renderFocus,
@@ -659,8 +664,11 @@ function setTabSilent(tab) {
   _tab = tab;
   const b = body();
   if (b) b.onclick = null;
-  _pane?.querySelectorAll('.study-tab').forEach(btn =>
-    btn.classList.toggle('active', btn.dataset.tab === tab));
+  _pane?.querySelectorAll('.study-tab').forEach(btn => {
+    const active = btn.dataset.tab === tab;
+    btn.classList.toggle('active', active);
+    btn.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,10 +1765,27 @@ function renderCardList() {
     try {
       if (editId) {
         const c = s.cards.find(x => x.id === editId);
-        const front = prompt('Front:', c.front); if (front === null) return;
-        const back = prompt('Back:', c.back); if (back === null) return;
-        await jput(`/api/study/cards/${editId}`, { front, back });
-        reloadSubject();
+        // Inline edit form (Phase 4.2: replaces native prompt())
+        const wrap2 = el.querySelector(`[data-edit="${editId}"]`)?.closest('.study-row');
+        if (wrap2) {
+          wrap2.outerHTML = `<div class="study-card-edit" role="dialog" aria-label="Edit card">
+            <input class="study-input" id="study-edit-front" value="${esc(c.front)}" placeholder="Front" style="width:100%;margin-bottom:6px;" aria-label="Card front">
+            <textarea class="study-textarea" id="study-edit-back" style="min-height:80px;margin-bottom:6px;" aria-label="Card back">${esc(c.back)}</textarea>
+            <div class="study-form-row">
+              <button class="study-btn primary" id="study-edit-save" data-id="${editId}">Save</button>
+              <button class="study-btn" id="study-edit-cancel">Cancel</button>
+            </div>
+          </div>`;
+          el.querySelector('#study-edit-save')?.addEventListener('click', async () => {
+            const front = el.querySelector('#study-edit-front').value.trim();
+            const back = el.querySelector('#study-edit-back').value.trim();
+            if (!front) return toast('Front cannot be empty', true);
+            await jput(`/api/study/cards/${editId}`, { front, back });
+            reloadSubject();
+          });
+          el.querySelector('#study-edit-cancel')?.addEventListener('click', () => reloadSubject());
+          el.querySelector('#study-edit-front')?.focus();
+        }
       } else if (suspId) {
         const c = s.cards.find(x => x.id === suspId);
         await jput(`/api/study/cards/${suspId}`, { suspended: !c.suspended });
@@ -1920,26 +1945,43 @@ function reviewKeydown(e) {
   }
 }
 
-// Practice shortcuts: 1-9 pick an MCQ option, Enter checks the answer (or
-// goes to the next question once graded); inside the answer box Ctrl/Cmd+Enter
-// submits so Enter can still add a newline.
 function practiceKeydown(e) {
+  if (!S.practice || S.practice.loading) return;
+  if (e.target.closest('input, textarea, select')) return;
   const p = S.practice;
-  if (!p || p.loading) return;
-  const el = body();
-  if (!el) return;
-  if (e.target.closest('input, select')) return;
-  const inText = !!e.target.closest('textarea');
-  if (e.key === 'Enter') {
-    if (inText && !(e.ctrlKey || e.metaKey)) return;
-    e.preventDefault();
-    (el.querySelector('#study-prac-next') || el.querySelector('#study-prac-submit'))?.click();
-    return;
+  const q = p.queue[p.idx];
+  if (!q) return;
+
+  // MCQ option selection: 1-n selects, Enter submits
+  if (q.qtype === 'mcq' && !p.result) {
+    if (/^[1-9]$/.test(e.key)) {
+      const idx = parseInt(e.key, 10) - 1;
+      if (idx < (q.options || []).length) {
+        e.preventDefault();
+        p.choice = idx;
+        renderPractice();
+      }
+    } else if (e.key === 'Enter' && p.choice != null) {
+      e.preventDefault();
+      el = body();
+      el.querySelector('#study-prac-submit')?.click();
+    }
   }
-  if (inText) return;
-  if (/^[1-9]$/.test(e.key) && !p.result) {
-    const opt = el.querySelector(`[data-opt="${parseInt(e.key, 10) - 1}"]`);
-    if (opt) { e.preventDefault(); opt.click(); }
+
+  // H = hint, C = consult, N = next (when result shown)
+  if (e.key === 'h' || e.key === 'H') {
+    if (!p.result && p.hints.length < 3 && !p.hintBusy) {
+      e.preventDefault();
+      body().querySelector('#study-prac-hint')?.click();
+    }
+  }
+  if (e.key === 'c' || e.key === 'C') {
+    e.preventDefault();
+    body().querySelector('#study-prac-consult')?.click();
+  }
+  if ((e.key === 'n' || e.key === 'N') && p.result) {
+    e.preventDefault();
+    body().querySelector('#study-prac-next')?.click();
   }
 }
 
@@ -2163,8 +2205,8 @@ async function renderPractice() {
           ${_originalQuestionButton(q)}
           <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>
           <button class="study-btn" id="study-prac-skip">Skip</button>
-          ${p.mock ? `<span style="flex:1;"></span><button class="study-btn" id="study-prac-endmock" title="Stop answering and predict your score">Finish early</button>` : ''}
-        </div>` : `
+        </div>
+        <div class="study-tip" style="text-align:left;font-size:11px;">Keyboard: <b>1–9</b> select option, <b>Enter</b> check, <b>H</b> hint, <b>C</b> consult, <b>N</b> next.</div>` : `
         <div class="study-grade ${res.correct === true || (res.score ?? 0) >= 85 ? 'correct' : (res.correct === false || (res.score ?? 0) < 60 ? 'incorrect' : '')}">
           ${isMcq
             ? `<b class="score">${res.correct ? 'Correct' : 'Incorrect'}</b>`
