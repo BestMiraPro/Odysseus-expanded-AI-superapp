@@ -970,6 +970,11 @@ async function renderSubjects() {
       </select>
     </div>
     <div id="study-deck-list"></div>
+    <div class="study-form-row" style="margin-top:14px;">
+      <input class="study-input" id="study-global-search" placeholder="Search across all subjects (questions + cards)…" style="flex:1;max-width:400px;" aria-label="Cross-subject search">
+      <button class="study-btn" id="study-global-search-btn">Search</button>
+    </div>
+    <div id="study-search-results"></div>
   `;
   const list = el.querySelector('#study-deck-list');
   list.innerHTML = S.decks.length ? S.decks.map(d => `
@@ -1023,6 +1028,33 @@ async function renderSubjects() {
     }
     const row = e.target.closest('[data-deck]');
     if (row) openSubject(row.dataset.deck);
+  });
+
+  // Phase 5: cross-subject search
+  const doGlobalSearch = async () => {
+    const query = el.querySelector('#study-global-search').value.trim();
+    const resEl = el.querySelector('#study-search-results');
+    if (!query) { resEl.innerHTML = ''; return; }
+    resEl.innerHTML = '<div class="study-subtle">Searching…</div>';
+    try {
+      const r = await jget(`/api/study/search?q=${encodeURIComponent(query)}&limit=20`);
+      const qs = r.questions || [];
+      const cs = r.cards || [];
+      if (!qs.length && !cs.length) {
+        resEl.innerHTML = '<div class="study-empty">No results.</div>';
+        return;
+      }
+      resEl.innerHTML = `
+        ${qs.length ? `<div class="study-section-title">Questions (${qs.length})</div>` : ''}
+        ${qs.map(q => `<div class="study-row"><span class="grow">${esc(q.question.slice(0, 100))}</span><span class="study-subtle">${esc(q.qtype)}</span></div>`).join('')}
+        ${cs.length ? `<div class="study-section-title" style="margin-top:10px;">Cards (${cs.length})</div>` : ''}
+        ${cs.map(c => `<div class="study-row"><span class="grow">${esc(c.front.slice(0, 80))}</span><span class="study-subtle">card</span></div>`).join('')}
+      `;
+    } catch (err) { resEl.innerHTML = `<div class="study-empty">${esc(err.message)}</div>`; }
+  };
+  el.querySelector('#study-global-search-btn')?.addEventListener('click', doGlobalSearch);
+  el.querySelector('#study-global-search')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); doGlobalSearch(); }
   });
 }
 

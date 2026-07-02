@@ -4100,6 +4100,45 @@ def setup_study_routes():
         finally:
             db.close()
 
+    @router.get("/search")
+    def cross_subject_search(request: Request, q: str = "", limit: int = 20):
+        """Phase 5: global cross-subject search across all questions and cards.
+
+        Searches question text and card fronts/backs across all the user's
+        decks — useful for finding related material across subjects.
+        """
+        user = _owner(request)
+        q = q.strip()
+        if not q:
+            return {"questions": [], "cards": []}
+        limit = max(1, min(50, limit))
+        db = SessionLocal()
+        try:
+            q_rows = []
+            c_rows = []
+            if user is not None:
+                q_rows = db.query(StudyQuestion).filter(
+                    StudyQuestion.owner == user,
+                    StudyQuestion.question.ilike(f"%{q}%"),
+                ).order_by(StudyQuestion.created_at.desc()).limit(limit).all()
+                c_rows = db.query(StudyCard).filter(
+                    StudyCard.owner == user,
+                    (StudyCard.front.ilike(f"%{q}%") | StudyCard.back.ilike(f"%{q}%")),
+                ).order_by(StudyCard.created_at.desc()).limit(limit).all()
+            else:
+                q_rows = db.query(StudyQuestion).filter(
+                    StudyQuestion.question.ilike(f"%{q}%"),
+                ).order_by(StudyQuestion.created_at.desc()).limit(limit).all()
+                c_rows = db.query(StudyCard).filter(
+                    StudyCard.front.ilike(f"%{q}%") | StudyCard.back.ilike(f"%{q}%"),
+                ).order_by(StudyCard.created_at.desc()).limit(limit).all()
+            return {
+                "questions": [_question_to_dict(r) for r in q_rows],
+                "cards": [_card_to_dict(r) for r in c_rows],
+            }
+        finally:
+            db.close()
+
     @router.put("/questions/{question_id}")
     def update_question(request: Request, question_id: str, body: QuestionUpdate):
         user = _owner(request)
@@ -4450,6 +4489,8 @@ def setup_study_routes():
                 "interval_days": result["interval_days"],
                 "next_due": _iso(row.due),
                 "require_reengage": require_reengage,
+                "delay_feedback": (confidence is not None and confidence >= 85
+                                    and correct is False),
             }
         finally:
             db.close()
