@@ -163,6 +163,7 @@ def client(monkeypatch):
     monkeypatch.setattr(sr, "SessionLocal", lambda: session)
     monkeypatch.setattr(sr, "get_current_user", lambda _request: OWNER)
     monkeypatch.setattr(sr, "_read_pref", lambda _owner, key: None)
+    monkeypatch.setattr(sr.RateLimiter, "check", lambda *_a, **_k: True)
     monkeypatch.setattr(sr, "_utcnow_naive", lambda: NOW)
     return TestClient(app), session
 

@@ -38,6 +38,7 @@ def study_app(tmp_path, monkeypatch):
     monkeypatch.setattr(study_routes, "SessionLocal", TestSessionLocal)
     monkeypatch.setattr(study_routes, "get_current_user", lambda _request: OWNER)
     monkeypatch.setattr(study_routes, "_read_pref", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(study_routes.RateLimiter, "check", lambda *_a, **_k: True)
     return TestClient(app), TestSessionLocal
 
 
