@@ -1823,6 +1823,11 @@ class StudyFocusSession(TimestampMixin, Base):
     started_at  = Column(DateTime, default=utcnow_naive, index=True)
     ended_at    = Column(DateTime, nullable=True)
     completed   = Column(Boolean, default=False)
+    # Phase 3.2 Focus<->Plan link: optionally attribute the session to a
+    # subject (deck) and/or a specific plan block (exam + block key).
+    deck_id     = Column(String, ForeignKey("study_decks.id"), nullable=True, index=True)
+    exam_id     = Column(String, ForeignKey("study_exams.id"), nullable=True, index=True)
+    block_key   = Column(String, nullable=True)       # "{date}:{idx}" in done_blocks
 
 
 class StudyMaterial(TimestampMixin, Base):
@@ -2107,6 +2112,7 @@ def init_db():
     _migrate_backfill_task_folders()
     _migrate_add_study_composite_indexes()
     _migrate_add_study_user_params()
+    _migrate_add_study_focus_link_columns()
 
 
 def _migrate_backfill_task_folders():
@@ -2632,6 +2638,48 @@ def archive_session(session_id: str):
             db.commit()
             return True
     return False
+
+
+def _migrate_add_study_focus_link_columns():
+    """Add deck_id/exam_id/block_key to study_focus_sessions (Phase 3.2).
+
+    Idempotent: checks each column before adding. Backwards-compatible — all
+    three default to NULL so existing sessions are unaffected.
+    """
+    import sqlite3
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(study_focus_sessions)").fetchall()]
+        if not cols:
+            return  # table doesn't exist yet; create_all handles it
+        if "deck_id" not in cols:
+            conn.execute("ALTER TABLE study_focus_sessions ADD COLUMN deck_id TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_study_focus_sessions_deck_id "
+                         "ON study_focus_sessions(deck_id)")
+        if "exam_id" not in cols:
+            conn.execute("ALTER TABLE study_focus_sessions ADD COLUMN exam_id TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS ix_study_focus_sessions_exam_id "
+                         "ON study_focus_sessions(exam_id)")
+        if "block_key" not in cols:
+            conn.execute("ALTER TABLE study_focus_sessions ADD COLUMN block_key TEXT")
+        conn.commit()
+        logging.getLogger(__name__).info(
+            "Migrated: added deck_id/exam_id/block_key to study_focus_sessions"
+        )
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"study focus link migration failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 # Initialize the database by creating all tables
 

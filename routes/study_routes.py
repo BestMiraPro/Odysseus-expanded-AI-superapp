@@ -197,6 +197,9 @@ class ToggleBlockIn(BaseModel):
 class FocusStart(BaseModel):
     label: Optional[str] = None
     planned_min: int = 25
+    deck_id: Optional[str] = None      # Phase 3.2: attribute to a subject
+    exam_id: Optional[str] = None      # Phase 3.2: attribute to a plan block
+    block_key: Optional[str] = None    # Phase 3.2: "{date}:{idx}" in done_blocks
 
 
 class FocusFinish(BaseModel):
@@ -344,6 +347,9 @@ def _focus_to_dict(s: StudyFocusSession) -> Dict:
         "started_at": _iso(s.started_at),
         "ended_at": _iso(s.ended_at),
         "completed": bool(s.completed),
+        "deck_id": getattr(s, "deck_id", None),
+        "exam_id": getattr(s, "exam_id", None),
+        "block_key": getattr(s, "block_key", None),
     }
 
 
@@ -3427,6 +3433,9 @@ def setup_study_routes():
                 id=str(uuid.uuid4()), owner=user, label=body.label,
                 planned_min=max(1, min(240, body.planned_min)),
                 started_at=_utcnow_naive(),
+                deck_id=getattr(body, "deck_id", None),
+                exam_id=getattr(body, "exam_id", None),
+                block_key=getattr(body, "block_key", None),
             )
             db.add(s)
             db.commit()
@@ -3462,6 +3471,44 @@ def setup_study_routes():
                 q = q.filter(StudyFocusSession.owner == user)
             sessions = q.order_by(StudyFocusSession.started_at.desc()).all()
             return {"sessions": [_focus_to_dict(s) for s in sessions]}
+        finally:
+            db.close()
+
+    @router.get("/focus/today-blocks")
+    def focus_today_blocks(request: Request):
+        """Phase 3.2: return today's plan blocks that can be linked to a
+        focus session, plus the deck list for subject attribution."""
+        user = _owner(request)
+        db = SessionLocal()
+        try:
+            now = _utcnow_naive()
+            today_iso = now.date().isoformat()
+
+            deck_q = db.query(StudyDeck).filter(StudyDeck.archived == False)  # noqa: E712
+            if user is not None:
+                deck_q = deck_q.filter(StudyDeck.owner == user)
+            decks = [{"id": d.id, "name": d.name} for d in deck_q.all()]
+
+            exam_q = db.query(StudyExam).filter(StudyExam.archived == False)  # noqa: E712
+            if user is not None:
+                exam_q = exam_q.filter(StudyExam.owner == user)
+            blocks = []
+            for e in exam_q.order_by(StudyExam.exam_date.asc()).all():
+                plan = json.loads(e.plan) if e.plan else None
+                if not plan:
+                    continue
+                for d in plan.get("days", []):
+                    if d.get("date") == today_iso:
+                        for i, b in enumerate(d.get("blocks", [])):
+                            blocks.append({
+                                "exam_id": e.id,
+                                "exam_title": e.title,
+                                "block_key": f"{today_iso}:{i}",
+                                "type": b.get("type"),
+                                "topics": b.get("topics", []),
+                                "minutes": b.get("minutes", 25),
+                            })
+            return {"decks": decks, "blocks": blocks}
         finally:
             db.close()
 
