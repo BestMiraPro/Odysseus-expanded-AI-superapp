@@ -30,6 +30,9 @@ class _FakeQuery:
     def filter(self, *_args):
         return self
 
+    def order_by(self, *_args):
+        return self
+
     def all(self):
         return list(self._rows)
 
@@ -38,11 +41,13 @@ class _FakeQuery:
 
 
 class _FakeDb:
-    def __init__(self, *, reviews=None, attempts=None, focus=None, cards=None):
+    def __init__(self, *, reviews=None, attempts=None, focus=None, cards=None,
+                 questions=None):
         self._reviews = reviews or []
         self._attempts = attempts or []
         self._focus = focus or []
         self._cards = cards or []
+        self._questions = questions or []
 
     def query(self, model):
         if model.__name__ == "StudyReview":
@@ -53,6 +58,8 @@ class _FakeDb:
             return _FakeQuery(self._focus)
         if model.__name__ == "StudyCard":
             return _FakeQuery(self._cards)
+        if model.__name__ == "StudyQuestion":
+            return _FakeQuery(self._questions)
         return _FakeQuery([])
 
     def close(self):
@@ -172,13 +179,21 @@ class TestGetStats:
         db = _FakeDb(
             reviews=[_FakeRow(rating=3, reviewed_at=NOW)],
             focus=[_FakeRow(started_at=NOW, actual_min=15)],
-            attempts=[_FakeRow(attempted_at=NOW, correct=True, score=85, confidence=85)],
-            cards=[_FakeRow(id="c1")],
+            attempts=[_FakeRow(attempted_at=NOW, correct=True, score=85,
+                               confidence=85, question_id="q1")],
+            cards=[_FakeRow(id="c1", state="review", stability="2",
+                           last_review=NOW, due=NOW)],
+            questions=[_FakeRow(id="q1", topic="biology", state="review",
+                               due=NOW)],
         )
         out = get_stats(db, OWNER, days=7, now=NOW)
         assert "daily" in out
         assert "totals" in out
         assert "calibration" in out
+        assert "calibration_curve" in out
+        assert "retention" in out
+        assert "due_forecast" in out
+        assert "topic_accuracy" in out
         totals = out["totals"]
         assert totals["reviews"] == 1
         assert totals["success_rate"] == 1.0
@@ -188,6 +203,15 @@ class TestGetStats:
         assert totals["accuracy"] == 1.0
         assert totals["avg_score"] == 85.0
         assert len(out["calibration"]) == 1
+        # retention over the single review card
+        assert out["retention"]["n"] == 1
+        assert out["retention"]["mean"] is not None
+        # due forecast spans 14 days
+        assert len(out["due_forecast"]) == 14
+        # topic accuracy lists the one topic, accuracy 1.0
+        assert len(out["topic_accuracy"]) == 1
+        assert out["topic_accuracy"][0]["topic"] == "biology"
+        assert out["topic_accuracy"][0]["accuracy"] == 1.0
 
     def test_days_clamped(self):
         db = _FakeDb(cards=[])
@@ -196,7 +220,122 @@ class TestGetStats:
 
 
 # ---------------------------------------------------------------------------
-# 2. endpoint contract test
+# 2. due forecast / topic accuracy / retention unit tests
+# ---------------------------------------------------------------------------
+
+class TestDueForecast:
+    def test_empty_returns_14_days(self):
+        from src.study_stats import get_due_forecast
+        db = _FakeDb()
+        out = get_due_forecast(db, OWNER, now=NOW)
+        assert len(out) == 14
+        assert all(v["cards"] == 0 and v["questions"] == 0 for v in out)
+        assert out[0]["date"] == NOW.date().isoformat()
+        assert out[-1]["date"] == (NOW + timedelta(days=13)).date().isoformat()
+
+    def test_overdue_rolls_into_today(self):
+        from src.study_stats import get_due_forecast
+        past = NOW - timedelta(days=3)
+        db = _FakeDb(
+            cards=[_FakeRow(state="review", due=past)],
+            questions=[_FakeRow(state="review", due=past)],
+        )
+        out = get_due_forecast(db, OWNER, now=NOW)
+        assert out[0]["cards"] == 1
+        assert out[0]["questions"] == 1
+        assert sum(v["cards"] for v in out[1:]) == 0
+
+    def test_future_due_buckets_correctly(self):
+        from src.study_stats import get_due_forecast
+        db = _FakeDb(
+            cards=[_FakeRow(state="review", due=NOW + timedelta(days=5))],
+        )
+        out = get_due_forecast(db, OWNER, now=NOW)
+        assert out[5]["cards"] == 1
+        assert out[0]["cards"] == 0
+
+
+class TestTopicAccuracy:
+    def test_empty(self):
+        from src.study_stats import get_topic_accuracy
+        db = _FakeDb()
+        assert get_topic_accuracy(db, OWNER, SINCE) == []
+
+    def test_weakest_first(self):
+        from src.study_stats import get_topic_accuracy
+        db = _FakeDb(
+            attempts=[
+                _FakeRow(attempted_at=NOW, correct=True, score=None,
+                         question_id="q1"),
+                _FakeRow(attempted_at=NOW, correct=True, score=None,
+                         question_id="q1"),
+                _FakeRow(attempted_at=NOW, correct=False, score=None,
+                         question_id="q2"),
+                _FakeRow(attempted_at=NOW, correct=False, score=None,
+                         question_id="q2"),
+                _FakeRow(attempted_at=NOW, correct=True, score=None,
+                         question_id="q3"),
+                _FakeRow(attempted_at=NOW, correct=False, score=None,
+                         question_id="q3"),
+            ],
+            questions=[
+                _FakeRow(id="q1", topic="easy"),
+                _FakeRow(id="q2", topic="hard"),
+                _FakeRow(id="q3", topic="med"),
+            ],
+        )
+        out = get_topic_accuracy(db, OWNER, SINCE)
+        topics = [t["topic"] for t in out]
+        assert topics[0] == "hard"
+        assert topics[1] == "med"
+        assert topics[2] == "easy"
+        assert out[0]["accuracy"] == 0.0
+        assert out[2]["accuracy"] == 1.0
+
+    def test_top_n_limit(self):
+        from src.study_stats import get_topic_accuracy
+        attempts, questions = [], []
+        for i in range(20):
+            qid = f"q{i}"
+            attempts.append(_FakeRow(attempted_at=NOW, correct=False,
+                                     score=None, question_id=qid))
+            questions.append(_FakeRow(id=qid, topic=f"topic-{i}"))
+        db = _FakeDb(attempts=attempts, questions=questions)
+        out = get_topic_accuracy(db, OWNER, SINCE, top_n=5)
+        assert len(out) == 5
+
+
+class TestRetentionSummary:
+    def test_empty_no_review_cards(self):
+        from src.study_stats import get_retention_summary
+        db = _FakeDb()
+        out = get_retention_summary(db, OWNER, now=NOW)
+        assert out == {"mean": None, "n": 0, "mature_pct": None}
+
+    def test_excludes_non_review_cards(self):
+        from src.study_stats import get_retention_summary
+        db = _FakeDb(cards=[_FakeRow(id="c1", state="learning",
+                                     stability="2", last_review=NOW, due=NOW)])
+        out = get_retention_summary(db, OWNER, now=NOW)
+        assert out["n"] == 0
+        assert out["mean"] is None
+
+    def test_mean_and_mature(self):
+        from src.study_stats import get_retention_summary
+        db = _FakeDb(cards=[
+            _FakeRow(id="c1", state="review", stability="30",
+                     last_review=NOW, due=NOW),
+            _FakeRow(id="c2", state="review", stability="1",
+                     last_review=NOW, due=NOW),
+        ])
+        out = get_retention_summary(db, OWNER, now=NOW)
+        assert out["n"] == 2
+        assert 0.0 <= out["mean"] <= 1.0
+        assert out["mature_pct"] == 0.5
+
+
+# ---------------------------------------------------------------------------
+# 3. endpoint contract test
 # ---------------------------------------------------------------------------
 
 class TestEndpoint:

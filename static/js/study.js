@@ -43,7 +43,7 @@ const S = {
 const TABS = [
   ['today', 'Today'], ['subjects', 'Subjects'], ['review', 'Cards'],
   ['practice', 'Practice'], ['plan', 'Plan'], ['focus', 'Focus'],
-  ['history', 'History'], ['agent', 'Agent'],
+  ['stats', 'Stats'], ['history', 'History'],
 ];
 
 const TIPS = [
@@ -293,6 +293,29 @@ a.study-btn { display: inline-flex; align-items: center; text-decoration: none; 
 .study-tip { font-size: 11.5px; opacity: 0.55; font-style: italic; margin-top: 22px;
   border-left: 2px solid var(--border); padding-left: 10px; }
 .study-empty { opacity: 0.55; font-size: 12.5px; padding: 14px 4px; }
+/* stats dashboard */
+.study-dash-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 8px; }
+@media (max-width: 720px) { .study-dash-grid { grid-template-columns: 1fr; } }
+.study-card-box { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+.study-card-box h4 { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  opacity: 0.6; margin: 0 0 10px; font-weight: 600; }
+.study-bar-row { display: flex; align-items: center; gap: 8px; margin: 3px 0; font-size: 11.5px; }
+.study-bar-row .lbl { width: 70px; text-align: right; opacity: 0.7; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.study-bar-track { flex: 1; height: 14px; background: rgba(128,128,128,0.12); border-radius: 7px; overflow: hidden; }
+.study-bar-fill { height: 100%; border-radius: 7px; background: var(--accent, #5b8abf); }
+.study-bar-fill.good { background: var(--green, #4f9e60); }
+.study-bar-fill.warn { background: var(--red, #e05555); }
+.study-cal-row { display: flex; align-items: flex-end; gap: 4px; height: 80px; margin-top: 6px; }
+.study-cal-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.study-cal-bar { width: 100%; border-radius: 3px 3px 0 0; background: var(--accent, #5b8abf); min-height: 2px; }
+.study-cal-ideal { width: 100%; border-top: 1px dashed var(--border); position: relative; }
+.study-cal-lbl { font-size: 9px; opacity: 0.5; }
+.study-mini-row { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 0; }
+.study-mini-row .grow { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.study-pct { font-size: 11px; font-weight: 600; min-width: 38px; text-align: right; }
+.study-big { font-size: 22px; font-weight: 700; }
+.study-subtle { font-size: 11px; opacity: 0.5; }
 .study-toast { position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%);
   background: var(--panel, var(--bg)); color: var(--fg); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px 16px; font-size: 12.5px; z-index: 20;
@@ -610,7 +633,7 @@ function setTab(tab) {
   const render = {
     today: renderToday, subjects: renderSubjects, review: renderReview,
     practice: renderPractice, plan: renderPlan, focus: renderFocus,
-    history: renderHistory, agent: renderAgent,
+    stats: renderStats, history: renderHistory,
   }[tab];
   if (render) render();
 }
@@ -638,6 +661,122 @@ function setTabSilent(tab) {
   if (b) b.onclick = null;
   _pane?.querySelectorAll('.study-tab').forEach(btn =>
     btn.classList.toggle('active', btn.dataset.tab === tab));
+}
+
+// ---------------------------------------------------------------------------
+// STATS DASHBOARD (Phase 3.1)
+// ---------------------------------------------------------------------------
+
+function _pct(v) { return v == null ? '—' : `${Math.round(v * 100)}%`; }
+function _num(v) { return v == null ? '—' : String(v); }
+
+function _calibrationChart(curve) {
+  if (!curve || !curve.length) {
+    return '<div class="study-empty">Not enough data yet. Answer questions with a confidence rating to build your calibration curve.</div>';
+  }
+  const cols = curve.map(c => {
+    const acc = c.accuracy == null ? 0 : c.accuracy;
+    const h = Math.round(acc * 100);
+    const low = c.low_n ? 'opacity:0.4;' : '';
+    const fill = h < 40 ? 'warn' : (h >= 80 ? 'good' : '');
+    return `<div class="study-cal-col">
+      <div style="height:80px;display:flex;flex-direction:column;justify-content:flex-end;width:100%;">
+        <div class="study-cal-bar ${fill}" style="height:${h}%;${low}"></div>
+      </div>
+      <div class="study-cal-lbl">${c.label}</div>
+    </div>`;
+  }).join('');
+  return `<div class="study-cal-row">${cols}</div>
+    <div class="study-subtle" style="margin-top:6px;">Bars = actual % correct in each confidence band. Dimmed bars have too few attempts to be reliable.</div>`;
+}
+
+function _dailyActivity(daily) {
+  if (!daily || !daily.length) return '<div class="study-empty">No activity recorded yet.</div>';
+  const maxR = Math.max(1, ...daily.map(d => d.reviews + d.attempts));
+  return daily.map(d => {
+    const total = d.reviews + d.attempts;
+    const h = Math.round((total / maxR) * 100);
+    const label = d.date.slice(5);
+    return `<div class="study-bar-row">
+      <span class="lbl">${label}</span>
+      <div class="study-bar-track"><div class="study-bar-fill" style="width:${h}%"></div></div>
+      <span class="study-pct">${total}</span>
+    </div>`;
+  }).join('');
+}
+
+function _topicList(topics) {
+  if (!topics || !topics.length) return '<div class="study-empty">No topic-level data yet. Practice questions tagged with topics to see accuracy by area.</div>';
+  return topics.map(t => {
+    const h = Math.round((t.accuracy || 0) * 100);
+    const fill = h < 40 ? 'warn' : (h >= 80 ? 'good' : '');
+    return `<div class="study-bar-row">
+      <span class="lbl" title="${esc(t.topic)}">${esc(t.topic)}</span>
+      <div class="study-bar-track"><div class="study-bar-fill ${fill}" style="width:${h}%"></div></div>
+      <span class="study-pct">${_pct(t.accuracy)}</span>
+    </div>`;
+  }).join('');
+}
+
+function _forecastChart(forecast) {
+  if (!forecast || !forecast.length) return '<div class="study-empty">No scheduled reviews ahead.</div>';
+  const maxD = Math.max(1, ...forecast.map(d => d.cards + d.questions));
+  return forecast.map(d => {
+    const total = d.cards + d.questions;
+    const h = Math.round((total / maxD) * 100);
+    const label = d.date.slice(5);
+    return `<div class="study-bar-row">
+      <span class="lbl">${label}</span>
+      <div class="study-bar-track"><div class="study-bar-fill" style="width:${h}%"></div></div>
+      <span class="study-pct">${total}</span>
+    </div>`;
+  }).join('');
+}
+
+async function renderStats() {
+  const el = body();
+  el.innerHTML = '<div class="study-empty">Loading…</div>';
+  let s;
+  try { s = await jget('/api/study/stats?days=42'); }
+  catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  if (_tab !== 'stats') return;
+  const t = s.totals || {};
+  const ret = s.retention || {};
+  const sr = t.success_rate == null ? '—' : `${Math.round(t.success_rate * 100)}%`;
+  const acc = t.accuracy == null ? '—' : `${Math.round(t.accuracy * 100)}%`;
+  el.innerHTML = `
+    <div class="study-chips">
+      <div class="study-chip"><b>${_num(t.reviews)}</b><span>card reviews (42d)</span></div>
+      <div class="study-chip"><b>${sr}</b><span>recall success</span></div>
+      <div class="study-chip"><b>${_num(t.cards)}</b><span>cards tracked</span></div>
+      <div class="study-chip"><b>${acc}</b><span>question accuracy</span></div>
+      <div class="study-chip"><b>${_num(t.focus_min)}</b><span>focus minutes</span></div>
+      <div class="study-chip"><b>${ret.mean == null ? '—' : Math.round(ret.mean * 100) + '%'}</b><span>avg recall now</span></div>
+    </div>
+
+    <div class="study-dash-grid">
+      <div class="study-card-box">
+        <h4>Calibration — confidence vs accuracy</h4>
+        ${_calibrationChart(s.calibration_curve)}
+      </div>
+      <div class="study-card-box">
+        <h4>Daily activity — last 6 weeks</h4>
+        ${_dailyActivity(s.daily)}
+      </div>
+      <div class="study-card-box">
+        <h4>Topic accuracy — weakest first</h4>
+        ${_topicList(s.topic_accuracy)}
+      </div>
+      <div class="study-card-box">
+        <h4>Due forecast — next 14 days</h4>
+        ${_forecastChart(s.due_forecast)}
+      </div>
+    </div>
+    <div class="study-subtle" style="margin-top:14px;">
+      ${ret.n ? `${ret.n} review cards tracked · ${ret.mature_pct == null ? '—' : Math.round(ret.mature_pct * 100) + '%'} mature (≥21d stability)` : 'No cards in review state yet.'}
+      ${t.avg_score != null ? ` · avg open-answer score ${t.avg_score}/100` : ''}
+    </div>
+  `;
 }
 
 // ---------------------------------------------------------------------------

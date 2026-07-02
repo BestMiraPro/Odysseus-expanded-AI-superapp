@@ -33,6 +33,9 @@ class _FakeQuery:
     def filter(self, *_):
         return self
 
+    def order_by(self, *_):
+        return self
+
     def all(self):
         return list(self._rows)
 
@@ -41,11 +44,13 @@ class _FakeQuery:
 
 
 class _FakeDb:
-    def __init__(self, *, attempts=None, reviews=None, focus=None, cards=None):
+    def __init__(self, *, attempts=None, reviews=None, focus=None, cards=None,
+                 questions=None):
         self._attempts = attempts or []
         self._reviews = reviews or []
         self._focus = focus or []
         self._cards = cards or []
+        self._questions = questions or []
 
     def query(self, model):
         n = model.__name__
@@ -57,6 +62,8 @@ class _FakeDb:
             return _FakeQuery(self._focus)
         if n == "StudyCard":
             return _FakeQuery(self._cards)
+        if n == "StudyQuestion":
+            return _FakeQuery(self._questions)
         return _FakeQuery([])
 
     def close(self):
@@ -186,10 +193,12 @@ class TestCalibrationCurve:
 class TestStatsCurve:
     def test_stats_includes_curve(self):
         db = _FakeDb(
-            attempts=[_FakeRow(confidence=85, correct=True, score=90, attempted_at=NOW)],
+            attempts=[_FakeRow(confidence=85, correct=True, score=90, attempted_at=NOW,
+                               question_id="q1")],
             reviews=[_FakeRow(rating=3, reviewed_at=NOW)],
             focus=[_FakeRow(started_at=NOW, actual_min=10)],
-            cards=[_FakeRow(id="c1")],
+            cards=[_FakeRow(id="c1", state="new", stability="0", due=NOW)],
+            questions=[_FakeRow(id="q1", topic="general", state="new", due=NOW)],
         )
         out = get_stats(db, OWNER, days=14, now=NOW)
         assert "calibration_curve" in out
@@ -203,9 +212,13 @@ class TestStatsCurve:
             reviews=[],
             focus=[],
             cards=[],
+            questions=[],
         )
         out = get_stats(db, OWNER, days=14, now=NOW)
         assert out["calibration_curve"] == []
+        assert out["retention"]["mean"] is None
+        assert out["due_forecast"] == [] or len(out["due_forecast"]) == 14
+        assert out["topic_accuracy"] == []
 
 
 # ---------------------------------------------------------------------------

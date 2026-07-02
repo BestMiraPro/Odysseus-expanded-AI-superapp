@@ -323,6 +323,123 @@ def get_daily_breakdown(
     return daily, total_reviews, total_again, total_focus
 
 
+def get_due_forecast(
+    db: Session,
+    owner: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+    horizon_days: int = 14,
+) -> List[Dict[str, Any]]:
+    """Return a per-day due-card/question forecast for the next `horizon_days`.
+
+    Each entry: {date, cards, questions}. Only cards/questions in the 'review'
+    state with a future `due` date are counted; already-due items roll into
+    the first bucket (offset 0). Pure read, owner-scoped, deterministic.
+    """
+    if now is None:
+        now = datetime.utcnow()
+    today = now.date()
+    buckets: Dict[str, Dict[str, int]] = {}
+    for i in range(horizon_days):
+        d = (today + timedelta(days=i)).isoformat()
+        buckets[d] = {"date": d, "cards": 0, "questions": 0}
+
+    def _count(model, due_col, key):
+        q = db.query(model).filter(model.state != "new", due_col.isnot(None))
+        if owner is not None:
+            q = q.filter(model.owner == owner)
+        for row in q.all():
+            d = row.due.date() if row.due else None
+            if d is None:
+                continue
+            offset = (d - today).days
+            if offset < 0:
+                offset = 0
+            key_date = (today + timedelta(days=offset)).isoformat()
+            if key_date in buckets:
+                buckets[key_date][key] += 1
+
+    _count(StudyCard, StudyCard.due, "cards")
+    _count(StudyQuestion, StudyQuestion.due, "questions")
+    return sorted(buckets.values(), key=lambda v: v["date"])
+
+
+def get_topic_accuracy(
+    db: Session,
+    owner: Optional[str],
+    since: datetime,
+    *,
+    top_n: int = 12,
+) -> List[Dict[str, Any]]:
+    """Return per-topic question accuracy, sorted weakest-first (limited to top_n).
+
+    Reuses get_weak_question_signals' by_topic aggregation so the numbers
+    match what the adaptive selector sees. Each entry: {topic, total, correct,
+    accuracy}.
+    """
+    signals = get_weak_question_signals(db, owner, since)
+    by_topic = signals.get("by_topic", {})
+    topics = [
+        {
+            "topic": t,
+            "total": v["total"],
+            "correct": v["correct"],
+            "accuracy": v["accuracy"],
+        }
+        for t, v in by_topic.items()
+    ]
+    # weakest first (lowest accuracy), break ties by most attempts
+    topics.sort(key=lambda x: (x["accuracy"], -x["total"]))
+    return topics[:top_n]
+
+
+def get_retention_summary(
+    db: Session,
+    owner: Optional[str],
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Return the mean predicted retrievability of all review-state cards.
+
+    Uses fsrs.retrievability(elapsed_days, stability). Cards in the 'new' or
+    'learning' state are excluded (no meaningful stability). Returns:
+      {mean: float|null, n: int, mature_pct: float|null}
+    where mature_pct is the share of cards with stability >= 21d.
+    """
+    from src.fsrs import retrievability
+
+    if now is None:
+        now = datetime.utcnow()
+    q = db.query(StudyCard).filter(StudyCard.state == "review")
+    if owner is not None:
+        q = q.filter(StudyCard.owner == owner)
+    cards = q.all()
+    if not cards:
+        return {"mean": None, "n": 0, "mature_pct": None}
+    r_vals: List[float] = []
+    mature = 0
+    for c in cards:
+        # Defensive double-check of state (query already filters in production;
+        # the explicit guard keeps the function correct against callers that
+        # pass an unfiltered row set and makes it unit-testable).
+        if getattr(c, "state", "review") != "review":
+            continue
+        stab = float(c.stability or 0.0)
+        if stab <= 0:
+            continue
+        elapsed = (now - (c.last_review or c.due or now)).total_seconds() / 86400.0
+        elapsed = max(0.0, elapsed)
+        r_vals.append(retrievability(elapsed, stab))
+        if stab >= 21.0:
+            mature += 1
+    # n reflects review-state cards with positive stability (the set we can
+    # actually compute retrievability over), not the raw query output.
+    n = len(r_vals)
+    mean = round(sum(r_vals) / n, 3) if n else None
+    mature_pct = round(mature / n, 3) if n else None
+    return {"mean": mean, "n": n, "mature_pct": mature_pct}
+
+
 def get_stats(
     db: Session,
     owner: Optional[str],
@@ -337,6 +454,9 @@ def get_stats(
       - totals: rollup (reviews, success_rate, cards, focus_min, attempts, accuracy, avg_score)
       - calibration: legacy 20-point confidence buckets
       - calibration_curve: decile-based persistent calibration
+      - retention: mean predicted retrievability of review-state cards
+      - due_forecast: per-day due cards/questions for the next 14 days
+      - topic_accuracy: per-topic accuracy, weakest first (top 12)
     """
     days = max(7, min(180, days))
     if now is None:
@@ -355,6 +475,9 @@ def get_stats(
     accuracy = get_question_accuracy(db, owner, since)
     calibration = get_calibration(db, owner, since)
     calibration_curve = get_calibration_curve(db, owner, since)
+    retention = get_retention_summary(db, owner, now=now)
+    due_forecast = get_due_forecast(db, owner, now=now)
+    topic_accuracy = get_topic_accuracy(db, owner, since)
 
     return {
         "daily": daily,
@@ -371,4 +494,7 @@ def get_stats(
         },
         "calibration": calibration,
         "calibration_curve": calibration_curve,
+        "retention": retention,
+        "due_forecast": due_forecast,
+        "topic_accuracy": topic_accuracy,
     }
