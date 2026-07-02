@@ -853,11 +853,12 @@ async function renderToday() {
   const o = S.overview;
   const t = o.today;
   const succ = t.success_rate == null ? '' : ` · ${Math.round(t.success_rate * 100)}%`;
+  const flexBadge = t.flex_used ? ` <span class="study-badge" style="opacity:0.7;font-size:10px;">${t.flex_used} flex day${t.flex_used > 1 ? 's' : ''}</span>` : '';
   el.innerHTML = `
     <div class="study-chips">
       <div class="study-chip"><b>${o.due_total}</b><span>cards due</span></div>
       <div class="study-chip"><b>${o.q_due_total ?? 0}</b><span>questions due</span></div>
-      <div class="study-chip"><b>${t.streak_days}</b><span>day streak</span></div>
+      <div class="study-chip"><b>${t.streak_days}</b><span>day streak${flexBadge}</span></div>
       <div class="study-chip"><b>${t.reviews + (t.attempts || 0)}</b><span>retrievals today${succ}</span></div>
       <div class="study-chip"><b>${t.focus_min}</b><span>focus min today</span></div>
     </div>
@@ -2526,6 +2527,9 @@ function renderPlanDays(container, exam) {
       ${meta.mode === 'cram' ? `⚠ ${esc(meta.warning || 'Cram mode')}` :
         `~${meta.daily_minutes} min/day · reviews at +${(meta.offsets || []).join(', +')}d · mocks: ${(meta.mock_dates || []).join(', ') || '—'}`}
     </div>
+    ${(meta.intention_cues || []).filter(c => c.date === today).map(c => `
+      <div class="study-tip" style="margin:4px 2px 12px;">💡 <b>Implementation intention:</b> ${esc(c.cue)}</div>
+    `).join('')}
     ${plan.days.map(d => `
       <div class="study-plan-day ${d.date === today ? 'today' : ''}" ${d.date < today ? 'style="opacity:0.5;"' : ''}>
         <div class="study-plan-date">${esc(d.date)}${d.date === today ? ' · today' : ''}</div>

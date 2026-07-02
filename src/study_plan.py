@@ -119,6 +119,39 @@ def _plan_valid_keys(plan: Dict) -> set:
     return valid
 
 
+def build_intention_cues(days: List[Dict], rest_days: Optional[List[int]] = None) -> List[Dict]:
+    """Generate non-coercive implementation-intention cues for each study day.
+
+    An implementation intention ("If [situation], then [action]") is one of the
+    most replicated motivation interventions (Gollwitzer meta-analysis,
+    d≈0.6). We generate one per study day, anchored to the day's topics and
+    a generic time-of-day slot. They are *suggestions*, never requirements —
+    the user picks their own slot.
+
+    Returns: [{date, cue, topics}]
+    """
+    rest = set(rest_days or [])
+    cues = []
+    _slots = [
+        "morning (before the day starts)",
+        "after lunch",
+        "evening",
+    ]
+    for i, day in enumerate(days):
+        d = day.get("date", "")
+        blocks = day.get("blocks", [])
+        topics = []
+        for b in blocks:
+            for t in b.get("topics", []):
+                if t not in topics:
+                    topics.append(t)
+        slot = _slots[i % len(_slots)]
+        topic_str = ", ".join(topics[:2]) if topics else "your highest-priority topic"
+        cue = f"If {d} {slot} arrives and I haven't studied yet, then I'll spend 25 minutes on {topic_str}."
+        cues.append({"date": d, "cue": cue, "topics": topics})
+    return cues
+
+
 def migrate_done_blocks(old_done: List[str], new_plan: Dict) -> List[str]:
     """Preserve done-block checkmarks across plan regeneration.
 
@@ -216,6 +249,7 @@ def generate_plan(
                 "warning": "Runway too short for spaced repetition. This buys the exam, "
                            "not the knowledge — schedule real spacing afterwards if the "
                            "material recurs.",
+                "intention_cues": build_intention_cues(days_out, rest),
             },
         }
 
@@ -329,5 +363,6 @@ def generate_plan(
             "offsets": offsets,
             "mock_dates": [d.isoformat() for d in mock_days],
             "taper_date": taper_day.isoformat(),
+            "intention_cues": build_intention_cues(days_out, rest),
         },
     }
