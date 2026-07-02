@@ -1825,7 +1825,8 @@ async function startPractice(deckId = null, limit = 12, scope = null, mock = nul
                  prereqs: null, prereqsFor: null, prereqsBusy: false,
                  explainText: null, explainBusy: false,
                  ask: [], askBusy: false,
-                 log: [], startTs: Date.now(), qShownTs: Date.now() };
+                 log: [], startTs: Date.now(), qShownTs: Date.now(),
+                 reengaged: false };
   renderPractice();
   try {
     const params = new URLSearchParams({ limit: String(limit) });
@@ -2034,8 +2035,9 @@ async function renderPractice() {
           ${res.reference ? `<div class="study-md" style="font-size:12px;margin-top:10px;opacity:0.65;"><b>Reference:</b> ${_mdInline(res.reference)}</div>` : ''}
           ${p.explainText ? `<div class="study-md" style="font-size:12.5px;margin-top:10px;line-height:1.5;border-top:1px solid var(--border);padding-top:8px;">${_md(p.explainText)}</div>` : ''}
         </div>
+        ${res.require_reengage && !p.reengaged ? `<div class="study-hint" style="border-color:var(--red,#e05555);"><b>Re-engage required:</b> Review the correct answer before continuing.</div>` : ''}
         <div class="study-form-row" style="margin-top:12px;">
-          <button class="study-btn primary" id="study-prac-next">Next →</button>
+          <button class="study-btn primary" id="study-prac-next">${res.require_reengage && !p.reengaged ? 'Acknowledge →' : 'Next →'}</button>
           ${isMcq && !p.explainText ? `<button class="study-btn" id="study-prac-explain" ${p.explainBusy ? 'disabled' : ''}>${p.explainBusy ? 'Explaining…' : 'Explain options'}</button>` : ''}
           <button class="study-btn" id="study-prac-explain-further" title="Pull the underlying theory from your material, with where to review it">Explain further</button>
           ${_originalQuestionButton(q)}
@@ -2186,9 +2188,14 @@ async function renderPractice() {
   });
 
   el.querySelector('#study-prac-next')?.addEventListener('click', () => {
-    // failed questions come back at the end of this session (re-drill); a mock
-    // is a fixed paper, so it never grows mid-run.
-    if (!p.mock && p.result && p.result.rating === 1) {
+    // Phase 2.5 wrong-MCQ gate: require acknowledgment before advancing
+    if (p.result && p.result.require_reengage && !p.reengaged) {
+      p.reengaged = true;
+      renderPractice();
+      return;
+    }
+    // failed questions come back at the end of this session (re-drill)
+    if (p.result && p.result.rating === 1) {
       p.queue.push({ ...q });
     }
     advancePractice();
@@ -2204,6 +2211,7 @@ function advancePractice() {
   p.prereqs = null; p.prereqsFor = null; p.prereqsBusy = false;
   p.ask = []; p.askBusy = false;
   p.qShownTs = Date.now();
+  p.reengaged = false;
   renderPractice();
 }
 

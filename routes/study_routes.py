@@ -235,11 +235,13 @@ class QuestionUpdate(BaseModel):
 
 class AttemptIn(BaseModel):
     choice_index: Optional[int] = None   # mcq
-    answer: Optional[str] = None         # open
+    answer: Optional[str] = None         # open, or mcq when typed_recall
     confidence: Optional[int | str] = None  # 0-100 numeric, or legacy label ("sure"/"unsure"/"guess")
     hints_used: int = 0
     duration_ms: Optional[int] = None
     idempotency_key: Optional[str] = None
+    typed_recall: bool = False           # Phase 2.5: answer MCQ by free recall (uses open grading)
+    wrong_mcq_gate: bool = False          # Phase 2.5: wrong MCQ requires re-engage before advancing
 
 
 class HintIn(BaseModel):
@@ -4209,50 +4211,67 @@ def setup_study_routes():
                         "rating": prior.rating,
                         "interval_days": None,
                         "next_due": _iso(row.due),
+                        "require_reengage": False,
                     }
         finally:
             db.close()
+        async def _grade_open_answer(answer_text: str, ref_block: str) -> tuple:
+            """Reuse the existing open-answer AI grading path (Phase 2.5)."""
+            if not answer_text:
+                return (0, {"score": 0, "verdict": "incorrect",
+                            "feedback": "No answer given. Attempt the recall before "
+                                        "checking — even a failed attempt strengthens "
+                                        "the memory more than peeking.",
+                            "followup": None})
+            prompt = (f"QUESTION:\n{question_text}\n\n"
+                      f"REFERENCE ANSWER:\n{ref_block}\n\n"
+                      f"LEARNER'S ANSWER:\n{answer_text[:8000]}")
+            value = await _llm_json(user, GRADE_OPEN_SYSTEM, prompt,
+                                    temperature=0.2, max_tokens=8000, timeout=180)
+            if not isinstance(value, dict):
+                raise HTTPException(502, "Model grade was unparseable. Try again.")
+            try:
+                s = max(0, min(100, int(value.get("score"))))
+            except (TypeError, ValueError):
+                s = 0
+            verdict = value.get("verdict")
+            if verdict not in ("correct", "partial", "incorrect"):
+                verdict = "correct" if s >= 85 else ("partial" if s >= 40 else "incorrect")
+            grading = {"score": s, "verdict": verdict,
+                       "feedback": str(value.get("feedback") or "").strip(),
+                       "followup": (str(value.get("followup")).strip()
+                                    if value.get("followup") else None)}
+            return s, grading
 
         correct = None
         score = None
         grading = None
         answer_text = ""
-        if qtype == "mcq":
+        require_reengage = False
+
+        if qtype == "mcq" and body.typed_recall:
+            # Phase 2.5 typed-recall: free-typed answer for an MCQ, graded via open path
+            answer_text = (body.answer or "").strip()
+            ref_block = reference if reference.strip() else (
+                options[correct_index] if correct_index is not None and options else "")
+            score, grading = await _grade_open_answer(answer_text, ref_block)
+            correct = (grading["verdict"] == "correct")
+        elif qtype == "mcq":
             if body.choice_index is None or not (0 <= body.choice_index < len(options)):
                 raise HTTPException(400, "choice_index required for MCQ")
             correct = (body.choice_index == correct_index)
             answer_text = options[body.choice_index]
         else:
             answer_text = (body.answer or "").strip()
-            if not answer_text:
-                grading = {"score": 0, "verdict": "incorrect",
-                           "feedback": "No answer given. Attempt the recall before "
-                                       "checking — even a failed attempt strengthens "
-                                       "the memory more than peeking.",
-                           "followup": None}
-                score = 0
-            else:
-                ref_block = reference if reference.strip() else (
-                    "(no reference available - first work out the correct answer "
-                    "yourself, then grade the learner's answer against it)")
-                prompt = (f"QUESTION:\n{question_text}\n\n"
-                          f"REFERENCE ANSWER:\n{ref_block}\n\n"
-                          f"LEARNER'S ANSWER:\n{answer_text[:8000]}")
-                value = await _llm_json(user, GRADE_OPEN_SYSTEM, prompt,
-                                        temperature=0.2, max_tokens=8000, timeout=180)
-                if not isinstance(value, dict):
-                    raise HTTPException(502, "Model grade was unparseable. Try again.")
-                try:
-                    score = max(0, min(100, int(value.get("score"))))
-                except (TypeError, ValueError):
-                    score = 0
-                verdict = value.get("verdict")
-                if verdict not in ("correct", "partial", "incorrect"):
-                    verdict = "correct" if score >= 85 else ("partial" if score >= 40 else "incorrect")
-                grading = {"score": score, "verdict": verdict,
-                           "feedback": str(value.get("feedback") or "").strip(),
-                           "followup": (str(value.get("followup")).strip()
-                                        if value.get("followup") else None)}
+            ref_block = reference if reference.strip() else (
+                "(no reference available - first work out the correct answer "
+                "yourself, then grade the learner's answer against it)")
+            score, grading = await _grade_open_answer(answer_text, ref_block)
+            correct = (grading["verdict"] == "correct")
+
+        # Phase 2.5 wrong-MCQ gate: backend signal when flag is on and MCQ is wrong
+        if body.wrong_mcq_gate and qtype == "mcq" and correct is False:
+            require_reengage = True
 
         confidence = confidence_to_numeric(body.confidence)
         rating = rating_from_outcome(qtype, correct=correct, score=score,
@@ -4325,6 +4344,7 @@ def setup_study_routes():
                         "rating": prior.rating,
                         "interval_days": None,
                         "next_due": _iso(row.due),
+                        "require_reengage": False,
                     }
                 raise
             return {
@@ -4337,6 +4357,7 @@ def setup_study_routes():
                 "rating": rating,
                 "interval_days": result["interval_days"],
                 "next_due": _iso(row.due),
+                "require_reengage": require_reengage,
             }
         finally:
             db.close()
