@@ -30,6 +30,7 @@ Design notes:
 """
 
 import asyncio
+import threading
 import json
 import logging
 import re
@@ -2842,6 +2843,12 @@ async def run_audit_questions(user, deck_id: Optional[str] = None) -> Dict:
 # Router
 # ---------------------------------------------------------------------------
 
+# Phase 4.3: shared background-task state for async FSRS optimization.
+# Module-level so the status endpoint and tests can access it.
+_optimize_locks: Dict[str, threading.Lock] = {}
+_optimize_status: Dict[str, Dict] = {}
+
+
 def setup_study_routes():
     router = APIRouter(prefix="/api/study", tags=["study"])
 
@@ -4992,14 +4999,54 @@ def setup_study_routes():
         finally:
             db.close()
 
+    def _run_optimize(user: str, snapshots: list, reviews: list):
+        """Background worker for FSRS w fitting (Phase 4.3: async DB)."""
+        try:
+            fitted = fsrs_optimizer.fit_w(snapshots, reviews, seed=42)
+            if fitted is None:
+                _optimize_status[user] = {
+                    "status": "insufficient_data",
+                    "reviews": len(reviews),
+                    "min_required": fsrs_optimizer.MIN_REVIEWS,
+                }
+                return
+            # Persist in a fresh session (the background thread can't reuse the
+            # request's DB session).
+            db2 = SessionLocal()
+            try:
+                row = db2.query(StudyUserParams).filter(StudyUserParams.owner == user).first()
+                now = _utcnow_naive()
+                if row is None:
+                    db2.add(StudyUserParams(
+                        id=str(uuid.uuid4()), owner=user,
+                        w_json=json.dumps(fitted),
+                        review_count=len(reviews),
+                        fitted_at=now,
+                    ))
+                else:
+                    row.w_json = json.dumps(fitted)
+                    row.review_count = len(reviews)
+                    row.fitted_at = now
+                db2.commit()
+                _optimize_status[user] = {
+                    "status": "ok", "reviews": len(reviews), "w": fitted,
+                }
+            finally:
+                db2.close()
+        except Exception as e:
+            _optimize_status[user] = {"status": "error", "message": str(e)}
+
     @router.post("/optimize")
     def optimize_weights(request: Request):
-        """Trigger per-user FSRS weight fitting (A6)."""
+        """Trigger per-user FSRS weight fitting (A6).
+
+        Phase 4.3: runs asynchronously in a background thread so the request
+        returns immediately with a task_id. Poll /optimize/status for results.
+        """
         user = _owner(request)
         db = SessionLocal()
         try:
             # ----- load this user's review history -----
-            # Need cards owned by user for initial snapshots.
             cards = db.query(StudyCard).filter(StudyCard.owner == user).all() if user else []
             snapshots = []
             for c in cards:
@@ -5023,29 +5070,23 @@ def setup_study_routes():
                     "state_before": r.state_before,
                     "reviewed_at": _iso(r.reviewed_at),
                 })
-            # Gate / fit
-            fitted = fsrs_optimizer.fit_w(snapshots, reviews, seed=42)
-            if fitted is None:
-                return {"status": "insufficient_data",
-                        "reviews": len(reviews),
-                        "min_required": fsrs_optimizer.MIN_REVIEWS}
-            # Persist
-            row = db.query(StudyUserParams).filter(StudyUserParams.owner == user).first()
-            now = _utcnow_naive()
-            if row is None:
-                db.add(StudyUserParams(
-                    id=str(uuid.uuid4()), owner=user,
-                    w_json=json.dumps(fitted),
-                    review_count=len(reviews),
-                    fitted_at=now,
-                ))
-            else:
-                row.w_json = json.dumps(fitted)
-                row.review_count = len(reviews)
-                row.fitted_at = now
-            db.commit()
-            return {"status": "ok", "reviews": len(reviews), "w": fitted}
-        finally:
             db.close()
+
+            # Run in background thread (Phase 4.3)
+            _optimize_status[user] = {"status": "running", "reviews": len(reviews)}
+            t = threading.Thread(
+                target=_run_optimize, args=(user, snapshots, reviews), daemon=True,
+            )
+            t.start()
+            return {"status": "running", "reviews": len(reviews)}
+        except Exception:
+            db.close()
+            raise
+
+    @router.get("/optimize/status")
+    def optimize_status(request: Request):
+        """Poll the status of a background FSRS optimization (Phase 4.3)."""
+        user = _owner(request)
+        return _optimize_status.get(user, {"status": "never_run"})
 
     return router
