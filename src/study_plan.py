@@ -152,6 +152,60 @@ def build_intention_cues(days: List[Dict], rest_days: Optional[List[int]] = None
     return cues
 
 
+def _semantic_interleave(
+    names: List[str],
+    k: int,
+    day_index: int,
+    topic_affinity: Optional[Dict[str, Dict[str, float]]] = None,
+) -> List[str]:
+    """Select k topics for an interleaved block, preferring related topics.
+
+    Phase 4.1: when ``topic_affinity`` is provided (a name→{name→similarity}
+    dict, computed from topic embeddings by the route layer), we group
+    related topics so interleaved blocks pair cognitively-close material.
+    Falls back to the original index-rotation when affinity is absent.
+
+    Deterministic given the same affinity + day index (no randomness).
+    """
+    if not names or k <= 0:
+        return []
+    k = min(k, len(names))
+
+    if not topic_affinity:
+        # Original round-robin rotation
+        rot = day_index % max(1, len(names))
+        return [names[(rot + j) % len(names)] for j in range(k)]
+
+    # Semantic mode: pick the seed topic by rotation, then greedily add the
+    # most similar remaining topic each step. This produces a block of
+    # k topics that are mutually related, with the seed rotating by day so
+    # pairings still vary across days.
+    rot = day_index % max(1, len(names))
+    seed = names[rot]
+    selected = [seed]
+    remaining = [n for n in names if n != seed]
+
+    while len(selected) < k and remaining:
+        best = None
+        best_sim = -2.0  # below any cosine similarity
+        for n in remaining:
+            sim = topic_affinity.get(seed, {}).get(n, 0.0)
+            # also consider average similarity to all already-selected topics
+            avg_sim = sim
+            if len(selected) > 1:
+                sims = [topic_affinity.get(s, {}).get(n, 0.0) for s in selected]
+                avg_sim = sum(sims) / len(sims)
+            if avg_sim > best_sim:
+                best_sim = avg_sim
+                best = n
+        if best is None:
+            break
+        selected.append(best)
+        remaining.remove(best)
+
+    return selected
+
+
 def migrate_done_blocks(old_done: List[str], new_plan: Dict) -> List[str]:
     """Preserve done-block checkmarks across plan regeneration.
 
@@ -185,6 +239,7 @@ def generate_plan(
     hours_per_week: float = 7.0,
     rest_days: Optional[List[int]] = None,  # weekday() ints, e.g. [6] = Sunday
     mastery_scores: Optional[Dict[str, float]] = None,
+    topic_affinity: Optional[Dict[str, Dict[str, float]]] = None,  # Phase 4.1
 ) -> Dict:
     """Return {days: [{date, blocks: [...]}, ...], meta: {...}}.
 
@@ -340,11 +395,11 @@ def generate_plan(
             remaining -= m
 
         if remaining >= MIN_SESSION_MIN:
-            # Interleaved practice across 2-4 topics, rotated by day index so
-            # pairings vary instead of always drilling the same neighbors.
+            # Interleaved practice across 2-4 topics. Phase 4.1: use semantic
+            # grouping when topic_affinity is provided (relatedness-based),
+            # else fall back to index rotation.
             k = min(len(names), max(2, min(4, len(names))))
-            rot = study_days.index(d) % max(1, len(names))
-            mix = [names[(rot + j) % len(names)] for j in range(k)]
+            mix = _semantic_interleave(names, k, study_days.index(d), topic_affinity)
             blocks.append({
                 "type": "interleaved",
                 "topics": mix,
@@ -364,5 +419,6 @@ def generate_plan(
             "mock_dates": [d.isoformat() for d in mock_days],
             "taper_date": taper_day.isoformat(),
             "intention_cues": build_intention_cues(days_out, rest),
+            "semantic_interleaving": bool(topic_affinity),
         },
     }

@@ -102,7 +102,7 @@ from src import fsrs
 from src import fsrs_optimizer
 from src import study_service
 from src.study_source import build_original_question_link, infer_source_page
-from src.study_plan import generate_plan, compute_mastery_scores, migrate_done_blocks
+from src.study_plan import generate_plan, compute_mastery_scores, migrate_done_blocks, _semantic_interleave  # noqa: F401
 from src.study_stats import (
     get_stats as _get_stats,
     get_calibration_curve,
@@ -685,6 +685,39 @@ def _read_pref(owner, key: str) -> str:
         return str((_load_for_user(owner) or {}).get(key) or "").strip()
     except Exception:
         return ""
+
+
+def _compute_topic_affinity(topic_names: List[str]) -> Optional[Dict[str, Dict[str, float]]]:
+    """Phase 4.1: compute pairwise topic similarity via embeddings.
+
+    Returns a name→{name→cosine_similarity} dict, or None if embeddings are
+    unavailable (the plan generator falls back to round-robin rotation).
+    """
+    if len(topic_names) < 2:
+        return None
+    try:
+        from src.embeddings import get_embedding_client
+        import numpy as np
+        client = get_embedding_client()
+        if client is None:
+            return None
+        vecs = client.encode(topic_names)  # (N, dim) float32
+        if vecs is None or len(vecs) != len(topic_names):
+            return None
+        # cosine similarity (already normalized if normalize_embeddings=True)
+        vecs = np.asarray(vecs)
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        normed = vecs / norms
+        sim = normed @ normed.T  # (N, N)
+        affinity: Dict[str, Dict[str, float]] = {}
+        for i, a in enumerate(topic_names):
+            affinity[a] = {}
+            for j, b in enumerate(topic_names):
+                affinity[a][b] = float(sim[i, j])
+        return affinity
+    except Exception:
+        return None
 
 
 def _web_source_links(sources, limit: int = 5) -> List[Dict]:
@@ -3383,12 +3416,17 @@ def setup_study_routes():
                 mastery_scores = compute_mastery_scores(topic_names, card_dicts, q_dicts)
 
             try:
+                # Phase 4.1: compute topic affinity from embeddings for
+                # semantic interleaving. Gracefully degrades to round-robin
+                # when embeddings are unavailable.
+                topic_affinity = _compute_topic_affinity(topic_names)
                 plan = generate_plan(
                     date.fromisoformat(exam.exam_date),
                     topics,
                     hours_per_week=_flt(exam.hours_per_week, 7.0),
                     rest_days=json.loads(exam.rest_days) if exam.rest_days else None,
                     mastery_scores=mastery_scores or None,
+                    topic_affinity=topic_affinity,
                 )
             except ValueError as e:
                 raise HTTPException(400, str(e))
