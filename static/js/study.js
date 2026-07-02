@@ -2749,12 +2749,13 @@ async function renderFocus() {
   }
 
   el.innerHTML = '<div class="study-empty">Loading…</div>';
-  let stats = null, calib = null;
+  let stats = null;
+  let todayBlocks = { decks: [], blocks: [] };
   try {
-    [S.focusHistory, stats, calib] = await Promise.all([
+    [S.focusHistory, stats, todayBlocks] = await Promise.all([
       jget('/api/study/focus/recent?days=14').then(r => r.sessions),
       jget('/api/study/stats?days=14'),
-      jget('/api/study/calibration?days=90').catch(() => null),
+      jget('/api/study/focus/today-blocks').catch(() => ({ decks: [], blocks: [] })),
     ]);
   } catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
   if (_tab !== 'focus' || S.focus) return;
@@ -2794,6 +2795,16 @@ async function renderFocus() {
       <div class="study-form-row">
         <input class="study-input" id="study-focus-label" placeholder="What are you working on?" style="flex:1;">
       </div>
+      ${(todayBlocks.blocks.length || todayBlocks.decks.length) ? `
+        <div class="study-form-row" id="study-focus-link-wrap" style="align-items:center;gap:8px;">
+          <select class="study-input" id="study-focus-link" style="flex:1;max-width:300px;">
+            <option value="">(no specific block)</option>
+            ${todayBlocks.blocks.map(b => `<option value="block:${esc(b.exam_id)}:${esc(b.block_key)}:${esc(b.type || '')}">${esc(b.exam_title)} — ${esc(b.type || 'block')} (${esc(b.topics.join(', ') || 'review')}, ${b.minutes}min)</option>`).join('')}
+            ${todayBlocks.decks.map(d => `<option value="deck:${esc(d.id)}">${esc(d.name)}</option>`).join('')}
+          </select>
+          <span class="study-subtle" style="font-size:11px;">optional · link this session to a plan block or subject</span>
+        </div>
+      ` : ''}
       <div class="study-form-row">
         ${[25, 50, 90].map(m => `<button class="study-btn" data-fmin="${m}">${m} min</button>`).join('')}
         <input class="study-input" id="study-focus-custom" type="number" min="5" max="240" placeholder="custom" style="width:80px;">
@@ -2815,18 +2826,35 @@ async function renderFocus() {
       ${calibHtml}
       <div class="study-section-title" style="margin-top:34px;">Recent sessions</div>
       <div>
-        ${S.focusHistory.length ? S.focusHistory.slice(0, 12).map(s => `
+        ${S.focusHistory.length ? S.focusHistory.slice(0, 12).map(s => {
+          const attr = s.exam_id && s.block_key ? ` · plan block`
+            : s.deck_id ? ` · subject`
+            : '';
+          return `
           <div class="study-row">
-            <span class="grow">${esc(s.label || 'Focus')}</span>
+            <span class="grow">${esc(s.label || 'Focus')}<span class="study-subtle" style="font-size:11px;">${attr}</span></span>
             <span class="study-subtle">${s.actual_min ?? '…'}min ${s.completed ? '✓' : s.ended_at ? '✗' : '· running'}</span>
-          </div>`).join('') : '<div class="study-empty">No sessions yet.</div>'}
+          </div>`;
+        }).join('') : '<div class="study-empty">No sessions yet.</div>'}
       </div>
     </div>`;
 
   const start = async (min) => {
     const label = el.querySelector('#study-focus-label').value.trim() || null;
+    // Phase 3.2: optional Focus<->Plan link
+    const linkSel = el.querySelector('#study-focus-link');
+    let deck_id = null, exam_id = null, block_key = null;
+    if (linkSel) {
+      const v = linkSel.value.trim();
+      if (v.startsWith('block:')) {
+        const [, ex, bk] = v.split(':');
+        exam_id = ex; block_key = bk;
+      } else if (v.startsWith('deck:')) {
+        deck_id = v.slice(5);
+      }
+    }
     try {
-      const s = await jpost('/api/study/focus/start', { label, planned_min: min });
+      const s = await jpost('/api/study/focus/start', { label, planned_min: min, deck_id, exam_id, block_key });
       S.focus = { id: s.id, label, plannedMin: min, startTs: Date.now(), timerId: null };
       renderFocus();
     } catch (e) { toast(e.message, true); }
