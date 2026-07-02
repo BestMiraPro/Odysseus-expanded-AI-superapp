@@ -95,28 +95,36 @@ The plan was written against the **dirty working tree**, which has tracked uncom
 ## 4. Sequenced roadmap
 
 ```
-Phase 0  Stabilize & secure
-  0.0  Commit working tree + record SHA + re-anchor (A1)   ← FIRST
-  0.1  Durable ratings + idempotency (A3: short-circuit before schedule)
-  0.2  Security: drop path-traversal; AI rate-limiting (11 eps) + KaTeX test (A2)
-  0.3  Numeric confidence slider + pinned mapping (A5)
-  0.4  Golden-value FSRS + study_vision tests (A8)
-  0.5  study_stats.py + /api/study/stats + composite indexes (B1)
-  0.6  Thin study_service.py + endpoint contract tests FIRST (A4)
-Phase 1  Close the data loop
-  1.1  Per-user w (≥400 threshold, warm-start, determinism, learning-row exclude) (A6)
-  1.2  Persistent calibration curve on numeric signal, merged with dashboard (A5)
-  1.3  Plan↔FSRS mastery + done_blocks preservation UX AC (C1)
-Phase 2  Retrieval hardening
-  2.1 fuzz ±25% (A7) · 2.2 elaborative-interrogation/JOL (ASK_COACH_SYSTEM:614) ·
-  2.3 pretesting (B2) · 2.4 adaptive selection · 2.5 typed-recall/wrong-MCQ gate
-Phase 3  Insight & habit
-  3.1 dashboard (study_stats) · 3.2 Focus↔Plan link · 3.3 non-coercive motivation
-Phase 4  Architecture
-  4.1 semantic interleaving · 4.2 full split + a11y (C2/C3) · 4.3 async DB (optional)
-Phase 5  Optional
-  FSRS-5/6 · faded worked examples · delayed feedback · bulk ops
+Phase 0  Stabilize & secure                                              ✅ DONE
+  0.0  Commit working tree + record SHA + re-anchor (A1)   ← FIRST       ✅
+  0.1  Durable ratings + idempotency (A3: short-circuit before schedule) ✅
+  0.2  Security: drop path-traversal; AI rate-limiting + KaTeX test (A2) ✅
+  0.3  Numeric confidence slider + pinned mapping (A5)                   ✅
+  0.4  Golden-value FSRS + study_vision tests (A8)                       ✅
+  0.5  study_stats.py + /api/study/stats + composite indexes (B1)        ✅
+  0.6  Thin study_service.py + endpoint contract tests FIRST (A4)        ✅
+Phase 1  Close the data loop                                            ✅ DONE
+  1.1  Per-user w (≥400 threshold, warm-start, determinism) (A6)         ✅
+  1.2  Persistent calibration curve on numeric signal (A5)               ✅
+  1.3  Plan↔FSRS mastery + done_blocks preservation UX AC (C1)           ✅
+Phase 2  Retrieval hardening                                            ✅ DONE
+  2.1 fuzz ±25% (A7) ✅ · 2.2 elaborative-interrogation/JOL ✅ ·
+  2.3 pretesting (B2) ✅ · 2.4 adaptive selection ✅ ·
+  2.5 typed-recall/wrong-MCQ gate ✅
+Phase 3  Insight & habit                                                ✅ DONE
+  3.1 dashboard (study_stats) ✅ · 3.2 Focus↔Plan link ✅ ·
+  3.3 non-coercive motivation ✅
+Phase 4  Architecture                                                  ✅ DONE
+  4.1 semantic interleaving ✅ · 4.2 full split + a11y (C2/C3) ✅ ·
+  4.3 async FSRS optimization (optional) ✅
+Phase 5  Optional                                                       ✅ DONE
+  delayed feedback ✅ · cross-subject search ✅ ·
+  (FSRS-5/6 · faded worked examples · bulk ops — deferred)
 ```
+
+> **Status:** All planned phases complete. The full study + FSRS test suite
+> (324 passed, 1 skipped) is green. The monolithic `routes/study_routes.py`
+> has been split into the `routes/study/` package (Phase 4.2).
 
 **Effort:** Tier A ≈ 26h · Tier A+B ≈ 33h.
 
