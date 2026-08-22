@@ -70,7 +70,7 @@ and the incremental commit history is preserved.
 | License | **Stays AGPL-3.0**, upstream attribution intact | Required by the license; `ACKNOWLEDGMENTS.md` already handles credit well |
 | Sequence | **Port first, publish second** | Avoids publishing a 2-month-stale tree and then force-pushing a rebase over it |
 | `Co-Authored-By: Claude` trailers (38 of 44 commits) | **Keep** | Stripping them to hide AI assistance would misrepresent the work; effective AI-assisted delivery of a 13k-line feature is a strength worth stating plainly in the README |
-| `user.name` for new commits | Set to the author's real name (**confirm exact spelling before setting**) | Currently `Study Upgrade Crew`. The email `dinas.m.mira@gmail.com` is already correct, so contributions link to the GitHub profile |
+| `user.name` for new commits | **`Dinis Mira`**, set repo-local (global stays `BestMiraPro`) | Was `Study Upgrade Crew`. The email `dinas.m.mira@gmail.com` is already correct, so contributions link to the GitHub profile |
 
 ---
 
