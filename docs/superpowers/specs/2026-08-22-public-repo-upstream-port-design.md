@@ -13,6 +13,13 @@
 (AGPL-3.0). It carries 44 commits of original work on top of an upstream
 snapshot from 2026-06-12. Upstream `dev` has since advanced to 2026-08-20.
 
+The commit range to be replayed, `9d7a3d6..dev`, holds **58 commits**: the 44
+authored locally plus **14 by `pewdiepie-archdaemon`** that arrived through the
+merge `1999025c Merge remote-tracking branch 'origin/dev' into study-into-dev`.
+Those 14 are upstream's own June work and are already present in current
+`upstream/dev` under different SHAs, so they are expected to drop out of the
+rebase as empty commits.
+
 ### Local work being preserved
 
 | Feature | Shape | Approx. size |
@@ -25,6 +32,10 @@ snapshot from 2026-06-12. Upstream `dev` has since advanced to 2026-08-20.
 Total delta `9d7a3d6..dev`: **62 files, +12,856 / −144**. Of that, **23 new
 non-test files** carry over untouched; only **~1,500 lines** modify existing
 upstream files. That ratio is what makes this port tractable.
+
+Because the range includes upstream's 14 commits, that diff **overstates** the
+local delta. Eleven of the files it touches carry no local change at all and are
+dropped wholesale in Tier 4 rather than hand-merged.
 
 ---
 
@@ -48,9 +59,10 @@ SHAs) against 2,057 upstream commits, producing thousands of phantom conflicts
 in code nobody here touched.
 
 **Consequence, exploited:** because the trees are identical,
-`git rebase --onto upstream/dev 9d7a3d6 dev` replays *exactly* the 44 local
-commits onto current upstream. Conflicts arise only in files both sides edited,
-and the incremental commit history is preserved.
+`git rebase --onto upstream/dev 9d7a3d6 dev` replays the 58 commits of the range
+onto current upstream — the 44 local ones land, and the 14 upstream ones drop out
+as empty. Conflicts arise only in files both sides edited, and the incremental
+commit history is preserved.
 
 ### Approaches rejected
 
@@ -114,8 +126,7 @@ specs and plans. These do not exist upstream; they apply verbatim.
 
 `.gitignore`, `requirements.txt`, `docker-compose.yml`, `Dockerfile`,
 `docker/entrypoint.sh`, `core/auth.py`, `src/session_search.py`,
-`routes/api_token_routes.py`, `static/js/modalManager.js`,
-`integrations/claude/**`, `integrations/codex/**`.
+`static/js/modalManager.js`.
 
 ### Tier 2 — medium (additive, but upstream churned nearby)
 
@@ -144,16 +155,27 @@ specs and plans. These do not exist upstream; they apply verbatim.
   fallback) against upstream +1,920. Upstream `2fb3a316 Hide untagged reasoning
   dumps in chat` may supersede it; if upstream now handles empty `content` with
   a populated `reasoning` field, drop the local fix rather than force-fit it.
-- **`routes/codex_routes.py`** — local 66 against upstream 154.
 
-### Tier 4 — verify obsolete, then drop
+### Tier 4 — drop, taking upstream's current version (11 files)
 
-- **`src/tool_implementations.py`** — local change is −3 lines; upstream deleted
-  4,103 in a module refactor. Almost certainly obsolete.
-- **`static/js/admin.js`** — local change is −25 lines against 922 of churn.
+Ten of these were touched **only** by the 14 upstream commits in the range and
+carry no local change whatsoever:
 
-Dropping is the correct outcome where upstream has independently solved the same
-problem. Each drop is recorded in the final port summary with its reason.
+`LICENSE`, `README.md`, `routes/api_token_routes.py`, `routes/codex_routes.py`,
+`static/js/admin.js`, `static/js/cookbookServe.js`,
+`integrations/claude/skills/odysseus/SKILL.md`,
+`integrations/claude/skills/odysseus/scripts/odysseus_api.py`,
+`integrations/codex/skills/odysseus/SKILL.md`,
+`integrations/codex/scripts/odysseus_api.py`.
+
+The eleventh, **`src/tool_implementations.py`**, carries a −3-line removal of the
+`context_after` block in `do_search_chats` that came from the merge `79d6806`
+rather than from a deliberate decision. Upstream deleted 4,103 lines from this
+file in a module refactor, so the removal is moot either way.
+
+`static/index.html` was touched by both sides and therefore stays in Tier 3.
+
+Each drop is recorded in `docs/PORT-NOTES.md` with its reason.
 
 ---
 
