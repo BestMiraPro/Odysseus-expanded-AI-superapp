@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import sqlite3
 import tarfile
 from io import BytesIO
 from pathlib import Path
@@ -27,6 +29,24 @@ _DEFAULT_MODEL_PREFS = ("glm-5", "glm", "qwen3", "deepseek", "llama")
 # typical gateway exposes (W&B lists ~29), bounded to guard against a runaway
 # endpoint flooding the picker and the orchestrator's spawn roster.
 _MAX_WORKERS = 40
+
+# Curated "best option" gateway models that get their own crew entry. The
+# broad `crew`/`crew-codex` can still delegate to every API model.
+_BEST_API_MODEL_HINTS = (
+    "glm-5", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4",
+    "kimi-k2", "qwen3-coder", "qwen3-235b", "minimax-m2",
+    "nemotron-3-ultra",
+)
+_MAX_API_CREWS = 10
+_LEGACY_AGENT_REPOINTS = "generated_agent_repoints.json"
+_KNOWN_STALE_SESSION_AGENT_NAMES = {
+    "deepseek-v3-1",
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "glm",
+    "glm-5-2",
+    "openai-agents",
+}
 
 
 def _endpoint_model_ids(ep) -> list[str]:
@@ -53,6 +73,20 @@ def _pick_default_model(ids: list[str]) -> str | None:
             if pref in mid.lower():
                 return mid
     return ids[0] if ids else None
+
+
+def _pick_best_api_models(ids: list[str], limit: int = _MAX_API_CREWS) -> list[str]:
+    chosen: list[str] = []
+    for hint in _BEST_API_MODEL_HINTS:
+        for mid in ids:
+            if hint in mid.lower() and mid not in chosen:
+                chosen.append(mid)
+    for mid in ids:
+        if len(chosen) >= limit:
+            break
+        if mid not in chosen:
+            chosen.append(mid)
+    return chosen[:limit]
 
 
 def _model_slug(model_id: str) -> str:
@@ -208,64 +242,99 @@ def _cli_worker_spec(w: dict) -> dict:
     }
 
 
-def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str | None) -> int:
-    """Write a ``crew`` orchestrator + one worker per API model under the bundled
-    Omnigent's ``~/.omnigent/agents/`` so the gateway models are delegatable
-    sub-agents that can actually inspect and build on the user's repo.
-
-    The orchestrator runs on ``claude-sdk`` with NO pinned model (so it works
-    under the Claude brain and orchestrates reliably); each worker runs its own
-    W&B model via openai-agents with inline auth (HOME-independent, see
-    :func:`_executor_block`). Both carry an ``os_env`` block so they have real
-    shell/file tools — without it they are bare chat LLMs that narrate and stop.
-    Worker config files are chmod 0600 because they carry the key inline.
-    """
-    # Install every API model as a worker (the user asked for "all API models"),
-    # bounded so a pathological endpoint can't flood the picker / spawn roster.
-    ids = [mid for mid in model_creds if mid][:_MAX_WORKERS]
-    if not ids:
-        return 0
-    crew = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents" / "crew"
-    wroot = crew / "agents"
-    slugs: list[str] = []
-    used: set[str] = set()
-    # Native coding CLIs first in the roster (the robust implementers), then the
-    # API models. Claude Code works off the same login as the brain; Codex needs
-    # a one-time `codex login` before it can run.
-    for w in _CLI_WORKERS:
-        wdir = wroot / w["slug"]
-        wdir.mkdir(parents=True, exist_ok=True)
-        (wdir / "config.yaml").write_text(yaml.safe_dump(_cli_worker_spec(w), sort_keys=False))
-        used.add(w["slug"])
-        slugs.append(w["slug"])
-    for mid in ids:
-        slug = _model_slug(mid)
-        while slug in used:
-            slug += "-x"
-        used.add(slug)
-        wdir = wroot / slug
-        wdir.mkdir(parents=True, exist_ok=True)
-        cfg_file = wdir / "config.yaml"
-        cfg_file.write_text(yaml.safe_dump({
-            "spec_version": 1,
-            "name": slug,
-            "description": f"{mid} worker (API model via the W&B gateway).",
-            "executor": _executor_block(mid, model_creds.get(mid)),
-            "os_env": _os_env_block(),
-            "prompt": _WORKER_PROMPT.format(slug=slug, mid=mid),
-            "guardrails": {"policies": {"blast_radius": _blast_radius_guardrail()}},
-        }, sort_keys=False))
-        _chmod_600(cfg_file)
-        slugs.append(slug)
-    crew.mkdir(parents=True, exist_ok=True)
-    crew_file = crew / "config.yaml"
-    crew_file.write_text(yaml.safe_dump({
+def _api_worker_spec(slug: str, mid: str, creds: tuple[str, str] | None) -> dict:
+    return {
         "spec_version": 1,
-        "name": "crew",
-        "description": "Claude-brained orchestrator that delegates to Claude Code, Codex, and your W&B API-model workers.",
-        # No model pinned: claude-sdk resolves the configured Claude default, so
-        # the Claude brain doesn't choke on a W&B model id.
-        "executor": {"type": "omnigent", "context_window": 1000000, "config": {"harness": "claude-sdk"}},
+        "name": slug,
+        "description": f"{mid} worker (API model via the W&B gateway).",
+        "executor": _executor_block(mid, creds),
+        "os_env": _os_env_block(),
+        "prompt": _WORKER_PROMPT.format(slug=slug, mid=mid) + _TOOL_PROTOCOL,
+        "guardrails": {"policies": {"blast_radius": _blast_radius_guardrail()}},
+    }
+
+
+def _write_worker(agents_dir: Path, slug: str, spec: dict) -> None:
+    wdir = agents_dir / slug
+    wdir.mkdir(parents=True, exist_ok=True)
+    cfg_file = wdir / "config.yaml"
+    cfg_file.write_text(yaml.safe_dump(spec, sort_keys=False))
+    _chmod_600(cfg_file)
+
+
+def _write_crew_file(crew_dir: Path, spec: dict) -> None:
+    crew_dir.mkdir(parents=True, exist_ok=True)
+    cfg_file = crew_dir / "config.yaml"
+    cfg_file.write_text(yaml.safe_dump(spec, sort_keys=False))
+    _chmod_600(cfg_file)
+
+
+# Mechanical tool-use protocol appended to every generated agent prompt. Weak
+# tool-calling models (gateway models over the chat wire, e.g. GLM) tend to
+# NARRATE tool use ("I'll dispatch codex to run the grid search") and end the
+# turn without emitting any function call — nothing happens. Abstract "act,
+# don't narrate" phrasing is not enough for them; this block is deliberately
+# blunt, example-driven, and sits at the END of the prompt where models attend
+# most.
+_TOOL_PROTOCOL = (
+    "\n\n=== TOOL-CALL PROTOCOL (MANDATORY) ===\n"
+    "Work happens ONLY through function calls. Text does nothing. Writing about an action does not "
+    "perform it.\n"
+    "WRONG (this is a failure): \"I'll dispatch a codex sub-agent to run the grid search while I run "
+    "rsi_sd myself.\" — a reply that only announces actions, with no function call attached.\n"
+    "RIGHT: emit the sys_session_send function call (and any sys_os_shell calls) IN THIS REPLY, then "
+    "briefly say what you started.\n"
+    "Rules:\n"
+    "1. If your reply says you will do, run, dispatch, check, read, or launch ANYTHING, the same reply "
+    "MUST contain the function call(s) that do it. No exceptions.\n"
+    "2. Never describe a shell command, file read, or delegation in prose instead of calling the tool.\n"
+    "3. Only two valid ways to end a reply: (a) function calls are attached, or (b) the task is DONE "
+    "and you are giving the final answer with results you actually obtained through earlier calls.\n"
+    "4. Before finishing, re-read your reply: if it contains a future-tense promise (\"I'll...\", "
+    "\"Let me...\", \"Next I will...\") with no attached function call, DELETE the promise and emit "
+    "the call instead."
+)
+
+
+def _crew_config(
+    name: str,
+    description: str,
+    executor: dict,
+    slugs: list[str],
+    primary_worker: str | None = None,
+    lead_model: str | None = None,
+) -> dict:
+    worker_list = ", ".join(slugs) if slugs else "none"
+    if lead_model:
+        prompt = (
+            f"You are `{name}`, the crew lead running directly on `{lead_model}`. "
+            "That selected model is your own executor; do not delegate the first task just to prove "
+            "the model is involved. Use your own sys_os_* tools to inspect files, run commands, and "
+            "produce the answer directly.\n\n"
+            f"Optional sub-agents: {worker_list}. Delegate with sys_session_send only when a worker "
+            "is clearly better suited, when you want parallel review, or when you need a fallback. "
+            "Codex is the coding/test-heavy fallback; you remain responsible for the final answer.\n\n"
+            "CRITICAL - ACT, DON'T NARRATE. Never end a turn after only saying what you are about to "
+            "do. If a sentence describes a next action, the tool calls that perform it MUST be in the "
+            "same turn. On your first turn, use your own tools to orient and start the actual work."
+            + _TOOL_PROTOCOL
+        )
+    else:
+        prompt = _CREW_PROMPT.format(workers=worker_list) + _TOOL_PROTOCOL
+    if primary_worker and not lead_model:
+        prompt = (
+            f"This crew is anchored on `{primary_worker}`. On the first turn, immediately delegate "
+            f"the user's substantive task to `{primary_worker}` with sys_session_send. Do not emit "
+            "a progress-only message before that tool call. After workers finish, call sys_read_inbox "
+            "and synthesize the results. If the anchored worker fails or stalls, re-dispatch the same "
+            "scoped task to another configured worker.\n\n"
+            f"{prompt}"
+        )
+    return {
+        "spec_version": 1,
+        "name": name,
+        "description": description,
+        "executor": executor,
         "spawn": True,
         "async": True,
         "cancellable": True,
@@ -274,7 +343,7 @@ def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str |
         "terminals": {
             "shell": {"command": "bash", "allow_cwd_override": True, "os_env": _os_env_block()},
         },
-        "prompt": _CREW_PROMPT.format(workers=", ".join(slugs)),
+        "prompt": prompt,
         "tools": {"agents": slugs},
         "guardrails": {
             "ask_timeout": 86400,
@@ -292,23 +361,300 @@ def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str |
                 "blast_radius": _blast_radius_guardrail(),
             },
         },
-    }, sort_keys=False))
-    return len(slugs)
+    }
+
+
+def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str | None) -> int:
+    """Write generated crew variants and their nested workers."""
+    ids = [mid for mid in model_creds if mid][:_MAX_WORKERS]
+    if not ids:
+        return 0
+    agents_root = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents"
+
+    for pattern in ("crew", "crew-api-*", "crew-*"):
+        for stale in agents_root.glob(pattern):
+            if stale.is_dir():
+                shutil.rmtree(stale, ignore_errors=True)
+
+    api_slugs: list[str] = []
+    api_slug_by_model: dict[str, str] = {}
+    used: set[str] = set()
+    for mid in ids:
+        slug = _model_slug(mid)
+        while slug in used:
+            slug += "-x"
+        used.add(slug)
+        api_slugs.append(slug)
+        api_slug_by_model[mid] = slug
+    api_specs = {slug: _api_worker_spec(slug, mid, model_creds.get(mid)) for slug, mid in zip(api_slugs, ids)}
+
+    crew_slugs = [w["slug"] for w in _CLI_WORKERS] + api_slugs
+
+    def write_full_roster_crew(name: str, description: str, executor: dict) -> None:
+        crew_dir = agents_root / name
+        for w in _CLI_WORKERS:
+            _write_worker(crew_dir / "agents", w["slug"], _cli_worker_spec(w))
+        for slug, spec in api_specs.items():
+            _write_worker(crew_dir / "agents", slug, spec)
+        _write_crew_file(crew_dir, _crew_config(
+            name,
+            description,
+            executor,
+            crew_slugs,
+        ))
+
+    claude_executor = {"type": "omnigent", "context_window": 1000000, "config": {"harness": "claude-sdk"}}
+    codex_executor = {
+        "type": "omnigent",
+        "model": "gpt-5.6-sol",
+        "context_window": 1000000,
+        "config": {
+            "harness": "codex-native",
+            "yolo": True,
+            "reasoning_effort": "xhigh",
+        },
+    }
+
+    write_full_roster_crew(
+        "crew",
+        "Claude-brained orchestrator that delegates to Claude Code, Codex, and your W&B API-model workers.",
+        claude_executor,
+    )
+    write_full_roster_crew(
+        "crew-claude",
+        "Claude-brained crew alias with Claude Code, Codex, and your W&B API-model workers.",
+        claude_executor,
+    )
+    written = 2
+
+    codex_dir = agents_root / "crew-codex"
+    for slug, spec in api_specs.items():
+        _write_worker(codex_dir / "agents", slug, spec)
+    _write_crew_file(codex_dir, _crew_config(
+        "crew-codex",
+        "Codex-brained crew that can use its own tools and delegate to your W&B API-model workers.",
+        codex_executor,
+        api_slugs,
+    ))
+    written += 1
+
+    codex_worker = next((w for w in _CLI_WORKERS if w["slug"] == "codex"), None)
+    for mid in _pick_best_api_models(ids):
+        target_slug = api_slug_by_model[mid]
+        crew_name = f"crew-{target_slug}"
+        variant_dir = agents_root / crew_name
+        model_crew_slugs: list[str] = []
+        if codex_worker:
+            _write_worker(variant_dir / "agents", codex_worker["slug"], _cli_worker_spec(codex_worker))
+            model_crew_slugs.append(codex_worker["slug"])
+        _write_crew_file(variant_dir, _crew_config(
+            crew_name,
+            f"{mid}-brained crew that uses the W&B gateway directly and can fall back to Codex.",
+            _executor_block(mid, model_creds.get(mid)),
+            model_crew_slugs,
+            lead_model=mid,
+        ))
+        written += 1
+
+    return written
+
+
+def _generated_crew_dirs(agents_root: Path) -> list[Path]:
+    crew_dirs: list[Path] = []
+    broad = agents_root / "crew"
+    if (broad / "config.yaml").exists():
+        crew_dirs.append(broad)
+    crew_dirs.extend(sorted(
+        p for p in agents_root.glob("crew-*")
+        if p.is_dir() and (p / "config.yaml").exists()
+    ))
+    return crew_dirs
+
+
+def _generated_api_worker_slugs(crew_dirs: list[Path]) -> set[str]:
+    cli_worker_slugs = {str(w["slug"]) for w in _CLI_WORKERS}
+    slugs: set[str] = set()
+    for crew in crew_dirs:
+        worker_root = crew / "agents"
+        if not worker_root.exists():
+            continue
+        for worker in worker_root.iterdir():
+            if (worker / "config.yaml").exists() and worker.name not in cli_worker_slugs:
+                slugs.add(worker.name)
+    return slugs
+
+
+def _artifact_model_slug(root: Path, bundle_location: str | None) -> str | None:
+    if not bundle_location:
+        return None
+    bundle_path = root / "artifacts" / bundle_location
+    try:
+        if not bundle_path.is_file():
+            return None
+        with tarfile.open(bundle_path, "r:*") as tf:
+            members = [m for m in tf.getmembers() if m.isfile()]
+            member = next((m for m in members if Path(m.name).name == "config.yaml"), None)
+            if member is None:
+                member = next((m for m in members if Path(m.name).suffix in {".yaml", ".yml"}), None)
+            if member is None:
+                return None
+            f = tf.extractfile(member)
+            if f is None:
+                return None
+            cfg = yaml.safe_load(f.read(262_144)) or {}
+    except Exception:
+        return None
+    executor = cfg.get("executor") if isinstance(cfg, dict) else None
+    model = executor.get("model") if isinstance(executor, dict) else None
+    return _model_slug(str(model)) if model else None
 
 
 def _builtin_agent_env() -> dict[str, str] | None:
-    """Env that registers the generated crew + per-model workers as Omnigent
-    built-in agents (the UI picker only lists built-ins, not ~/.omnigent/agents).
-    `OMNIGENT_BUILTIN_AGENT_DIRS` is os.pathsep-separated and read at server
-    startup."""
-    crew = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents" / "crew"
-    if not (crew / "config.yaml").exists():
-        return None
-    dirs = [str(crew)]
-    for w in sorted((crew / "agents").glob("*")):
-        if (w / "config.yaml").exists():
-            dirs.append(str(w))
-    return {"OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(dirs)}
+    """Register generated top-level crews as built-ins for the picker."""
+    agents_root = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents"
+    dirs = [str(p) for p in _generated_crew_dirs(agents_root)]
+    return {"OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(dirs)} if dirs else None
+
+
+def _purge_generated_builtin_agent_rows() -> int:
+    root = Path(DATA_DIR) / "omnigent-home" / ".omnigent"
+    db_path = root / "chat.db"
+    agents_root = root / "agents"
+    if not db_path.exists():
+        return 0
+    crew_dirs = _generated_crew_dirs(agents_root)
+    names: set[str] = {p.name for p in crew_dirs}
+    names.update(p.name for p in agents_root.glob("crew-api-*") if (p / "config.yaml").exists())
+    names.update(_generated_api_worker_slugs([*crew_dirs, *agents_root.glob("crew-api-*")]))
+    if not names:
+        return 0
+    placeholders = ",".join("?" for _ in names)
+    repoint_path = root / _LEGACY_AGENT_REPOINTS
+    with sqlite3.connect(db_path) as con:
+        legacy = con.execute(
+            "SELECT id, name FROM agents WHERE session_id IS NULL AND name LIKE 'crew-api-%'"
+        ).fetchall()
+        repoints = {
+            str(row[0]): f"crew-{str(row[1])[len('crew-api-'):]}"
+            for row in legacy
+            if str(row[1]).startswith("crew-api-")
+        }
+        if repoints:
+            repoint_path.write_text(json.dumps(repoints, sort_keys=True))
+            _chmod_600(repoint_path)
+        else:
+            try:
+                repoint_path.unlink()
+            except FileNotFoundError:
+                pass
+        cur = con.execute(
+            "DELETE FROM agents WHERE session_id IS NULL "
+            f"AND (name IN ({placeholders}) OR name LIKE 'crew-api-%')",
+            tuple(sorted(names)),
+        )
+        con.commit()
+        return int(cur.rowcount or 0)
+
+
+def _refresh_generated_session_agent_rows() -> int:
+    root = Path(DATA_DIR) / "omnigent-home" / ".omnigent"
+    db_path = root / "chat.db"
+    if not db_path.exists():
+        return 0
+    crew_dirs = _generated_crew_dirs(root / "agents")
+    crew_names = {p.name for p in crew_dirs}
+    if not crew_names:
+        return 0
+    api_worker_slugs = _generated_api_worker_slugs(crew_dirs)
+    placeholders = ",".join("?" for _ in crew_names)
+    repoint_path = root / _LEGACY_AGENT_REPOINTS
+    total = 0
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        fresh_rows = con.execute(
+            f"SELECT id, name, bundle_location, version FROM agents "
+            f"WHERE session_id IS NULL AND name IN ({placeholders})",
+            tuple(sorted(crew_names)),
+        ).fetchall()
+        fresh = {str(row["name"]): row for row in fresh_rows}
+        for name, row in fresh.items():
+            session_ids = [
+                str(session_row["id"])
+                for session_row in con.execute(
+                    "SELECT id FROM agents WHERE session_id IS NOT NULL AND name = ?",
+                    (name,),
+                ).fetchall()
+            ]
+            cur = con.execute(
+                "UPDATE agents SET bundle_location = ?, version = ? "
+                "WHERE session_id IS NOT NULL AND name = ?",
+                (row["bundle_location"], row["version"], name),
+            )
+            total += int(cur.rowcount or 0)
+            if session_ids:
+                session_placeholders = ",".join("?" for _ in session_ids)
+                cur = con.execute(
+                    "UPDATE conversations SET agent_id = ? "
+                    f"WHERE agent_id IN ({session_placeholders})",
+                    tuple([row["id"]] + session_ids),
+                )
+                total += int(cur.rowcount or 0)
+        repoints: dict[str, str] = {}
+        if repoint_path.exists():
+            try:
+                repoints = json.loads(repoint_path.read_text()) or {}
+            except Exception:
+                repoints = {}
+        for old_id, new_name in repoints.items():
+            row = fresh.get(str(new_name))
+            if not row:
+                continue
+            cur = con.execute(
+                "UPDATE conversations SET agent_id = ? WHERE agent_id = ?",
+                (row["id"], str(old_id)),
+            )
+            total += int(cur.rowcount or 0)
+        fallback_row = fresh.get("crew-codex") or fresh.get("crew")
+        stale_rows = con.execute(
+            "SELECT id, name, bundle_location FROM agents WHERE session_id IS NOT NULL"
+        ).fetchall()
+        for stale in stale_rows:
+            name = str(stale["name"])
+            if name in fresh:
+                continue
+            target_names: list[str] = []
+            generatedish = False
+            if name.startswith("crew-api-"):
+                target_names.append(f"crew-{name[len('crew-api-'):]}")
+                generatedish = True
+            if name in api_worker_slugs:
+                target_names.append(f"crew-{name}")
+                generatedish = True
+            if name in _KNOWN_STALE_SESSION_AGENT_NAMES:
+                target_names.append(f"crew-{name}")
+                generatedish = True
+            if generatedish:
+                model_slug = _artifact_model_slug(root, stale["bundle_location"])
+                if model_slug:
+                    target_names.append(f"crew-{model_slug}")
+                if fallback_row:
+                    target_names.append(str(fallback_row["name"]))
+            target_row = next((fresh[target] for target in target_names if target in fresh), None)
+            if not target_row:
+                continue
+            cur = con.execute(
+                "UPDATE conversations SET agent_id = ? WHERE agent_id = ?",
+                (target_row["id"], stale["id"]),
+            )
+            total += int(cur.rowcount or 0)
+            cur = con.execute("DELETE FROM agents WHERE id = ?", (stale["id"],))
+            total += int(cur.rowcount or 0)
+        con.commit()
+    try:
+        repoint_path.unlink()
+    except FileNotFoundError:
+        pass
+    return total
 
 
 def _credentials_env_for(base_url: str | None, api_key: str | None) -> dict[str, str] | None:
@@ -427,11 +773,16 @@ def _install_api_models(user: str | None) -> dict:
     except Exception:
         pass
     workers = _generate_crew(model_creds, default_model)
+    try:
+        purged_builtin_rows = _purge_generated_builtin_agent_rows()
+    except Exception:
+        purged_builtin_rows = 0
     return {
         "endpoints": len(providers),
         "models": model_count,
         "default_model": default_model,
         "workers": workers,
+        "purged_builtin_rows": purged_builtin_rows,
     }
 
 
@@ -515,11 +866,28 @@ def setup_omnigent_routes(
     @router.post("/server/start")
     def start_server(request: Request):
         require_admin(request)
+        user = get_current_user(request)
         try:
-            data = manager.start()
+            api = _install_api_models(user)
+        except Exception as exc:
+            api = {"endpoints": 0, "models": 0, "error": str(exc)}
+        env_extra = dict(_builtin_agent_env() or {})
+        try:
+            creds = _gateway_credentials_env(user)
+            if creds:
+                env_extra.update(creds)
+        except Exception:
+            pass
+        try:
+            data = manager.start(env_extra=env_extra or None)
+            try:
+                data["refreshed_generated_agent_rows"] = _refresh_generated_session_agent_rows()
+            except Exception:
+                data["refreshed_generated_agent_rows"] = 0
         except Exception as exc:
             raise HTTPException(500, str(exc))
         data["install"] = INSTALL_GUIDANCE
+        data["api_models"] = api
         return data
 
     @router.post("/server/stop")
@@ -605,6 +973,10 @@ def setup_omnigent_routes(
             pass
         try:
             data = manager.restart(env_extra=env_extra or None)
+            try:
+                data["refreshed_generated_agent_rows"] = _refresh_generated_session_agent_rows()
+            except Exception:
+                data["refreshed_generated_agent_rows"] = 0
         except Exception as exc:
             data = manager.status()
             data["error"] = str(exc)

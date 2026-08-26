@@ -37,18 +37,29 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # entrypoint) bridges its loopback-only web UI to the published :6868.
 ENV UV_TOOL_DIR=/opt/uv/tools \
     UV_TOOL_BIN_DIR=/usr/local/bin
+ARG OMNIGENT_VERSION=0.10.0
 RUN pip install --no-cache-dir uv \
-    && uv tool install omnigent \
+    && uv tool install "omnigent==${OMNIGENT_VERSION}" \
     && chmod -R a+rX /opt/uv \
     && rm -rf /root/.cache
 
 # Claude Code + Codex CLIs so their native harnesses are available as Omnigent
 # sub-agents alongside the API-model workers. Each still needs a one-time
 # interactive subscription login (the API/W&B workers need no login).
-RUN npm install -g @anthropic-ai/claude-code @openai/codex
+ARG CLAUDE_CODE_VERSION=2.1.245
+ARG CODEX_VERSION=0.150.0
+RUN npm install -g \
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    "@openai/codex@${CODEX_VERSION}"
 
 # Copy app code
 COPY . .
+
+# The app runs as a non-root UID, so apply the generated-crew picker metadata
+# patch while building and keep Omnigent's installed package read-only at runtime.
+RUN python -c "from src.omnigent_manager import OmnigentManager; OmnigentManager(command='/usr/local/bin/omnigent')._patch_picker_metadata('/usr/local/bin/omnigent')" \
+    && grep -R -q "ODYSSEUS_GENERATED_CREW_PICKER_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/server/routes/builtin_agents.py
 
 # Create data directory (mount a volume here for persistence)
 RUN mkdir -p data logs services/cache/search

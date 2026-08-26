@@ -27,6 +27,85 @@ INSTALL_GUIDANCE = {
     "source": "https://github.com/omnigent-ai/omnigent",
 }
 
+_PICKER_PATCH_MARKER = "ODYSSEUS_GENERATED_CREW_PICKER_PATCH"
+
+
+def _patch_builtin_agent_route_source(source: str) -> tuple[str, bool]:
+    """Mask generated crew variants in OmniGENT's picker-only metadata.
+
+    The real agent bundle keeps its Codex executor harness. This changes only
+    the `/v1/agents` response so OmniGENT's web UI displays generated
+    `crew-*` variants by name instead of collapsing them into the Codex wrapper.
+    """
+    return_needle = "    return AgentObject(\n"
+    if return_needle not in source:
+        return source, False
+    picker_block = (
+        f"    # {_PICKER_PATCH_MARKER}: generated crew variants are selectable\n"
+        "    # templates, not native harness wrappers. Keep the stored spec's\n"
+        "    # executor harness and builtin status intact; use a non-wrapper\n"
+        "    # harness metadata value so the main picker avoids codex-native\n"
+        "    # dedupe while the fork dialog still treats the agent as selectable.\n"
+        "    picker_harness = harness\n"
+        "    picker_builtin = agent.session_id is None and agent.id == builtin_agent_id(agent.name)\n"
+        "    if agent.session_id is None and agent.name.startswith(\"crew-\") and agent.name != \"crew-claude\":\n"
+        "        picker_harness = \"openai-agents\"\n"
+        "\n"
+    )
+    marker = f"    # {_PICKER_PATCH_MARKER}:"
+    marker_at = source.find(marker)
+    if marker_at >= 0:
+        return_at = source.find(return_needle, marker_at)
+        if return_at < 0:
+            return source, False
+        patched = source[:marker_at] + picker_block + source[return_at:]
+    else:
+        patched = source.replace(return_needle, f"{picker_block}{return_needle}", 1)
+    patched = patched.replace("        harness=harness,\n", "        harness=picker_harness,\n", 1)
+    builtin_block = (
+        "        builtin=agent.session_id is None and agent.id == builtin_agent_id(agent.name),\n"
+    )
+    if builtin_block in patched:
+        patched = patched.replace(builtin_block, "        builtin=picker_builtin,\n", 1)
+    else:
+        long_builtin_block = (
+            "        builtin=agent.session_id is None and agent.id == builtin_agent_id(agent.name),\n"
+        )
+        patched = patched.replace(long_builtin_block, "        builtin=picker_builtin,\n", 1)
+    if "        harness=picker_harness,\n" not in patched or "        builtin=picker_builtin,\n" not in patched:
+        return source, False
+    return patched, patched != source
+
+
+def _builtin_agent_route_candidates(command: str) -> list[Path]:
+    candidates: list[Path] = []
+    try:
+        resolved = Path(command).resolve()
+    except Exception:
+        resolved = Path(command)
+    lib_roots = [
+        Path("/opt/uv/tools/omnigent/lib"),
+        Path.home() / ".local" / "share" / "uv" / "tools" / "omnigent" / "lib",
+        resolved.parent.parent / "tools" / "omnigent" / "lib",
+        resolved.parent.parent.parent / "tools" / "omnigent" / "lib",
+    ]
+    rel = Path("site-packages") / "omnigent" / "server" / "routes" / "builtin_agents.py"
+    seen: set[Path] = set()
+    for root in lib_roots:
+        try:
+            matches = root.glob("python*/" + str(rel).replace("\\", "/"))
+        except Exception:
+            continue
+        for match in matches:
+            try:
+                key = match.resolve()
+            except Exception:
+                key = match
+            if key not in seen:
+                seen.add(key)
+                candidates.append(match)
+    return candidates
+
 
 @dataclass(slots=True)
 class OmnigentCommandResult:
@@ -58,6 +137,16 @@ class OmnigentManager:
             if resolved:
                 return resolved
         return None
+
+    def _patch_picker_metadata(self, command: str) -> None:
+        for path in _builtin_agent_route_candidates(command):
+            try:
+                source = path.read_text()
+                patched, changed = _patch_builtin_agent_route_source(source)
+                if changed:
+                    path.write_text(patched)
+            except Exception:
+                continue
 
     def _cli_worker(
         self,
@@ -135,6 +224,41 @@ class OmnigentManager:
             running = False
         return {"running": running, "url": url if running else None}
 
+    def _sync_bridge(self, url: str | None) -> None:
+        """Keep the Docker-published :6868 bridge pointed at Omnigent's port."""
+        if not url or not shutil.which("socat"):
+            return
+        bridge_port = os.environ.get("OMNIGENT_BRIDGE_PORT", "6868")
+        match = re.search(r":(\d+)$", url.rstrip("/"))
+        if not (bridge_port and match):
+            return
+        target_port = match.group(1)
+        if target_port == bridge_port:
+            return
+        try:
+            subprocess.run(
+                ["pkill", "-f", f"socat TCP-LISTEN:{bridge_port},"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except Exception:
+            pass
+        try:
+            subprocess.Popen(
+                [
+                    "socat",
+                    f"TCP-LISTEN:{bridge_port},fork,reuseaddr",
+                    f"TCP:127.0.0.1:{target_port}",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass
+
     def status(self) -> dict[str, Any]:
         command = self._resolve_command()
         if not command:
@@ -175,12 +299,14 @@ class OmnigentManager:
         command = self._resolve_command()
         if not command:
             raise RuntimeError("Omnigent CLI not found on PATH")
+        self._patch_picker_metadata(command)
         result = self._run([command, "server", "start"], timeout=30, env_extra=env_extra)
         # Learn the URL Omnigent actually bound (it prints e.g. "Started
         # background server at http://127.0.0.1:6767") so the probe matches.
         match = re.search(r"https?://127\.0\.0\.1:\d+", f"{result.stdout}\n{result.stderr}")
         if match:
             self._ui_url = match.group(0)
+            self._sync_bridge(self._ui_url)
         status = self.status()
         status.update({
             "last_command": "omnigent server start",

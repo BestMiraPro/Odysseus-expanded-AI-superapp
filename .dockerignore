@@ -1,5 +1,6 @@
 venv/
 .venv/
+.venv-win/
 node_modules/
 services/node_modules/
 __pycache__/
@@ -16,6 +17,9 @@ build/
 .claude/
 .playwright-mcp/
 .pytest_cache/
+.uv-cache/
+pytest-tmp/
+pytest-cache-files-*/
 .vscode/
 .idea/
 dev-docs/
