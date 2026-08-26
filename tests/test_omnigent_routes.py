@@ -554,3 +554,144 @@ def test_refresh_generated_session_agent_rows_repoints_existing_chats(tmp_path, 
     assert conversations["conv_other"] == "other"
     assert stale_agent_ids == set()
     assert not (root / "generated_agent_repoints.json").exists()
+
+
+def test_purge_generated_builtin_agent_rows_supports_kind_schema_and_blob_ids(tmp_path, monkeypatch):
+    import routes.omnigent_routes as omnigent_routes
+    from routes.omnigent_routes import _purge_generated_builtin_agent_rows
+
+    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
+    root = tmp_path / "omnigent-home" / ".omnigent"
+    agents_root = root / "agents"
+    for agent_name in ("crew", "crew-glm-5-2", "crew-api-glm-5-2"):
+        agent_dir = agents_root / agent_name
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "config.yaml").write_text(f"name: {agent_name}\n")
+    raw_worker = agents_root / "crew" / "agents" / "glm-5-2"
+    raw_worker.mkdir(parents=True)
+    (raw_worker / "config.yaml").write_text("name: glm-5-2\n")
+
+    legacy_id = bytes.fromhex("11" * 16)
+    db_path = root / "chat.db"
+    with sqlite3.connect(db_path) as con:
+        con.execute("CREATE TABLE agents (id BLOB, name TEXT, kind INTEGER)")
+        con.executemany(
+            "INSERT INTO agents VALUES (?, ?, ?)",
+            [
+                (bytes.fromhex("01" * 16), "crew", 1),
+                (legacy_id, "crew-api-glm-5-2", 1),
+                (bytes.fromhex("02" * 16), "crew-glm-5-2", 1),
+                (bytes.fromhex("03" * 16), "glm-5-2", 1),
+                (bytes.fromhex("04" * 16), "glm-5-2", 2),
+                (bytes.fromhex("05" * 16), "polly", 1),
+                (bytes.fromhex("06" * 16), "codex", 1),
+            ],
+        )
+        con.commit()
+
+    purged = _purge_generated_builtin_agent_rows()
+
+    assert purged == 4
+    with sqlite3.connect(db_path) as con:
+        remaining = set(con.execute("SELECT name, kind FROM agents").fetchall())
+    assert remaining == {("glm-5-2", 2), ("polly", 1), ("codex", 1)}
+    repoints = json.loads((root / "generated_agent_repoints.json").read_text())
+    assert repoints == {f"hex:{legacy_id.hex()}": "crew-glm-5-2"}
+
+
+def test_refresh_generated_session_agent_rows_supports_kind_schema_and_blob_ids(tmp_path, monkeypatch):
+    import routes.omnigent_routes as omnigent_routes
+    from routes.omnigent_routes import _refresh_generated_session_agent_rows
+
+    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
+    root = tmp_path / "omnigent-home" / ".omnigent"
+    crew_dir = root / "agents" / "crew"
+    crew_dir.mkdir(parents=True)
+    (crew_dir / "config.yaml").write_text("name: crew\n")
+    deepseek_worker = crew_dir / "agents" / "deepseek-v3-1"
+    deepseek_worker.mkdir(parents=True)
+    (deepseek_worker / "config.yaml").write_text("name: deepseek-v3-1\n")
+    codex_dir = root / "agents" / "crew-codex"
+    codex_dir.mkdir(parents=True)
+    (codex_dir / "config.yaml").write_text("name: crew-codex\n")
+    agent_dir = root / "agents" / "crew-glm-5-2"
+    agent_dir.mkdir(parents=True)
+    (agent_dir / "config.yaml").write_text("name: crew-glm-5-2\n")
+
+    ids = {name: bytes([idx]) * 16 for idx, name in enumerate(
+        ("fresh_codex", "fresh", "session", "raw_glm", "legacy_session_api", "old_openai", "raw_v3", "legacy"),
+        start=1,
+    )}
+    (root / "generated_agent_repoints.json").write_text(json.dumps({
+        f"hex:{ids['legacy'].hex()}": "crew-glm-5-2",
+    }))
+
+    old_openai_bundle = root / "artifacts" / "ag_openai" / "bundle"
+    old_openai_bundle.parent.mkdir(parents=True)
+    old_openai_config = (
+        "name: openai-agents\n"
+        "executor:\n"
+        "  model: zai-org/GLM-5.2\n"
+        "  config:\n"
+        "    harness: openai-agents\n"
+    ).encode()
+    with tarfile.open(old_openai_bundle, "w:gz") as tf:
+        info = tarfile.TarInfo("./config.yaml")
+        info.size = len(old_openai_config)
+        tf.addfile(info, BytesIO(old_openai_config))
+
+    db_path = root / "chat.db"
+    with sqlite3.connect(db_path) as con:
+        con.execute("CREATE TABLE agents (id BLOB, name TEXT, bundle_location TEXT, version INTEGER, kind INTEGER)")
+        con.execute("CREATE TABLE conversations (id TEXT, agent_id BLOB)")
+        con.executemany(
+            "INSERT INTO agents VALUES (?, ?, ?, ?, ?)",
+            [
+                (ids["fresh_codex"], "crew-codex", "new_codex_bundle", 2, 1),
+                (ids["fresh"], "crew-glm-5-2", "new_bundle", 7, 1),
+                (ids["session"], "crew-glm-5-2", "old_bundle", 1, 2),
+                (ids["raw_glm"], "glm-5-2", "raw_bundle", 1, 2),
+                (ids["legacy_session_api"], "crew-api-glm-5-2", "old_api_bundle", 1, 2),
+                (ids["old_openai"], "openai-agents", "ag_openai/bundle", 1, 2),
+                (ids["raw_v3"], "deepseek-v3-1", "old_v3_bundle", 1, 2),
+            ],
+        )
+        con.executemany(
+            "INSERT INTO conversations VALUES (?, ?)",
+            [
+                ("conv_session", ids["session"]),
+                ("conv_raw_glm", ids["raw_glm"]),
+                ("conv_session_api", ids["legacy_session_api"]),
+                ("conv_openai", ids["old_openai"]),
+                ("conv_raw_v3", ids["raw_v3"]),
+                ("conv_legacy", ids["legacy"]),
+                ("conv_other", bytes.fromhex("ff" * 16)),
+            ],
+        )
+        con.commit()
+
+    refreshed = _refresh_generated_session_agent_rows()
+
+    assert refreshed == 11
+    with sqlite3.connect(db_path) as con:
+        session_row = con.execute(
+            "SELECT bundle_location, version FROM agents WHERE id = ?", (ids["session"],)
+        ).fetchone()
+        conversations = dict(con.execute("SELECT id, agent_id FROM conversations").fetchall())
+        stale_agent_ids = {
+            row[0]
+            for row in con.execute(
+                "SELECT id FROM agents WHERE id IN (?, ?, ?, ?)",
+                (ids["raw_glm"], ids["legacy_session_api"], ids["old_openai"], ids["raw_v3"]),
+            ).fetchall()
+        }
+    assert session_row == ("new_bundle", 7)
+    assert conversations["conv_session"] == ids["fresh"]
+    assert conversations["conv_raw_glm"] == ids["fresh"]
+    assert conversations["conv_session_api"] == ids["fresh"]
+    assert conversations["conv_openai"] == ids["fresh"]
+    assert conversations["conv_raw_v3"] == ids["fresh_codex"]
+    assert conversations["conv_legacy"] == ids["fresh"]
+    assert conversations["conv_other"] == bytes.fromhex("ff" * 16)
+    assert stale_agent_ids == set()
+    assert not (root / "generated_agent_repoints.json").exists()

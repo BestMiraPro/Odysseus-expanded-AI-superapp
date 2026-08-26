@@ -17,6 +17,7 @@ from core.database import ModelEndpoint, SessionLocal
 from core.middleware import require_admin
 from src.auth_helpers import get_current_user, owner_filter, require_authenticated_request
 from src.constants import DATA_DIR
+from src.omnigent_catalog import load_declared, select_workers
 from src.omnigent_native import NativeOmnigentManager
 from src.omnigent_manager import INSTALL_GUIDANCE, OmnigentManager
 
@@ -366,7 +367,15 @@ def _crew_config(
 
 def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str | None) -> int:
     """Write generated crew variants and their nested workers."""
-    ids = [mid for mid in model_creds if mid][:_MAX_WORKERS]
+    raw_ids = [mid for mid in model_creds if mid]
+    # Rank rather than truncate: provider cache order is arbitrary and would
+    # fill the roster with deprecated/unmeasured models while the best ones
+    # went unused. Catalog ranking prefers measured benchmarks, then scale.
+    try:
+        declared = load_declared(path=str(Path(DATA_DIR) / "omnigent-model-costs.json"))
+        ids = select_workers(raw_ids, declared, limit=_MAX_WORKERS)
+    except Exception:
+        ids = raw_ids[:_MAX_WORKERS]
     if not ids:
         return 0
     agents_root = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents"
@@ -516,6 +525,23 @@ def _builtin_agent_env() -> dict[str, str] | None:
     return {"OMNIGENT_BUILTIN_AGENT_DIRS": os.pathsep.join(dirs)} if dirs else None
 
 
+def _agent_id_to_key(id_val) -> str:
+    """Encode an agent id for the repoints file. BLOB ids become hex: prefixed."""
+    if isinstance(id_val, (bytes, bytearray, memoryview)):
+        return f"hex:{bytes(id_val).hex()}"
+    return str(id_val)
+
+
+def _key_to_agent_id(key: str):
+    """Decode a repoints key back to the DB id value (bytes for hex:)."""
+    if isinstance(key, str) and key.startswith("hex:"):
+        try:
+            return bytes.fromhex(key[4:])
+        except Exception:
+            return key
+    return key
+
+
 def _purge_generated_builtin_agent_rows() -> int:
     root = Path(DATA_DIR) / "omnigent-home" / ".omnigent"
     db_path = root / "chat.db"
@@ -531,14 +557,26 @@ def _purge_generated_builtin_agent_rows() -> int:
     placeholders = ",".join("?" for _ in names)
     repoint_path = root / _LEGACY_AGENT_REPOINTS
     with sqlite3.connect(db_path) as con:
-        legacy = con.execute(
-            "SELECT id, name FROM agents WHERE session_id IS NULL AND name LIKE 'crew-api-%'"
-        ).fetchall()
-        repoints = {
-            str(row[0]): f"crew-{str(row[1])[len('crew-api-'):]}"
-            for row in legacy
-            if str(row[1]).startswith("crew-api-")
-        }
+        cols = {row[1] for row in con.execute("PRAGMA table_info(agents)").fetchall()}
+        has_kind = "kind" in cols
+        has_session = "session_id" in cols
+        if has_kind:
+            template_where = "kind = 1"
+        elif has_session:
+            template_where = "session_id IS NULL"
+        else:
+            return 0
+        try:
+            legacy = con.execute(
+                f"SELECT id, name FROM agents WHERE {template_where} AND name LIKE 'crew-api-%'"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            legacy = []
+        repoints = {}
+        for row in legacy:
+            id_val, name = row[0], row[1]
+            if str(name).startswith("crew-api-"):
+                repoints[_agent_id_to_key(id_val)] = f"crew-{str(name)[len('crew-api-'):]}"
         if repoints:
             repoint_path.write_text(json.dumps(repoints, sort_keys=True))
             _chmod_600(repoint_path)
@@ -547,11 +585,18 @@ def _purge_generated_builtin_agent_rows() -> int:
                 repoint_path.unlink()
             except FileNotFoundError:
                 pass
-        cur = con.execute(
-            "DELETE FROM agents WHERE session_id IS NULL "
-            f"AND (name IN ({placeholders}) OR name LIKE 'crew-api-%')",
-            tuple(sorted(names)),
-        )
+        if has_kind:
+            cur = con.execute(
+                f"DELETE FROM agents WHERE {template_where} "
+                f"AND (name IN ({placeholders}) OR name LIKE 'crew-api-%')",
+                tuple(sorted(names)),
+            )
+        else:
+            cur = con.execute(
+                "DELETE FROM agents WHERE session_id IS NULL "
+                f"AND (name IN ({placeholders}) OR name LIKE 'crew-api-%')",
+                tuple(sorted(names)),
+            )
         con.commit()
         return int(cur.rowcount or 0)
 
@@ -571,53 +616,87 @@ def _refresh_generated_session_agent_rows() -> int:
     total = 0
     with sqlite3.connect(db_path) as con:
         con.row_factory = sqlite3.Row
+        cols = {row[1] for row in con.execute("PRAGMA table_info(agents)").fetchall()}
+        has_kind = "kind" in cols
+        has_session = "session_id" in cols
+        if has_kind:
+            template_where = "kind = 1"
+            session_where = "kind = 2"
+        elif has_session:
+            template_where = "session_id IS NULL"
+            session_where = "session_id IS NOT NULL"
+        else:
+            return 0
         fresh_rows = con.execute(
             f"SELECT id, name, bundle_location, version FROM agents "
-            f"WHERE session_id IS NULL AND name IN ({placeholders})",
+            f"WHERE {template_where} AND name IN ({placeholders})",
             tuple(sorted(crew_names)),
         ).fetchall()
         fresh = {str(row["name"]): row for row in fresh_rows}
         for name, row in fresh.items():
-            session_ids = [
-                str(session_row["id"])
-                for session_row in con.execute(
-                    "SELECT id FROM agents WHERE session_id IS NOT NULL AND name = ?",
+            try:
+                session_id_rows = con.execute(
+                    f"SELECT id FROM agents WHERE {session_where} AND name = ?",
                     (name,),
                 ).fetchall()
-            ]
-            cur = con.execute(
-                "UPDATE agents SET bundle_location = ?, version = ? "
-                "WHERE session_id IS NOT NULL AND name = ?",
-                (row["bundle_location"], row["version"], name),
-            )
-            total += int(cur.rowcount or 0)
-            if session_ids:
-                session_placeholders = ",".join("?" for _ in session_ids)
+            except sqlite3.OperationalError:
+                session_id_rows = []
+            session_ids = [r["id"] for r in session_id_rows]
+            try:
                 cur = con.execute(
-                    "UPDATE conversations SET agent_id = ? "
-                    f"WHERE agent_id IN ({session_placeholders})",
-                    tuple([row["id"]] + session_ids),
+                    f"UPDATE agents SET bundle_location = ?, version = ? "
+                    f"WHERE {session_where} AND name = ?",
+                    (row["bundle_location"], row["version"], name),
                 )
                 total += int(cur.rowcount or 0)
+            except sqlite3.OperationalError:
+                pass
+            if session_ids:
+                session_placeholders = ",".join("?" for _ in session_ids)
+                # Need to handle both TEXT and BLOB agent_id types; use actual values
+                try:
+                    cur = con.execute(
+                        "UPDATE conversations SET agent_id = ? "
+                        f"WHERE agent_id IN ({session_placeholders})",
+                        tuple([row["id"]] + session_ids),
+                    )
+                    total += int(cur.rowcount or 0)
+                except sqlite3.OperationalError:
+                    pass
         repoints: dict[str, str] = {}
         if repoint_path.exists():
             try:
                 repoints = json.loads(repoint_path.read_text()) or {}
             except Exception:
                 repoints = {}
-        for old_id, new_name in repoints.items():
+        for old_id_key, new_name in repoints.items():
             row = fresh.get(str(new_name))
             if not row:
                 continue
-            cur = con.execute(
-                "UPDATE conversations SET agent_id = ? WHERE agent_id = ?",
-                (row["id"], str(old_id)),
-            )
-            total += int(cur.rowcount or 0)
+            old_id_val = _key_to_agent_id(str(old_id_key))
+            try:
+                cur = con.execute(
+                    "UPDATE conversations SET agent_id = ? WHERE agent_id = ?",
+                    (row["id"], old_id_val),
+                )
+                total += int(cur.rowcount or 0)
+            except sqlite3.OperationalError:
+                # fallback for TEXT id stored as string
+                try:
+                    cur = con.execute(
+                        "UPDATE conversations SET agent_id = ? WHERE agent_id = ?",
+                        (row["id"], str(old_id_key)),
+                    )
+                    total += int(cur.rowcount or 0)
+                except Exception:
+                    pass
         fallback_row = fresh.get("crew-codex") or fresh.get("crew")
-        stale_rows = con.execute(
-            "SELECT id, name, bundle_location FROM agents WHERE session_id IS NOT NULL"
-        ).fetchall()
+        try:
+            stale_rows = con.execute(
+                f"SELECT id, name, bundle_location FROM agents WHERE {session_where}"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            stale_rows = []
         for stale in stale_rows:
             name = str(stale["name"])
             if name in fresh:
@@ -642,13 +721,16 @@ def _refresh_generated_session_agent_rows() -> int:
             target_row = next((fresh[target] for target in target_names if target in fresh), None)
             if not target_row:
                 continue
-            cur = con.execute(
-                "UPDATE conversations SET agent_id = ? WHERE agent_id = ?",
-                (target_row["id"], stale["id"]),
-            )
-            total += int(cur.rowcount or 0)
-            cur = con.execute("DELETE FROM agents WHERE id = ?", (stale["id"],))
-            total += int(cur.rowcount or 0)
+            try:
+                cur = con.execute(
+                    "UPDATE conversations SET agent_id = ? WHERE agent_id = ?",
+                    (target_row["id"], stale["id"]),
+                )
+                total += int(cur.rowcount or 0)
+                cur = con.execute("DELETE FROM agents WHERE id = ?", (stale["id"],))
+                total += int(cur.rowcount or 0)
+            except sqlite3.OperationalError:
+                pass
         con.commit()
     try:
         repoint_path.unlink()

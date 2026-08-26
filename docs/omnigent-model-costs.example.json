@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "Copy to data/omnigent-model-costs.json and fill in from your provider's",
+    "pricing page and published benchmark results. Odysseus ships NO numbers of",
+    "its own: a model with no entry here is reported to the crew orchestrator as",
+    "'cost unknown', and it falls back to the size tier read from the model id.",
+    "Every field is optional. Keys are the exact model ids shown in Settings ->",
+    "Added Models."
+  ],
+  "zai-org/GLM-5.2": {
+    "input_per_mtok": 0.0,
+    "output_per_mtok": 0.0,
+    "currency": "USD",
+    "benchmarks": { "swe-bench-verified": 0.0 },
+    "notes": "replace these placeholders with real figures before relying on them"
+  },
+  "meta-llama/Llama-3.1-8B-Instruct": {
+    "input_per_mtok": 0.0,
+    "output_per_mtok": 0.0,
+    "notes": "cheap worker for routine edits, lookups and formatting"
+  }
+}
