@@ -33,12 +33,13 @@ _MAX_WORKERS = 40
 
 # Curated "best option" gateway models that get their own crew entry. The
 # broad `crew`/`crew-codex` can still delegate to every API model.
+# Qwen 27B explicitly requested as a dedicated crew (cheap, good for 27B tier).
 _BEST_API_MODEL_HINTS = (
     "glm-5", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4",
-    "kimi-k2", "qwen3-coder", "qwen3-235b", "minimax-m2",
-    "nemotron-3-ultra",
+    "kimi-k2", "qwen3-coder", "qwen3-235b", "qwen3-27b", "qwen2.5-27b",
+    "qwen-27b", "27b", "minimax-m2", "nemotron-3-ultra",
 )
-_MAX_API_CREWS = 10
+_MAX_API_CREWS = 12
 _LEGACY_AGENT_REPOINTS = "generated_agent_repoints.json"
 _KNOWN_STALE_SESSION_AGENT_NAMES = {
     "deepseek-v3-1",
@@ -447,18 +448,18 @@ def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str |
     ))
     written += 1
 
-    codex_worker = next((w for w in _CLI_WORKERS if w["slug"] == "codex"), None)
+    # Per-model crews: API-model-brained, no Codex/Claude sub-agents to avoid
+    # burning subscription usage. They run directly on their model and spawn
+    # only other API workers if needed (currently lean: no sub-agents, broad
+    # crews retain Codex/Claude for deep code work).
     for mid in _pick_best_api_models(ids):
         target_slug = api_slug_by_model[mid]
         crew_name = f"crew-{target_slug}"
         variant_dir = agents_root / crew_name
         model_crew_slugs: list[str] = []
-        if codex_worker:
-            _write_worker(variant_dir / "agents", codex_worker["slug"], _cli_worker_spec(codex_worker))
-            model_crew_slugs.append(codex_worker["slug"])
         _write_crew_file(variant_dir, _crew_config(
             crew_name,
-            f"{mid}-brained crew that uses the W&B gateway directly and can fall back to Codex.",
+            f"{mid}-brained crew running directly on {mid} (no Codex/Claude fallback to save subscription usage).",
             _executor_block(mid, model_creds.get(mid)),
             model_crew_slugs,
             lead_model=mid,

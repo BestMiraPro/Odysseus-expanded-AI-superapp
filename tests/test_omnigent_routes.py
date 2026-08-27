@@ -388,16 +388,56 @@ def test_generate_crew_writes_broad_and_curated_crew_variants(tmp_path, monkeypa
     assert glm_crew["executor"]["model"] == "zai-org/GLM-5.2"
     assert glm_crew["executor"]["auth"]["api_key"] == "wandb_key"
     assert glm_crew["executor"]["auth"]["base_url"] == "https://api.inference.wandb.ai/v1"
-    assert glm_crew["tools"]["agents"] == ["codex"]
+    # Per-model crews are API-model-brained without Codex/Claude to save subscription usage
+    assert glm_crew["tools"]["agents"] == []
     assert "running directly on `zai-org/GLM-5.2`" in glm_crew["prompt"]
     assert "anchored on `glm-5-2`" not in glm_crew["prompt"]
     assert not (agents_root / "crew-glm-5-2" / "agents" / "glm-5-2").exists()
+    # No Codex/Claude sub-agent should be written inside per-model crew
+    assert not (agents_root / "crew-glm-5-2" / "agents" / "codex").exists()
+    assert not (agents_root / "crew-glm-5-2" / "agents" / "claude-code").exists()
 
     glm_worker = yaml.safe_load((agents_root / "crew" / "agents" / "glm-5-2" / "config.yaml").read_text())
     assert glm_worker["executor"]["config"]["harness"] == "openai-agents"
     assert glm_worker["executor"]["model"] == "zai-org/GLM-5.2"
     assert glm_worker["executor"]["auth"]["api_key"] == "wandb_key"
     assert glm_worker["executor"]["auth"]["base_url"] == "https://api.inference.wandb.ai/v1"
+
+
+def test_generate_crew_creates_qwen_27b_variant_without_codex_subagent(tmp_path, monkeypatch):
+    import routes.omnigent_routes as omnigent_routes
+    from routes.omnigent_routes import _generate_crew
+
+    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
+    agents_root = tmp_path / "omnigent-home" / ".omnigent" / "agents"
+
+    models = {
+        "zai-org/GLM-5.2": ("https://api.inference.wandb.ai/v1", "k1"),
+        "Qwen/Qwen3-27B": ("https://api.inference.wandb.ai/v1", "k2"),
+        "Qwen/Qwen2.5-27B-Instruct": ("https://api.inference.wandb.ai/v1", "k3"),
+    }
+
+    written = _generate_crew(models, "Qwen/Qwen3-27B")
+
+    # Qwen 27B should get a dedicated crew via _BEST_API_MODEL_HINTS ("27b")
+    assert (agents_root / "crew-qwen3-27b" / "config.yaml").exists() or (agents_root / "crew-qwen2-5-27b-instruct" / "config.yaml").exists()
+    # Find the qwen crew that was created
+    qwen_crew_path = None
+    for p in agents_root.glob("crew-qwen*27b*"):
+        if (p / "config.yaml").exists():
+            qwen_crew_path = p
+            break
+    assert qwen_crew_path is not None, "Qwen 27B crew not created"
+    cfg = yaml.safe_load((qwen_crew_path / "config.yaml").read_text())
+    # Must run directly on Qwen model and have no Codex/Claude sub-agents
+    assert cfg["executor"]["model"] in ("Qwen/Qwen3-27B", "Qwen/Qwen2.5-27B-Instruct")
+    assert cfg["tools"]["agents"] == []
+    assert not (qwen_crew_path / "agents" / "codex").exists()
+    assert not (qwen_crew_path / "agents" / "claude-code").exists()
+    # Broad crews still retain Codex/Claude for deep work
+    crew = yaml.safe_load((agents_root / "crew" / "config.yaml").read_text())
+    assert "codex" in crew["tools"]["agents"]
+    assert "claude-code" in crew["tools"]["agents"]
 
 
 def test_builtin_agent_env_registers_only_top_level_crews(tmp_path, monkeypatch):
