@@ -32,14 +32,15 @@ from pathlib import Path
 
 MARKER = "turn-2 re-seed crash"
 
-OLD_SIG = (
+# Support both omnigent 0.3 (Any) and 0.10 (object) signatures
+OLD_SIG_V03 = (
     "def _normalize_message_content(\n"
     "    content: Any,  # type: ignore[explicit-any]\n"
     "    *,\n"
     "    empty_placeholder: str,\n"
     ") -> str | list[dict[str, Any]]:"
 )
-NEW_SIG = (
+NEW_SIG_V03 = (
     "def _normalize_message_content(\n"
     "    content: Any,  # type: ignore[explicit-any]\n"
     "    *,\n"
@@ -47,6 +48,24 @@ NEW_SIG = (
     '    role: str = "user",\n'
     ") -> str | list[dict[str, Any]]:"
 )
+OLD_SIG_V10 = (
+    "def _normalize_message_content(\n"
+    "    content: object,\n"
+    "    *,\n"
+    "    empty_placeholder: str,\n"
+    ") -> str | list[dict[str, object]]:"
+)
+NEW_SIG_V10 = (
+    "def _normalize_message_content(\n"
+    "    content: object,\n"
+    "    *,\n"
+    "    empty_placeholder: str,\n"
+    '    role: str = "user",\n'
+    ") -> str | list[dict[str, object]]:"
+)
+# Keep OLD_SIG/NEW_SIG as aliases for backwards compat (tests may import them)
+OLD_SIG = OLD_SIG_V03
+NEW_SIG = NEW_SIG_V03
 
 OLD_BODY = (
     "    if not content:\n"
@@ -136,7 +155,15 @@ def main() -> None:
         print(f"already patched: {path}")
         return
 
-    for name, old in (("signature", OLD_SIG), ("body", OLD_BODY),
+    # Determine which version is present (0.3 vs 0.10)
+    if OLD_SIG_V10 in src:
+        sig_old, sig_new = OLD_SIG_V10, NEW_SIG_V10
+    elif OLD_SIG_V03 in src:
+        sig_old, sig_new = OLD_SIG_V03, NEW_SIG_V03
+    else:
+        sys.exit(f"signature not found — upstream changed, patch needs updating: {path}")
+
+    for name, old in (("body", OLD_BODY),
                       ("user call site", OLD_CALL_USER), ("assistant call site", OLD_CALL_ASST)):
         if old not in src:
             sys.exit(f"{name} not found — upstream changed, patch needs updating: {path}")
@@ -144,7 +171,7 @@ def main() -> None:
     backup = path.with_suffix(path.suffix + ".bak-turn2fix")
     shutil.copyfile(path, backup)
 
-    src = src.replace(OLD_SIG, NEW_SIG, 1)
+    src = src.replace(sig_old, sig_new, 1)
     src = src.replace(OLD_BODY, NEW_BODY, 1)
     src = src.replace(OLD_CALL_USER, NEW_CALL_USER, 1)
     src = src.replace(OLD_CALL_ASST, NEW_CALL_ASST, 1)
