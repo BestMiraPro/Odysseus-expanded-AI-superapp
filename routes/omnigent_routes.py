@@ -34,9 +34,11 @@ _MAX_WORKERS = 40
 # Curated "best option" gateway models that get their own crew entry. The
 # broad `crew`/`crew-codex` can still delegate to every API model.
 # Qwen 27B explicitly requested as a dedicated crew (cheap, good for 27B tier).
+# Qwen 3.8 27B is the current target — ensure exact match variants rank first.
 _BEST_API_MODEL_HINTS = (
     "glm-5", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4",
-    "kimi-k2", "qwen3-coder", "qwen3-235b", "qwen3-27b", "qwen2.5-27b",
+    "kimi-k2", "qwen3-coder", "qwen3-235b",
+    "qwen3.8-27b", "qwen3-8-27b", "3.8-27b", "qwen3-27b", "qwen2.5-27b",
     "qwen-27b", "27b", "minimax-m2", "nemotron-3-ultra",
 )
 _MAX_API_CREWS = 12
