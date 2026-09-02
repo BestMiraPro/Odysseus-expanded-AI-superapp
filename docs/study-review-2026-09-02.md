@@ -137,11 +137,17 @@ written; the **Done** line records what actually shipped.
 
 ### The review pass itself
 
-- `PYTHONUTF8=1 python -m pytest` on Windows (host Python 3.14, no Docker):
-  3212 passed / 231 failed / 17 skipped / 5 errors. The failing set is the
-  pre-existing environment one (missing bcrypt/pyotp/pytest-asyncio, charmap
-  collection errors) — compared as a set against the same suite run at the
-  pre-change commit, not against the earlier run's totals.
+- `PYTHONUTF8=1 python -m pytest` on Windows (host Python 3.14, no Docker), run
+  in a fresh detached worktree at each commit so the environments match:
+  **3214 passed / 229 failed / 17 skipped / 5 errors** here against
+  **3147 / 267 / 18 / 5** at the pre-change commit `74f6bc8f`.
+  Compared as failing-id *sets*, not totals: one test differs in the direction
+  of a regression (`test_hwfit_macos.py::test_detect_system_propagates_unified_memory`)
+  and it passes in isolation at both commits — order-dependent, and untouched by
+  this pass. 39 pre-existing failures (JS/calendar/cookbook) flip the other way
+  for the same reason: this suite is flaky on Windows, so only the set diff is
+  meaningful. The stable remainder is the known environment set (missing
+  bcrypt/pyotp/pytest-asyncio, charmap collection errors).
 - 29 new tests: `tests/test_study_review_followups.py` (26 — interleaving, the
   blended stats payload, calibration scoring, card sourcing, deck-scoped
   maintenance, mock papers) and 2 added to
