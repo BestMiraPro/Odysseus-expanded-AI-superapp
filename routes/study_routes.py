@@ -2033,6 +2033,22 @@ def _split_topics(topics) -> List[str]:
     return [t.strip().lower() for t in items if t and t.strip()]
 
 
+def _round_robin(rows: List, key) -> List:
+    """Reorder rows so consecutive items come from different groups, preserving
+    each group's internal order. Groups are visited in first-appearance order,
+    so the highest-priority group still leads."""
+    groups: Dict[str, List] = {}
+    for r in rows:
+        groups.setdefault(key(r), []).append(r)
+    out: List = []
+    while groups:
+        for k in list(groups.keys()):
+            out.append(groups[k].pop(0))
+            if not groups[k]:
+                del groups[k]
+    return out
+
+
 def practice_queue_payload(user, *, deck_id: Optional[str] = None,
                            material_id: Optional[str] = None, topics=None,
                            limit: int = 20) -> Dict:
@@ -2061,9 +2077,28 @@ def practice_queue_payload(user, *, deck_id: Optional[str] = None,
         if user is not None:
             base = base.filter(StudyQuestion.owner == user)
 
+        # A session scoped to one subject (or material) has nothing to
+        # interleave across; "practice everything" does.
+        scoped_to_one = bool(material_id or deck_id)
+
         def _pull(q):
-            due = q.filter(StudyQuestion.state != "new", StudyQuestion.due <= now) \
-                .order_by(StudyQuestion.due.asc()).limit(limit).all()
+            due_base = q.filter(StudyQuestion.state != "new",
+                                StudyQuestion.due <= now)
+            if scoped_to_one:
+                due = due_base.order_by(StudyQuestion.due.asc()).limit(limit).all()
+            else:
+                # Take each subject's most-overdue questions and round-robin
+                # them, so a large backlog in one subject cannot crowd every
+                # other subject out of the session.
+                deck_ids = [r[0] for r in due_base.with_entities(
+                    StudyQuestion.deck_id).distinct().all()]
+                pooled = []
+                for did in deck_ids:
+                    pooled.extend(
+                        due_base.filter(StudyQuestion.deck_id == did)
+                        .order_by(StudyQuestion.due.asc()).limit(limit).all())
+                pooled.sort(key=lambda r: (r.due or now))
+                due = _round_robin(pooled, lambda r: r.deck_id or "")[:limit]
             new_rows = q.filter(StudyQuestion.state == "new") \
                 .order_by(StudyQuestion.created_at.asc()).limit(limit * 3).all()
             return due, new_rows
@@ -2079,17 +2114,11 @@ def practice_queue_payload(user, *, deck_id: Optional[str] = None,
         else:
             due, new_rows = _pull(base)
 
-        # Interleave new questions across topics: round-robin over topic groups.
-        groups: Dict[str, List[StudyQuestion]] = {}
-        for r in new_rows:
-            groups.setdefault(r.topic or "general", []).append(r)
-        interleaved: List[StudyQuestion] = []
-        while groups and len(interleaved) < limit:
-            for key in list(groups.keys()):
-                if groups[key]:
-                    interleaved.append(groups[key].pop(0))
-                if not groups[key]:
-                    del groups[key]
+        # Interleave new questions across subject *and* topic, so an unscoped
+        # session mixes subjects here too (within one subject the deck part of
+        # the key is constant and this stays the old topic round-robin).
+        interleaved = _round_robin(
+            new_rows, lambda r: f"{r.deck_id or ''}|{r.topic or 'general'}")[:limit]
         queue = due + interleaved
         return {"queue": [_question_to_dict(r, with_answer=False)
                           for r in queue[:limit]],
@@ -2187,8 +2216,7 @@ def overview_payload(user) -> Dict:
         if user is not None:
             att_q = att_q.filter(StudyAttempt.owner == user)
         today_attempts = att_q.all()
-        att_ok = sum(1 for t in today_attempts
-                     if (t.correct is True) or ((t.score or 0) >= 60))
+        att_ok = sum(1 for t in today_attempts if _attempt_ok(t))
 
         return {
             "decks": deck_rows,
@@ -2273,6 +2301,82 @@ def history_entries(user, limit: int = 100) -> Dict:
     finally:
         db.close()
 
+
+
+def _attempt_ok(a) -> bool:
+    """Did a practice attempt count as a successful retrieval? MCQs are graded
+    right/wrong; open answers pass at the same 60% mark the dashboard uses."""
+    return (a.correct is True) or ((a.score or 0) >= 60)
+
+
+def stats_payload(user, days: int = 42) -> Dict:
+    """Daily retrieval chart + totals for the last ``days`` days.
+
+    Counts both kinds of retrieval — card reviews *and* practice-question
+    attempts. Practice is where most retrieval happens now, so a chart fed by
+    card reviews alone under-reports both the work done and the success rate.
+    Shared by the /stats route and the Study agent."""
+    days = max(7, min(180, days))
+    db = SessionLocal()
+    try:
+        now = _utcnow_naive()
+        since = now - timedelta(days=days)
+        rev_q = db.query(StudyReview).filter(StudyReview.reviewed_at >= since)
+        att_q = db.query(StudyAttempt).filter(StudyAttempt.attempted_at >= since)
+        foc_q = db.query(StudyFocusSession).filter(
+            StudyFocusSession.started_at >= since)
+        if user is not None:
+            rev_q = rev_q.filter(StudyReview.owner == user)
+            att_q = att_q.filter(StudyAttempt.owner == user)
+            foc_q = foc_q.filter(StudyFocusSession.owner == user)
+
+        by_day: Dict[str, Dict] = {}
+        for i in range(days + 1):
+            d = (since + timedelta(days=i)).date().isoformat()
+            by_day[d] = {"date": d, "reviews": 0, "again": 0,
+                         "attempts": 0, "attempts_ok": 0, "focus_min": 0}
+        for r in rev_q.all():
+            k = r.reviewed_at.date().isoformat() if r.reviewed_at else None
+            if k in by_day:
+                by_day[k]["reviews"] += 1
+                if r.rating == 1:
+                    by_day[k]["again"] += 1
+        for t in att_q.all():
+            k = t.attempted_at.date().isoformat() if t.attempted_at else None
+            if k in by_day:
+                by_day[k]["attempts"] += 1
+                if _attempt_ok(t):
+                    by_day[k]["attempts_ok"] += 1
+        for s in foc_q.all():
+            k = s.started_at.date().isoformat() if s.started_at else None
+            if k in by_day:
+                by_day[k]["focus_min"] += s.actual_min or 0
+
+        total_reviews = sum(v["reviews"] for v in by_day.values())
+        total_again = sum(v["again"] for v in by_day.values())
+        total_attempts = sum(v["attempts"] for v in by_day.values())
+        total_att_ok = sum(v["attempts_ok"] for v in by_day.values())
+        # One blended retrieval rate: recalled cards + correct attempts over
+        # every graded retrieval in the window.
+        retrievals = total_reviews + total_attempts
+        recalled = (total_reviews - total_again) + total_att_ok
+
+        card_q = db.query(StudyCard)
+        if user is not None:
+            card_q = card_q.filter(StudyCard.owner == user)
+        return {
+            "daily": sorted(by_day.values(), key=lambda v: v["date"]),
+            "totals": {
+                "reviews": total_reviews,
+                "attempts": total_attempts,
+                "retrievals": retrievals,
+                "success_rate": round(recalled / retrievals, 3) if retrievals else None,
+                "cards": card_q.count(),
+                "focus_min": sum(v["focus_min"] for v in by_day.values()),
+            },
+        }
+    finally:
+        db.close()
 
 
 def run_dedup(user) -> Dict:
@@ -3389,48 +3493,7 @@ def setup_study_routes():
 
     @router.get("/stats")
     def stats(request: Request, days: int = 42):
-        user = _owner(request)
-        days = max(7, min(180, days))
-        db = SessionLocal()
-        try:
-            now = _utcnow_naive()
-            since = now - timedelta(days=days)
-            rev_q = db.query(StudyReview).filter(StudyReview.reviewed_at >= since)
-            foc_q = db.query(StudyFocusSession).filter(StudyFocusSession.started_at >= since)
-            if user is not None:
-                rev_q = rev_q.filter(StudyReview.owner == user)
-                foc_q = foc_q.filter(StudyFocusSession.owner == user)
-            by_day: Dict[str, Dict] = {}
-            for i in range(days + 1):
-                d = (since + timedelta(days=i)).date().isoformat()
-                by_day[d] = {"date": d, "reviews": 0, "again": 0, "focus_min": 0}
-            for r in rev_q.all():
-                k = r.reviewed_at.date().isoformat() if r.reviewed_at else None
-                if k in by_day:
-                    by_day[k]["reviews"] += 1
-                    if r.rating == 1:
-                        by_day[k]["again"] += 1
-            for s in foc_q.all():
-                k = s.started_at.date().isoformat() if s.started_at else None
-                if k in by_day:
-                    by_day[k]["focus_min"] += s.actual_min or 0
-            total_reviews = sum(v["reviews"] for v in by_day.values())
-            total_again = sum(v["again"] for v in by_day.values())
-            card_q = db.query(StudyCard)
-            if user is not None:
-                card_q = card_q.filter(StudyCard.owner == user)
-            return {
-                "daily": sorted(by_day.values(), key=lambda v: v["date"]),
-                "totals": {
-                    "reviews": total_reviews,
-                    "success_rate": round(1 - total_again / total_reviews, 3)
-                    if total_reviews else None,
-                    "cards": card_q.count(),
-                    "focus_min": sum(v["focus_min"] for v in by_day.values()),
-                },
-            }
-        finally:
-            db.close()
+        return stats_payload(_owner(request), days=days)
 
     @router.get("/history")
     def history(request: Request, limit: int = 100):

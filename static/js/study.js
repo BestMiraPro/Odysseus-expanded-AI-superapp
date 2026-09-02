@@ -2130,6 +2130,13 @@ async function renderFocus() {
 
   const last14 = stats.daily.slice(-14);
   const maxMin = Math.max(30, ...last14.map(d => d.focus_min));
+  // Retrievals = card reviews + practice answers. Practice is where most
+  // retrieval happens, so a chart of card reviews alone under-reports the work.
+  const retr = last14.map(d => (d.reviews || 0) + (d.attempts || 0));
+  const maxRetr = Math.max(5, ...retr);
+  const t = stats.totals || {};
+  const okPct = (t.success_rate === null || t.success_rate === undefined)
+    ? null : Math.round(t.success_rate * 100);
   el.innerHTML = `
     <div style="max-width:560px;">
       <div class="study-section-title">Start a focus session</div>
@@ -2145,6 +2152,14 @@ async function renderFocus() {
       <div class="study-bars">
         ${last14.map(d => `<div class="study-bar" style="height:${Math.round((d.focus_min / maxMin) * 100)}%"
           title="${d.date}: ${d.focus_min}min"><i>${d.date.slice(8)}</i></div>`).join('')}
+      </div>
+      <div class="study-section-title" style="margin-top:26px;">Last 14 days (retrievals)</div>
+      <div class="study-bars">
+        ${last14.map((d, i) => `<div class="study-bar" style="height:${Math.round((retr[i] / maxRetr) * 100)}%"
+          title="${d.date}: ${d.attempts || 0} practice answer(s) + ${d.reviews || 0} card review(s)"><i>${d.date.slice(8)}</i></div>`).join('')}
+      </div>
+      <div class="study-subtle" style="margin-top:6px;">
+        ${t.attempts || 0} practice answers · ${t.reviews || 0} card reviews${okPct === null ? '' : ` · ${okPct}% recalled`}
       </div>
       <div class="study-section-title" style="margin-top:34px;">Recent sessions</div>
       <div>
