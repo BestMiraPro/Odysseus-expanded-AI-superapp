@@ -790,7 +790,9 @@ function renderSubjectDetail() {
         <option value="">All materials</option>
         ${s.materials.map(m => `<option value="${esc(m.id)}" ${s.qMaterial === m.id ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
       </select>
+      <button class="study-btn small" id="study-tidy-toggle" title="Bank maintenance passes for this subject">Tidy bank</button>
     </div>
+    <div id="study-tidy" ${s.tidyOpen ? '' : 'hidden'}></div>
     <div id="study-q-list"></div>
 
     <div class="study-section-title">Flashcards (atomic facts)</div>
@@ -876,6 +878,7 @@ function renderSubjectDetail() {
   renderQuestionList();
   renderProposals();
   renderCardList();
+  if (s.tidyOpen) renderTidyBank();
 
   // --- flashcards ---
   el.querySelector('#study-card-add').addEventListener('click', async () => {
@@ -905,6 +908,13 @@ function renderSubjectDetail() {
       if (res.source === 'notes') toast('Cards written from this material\u2019s study notes');
     } catch (err) { toast(err.message, true); }
     btn.disabled = false; btn.textContent = 'Generate cards';
+  });
+
+  el.querySelector('#study-tidy-toggle').addEventListener('click', () => {
+    s.tidyOpen = !s.tidyOpen;
+    const box = el.querySelector('#study-tidy');
+    box.hidden = !s.tidyOpen;
+    if (s.tidyOpen) renderTidyBank();
   });
 
   el.querySelector('#study-q-mat').addEventListener('change', (e) => {
@@ -1313,6 +1323,66 @@ function renderQuestionList() {
       }
     } catch (err) { toast(err.message, true); }
   };
+}
+
+// Bank maintenance for one subject. These passes used to be reachable only
+// through the agent; each is scoped to this subject by deck_id. Dedup and audit
+// change the bank in bulk, so both are armed two-click buttons.
+const TIDY_ACTIONS = [
+  { key: 'dedup', label: 'Remove duplicates', arm: true,
+    hint: 'Deletes repeated questions, keeping the best copy of each.',
+    path: 'dedup', report: r => `${r.deleted} duplicate(s) removed` },
+  { key: 'link_parts', label: 'Link multi-part problems', arm: false,
+    hint: 'Groups parts of one problem so practice shows the earlier parts first.',
+    path: 'link-parts', report: r => `${r.linked} part(s) linked of ${r.analyzed} analysed` },
+  { key: 'backfill', label: 'Recover problem setups', arm: false,
+    hint: 'Rebuilds the shared stem for multi-part questions that lost it. Slow (AI).',
+    path: 'backfill-context', report: r => `${r.filled} of ${r.scanned} filled` },
+  { key: 'audit', label: 'Suspend leaked answers', arm: true,
+    hint: 'Suspends "questions" that state their own answer. Reversible in the bank. Slow (AI).',
+    path: 'audit-questions', report: r => `${r.suspended} suspended of ${r.scanned} scanned` },
+  { key: 'reformat', label: 'Reformat maths', arm: false,
+    hint: 'Rewrites questions and cards to LaTeX + Markdown. Idempotent. Slow (AI).',
+    path: 'reformat', report: r => `${r.questions_reformatted} question(s), ${r.cards_reformatted} card(s)` },
+];
+
+function renderTidyBank() {
+  const box = body()?.querySelector('#study-tidy');
+  const s = S.subject;
+  if (!box || !s) return;
+  box.innerHTML = `
+    <div class="study-subtle" style="margin:4px 0 8px;">
+      Maintenance passes for <b>${esc(s.deck.name)}</b> only. The AI passes take a while.
+    </div>
+    ${TIDY_ACTIONS.map(a => `
+      <div class="study-row">
+        <span class="grow">
+          <b style="font-size:12.5px;">${a.label}</b>
+          <div class="study-subtle">${a.hint}</div>
+        </span>
+        <span class="study-subtle" data-tidy-out="${a.key}">${esc(s.tidyOut?.[a.key] || '')}</span>
+        <button class="study-btn small" data-tidy="${a.key}">Run</button>
+      </div>`).join('')}`;
+
+  box.querySelectorAll('[data-tidy]').forEach(btn => {
+    const act = TIDY_ACTIONS.find(a => a.key === btn.dataset.tidy);
+    const run = async () => {
+      const out = box.querySelector(`[data-tidy-out="${act.key}"]`);
+      btn.disabled = true; btn.textContent = 'Running…'; out.textContent = '';
+      try {
+        const url = act.key === 'link_parts'
+          ? `/api/study/decks/${encodeURIComponent(s.deck.id)}/link-parts`
+          : `/api/study/${act.path}?deck_id=${encodeURIComponent(s.deck.id)}`;
+        const res = await jpost(url, {});
+        const msg = act.report(res || {});
+        (S.subject.tidyOut ||= {})[act.key] = msg;
+        out.textContent = msg;
+        await reloadSubject();
+      } catch (e) { toast(e.message, true); }
+      btn.disabled = false; btn.textContent = 'Run';
+    };
+    btn.addEventListener('click', act.arm ? () => armThen(btn, run) : run);
+  });
 }
 
 function renderProposals() {

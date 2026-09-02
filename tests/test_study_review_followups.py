@@ -330,3 +330,106 @@ def test_card_author_prompt_defaults_to_cloze(db):
     low = CARD_AUTHOR_SYSTEM.lower()
     assert "default to atomic cloze" in low
     assert "_____" in CARD_AUTHOR_SYSTEM
+
+
+# ------------------------------------------------------------- #8 tidy the bank
+
+def _bank_across_two_subjects(SessionLocal, owner="alice"):
+    """Duplicate questions in both subjects, none with context."""
+    from core.database import StudyDeck, StudyMaterial, StudyQuestion
+
+    s = SessionLocal()
+    s.add_all([
+        StudyDeck(id="dA", owner=owner, name="Micro", new_per_day=15, retention="0.9"),
+        StudyDeck(id="dB", owner=owner, name="Stats", new_per_day=15, retention="0.9"),
+        StudyMaterial(id="mA", owner=owner, deck_id="dA", name="ExA", kind="text",
+                      content="source A", char_count=8, category="exam"),
+        StudyMaterial(id="mB", owner=owner, deck_id="dB", name="ExB", kind="text",
+                      content="source B", char_count=8, category="exam"),
+    ])
+    for deck, mat, tag in (("dA", "mA", "a"), ("dB", "mB", "b")):
+        for i in range(2):
+            s.add(StudyQuestion(
+                id=f"{tag}{i}", owner=owner, deck_id=deck, material_id=mat,
+                qtype="open", question="State the law of demand.", reference="r",
+                topic="t", state="new"))
+    s.commit()
+    s.close()
+
+
+def test_dedup_can_be_scoped_to_one_subject(db):
+    """The Tidy-bank button sits in a subject, so it must only touch that
+    subject — not silently rewrite every other bank."""
+    from routes.study_routes import run_dedup
+
+    _bank_across_two_subjects(db)
+    out = run_dedup("alice", deck_id="dA")
+
+    assert out["deleted"] == 1
+    assert set(out["by_deck"]) == {"dA"}
+
+
+def test_dedup_without_deck_still_spans_every_subject(db):
+    from routes.study_routes import run_dedup
+
+    _bank_across_two_subjects(db)
+    out = run_dedup("alice")
+
+    assert out["deleted"] == 2
+    assert set(out["by_deck"]) == {"dA", "dB"}
+
+
+def test_audit_can_be_scoped_to_one_subject(db, monkeypatch):
+    import asyncio
+
+    from routes import study_routes as sr
+
+    _bank_across_two_subjects(db)
+
+    async def _no_llm(owner, questions):
+        return set()
+
+    monkeypatch.setattr(sr, "_audit_solution_statements", _no_llm)
+    out = asyncio.run(sr.run_audit_questions("alice", deck_id="dA"))
+    assert out["scanned"] == 2
+
+    out_all = asyncio.run(sr.run_audit_questions("alice"))
+    assert out_all["scanned"] == 4
+
+
+def test_backfill_can_be_scoped_to_one_subject(db, monkeypatch):
+    import asyncio
+
+    from routes import study_routes as sr
+
+    _bank_across_two_subjects(db)
+
+    async def _no_llm(owner, material_text, items):
+        return {}
+
+    monkeypatch.setattr(sr, "_backfill_context_items", _no_llm)
+    out = asyncio.run(sr.run_backfill_context("alice", deck_id="dA"))
+    assert out["scanned"] == 2
+
+    out_all = asyncio.run(sr.run_backfill_context("alice"))
+    assert out_all["scanned"] == 4
+
+
+def test_reformat_can_be_scoped_to_one_subject(db, monkeypatch):
+    import asyncio
+
+    from routes import study_routes as sr
+
+    _bank_across_two_subjects(db)
+    seen = {}
+
+    async def _no_llm(owner, items):
+        seen.setdefault("batches", []).append([i["id"] for i in items])
+        return {}
+
+    monkeypatch.setattr(sr, "_reformat_items", _no_llm)
+    monkeypatch.setattr(sr, "_needs_reformat", lambda *a, **k: True)
+    out = asyncio.run(sr.run_reformat("alice", deck_id="dA"))
+
+    assert out["questions"] == 0          # nothing came back from the model
+    assert sorted(seen["batches"][0]) == ["a0", "a1"]

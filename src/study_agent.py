@@ -814,19 +814,23 @@ async def _generate_overview(owner, args):
     return {"chars": len(ov), "preview": ov[:600]}
 
 
-@tool("maintain_bank", "Question-bank maintenance: dedup (remove duplicate questions), audit (suspend 'questions' that state their own answer), link_parts (group multi-part problems so practice shows earlier parts), backfill_context (recover shared problem setups).",
-      {"action": _s("dedup | audit | link_parts | backfill_context", enum=["dedup", "audit", "link_parts", "backfill_context"]),
-       "deck_id": _s("Subject id (required for link_parts)")}, ["action"])
+@tool("maintain_bank", "Question-bank maintenance: dedup (remove duplicate questions), audit (suspend 'questions' that state their own answer), link_parts (group multi-part problems so practice shows earlier parts), backfill_context (recover shared problem setups), reformat (LaTeX/Markdown pass). Pass deck_id to confine the pass to one subject.",
+      {"action": _s("dedup | audit | link_parts | backfill_context | reformat",
+                    enum=["dedup", "audit", "link_parts", "backfill_context", "reformat"]),
+       "deck_id": _s("Subject id (required for link_parts, optional elsewhere)")}, ["action"])
 async def _maintain_bank(owner, args):
     _require(args, "action")
     sr = _sr()
     action = args["action"]
+    deck_id = args.get("deck_id") or None
     if action == "dedup":
-        return await asyncio.to_thread(sr.run_dedup, owner)
+        return await asyncio.to_thread(sr.run_dedup, owner, deck_id)
     if action == "audit":
-        return await sr.run_audit_questions(owner)
+        return await sr.run_audit_questions(owner, deck_id=deck_id)
     if action == "backfill_context":
-        return await sr.run_backfill_context(owner)
+        return await sr.run_backfill_context(owner, deck_id=deck_id)
+    if action == "reformat":
+        return await sr.run_reformat(owner, deck_id=deck_id)
     if action == "link_parts":
         _require(args, "deck_id")
         db = SessionLocal()

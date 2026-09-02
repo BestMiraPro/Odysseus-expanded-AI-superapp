@@ -2506,15 +2506,21 @@ def calibration_payload(user, days: int = 90) -> Dict:
         db.close()
 
 
-def run_dedup(user) -> Dict:
-    """Remove duplicate questions across the caller's decks (same notation-
-    insensitive key); keeps the best copy of each cluster. {deleted, by_deck}."""
+def run_dedup(user, deck_id: Optional[str] = None) -> Dict:
+    """Remove duplicate questions (same notation-insensitive key); keeps the
+    best copy of each cluster. Scoped to one subject when ``deck_id`` is given —
+    the Tidy-bank UI runs per subject — else across all of them.
+    {deleted, by_deck}."""
     db = SessionLocal()
     try:
-        dq = db.query(StudyDeck)
-        if user is not None:
-            dq = dq.filter(StudyDeck.owner == user)
-        deck_ids = [d.id for d in dq.all()]
+        if deck_id:
+            _get_deck(db, deck_id, user)
+            deck_ids = [deck_id]
+        else:
+            dq = db.query(StudyDeck)
+            if user is not None:
+                dq = dq.filter(StudyDeck.owner == user)
+            deck_ids = [d.id for d in dq.all()]
         out = {}
         total = 0
         for did in deck_ids:
@@ -2527,14 +2533,18 @@ def run_dedup(user) -> Dict:
     return {"deleted": total, "by_deck": out}
 
 
-async def run_backfill_context(user) -> Dict:
+async def run_backfill_context(user, deck_id: Optional[str] = None) -> Dict:
     """Recover the shared problem setup for multi-part questions split at
-    extraction (idempotent; questions with context are skipped). {filled, scanned}."""
+    extraction (idempotent; questions with context are skipped). Scoped to one
+    subject when ``deck_id`` is given. {filled, scanned}."""
     db = SessionLocal()
     try:
         qq = db.query(StudyQuestion)
         if user is not None:
             qq = qq.filter(StudyQuestion.owner == user)
+        if deck_id:
+            _get_deck(db, deck_id, user)
+            qq = qq.filter(StudyQuestion.deck_id == deck_id)
         rows = qq.order_by(StudyQuestion.created_at.asc()).all()
         by_mat = defaultdict(list)
         for r in rows:
@@ -2579,14 +2589,91 @@ async def run_backfill_context(user) -> Dict:
     return {"filled": filled, "scanned": scanned}
 
 
-async def run_audit_questions(user) -> Dict:
+async def run_reformat(user, deck_id: Optional[str] = None) -> Dict:
+    """Reformat existing questions and cards to LaTeX (math) + Markdown,
+    preserving content. Idempotent — items already using $ are skipped. Touches
+    only text fields; answers/correct_index are untouched. Scoped to one
+    subject when ``deck_id`` is given. {questions, cards, *_scanned}."""
+    db = SessionLocal()
+    try:
+        qq = db.query(StudyQuestion)
+        cc = db.query(StudyCard)
+        if user is not None:
+            qq = qq.filter(StudyQuestion.owner == user)
+            cc = cc.filter(StudyCard.owner == user)
+        if deck_id:
+            _get_deck(db, deck_id, user)
+            qq = qq.filter(StudyQuestion.deck_id == deck_id)
+            cc = cc.filter(StudyCard.deck_id == deck_id)
+        q_items, q_opts = [], {}
+        for q in qq.all():
+            opts = json.loads(q.options) if q.options else None
+            if not _needs_reformat(q.question, q.reference or "",
+                                   " ".join(opts or [])):
+                continue
+            item = {"id": q.id, "question": q.question}
+            if opts:
+                item["options"] = opts
+            if q.reference:
+                item["reference"] = q.reference
+            q_items.append(item)
+            q_opts[q.id] = opts
+        c_items = []
+        for c in cc.all():
+            if not _needs_reformat(c.front, c.back):
+                continue
+            c_items.append({"id": c.id, "front": c.front, "back": c.back})
+    finally:
+        db.close()
+
+    q_updates = await _reformat_items(user, q_items)
+    c_updates = await _reformat_items(user, c_items)
+
+    q_n = c_n = 0
+    db = SessionLocal()
+    try:
+        for q in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(q_updates)))
+                  .all() if q_updates else []):
+            u = q_updates.get(q.id) or {}
+            changed = False
+            if isinstance(u.get("question"), str) and u["question"].strip():
+                q.question = u["question"]; changed = True
+            if "reference" in u and isinstance(u["reference"], str):
+                q.reference = u["reference"]; changed = True
+            # Only replace options if the count matches (keeps correct_index valid).
+            orig = q_opts.get(q.id)
+            if isinstance(u.get("options"), list) and orig and len(u["options"]) == len(orig):
+                q.options = json.dumps([str(o) for o in u["options"]]); changed = True
+            if changed:
+                q.explanation = None  # cached MCQ explanation may be stale
+                q_n += 1
+        for c in (db.query(StudyCard).filter(StudyCard.id.in_(list(c_updates)))
+                  .all() if c_updates else []):
+            u = c_updates.get(c.id) or {}
+            if isinstance(u.get("front"), str) and u["front"].strip():
+                c.front = u["front"]
+            if isinstance(u.get("back"), str) and u["back"].strip():
+                c.back = u["back"]
+            c_n += 1
+        db.commit()
+    finally:
+        db.close()
+    return {"questions": q_n, "cards": c_n,
+            "questions_scanned": len(q_items), "cards_scanned": len(c_items)}
+
+
+async def run_audit_questions(user, deck_id: Optional[str] = None) -> Dict:
     """Suspend 'questions' that state their own answer (solution steps leaked
-    at extraction). Reversible in the bank. {flagged, suspended, scanned}."""
+    at extraction). Reversible in the bank. Scoped to one subject when
+    ``deck_id`` is given. {flagged, suspended, scanned}."""
     db = SessionLocal()
     try:
         qq = db.query(StudyQuestion).filter(StudyQuestion.qtype == "open")
         if user is not None:
             qq = qq.filter(StudyQuestion.owner == user)
+        if deck_id:
+            _get_deck(db, deck_id, user)
+            qq = qq.filter(StudyQuestion.deck_id == deck_id)
         rows = [r for r in qq.all() if not r.suspended]
         items = [{"id": r.id, "question": (r.question or "")[:600]} for r in rows]
         # Deterministic layer: obvious conclusion openers, caught for free.
@@ -3628,73 +3715,14 @@ def setup_study_routes():
         return history_entries(_owner(request), limit=limit)
 
     @router.post("/reformat")
-    async def reformat_text(request: Request):
+    async def reformat_text(request: Request, deck_id: Optional[str] = None):
         """One-time: reformat existing questions and cards to LaTeX (math) +
-        Markdown, preserving content. Idempotent — items already using $ are
-        skipped. Touches only text fields; answers/correct_index are untouched."""
-        user = _owner(request)
-        db = SessionLocal()
-        try:
-            qq = db.query(StudyQuestion)
-            cc = db.query(StudyCard)
-            if user is not None:
-                qq = qq.filter(StudyQuestion.owner == user)
-                cc = cc.filter(StudyCard.owner == user)
-            q_items, q_opts = [], {}
-            for q in qq.all():
-                opts = json.loads(q.options) if q.options else None
-                if not _needs_reformat(q.question, q.reference or "",
-                                       " ".join(opts or [])):
-                    continue
-                item = {"id": q.id, "question": q.question}
-                if opts:
-                    item["options"] = opts
-                if q.reference:
-                    item["reference"] = q.reference
-                q_items.append(item)
-                q_opts[q.id] = opts
-            c_items = []
-            for c in cc.all():
-                if not _needs_reformat(c.front, c.back):
-                    continue
-                c_items.append({"id": c.id, "front": c.front, "back": c.back})
-        finally:
-            db.close()
-
-        q_updates = await _reformat_items(user, q_items)
-        c_updates = await _reformat_items(user, c_items)
-
-        q_n = c_n = 0
-        db = SessionLocal()
-        try:
-            for q in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(q_updates)))
-                      .all() if q_updates else []):
-                u = q_updates.get(q.id) or {}
-                changed = False
-                if isinstance(u.get("question"), str) and u["question"].strip():
-                    q.question = u["question"]; changed = True
-                if "reference" in u and isinstance(u["reference"], str):
-                    q.reference = u["reference"]; changed = True
-                # Only replace options if the count matches (keeps correct_index valid).
-                orig = q_opts.get(q.id)
-                if isinstance(u.get("options"), list) and orig and len(u["options"]) == len(orig):
-                    q.options = json.dumps([str(o) for o in u["options"]]); changed = True
-                if changed:
-                    q.explanation = None  # cached MCQ explanation may be stale
-                    q_n += 1
-            for c in (db.query(StudyCard).filter(StudyCard.id.in_(list(c_updates)))
-                      .all() if c_updates else []):
-                u = c_updates.get(c.id) or {}
-                if isinstance(u.get("front"), str) and u["front"].strip():
-                    c.front = u["front"]
-                if isinstance(u.get("back"), str) and u["back"].strip():
-                    c.back = u["back"]
-                c_n += 1
-            db.commit()
-        finally:
-            db.close()
-        return {"questions_reformatted": q_n, "cards_reformatted": c_n,
-                "questions_scanned": len(q_items), "cards_scanned": len(c_items)}
+        Markdown, preserving content. Optionally scoped to one subject."""
+        out = await run_reformat(_owner(request), deck_id=deck_id)
+        return {"questions_reformatted": out["questions"],
+                "cards_reformatted": out["cards"],
+                "questions_scanned": out["questions_scanned"],
+                "cards_scanned": out["cards_scanned"]}
 
     @router.post("/decks/{deck_id}/link-parts")
     async def link_parts(request: Request, deck_id: str):
@@ -3709,17 +3737,19 @@ def setup_study_routes():
             db.close()
         return await _link_deck_parts(user, deck_id)
 
+    # The three maintenance passes below (and /reformat above) take an optional
+    # deck_id so the subject view's "Tidy bank" panel only touches that subject.
     @router.post("/dedup")
-    def dedup_questions_route(request: Request):
-        return run_dedup(_owner(request))
+    def dedup_questions_route(request: Request, deck_id: Optional[str] = None):
+        return run_dedup(_owner(request), deck_id=deck_id)
 
     @router.post("/backfill-context")
-    async def backfill_context(request: Request):
-        return await run_backfill_context(_owner(request))
+    async def backfill_context(request: Request, deck_id: Optional[str] = None):
+        return await run_backfill_context(_owner(request), deck_id=deck_id)
 
     @router.post("/audit-questions")
-    async def audit_questions(request: Request):
-        return await run_audit_questions(_owner(request))
+    async def audit_questions(request: Request, deck_id: Optional[str] = None):
+        return await run_audit_questions(_owner(request), deck_id=deck_id)
 
     @router.get("/questions/{question_id}/prereqs")
     def question_prereqs(request: Request, question_id: str):
