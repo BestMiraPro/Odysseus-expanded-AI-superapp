@@ -1781,7 +1781,10 @@ async function renderPractice() {
 
   const q = p.queue[p.idx];
   // A mock is marked only after you commit to a prediction.
-  if (p.mock && (!q || p.mock.phase === 'predict') && p.mock.predicted === null) {
+  // Nothing answered (an empty paper, or every question skipped) — there is
+  // nothing to predict, so go straight to the summary.
+  if (p.mock && (!q || p.mock.phase === 'predict')
+      && p.mock.predicted === null && p.log.some(l => l.result)) {
     return renderMockPrediction();
   }
   if (!q || (p.mock && p.mock.phase === 'predict')) { return renderPracticeSummary(); }
@@ -2055,7 +2058,7 @@ function renderPracticeSummary() {
     <div class="study-card-stage">
       <div style="font-size:22px;margin-bottom:6px;">${p.mock ? 'Mock marked' : 'Practice complete'}</div>
       <div style="opacity:0.65;font-size:13px;">${answered.length} answered · ${answered.length ? Math.round(ok.length / answered.length * 100) : 0}% success · ${hintsTotal} hints · ~${mins} min</div>
-      ${p.mock ? (() => {
+      ${p.mock && p.mock.predicted !== null ? (() => {
         const pred = p.mock.predicted;
         const gap = pred - ok.length;
         const verdict = gap === 0 ? 'called it exactly'
