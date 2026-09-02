@@ -267,3 +267,66 @@ def test_calibration_scoped_to_owner(db):
     _tagged_attempts(db, owner="bob")
     assert calibration_payload("alice", days=90)["overall"]["graded"] == 0
     assert calibration_payload("bob", days=90)["overall"]["graded"] == 4
+
+
+# ------------------------------------------------------------- #5 card sourcing
+
+def _material(SessionLocal, *, summary=None, content="x" * 900, owner="alice"):
+    from core.database import StudyDeck, StudyMaterial
+    s = SessionLocal()
+    if not s.query(StudyDeck).filter(StudyDeck.id == "dA").first():
+        s.add(StudyDeck(id="dA", owner=owner, name="Micro", new_per_day=15,
+                        retention="0.9"))
+    s.add(StudyMaterial(id="m1", owner=owner, deck_id="dA", name="Ch3",
+                        kind="text", content=content, char_count=len(content),
+                        summary=summary, category="theory"))
+    s.commit()
+    s.close()
+
+
+def test_card_source_prefers_notes_over_raw_material(db):
+    """Notes are denser and already structured — better card fodder."""
+    from routes.study_routes import card_source_text
+
+    notes = "## Elasticity\n" + ("Demand responds to price. " * 40)
+    _material(db, summary=notes)
+    out = card_source_text("alice", "m1")
+
+    assert out["source"] == "notes"
+    assert out["text"] == notes.strip()
+
+
+def test_card_source_falls_back_to_material_without_notes(db):
+    from routes.study_routes import card_source_text
+
+    _material(db, summary=None)
+    out = card_source_text("alice", "m1")
+
+    assert out["source"] == "material"
+    assert out["text"].startswith("x")
+
+
+def test_card_source_ignores_stub_notes(db):
+    """A half-generated stub is worse than the real text."""
+    from routes.study_routes import card_source_text
+
+    _material(db, summary="Notes pending.")
+    assert card_source_text("alice", "m1")["source"] == "material"
+
+
+def test_card_source_rejects_other_owners_material(db):
+    from fastapi import HTTPException
+    from routes.study_routes import card_source_text
+
+    _material(db, owner="alice")
+    with pytest.raises(HTTPException):
+        card_source_text("bob", "m1")
+
+
+def test_card_author_prompt_defaults_to_cloze(db):
+    """Atomic cloze deletions are the default card shape now."""
+    from routes.study_routes import CARD_AUTHOR_SYSTEM
+
+    low = CARD_AUTHOR_SYSTEM.lower()
+    assert "default to atomic cloze" in low
+    assert "_____" in CARD_AUTHOR_SYSTEM

@@ -900,7 +900,9 @@ function renderSubjectDetail() {
         material_id: mat.id, count: 12,
       });
       s.proposals = res.cards.map(c => ({ ...c, checked: true }));
+      s.proposalSource = res.source || null;
       renderProposals();
+      if (res.source === 'notes') toast('Cards written from this material\u2019s study notes');
     } catch (err) { toast(err.message, true); }
     btn.disabled = false; btn.textContent = 'Generate cards';
   });
@@ -1322,6 +1324,7 @@ function renderProposals() {
     <div style="margin-top:10px;">
       <div class="study-form-row">
         <b style="font-size:12.5px;">${s.proposals.filter(p => p.checked).length}/${s.proposals.length} selected</b>
+        ${s.proposalSource ? `<span class="study-subtle">from ${s.proposalSource === 'notes' ? 'study notes' : 'the material text'}</span>` : ''}
         <button class="study-btn small" id="study-prop-all">Toggle all</button>
         <button class="study-btn small primary" id="study-prop-add">Add selected</button>
         <button class="study-btn small" id="study-prop-discard">Discard</button>
