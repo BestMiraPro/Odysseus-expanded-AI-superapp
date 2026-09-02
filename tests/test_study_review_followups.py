@@ -433,3 +433,74 @@ def test_reformat_can_be_scoped_to_one_subject(db, monkeypatch):
 
     assert out["questions"] == 0          # nothing came back from the model
     assert sorted(seen["batches"][0]) == ["a0", "a1"]
+
+
+# ------------------------------------------------------------------ #2 mock mode
+
+def _mixed_states(SessionLocal, owner="alice"):
+    """One deck: 2 questions due, 2 new, 2 scheduled well into the future."""
+    from core.database import StudyDeck, StudyQuestion
+    from routes.study_routes import _utcnow_naive
+
+    s = SessionLocal()
+    s.add(StudyDeck(id="dA", owner=owner, name="Micro", new_per_day=15,
+                    retention="0.9"))
+    now = _utcnow_naive()
+    for i in range(2):
+        s.add(StudyQuestion(id=f"due{i}", owner=owner, deck_id="dA", qtype="open",
+                            question=f"due {i}", reference="r", topic="t1",
+                            state="review", due=now - timedelta(days=1)))
+        s.add(StudyQuestion(id=f"new{i}", owner=owner, deck_id="dA", qtype="open",
+                            question=f"new {i}", reference="r", topic="t2",
+                            state="new", due=now))
+        s.add(StudyQuestion(id=f"far{i}", owner=owner, deck_id="dA", qtype="open",
+                            question=f"far {i}", reference="r", topic="t3",
+                            state="review", due=now + timedelta(days=30)))
+    s.commit()
+    s.close()
+
+
+def test_mock_draws_a_full_paper_ignoring_the_schedule(db):
+    """A mock is a timed full-format pass, not a spaced-repetition session: it
+    must be able to ask questions that are not due yet."""
+    from routes.study_routes import practice_queue_payload
+
+    _mixed_states(db)
+    out = practice_queue_payload("alice", deck_id="dA", limit=6, mock=True)
+
+    assert len(out["queue"]) == 6
+    assert any(q["id"].startswith("far") for q in out["queue"])
+    assert out["mock"] is True
+
+
+def test_normal_practice_still_respects_the_schedule(db):
+    """Without mock the future-dated questions stay out of the queue."""
+    from routes.study_routes import practice_queue_payload
+
+    _mixed_states(db)
+    out = practice_queue_payload("alice", deck_id="dA", limit=6)
+
+    assert not any(q["id"].startswith("far") for q in out["queue"])
+    assert out.get("mock") is False
+
+
+def test_mock_interleaves_topics(db):
+    """A mock rotates topics rather than blocking them."""
+    from routes.study_routes import practice_queue_payload
+
+    _mixed_states(db)
+    topics = [q["topic"] for q in
+              practice_queue_payload("alice", deck_id="dA", limit=6, mock=True)["queue"]]
+
+    assert topics[:3] == ["t1", "t2", "t3"]
+
+
+def test_mock_respects_the_topic_filter(db):
+    """Exam plan blocks name topics; a mock for a block stays inside them."""
+    from routes.study_routes import practice_queue_payload
+
+    _mixed_states(db)
+    out = practice_queue_payload("alice", deck_id="dA", topics="t3", limit=6,
+                                 mock=True)
+
+    assert {q["topic"] for q in out["queue"]} == {"t3"}

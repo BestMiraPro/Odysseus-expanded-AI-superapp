@@ -1669,9 +1669,16 @@ function practiceKeydown(e) {
 
 // `scope`: optional {materialId, topics (array|csv), label} — practice only one
 // material's questions, or an exam-plan block's topics.
-async function startPractice(deckId = null, limit = 12, scope = null) {
+// `mock`: optional {minutes, label} — a timed, closed-book full-format pass.
+// No hints, no consult, no per-question feedback: you answer everything, predict
+// your score, and only then see the marking. That prediction gap is the
+// calibration data the exam plan's mock blocks are asking for.
+async function startPractice(deckId = null, limit = 12, scope = null, mock = null) {
   setTabSilent('practice');
+  stopMockTimer();
   S.practice = { queue: [], idx: 0, deckId, scope: scope || null, loading: true,
+                 mock: mock ? { minutes: mock.minutes || 60, endsAt: null,
+                                predicted: null, phase: 'answer' } : null,
                  phase: 'answer', confidence: null, choice: null, emptyArmed: false,
                  hints: [], hintBusy: false, answerDraft: '', result: null,
                  consulted: false, consult: null, consultBusy: false,
@@ -1681,6 +1688,7 @@ async function startPractice(deckId = null, limit = 12, scope = null) {
   renderPractice();
   try {
     const params = new URLSearchParams({ limit: String(limit) });
+    if (mock) params.set('mock', 'true');
     if (deckId) params.set('deck_id', deckId);
     if (scope?.materialId) params.set('material_id', scope.materialId);
     if (scope?.topics) params.set('topics', Array.isArray(scope.topics) ? scope.topics.join(',') : scope.topics);
@@ -1689,7 +1697,50 @@ async function startPractice(deckId = null, limit = 12, scope = null) {
     if (res.topic_fallback) toast('No questions matched those topics — practising the whole subject instead');
   } catch (e) { toast(e.message, true); }
   S.practice.loading = false;
+  if (S.practice.mock && S.practice.queue.length) startMockTimer();
   renderPractice();
+}
+
+// The mock clock runs off a wall-clock deadline, so it stays honest while the
+// pane is closed or another tab is open; only the visible clock needs the DOM.
+// Held module-level, not on S.practice, so the interval is still clearable
+// after the session object is dropped (leaving practice, closing the pane).
+let _mockTimer = null;
+
+function startMockTimer() {
+  const p = S.practice;
+  if (!p?.mock) return;
+  p.mock.endsAt = Date.now() + p.mock.minutes * 60000;
+  stopMockTimer();
+  _mockTimer = setInterval(() => {
+    const cur = S.practice;
+    if (!cur?.mock) return stopMockTimer();
+    const left = mockRemainingSec();
+    const clock = (_open && _tab === 'practice')
+      ? body()?.querySelector('#study-mock-clock') : null;
+    if (clock) clock.textContent = fmtClock(left);
+    if (left <= 0) {
+      stopMockTimer();
+      cur.mock.phase = 'predict';
+      cur.mock.timeUp = true;
+      if (_open && _tab === 'practice') renderPractice();
+    }
+  }, 500);
+}
+
+function stopMockTimer() {
+  if (_mockTimer) clearInterval(_mockTimer);
+  _mockTimer = null;
+}
+
+function mockRemainingSec() {
+  const m = S.practice?.mock;
+  if (!m?.endsAt) return 0;
+  return Math.max(0, Math.round((m.endsAt - Date.now()) / 1000));
+}
+
+function fmtClock(sec) {
+  return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`;
 }
 
 async function renderPractice() {
@@ -1705,7 +1756,7 @@ async function renderPractice() {
     el.innerHTML = `
       <div class="study-card-stage">
         <div style="font-size:15px;margin-bottom:6px;">Question practice</div>
-        <div class="study-subtle" style="max-width:480px;margin:0 auto 18px;">Exam-format retrieval from your extracted question banks. Due questions come first (spacing); new ones are mixed across topics (interleaving). Hints cost you — a hinted success reschedules sooner.</div>
+        <div class="study-subtle" style="max-width:480px;margin:0 auto 18px;">Exam-format retrieval from your extracted question banks. Due questions come first (spacing); new ones are mixed across topics (interleaving). Hints cost you — a hinted success reschedules sooner. Timed mocks start from a mock block in the Plan tab.</div>
         <div class="study-rate-row" style="margin-top:0;">
           <button class="study-btn primary" id="study-practice-all" ${totalQ === 0 ? 'disabled' : ''}>Practice everything</button>
         </div>
@@ -1729,7 +1780,11 @@ async function renderPractice() {
   if (p.loading) { el.innerHTML = '<div class="study-empty">Loading questions…</div>'; return; }
 
   const q = p.queue[p.idx];
-  if (!q) { return renderPracticeSummary(); }
+  // A mock is marked only after you commit to a prediction.
+  if (p.mock && (!q || p.mock.phase === 'predict') && p.mock.predicted === null) {
+    return renderMockPrediction();
+  }
+  if (!q || (p.mock && p.mock.phase === 'predict')) { return renderPracticeSummary(); }
 
   // Lazily fetch prerequisite parts (multi-part questions) for the context box.
   if (q.has_prereqs && p.prereqsFor !== q.id && !p.prereqsBusy) {
@@ -1759,6 +1814,7 @@ async function renderPractice() {
         <span class="study-qchip ${q.difficulty === 'hard' ? 'hard' : ''}">${esc(q.difficulty)}</span>
         ${p.scope?.label ? `<span class="study-qchip" title="Practice scope">${esc(p.scope.label)}</span>` : ''}
         <span style="flex:1;"></span>
+        ${p.mock ? `<span class="study-qchip" id="study-mock-clock" title="Time left in this mock">${fmtClock(mockRemainingSec())}</span>` : ''}
         <span class="study-subtle">${p.idx + 1}/${p.queue.length}</span>
       </div>
       ${prereqs.length ? `<div class="study-prereq">
@@ -1805,11 +1861,13 @@ async function renderPractice() {
             <button data-conf="${cv}" class="${p.confidence === cv ? 'sel' : ''}">${cv}</button>`).join('')}
         </div>
         <div class="study-form-row" style="margin-top:10px;">
-          <button class="study-btn primary" id="study-prac-submit">Check answer</button>
+          <button class="study-btn primary" id="study-prac-submit">${p.mock ? 'Submit →' : 'Check answer'}</button>
+          ${p.mock ? '' : `
           <button class="study-btn" id="study-prac-hint" ${p.hints.length >= 3 || p.hintBusy ? 'disabled' : ''}>
             ${p.hintBusy ? 'Thinking…' : `Hint (${p.hints.length}/3)`}</button>
-          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>
+          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>`}
           <button class="study-btn" id="study-prac-skip">Skip</button>
+          ${p.mock ? `<span style="flex:1;"></span><button class="study-btn" id="study-prac-endmock" title="Stop answering and predict your score">Finish early</button>` : ''}
         </div>` : `
         <div class="study-grade ${res.correct === true || (res.score ?? 0) >= 85 ? 'correct' : (res.correct === false || (res.score ?? 0) < 60 ? 'incorrect' : '')}">
           ${isMcq
@@ -1858,6 +1916,12 @@ async function renderPractice() {
     advancePractice();
   });
 
+  el.querySelector('#study-prac-endmock')?.addEventListener('click', () => {
+    stopMockTimer();
+    p.mock.phase = 'predict';
+    renderPractice();
+  });
+
   el.querySelector('#study-prac-consult')?.addEventListener('click', () => {
     consultAction(q, !p.result);  // penalize only before the answer is submitted
   });
@@ -1894,6 +1958,9 @@ async function renderPractice() {
         duration_ms: Date.now() - p.qShownTs,
       });
       p.log.push({ q, result: p.result, confidence: p.confidence, hints: p.hints.length });
+      // Closed book: the marking is graded server-side but stays hidden until
+      // the prediction is in.
+      if (p.mock) { p.result = null; advancePractice(); return; }
       renderPractice();
     } catch (e) {
       toast(e.message, true);
@@ -1911,8 +1978,9 @@ async function renderPractice() {
   });
 
   el.querySelector('#study-prac-next')?.addEventListener('click', () => {
-    // failed questions come back at the end of this session (re-drill)
-    if (p.result && p.result.rating === 1) {
+    // failed questions come back at the end of this session (re-drill); a mock
+    // is a fixed paper, so it never grows mid-run.
+    if (!p.mock && p.result && p.result.rating === 1) {
       p.queue.push({ ...q });
     }
     advancePractice();
@@ -1930,9 +1998,47 @@ function advancePractice() {
   renderPractice();
 }
 
+// Predict before marking: the gap between what you think you scored and what
+// you scored is the calibration signal the plan's mock blocks are built around.
+function renderMockPrediction() {
+  const el = body();
+  const p = S.practice;
+  const answered = p.log.filter(l => l.result).length;
+  const asked = p.log.length;
+  el.innerHTML = `
+    <div class="study-card-stage">
+      <div style="font-size:22px;margin-bottom:6px;">Paper down</div>
+      <div class="study-subtle" style="max-width:460px;margin:0 auto 4px;">
+        ${p.mock.timeUp ? 'Time is up. ' : ''}${answered} answered${asked > answered ? ` · ${asked - answered} skipped` : ''}.
+      </div>
+      <div class="study-subtle" style="max-width:460px;margin:0 auto 18px;">
+        Before you see the marking: how many of the ${answered || 1} you answered did you get right?
+      </div>
+      <div class="study-form-row" style="justify-content:center;">
+        <input class="study-input" id="study-mock-predict" type="number" min="0"
+          max="${answered}" step="1" style="width:90px;" placeholder="0">
+        <span class="study-subtle">of ${answered}</span>
+        <button class="study-btn primary" id="study-mock-reveal">Mark it</button>
+      </div>
+    </div>`;
+  const input = el.querySelector('#study-mock-predict');
+  const reveal = () => {
+    const v = parseInt(input.value, 10);
+    if (Number.isNaN(v) || v < 0 || v > answered) {
+      toast(`Give a number between 0 and ${answered}`, true); return;
+    }
+    p.mock.predicted = v;
+    renderPractice();
+  };
+  el.querySelector('#study-mock-reveal').addEventListener('click', reveal);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') reveal(); });
+  input.focus();
+}
+
 function renderPracticeSummary() {
   const el = body();
   const p = S.practice;
+  stopMockTimer();
   const answered = p.log.filter(l => l.result);
   const ok = answered.filter(l => l.result.correct === true || (l.result.score ?? 0) >= 60);
   const sureWrong = answered.filter(l => l.confidence === 'sure' &&
@@ -1947,8 +2053,20 @@ function renderPracticeSummary() {
 
   el.innerHTML = `
     <div class="study-card-stage">
-      <div style="font-size:22px;margin-bottom:6px;">Practice complete</div>
+      <div style="font-size:22px;margin-bottom:6px;">${p.mock ? 'Mock marked' : 'Practice complete'}</div>
       <div style="opacity:0.65;font-size:13px;">${answered.length} answered · ${answered.length ? Math.round(ok.length / answered.length * 100) : 0}% success · ${hintsTotal} hints · ~${mins} min</div>
+      ${p.mock ? (() => {
+        const pred = p.mock.predicted;
+        const gap = pred - ok.length;
+        const verdict = gap === 0 ? 'called it exactly'
+          : gap > 0 ? `overestimated by ${gap}` : `underestimated by ${-gap}`;
+        return `<div class="study-chips" style="justify-content:center;margin-top:18px;">
+          <div class="study-chip"><b>${pred}</b><span>you predicted</span></div>
+          <div class="study-chip"><b>${ok.length}</b><span>actually right</span></div>
+          <div class="study-chip"><b>${answered.length ? Math.round(ok.length / answered.length * 100) : 0}%</b><span>score</span></div>
+        </div>
+        <div class="study-subtle" style="margin-top:8px;">You ${esc(verdict)}${Math.abs(gap) > 1 ? ' — the gap, not the score, is what to work on.' : '.'}</div>`;
+      })() : ''}
       <div class="study-chips" style="justify-content:center;margin-top:18px;">
         <div class="study-chip"><b>${ok.length}</b><span>recalled</span></div>
         <div class="study-chip"><b>${answered.length - ok.length}</b><span>missed</span></div>
@@ -1964,11 +2082,13 @@ function renderPracticeSummary() {
       ${weakTopics.length ? `<div class="study-subtle" style="margin-top:14px;">Weak topics this session: <b>${weakTopics.map(esc).join(', ')}</b></div>` : ''}
       <div class="study-rate-row">
         <button class="study-btn" id="study-prac-more">Practice more</button>
+        ${p.mock ? '<button class="study-btn" id="study-prac-review" title="See every answer with its marking">Review answers</button>' : ''}
         <button class="study-btn primary" id="study-prac-home">Back to Today</button>
       </div>
     </div>`;
   el.querySelector('#study-prac-more').addEventListener('click', () => startPractice(p.deckId, 12, p.scope));
-  el.querySelector('#study-prac-home').addEventListener('click', () => { S.practice = null; setTab('today'); });
+  el.querySelector('#study-prac-review')?.addEventListener('click', () => setTab('history'));
+  el.querySelector('#study-prac-home').addEventListener('click', () => { stopMockTimer(); S.practice = null; setTab('today'); });
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,7 +2181,9 @@ function renderPlanDays(container, exam) {
             <span class="study-block-text">${b.topics.map(esc).join(', ')} · ${b.minutes}min
               <span class="study-block-note">${esc(b.note || '')}</span></span>
           </label>
-          ${exam.deck_id && b.type !== 'mock' && d.date >= today ? `<button class="study-btn small" data-plan-practice="${esc(exam.deck_id)}" data-topics="${esc(b.topics.join(','))}" title="Practice this block's topics from the linked subject">Practice</button>` : ''}
+          ${exam.deck_id && d.date >= today ? (b.type === 'mock'
+            ? `<button class="study-btn small primary" data-plan-mock="${esc(exam.deck_id)}" data-topics="${esc(b.topics.join(','))}" data-minutes="${b.minutes}" title="Timed, closed-book, full format — predict your score before it is marked">Start mock</button>`
+            : `<button class="study-btn small" data-plan-practice="${esc(exam.deck_id)}" data-topics="${esc(b.topics.join(','))}" title="Practice this block's topics from the linked subject">Practice</button>`) : ''}
           </div>`;
         }).join('')}
       </div>`).join('')}
@@ -2069,6 +2191,15 @@ function renderPlanDays(container, exam) {
   container.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-plan-practice]');
     if (btn) startPractice(btn.dataset.planPractice, 12, { topics: btn.dataset.topics, label: btn.dataset.topics });
+    const mock = e.target.closest('[data-plan-mock]');
+    if (mock) {
+      const minutes = parseInt(mock.dataset.minutes, 10) || 60;
+      // Roughly one question per 4 minutes of the block, kept in sane bounds.
+      const count = Math.max(5, Math.min(40, Math.round(minutes / 4)));
+      startPractice(mock.dataset.planMock, count,
+        { topics: mock.dataset.topics, label: `mock · ${minutes}min` },
+        { minutes });
+    }
   });
   container.addEventListener('change', async (e) => {
     const cb = e.target.closest('input[data-key]');

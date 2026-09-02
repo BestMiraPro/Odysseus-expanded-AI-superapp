@@ -2081,7 +2081,7 @@ def _round_robin(rows: List, key) -> List:
 
 def practice_queue_payload(user, *, deck_id: Optional[str] = None,
                            material_id: Optional[str] = None, topics=None,
-                           limit: int = 20) -> Dict:
+                           limit: int = 20, mock: bool = False) -> Dict:
     """Build the practice queue: due questions first (spaced retrieval), then
     new ones interleaved across topics (round-robin) instead of blocked.
 
@@ -2089,7 +2089,12 @@ def practice_queue_payload(user, *, deck_id: Optional[str] = None,
     matched case-insensitively as substrings of the question's topic, OR-ed).
     A topic filter that matches nothing is dropped (``topic_fallback``) rather
     than returning an empty session — exam-plan topics rarely spell the
-    extractor's labels exactly."""
+    extractor's labels exactly.
+
+    ``mock=True`` builds a timed full-format paper instead: a fixed number of
+    questions drawn from the whole scope regardless of FSRS state, interleaved
+    across topics. A mock measures where you stand today, so it must be able to
+    ask questions that are not due yet."""
     limit = max(1, min(100, limit))
     wanted = _split_topics(topics)
     db = SessionLocal()
@@ -2112,6 +2117,11 @@ def practice_queue_payload(user, *, deck_id: Optional[str] = None,
         scoped_to_one = bool(material_id or deck_id)
 
         def _pull(q):
+            if mock:
+                # A mock ignores the schedule: draw the whole scope, oldest
+                # first, and let the topic round-robin below shape the paper.
+                return [], q.order_by(StudyQuestion.created_at.asc()).limit(
+                    max(limit * 4, 100)).all()
             due_base = q.filter(StudyQuestion.state != "new",
                                 StudyQuestion.due <= now)
             if scoped_to_one:
@@ -2153,6 +2163,7 @@ def practice_queue_payload(user, *, deck_id: Optional[str] = None,
         return {"queue": [_question_to_dict(r, with_answer=False)
                           for r in queue[:limit]],
                 "due": len(due), "total": len(queue),
+                "mock": bool(mock),
                 "topic_fallback": topic_fallback}
     finally:
         db.close()
@@ -3367,13 +3378,15 @@ def setup_study_routes():
     @router.get("/practice/queue")
     def practice_queue(request: Request, deck_id: Optional[str] = None,
                        material_id: Optional[str] = None, topics: Optional[str] = None,
-                       limit: int = 20):
+                       limit: int = 20, mock: bool = False):
         """Due questions first (spaced retrieval), then new ones interleaved
         across topics. Optional scope: one material, and/or a comma-separated
         topic list (substring match; falls back to the whole scope when no
-        question matches)."""
+        question matches). ``mock=true`` draws a fixed-size paper across the
+        whole scope regardless of the schedule (timed mock exams)."""
         return practice_queue_payload(_owner(request), deck_id=deck_id,
-                                      material_id=material_id, topics=topics, limit=limit)
+                                      material_id=material_id, topics=topics,
+                                      limit=limit, mock=mock)
 
     @router.post("/questions/{question_id}/attempt")
     async def attempt_question(request: Request, question_id: str, body: AttemptIn):
