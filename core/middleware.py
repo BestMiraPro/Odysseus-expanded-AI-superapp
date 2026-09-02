@@ -70,6 +70,11 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         # PDF previews are embedded by the in-app document library. Keep the
         # exception route-scoped so normal app pages remain unframeable.
         is_document_pdf_preview = path.startswith("/api/document/") and path.endswith("/render-pdf")
+        # Study materials are previewed in an in-pane iframe by the Study
+        # module's material viewer. The route itself serves only PDFs/images
+        # the caller owns, so the same same-origin-framing exception applies.
+        is_study_material_file = (path.startswith("/api/study/materials/")
+                                  and path.endswith("/file"))
         # Visual report pages are self-contained HTML — need inline scripts + external images
         is_report = path.startswith("/api/research/report/")
 
@@ -99,7 +104,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             # sandbox="allow-scripts" attribute provides isolation.
             # Don't overwrite the route's own restrictive CSP either.
             pass
-        elif is_document_pdf_preview:
+        elif is_document_pdf_preview or is_study_material_file:
             response.headers["X-Frame-Options"] = "SAMEORIGIN"
             response.headers["Content-Security-Policy"] = (
                 "default-src 'none'; "

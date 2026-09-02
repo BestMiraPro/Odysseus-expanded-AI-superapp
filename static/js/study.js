@@ -978,6 +978,30 @@ function openFileTab(fileId) {
   window.open(`${API}/api/upload/${encodeURIComponent(fileId)}?inline=1`, '_blank', 'noopener');
 }
 
+// The material file route serves PDFs and images only (a framed HTML upload
+// would run on our own origin), so everything else keeps opening in a tab.
+function _previewable(m) {
+  return !!m && !!m.file_id &&
+    (m.kind === 'pdf' || /\.(pdf|png|jpe?g|gif|webp|bmp|svg)$/i.test(m.name || ''));
+}
+
+// In-pane material viewer. PDFs and images are framed from the material's own
+// route, which is the one upload path allowed to be framed same-origin (see
+// SecurityHeadersMiddleware); the browser's built-in PDF viewer honours #page=N.
+// Anything it cannot render (or a blocked frame) falls back to a new tab.
+function openMaterialViewer(materialId, page, title) {
+  if (!materialId) return;
+  const src = `${API}/api/study/materials/${encodeURIComponent(materialId)}/file`
+    + (page ? `#page=${page}` : '');
+  const actions = `<button class="study-btn small" id="study-view-tab">Open in a tab</button>`;
+  const v = _viewerShell(title || 'Material', actions, `
+    <iframe id="study-view-frame" src="${esc(src)}" title="${esc(title || 'Material')}"
+      style="width:100%;height:min(78vh,900px);border:0;background:#fff;"></iframe>`);
+  v.querySelector('#study-view-tab').addEventListener('click', () => {
+    window.open(src, '_blank', 'noopener');
+  });
+}
+
 // Show a Markdown doc (study notes / subject overview) in the viewer, with a
 // Regenerate action. When none exists yet the viewer offers a Generate button
 // (no window.confirm — browsers may suppress it). `kind` is 'material' or 'deck'.
@@ -1062,6 +1086,9 @@ function _locLabel(l) {
 // Web sources are absolute URLs; material files are app-relative.
 function _openLoc(l) {
   if (!l || !l.url) return;
+  // Material citations open in the pane so consulting never leaves the app;
+  // web sources are external and still get a tab.
+  if (l.material_id) return openMaterialViewer(l.material_id, l.page, _locLabel(l));
   const u = /^https?:\/\//i.test(l.url) ? l.url : `${API}${l.url}`;
   window.open(u, '_blank', 'noopener');
 }
@@ -1129,7 +1156,7 @@ function renderMaterialList() {
         </select>
         ${s.extracting.has(m.id)
           ? '<span class="study-subtle">Working… (vision can take a few minutes)</span>'
-          : `${m.file_id ? `<button class="study-btn small" data-openfile="${m.id}" title="Open this file in a new browser tab">Open</button>` : ''}
+          : `${m.file_id ? `<button class="study-btn small" data-openfile="${m.id}" title="Open this file in the viewer">Open</button>` : ''}
              ${m.thin_text ? `<button class="study-btn small" data-transcribe="${m.id}" title="Vision OCR: transcribe the pages to text so notes, search and text extraction can read them">Transcribe</button>` : ''}
              <button class="study-btn small" data-notes="${m.id}" title="${m.has_summary ? 'View AI study notes for this material' : 'Generate AI study notes to consult while practising'}">${m.has_summary ? 'Notes' : 'Make notes'}</button>
              ${practice
@@ -1162,7 +1189,9 @@ function renderMaterialList() {
     const pm = e.target.closest('[data-pracmat]')?.dataset.pracmat;
     if (of) {
       const m = s.materials.find(x => x.id === of);
-      if (m) openFileTab(m.file_id);
+      // Only PDFs and images can be framed; anything else still gets a tab.
+      if (m) (_previewable(m) ? openMaterialViewer(m.id, null, m.name)
+                              : openFileTab(m.file_id));
       return;
     }
     if (nt) {
