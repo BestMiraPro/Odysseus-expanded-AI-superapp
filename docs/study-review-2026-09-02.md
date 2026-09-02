@@ -55,34 +55,67 @@ Companion to `docs/superpowers/specs/2026-09-02-study-agent-design.md`.
   `study_exams.deck_id`, `study_materials.page_count` (idempotent migration).
 - Tests: `tests/test_study_agent_tools.py` (18), `tests/test_study_practice_filters.py` (15).
 
-## 2. Recommendations not implemented (ranked)
+## 2. Recommendations (ranked) — all implemented 2026-09-02
+
+Implemented in the follow-up pass on `claude/study-app-review-changes-26c27e`,
+one commit per item in the order below. Each recommendation is kept as it was
+written; the **Done** line records what actually shipped.
 
 1. **Run the app with the repo bind-mounted when using code tools in Docker.**
    Today the container runs the image's baked copy; the agent's edits there
    vanish on rebuild. `docker-compose.yml` now carries a commented mount
    (`.:/app/code`) + `ODYSSEUS_CODE_DIR=/app/code`. Python edits still need a
    restart (`deploy.ps1` builds from `origin/<branch>`, so commit + push first).
+   **Done:** the commented lines became `docker-compose.code.yml` plus
+   `pwsh ./deploy.ps1 -CodeTools`; DEPLOY.md documents both traps, and the
+   agent's own "how changes apply" note distinguishes mounted from baked.
 2. **Exam mock blocks should launch a timed mock** (fixed count, timer, score
    prediction before marking — the plan text already asks for it). Needs a
    "mock" practice mode: no hints/consult, N questions, summary with predicted
    vs actual.
+   **Done:** `practice_queue_payload(mock=True)` draws a fixed paper across the
+   scope regardless of FSRS state; the pane runs a wall-clock countdown with no
+   hints, no consult and no per-question marking, then takes a score prediction
+   before revealing predicted vs actual. Mock blocks get a "Start mock" button
+   sized from the block's minutes.
 3. **Calibration dashboard**: the data exists (`confidence` × outcome per
    attempt). A per-subject "sure-but-wrong" rate and a Brier-style score would
    make the calibration habit visible over weeks, not just per session.
+   **Done:** `calibration_payload()` behind `GET /api/study/calibration`, the
+   agent's `study_calibration` tool, and a Calibration section in the Focus tab:
+   Brier score, stated vs actual accuracy per bucket, sure-but-wrong per subject.
 4. **Interleave across subjects in "Practice everything"**: the queue
    interleaves topics within the scope but orders due questions by due date
    only; cross-subject round-robin would strengthen interleaving.
+   **Done:** an unscoped queue pools each subject's most-overdue questions and
+   deals them out in turn, so one backlog cannot crowd out the rest; new
+   questions round-robin on subject+topic. Scoped sessions are unchanged.
 5. **Card generation should use the notes**, not the raw material, when notes
    exist (denser, already structured), and default to atomic cloze cards.
+   **Done:** `card_source_text()` prefers substantial notes (>= 400 chars, so a
+   stub still falls back), the response reports which source was used, and the
+   author prompt defaults to atomic cloze deletions.
 6. **`stats` ignores question attempts** (only card reviews feed the daily
    chart and success rate). Fold attempts in so the Focus/History charts
    reflect practice, which is where most retrieval happens now.
+   **Done:** the route body became `stats_payload()`, adding per-day
+   attempts/attempts_ok and one blended retrieval rate over cards and questions;
+   the Focus tab gained a retrievals chart beside focus minutes.
 7. **Material viewer in-app**: PDFs open in a new browser tab. An in-pane
    viewer (iframe to `/api/upload/{id}?inline=1#page=N`) was blocked by the
    browser earlier; a PDF.js-based viewer would keep consult inside the app.
+   **Done:** no PDF.js needed — the blocker was the blanket
+   `X-Frame-Options: DENY` on every response. A narrow, owner-checked
+   `GET /api/study/materials/{id}/file` (PDFs and images only) carries the same
+   same-origin framing exception as the document library's preview, and
+   citations now open in the pane at the cited page.
 8. **Reformat/dedup/audit/backfill** have no UI (the agent can run them now
    via `maintain_bank`); a "Tidy bank" button in the subject view would surface
    them for non-agent use.
+   **Done:** each pass takes an optional `deck_id` (so a subject-level button is
+   honest about its blast radius) and `/reformat` moved to `run_reformat()`; the
+   subject view has a "Tidy bank" panel, with armed two-click buttons for the two
+   passes that change the bank in bulk.
 
 ## 3. Study-method notes (from the data model + how the app is used)
 
@@ -101,6 +134,24 @@ Companion to `docs/superpowers/specs/2026-09-02-study-agent-design.md`.
   and treat mock blocks as timed closed-book runs with a score prediction.
 
 ## 4. Verification (2026-09-02)
+
+### The review pass itself
+
+- `PYTHONUTF8=1 python -m pytest` on Windows (host Python 3.14, no Docker):
+  3212 passed / 231 failed / 17 skipped / 5 errors. The failing set is the
+  pre-existing environment one (missing bcrypt/pyotp/pytest-asyncio, charmap
+  collection errors) — compared as a set against the same suite run at the
+  pre-change commit, not against the earlier run's totals.
+- 29 new tests: `tests/test_study_review_followups.py` (26 — interleaving, the
+  blended stats payload, calibration scoring, card sourcing, deck-scoped
+  maintenance, mock papers) and 2 added to
+  `tests/test_security_headers_pdf_preview.py` covering both sides of the new
+  framing exception. `node --check` passes for `study.js` and `studyAgent.js`;
+  `docker compose config` validates with and without the code-tools overlay.
+- Not exercised for real: the mock run and the in-pane viewer against a live
+  browser, and code tools inside Docker with the overlay mounted.
+
+### The pass being reviewed
 
 - `PYTHONUTF8=1 python -m pytest` on Windows (host Python 3.14, no Docker): 3147 passed /
   267 failed / 5 errors — the failing set is identical to the pre-change baseline
