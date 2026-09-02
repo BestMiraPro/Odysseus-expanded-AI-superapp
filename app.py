@@ -140,9 +140,10 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/cookbook/setup",  # remote pacman/apt installs
     "/api/upload",          # large files
     "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
-    "/api/study/materials", # AI question extraction — chunked LLM calls, minutes on long PDFs
-    "/api/study/ai",        # AI card generation
-    "/api/study/questions", # attempt grading, hints, explanations — LLM-backed
+    # Study: extraction/transcription/notes/overview/explain-further/grading/
+    # bank maintenance are all LLM-backed (minutes on long PDFs) and the agent
+    # chat is SSE — exempt the whole module rather than chase each route.
+    "/api/study/",
 )
 
 
@@ -666,6 +667,9 @@ app.include_router(setup_chatgpt_subscription_routes())
 # Omnigent agent bridge
 from routes.omnigent_routes import setup_omnigent_routes
 app.include_router(setup_omnigent_routes())
+
+from routes.study_agent_routes import setup_study_agent_routes
+app.include_router(setup_study_agent_routes())
 
 # TTS
 from routes.tts_routes import setup_tts_routes

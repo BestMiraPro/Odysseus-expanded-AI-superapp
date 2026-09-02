@@ -20,7 +20,7 @@ from typing import List
 
 logger = logging.getLogger(__name__)
 
-MAX_PAGES = 12          # cap per extraction run (cost/latency guard)
+MAX_PAGES = 40          # cap per extraction run (cost/latency guard; pages beyond it are reported as truncated)
 RENDER_SCALE = 2.0      # ~144 DPI — crisp enough for print text and formulas
 JPEG_QUALITY = 85
 MAX_SIDE = 2000         # downscale very large pages (token/cost guard)

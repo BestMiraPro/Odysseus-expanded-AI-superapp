@@ -349,6 +349,25 @@ def missing_question_numbers(manifest: List[Dict], extracted_numbers) -> List[Di
             if canonical_qnum(m.get("number")) not in have]
 
 
+def offset_manifest(manifest: List[Dict], page_offset: int) -> List[Dict]:
+    """Shift a batch-relative discovery manifest to document page numbers."""
+    if not page_offset:
+        return list(manifest or [])
+    return [{**m, "page": int(m.get("page") or 1) + page_offset} for m in (manifest or [])]
+
+
+def should_use_vision(*, has_pdf: bool, vision_available: bool,
+                      explicit: Optional[bool] = None) -> bool:
+    """Extraction path decision. ``explicit`` True/False forces a path (vision
+    still needs the PDF); None means "vision by default when possible": the
+    original PDF is on disk and a vision-capable model is configured."""
+    if not has_pdf:
+        return False
+    if explicit is not None:
+        return bool(explicit)
+    return bool(vision_available)
+
+
 def parse_answer_key_pages(value) -> List[int]:
     """Answer-key/solutions page numbers from a discovery reply.
 
@@ -776,6 +795,17 @@ Rules:
 - Use the material's language.
 
 Output ONLY JSON: {"items": [{"id": "<id>", "context": "<setup>"}, ...]} — include only the questions that need context. No commentary."""
+
+TRANSCRIBE_SYSTEM = """You transcribe pages of course material (scanned or formula-heavy PDFs) into faithful Markdown so a student can study from the text.
+
+Rules:
+- Transcribe EVERYTHING legible, in reading order, page by page. Begin each page with a line "[Page N text]:" (N = the document page number given in the instruction).
+- Keep the original wording and language; do not summarize, solve, or comment.
+- Write all mathematics as LaTeX ($...$ inline, $$...$$ display). Keep structure: headings, lists, tables (as Markdown tables), bold terms.
+- Describe figures briefly in brackets, e.g. [Figure: supply and demand curves crossing at P*].
+- If a page is blank or unreadable, write "[Page N text]:" followed by "(unreadable)".
+
+Output ONLY the Markdown transcription. No preamble, no code fences around the whole thing."""
 
 REFORMAT_SYSTEM = """You reformat already-extracted study text so it displays well. Convert all mathematics to LaTeX ($...$ inline, $$...$$ display) and fix Markdown formatting (sub/superscripts, fractions, lists, bold).
 

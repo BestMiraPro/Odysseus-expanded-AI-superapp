@@ -8,6 +8,8 @@
  *   Practice — question bank drilling: MCQ/open, confidence, hints, AI grading
  *   Plan     — exams with deterministic spaced/interleaved study plans
  *   Focus    — single-task focus timer with history
+ *   Agent    — in-app AI agent: tutors from the materials, manages the bank,
+ *              runs the AI pipelines, and (admins, opt-in) edits the app's code
  *
  * The science core: every question/card attempt is closed-book retrieval,
  * outcomes feed FSRS scheduling (spacing), new questions are served
@@ -17,6 +19,7 @@
 
 import * as Modals from './modalManager.js';
 import { mdToHtml } from './markdown.js';
+import { renderAgentTab, setAgentPrefill, setAgentScope } from './studyAgent.js';
 
 const API = window.location.origin;
 
@@ -40,7 +43,7 @@ const S = {
 const TABS = [
   ['today', 'Today'], ['subjects', 'Subjects'], ['review', 'Cards'],
   ['practice', 'Practice'], ['plan', 'Plan'], ['focus', 'Focus'],
-  ['history', 'History'],
+  ['history', 'History'], ['agent', 'Agent'],
 ];
 
 const TIPS = [
@@ -158,7 +161,10 @@ function injectStyles() {
 .study-btn:hover { background: rgba(128,128,128,0.12); }
 .study-btn.primary { border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); font-weight: 600; }
 .study-btn.danger { color: var(--red, #e05555); }
-.study-btn.danger.armed { background: var(--red, #e05555); color: #fff; border-color: var(--red, #e05555); font-weight: 600; }
+.study-btn.armed { background: var(--red, #e05555); color: #fff; border-color: var(--red, #e05555); font-weight: 600; }
+.study-block-row { display: flex; align-items: flex-start; gap: 8px; }
+.study-block-row .study-block { flex: 1; }
+.study-block-row .study-btn { margin-top: 3px; }
 .study-btn:disabled { opacity: 0.4; cursor: default; }
 .study-btn.small { padding: 3px 8px; font-size: 11px; }
 .study-input, .study-select, .study-textarea { background: var(--bg); color: var(--fg);
@@ -366,6 +372,7 @@ export function openPanel() {
       return;
     }
     if (_tab === 'review') reviewKeydown(e);
+    else if (_tab === 'practice') practiceKeydown(e);
   };
   document.addEventListener('keydown', _keyHandler);
 
@@ -474,9 +481,26 @@ function setTab(tab) {
   const render = {
     today: renderToday, subjects: renderSubjects, review: renderReview,
     practice: renderPractice, plan: renderPlan, focus: renderFocus,
-    history: renderHistory,
+    history: renderHistory, agent: renderAgent,
   }[tab];
   if (render) render();
+}
+
+// ---------------------------------------------------------------------------
+// AGENT (static/js/studyAgent.js)
+// ---------------------------------------------------------------------------
+
+function renderAgent() {
+  const el = body();
+  if (!el) return;
+  renderAgentTab({ el, decks: S.decks, deckId: S.subject?.deck?.id || null, esc, toast });
+}
+
+// Open the Agent tab focused on a subject, optionally with a drafted message.
+function openAgent(deckId, prefill) {
+  if (deckId) setAgentScope(deckId);
+  if (prefill) setAgentPrefill(prefill);
+  setTab('agent');
 }
 
 function setTabSilent(tab) {
@@ -614,12 +638,19 @@ async function renderToday() {
         <div style="font-size:12px;font-weight:600;margin-bottom:4px;">${esc(x.title)}
           <span style="opacity:0.5;font-weight:400;">· ${x.days_left}d left</span></div>
         ${x.today_blocks.map(b => `
+          <div class="study-block-row">
           <label class="study-block ${b.done ? 'done' : ''}">
             <input type="checkbox" data-exam="${x.id}" data-key="${esc(b.key)}" ${b.done ? 'checked' : ''}>
             <span class="study-block-type ${esc(b.type)}">${esc(b.type.replace('_', ' '))}</span>
             <span class="study-block-text">${b.topics.map(esc).join(', ')} · ${b.minutes}min</span>
-          </label>`).join('')}
+          </label>
+          ${x.deck_id && b.type !== 'mock' ? `<button class="study-btn small" data-plan-practice="${esc(x.deck_id)}" data-topics="${esc(b.topics.join(','))}" title="Practice this block's topics from the linked subject (whole subject if no question matches)">Practice</button>` : ''}
+          </div>`).join('')}
       </div>`).join('');
+    planEl.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-plan-practice]');
+      if (btn) startPractice(btn.dataset.planPractice, 12, { topics: btn.dataset.topics, label: btn.dataset.topics });
+    });
     planEl.addEventListener('change', async (e) => {
       const cb = e.target.closest('input[data-key]');
       if (!cb) return;
@@ -687,9 +718,10 @@ async function renderSubjects() {
     const del = e.target.closest('[data-del]');
     if (del) {
       e.stopPropagation();
-      if (!confirm('Delete this subject with all its materials, questions and cards?')) return;
-      try { await jdel(`/api/study/decks/${del.dataset.del}`); renderSubjects(); }
-      catch (err) { toast(err.message, true); }
+      armThen(del, async () => {
+        try { await jdel(`/api/study/decks/${del.dataset.del}`); renderSubjects(); }
+        catch (err) { toast(err.message, true); }
+      }, 'Delete all?');
       return;
     }
     const row = e.target.closest('[data-deck]');
@@ -700,7 +732,7 @@ async function renderSubjects() {
 async function openSubject(deckId) {
   const deck = S.decks.find(d => d.id === deckId) || { id: deckId, name: 'Subject' };
   S.subject = { deck, cards: [], materials: [], questions: [], proposals: null,
-                qFilter: '', qLimit: 40, extracting: new Set() };
+                qFilter: '', qMaterial: '', qLimit: 40, extracting: new Set() };
   await reloadSubject();
 }
 
@@ -730,13 +762,14 @@ function renderSubjectDetail() {
       <b style="font-size:14px;">${esc(s.deck.name)}</b>
       <span class="study-subtle" id="study-subj-counts">${s.questions.length} questions · ${s.cards.length} cards</span>
       <span style="flex:1;"></span>
+      <button class="study-btn small" id="study-subj-ask" title="Chat with the Study agent about this subject: it tutors from your materials and can manage the bank for you">Ask the tutor</button>
       <button class="study-btn small" id="study-subj-overview" title="An AI overview of the subject that ties the chapters together">Overview</button>
       <button class="study-btn small" id="study-subj-review" ${!s.cards.length ? 'disabled' : ''}>Review cards</button>
       <button class="study-btn small primary" id="study-subj-practice" ${!s.questions.length ? 'disabled' : ''}>Practice questions</button>
     </div>
 
     <div class="study-section-title">Materials → question bank</div>
-    <div class="study-subtle" style="margin-bottom:8px;">Feed it past papers and problem sets for faithful extraction, or notes/textbook sections for authored questions. Everything becomes closed-book practice, spaced by the scheduler.</div>
+    <div class="study-subtle" style="margin-bottom:8px;">Mark each material as <b>Practice</b> (past paper, problem set — its real questions are extracted faithfully, by the vision model for PDFs) or <b>Theory</b> (notes, slides — new exam-style questions are generated from it). Everything becomes closed-book practice, spaced by the scheduler.</div>
     <div class="study-form-row" style="align-items:stretch;">
       <textarea class="study-textarea" id="study-mat-text" placeholder="Paste material here (lecture notes, a past paper, problem set + solutions)…" style="flex:1;min-height:64px;"></textarea>
     </div>
@@ -753,6 +786,10 @@ function renderSubjectDetail() {
     <div class="study-section-title">Question bank</div>
     <div class="study-form-row">
       <input class="study-input" id="study-q-search" placeholder="Search questions…" style="width:220px;" value="${esc(s.qFilter)}">
+      <select class="study-select" id="study-q-mat" title="Only show questions from one material">
+        <option value="">All materials</option>
+        ${s.materials.map(m => `<option value="${esc(m.id)}" ${s.qMaterial === m.id ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
+      </select>
     </div>
     <div id="study-q-list"></div>
 
@@ -763,7 +800,10 @@ function renderSubjectDetail() {
       <button class="study-btn primary" id="study-card-add" style="align-self:flex-end;">Add</button>
     </div>
     <div class="study-form-row">
-      <button class="study-btn small" id="study-gen-cards-btn" title="Drafts atomic flashcards from the newest material">Generate cards from latest material</button>
+      <select class="study-select" id="study-gen-cards-mat" title="Material to draft flashcards from">
+        ${s.materials.map((m, i) => `<option value="${esc(m.id)}" ${i === 0 ? 'selected' : ''}>${esc(m.name)}</option>`).join('')}
+      </select>
+      <button class="study-btn small" id="study-gen-cards-btn" title="Drafts atomic flashcards from the selected material">Generate cards</button>
       <label class="study-subtle">new cards/day
         <input class="study-input" id="study-deck-npd" type="number" min="0" max="200"
           value="${s.deck.new_per_day ?? 15}" style="width:60px;padding:4px 6px;"></label>
@@ -776,6 +816,7 @@ function renderSubjectDetail() {
   el.querySelector('#study-subj-review').addEventListener('click', () => startReview(s.deck.id));
   el.querySelector('#study-subj-practice').addEventListener('click', () => startPractice(s.deck.id));
   el.querySelector('#study-subj-overview').addEventListener('click', () => openSubjectOverview(s.deck.id, s.deck.name));
+  el.querySelector('#study-subj-ask').addEventListener('click', () => openAgent(s.deck.id, ''));
   el.querySelector('#study-deck-npd').addEventListener('change', async (e) => {
     try { await jput(`/api/study/decks/${s.deck.id}`, { new_per_day: parseInt(e.target.value || '0', 10) }); }
     catch (err) { toast(err.message, true); }
@@ -849,7 +890,8 @@ function renderSubjectDetail() {
     } catch (err) { toast(err.message, true); }
   });
   el.querySelector('#study-gen-cards-btn').addEventListener('click', async (e) => {
-    const mat = s.materials[0];
+    const matId = el.querySelector('#study-gen-cards-mat')?.value;
+    const mat = s.materials.find(m => m.id === matId) || s.materials[0];
     if (!mat) { toast('Add a material first', true); return; }
     const btn = e.target;
     btn.disabled = true; btn.textContent = 'Generating…';
@@ -860,9 +902,12 @@ function renderSubjectDetail() {
       s.proposals = res.cards.map(c => ({ ...c, checked: true }));
       renderProposals();
     } catch (err) { toast(err.message, true); }
-    btn.disabled = false; btn.textContent = 'Generate cards from latest material';
+    btn.disabled = false; btn.textContent = 'Generate cards';
   });
 
+  el.querySelector('#study-q-mat').addEventListener('change', (e) => {
+    s.qMaterial = e.target.value; s.qLimit = 40; renderQuestionList();
+  });
   let searchT = null;
   el.querySelector('#study-q-search').addEventListener('input', (e) => {
     clearTimeout(searchT);
@@ -921,30 +966,37 @@ function openFileTab(fileId) {
   window.open(`${API}/api/upload/${encodeURIComponent(fileId)}?inline=1`, '_blank', 'noopener');
 }
 
-// Generate-if-missing then show a Markdown doc (study notes / subject overview)
-// in the viewer, with a Regenerate action. `kind` is 'material' or 'deck'.
+// Show a Markdown doc (study notes / subject overview) in the viewer, with a
+// Regenerate action. When none exists yet the viewer offers a Generate button
+// (no window.confirm — browsers may suppress it). `kind` is 'material' or 'deck'.
 async function _openMarkdownDoc({ title, getPath, postPath, field, confirmMsg, busyMsg }) {
   let r;
   try { r = await jget(getPath); }
   catch (e) { toast(e.message, true); return; }
-  if (!r || !r[field]) {
-    if (!confirm(confirmMsg)) return;
-    toast(busyMsg);
+  const show = () => {
+    const v = _viewerShell(title,
+      `<button class="study-btn small" id="study-doc-regen">Regenerate</button>`,
+      `<div class="study-viewer-body" id="study-viewer-body"></div>`);
+    _renderMarkdownInto(v.querySelector('#study-viewer-body'), r[field]);
+    v.querySelector('#study-doc-regen').addEventListener('click', async (ev) => {
+      ev.target.disabled = true; ev.target.textContent = 'Regenerating…';
+      try {
+        const rr = await jpost(postPath, {});
+        _renderMarkdownInto(v.querySelector('#study-viewer-body'), rr[field]);
+        reloadSubject();
+      } catch (e) { toast(e.message, true); }
+      ev.target.disabled = false; ev.target.textContent = 'Regenerate';
+    });
+  };
+  if (r && r[field]) { show(); return; }
+  const v0 = _viewerShell(title, '', `<div class="study-viewer-empty"><div>${esc(confirmMsg)}<br><br>
+    <button class="study-btn primary" id="study-doc-gen">Generate now</button></div></div>`);
+  v0.querySelector('#study-doc-gen').addEventListener('click', async (ev) => {
+    ev.target.disabled = true; ev.target.textContent = busyMsg;
     try { r = await jpost(postPath, {}); }
-    catch (e) { toast(e.message, true); return; }
+    catch (e) { toast(e.message, true); ev.target.disabled = false; ev.target.textContent = 'Generate now'; return; }
     reloadSubject();
-  }
-  const v = _viewerShell(title,
-    `<button class="study-btn small" id="study-doc-regen">Regenerate</button>`,
-    `<div class="study-viewer-body" id="study-viewer-body"></div>`);
-  _renderMarkdownInto(v.querySelector('#study-viewer-body'), r[field]);
-  v.querySelector('#study-doc-regen').addEventListener('click', async () => {
-    toast(busyMsg);
-    try {
-      const rr = await jpost(postPath, {});
-      _renderMarkdownInto(v.querySelector('#study-viewer-body'), rr[field]);
-      reloadSubject();
-    } catch (e) { toast(e.message, true); }
+    show();
   });
 }
 
@@ -1051,25 +1103,31 @@ function renderMaterialList() {
     wrap.innerHTML = '<div class="study-empty">No materials yet.</div>';
     return;
   }
-  wrap.innerHTML = s.materials.map(m => `
+  wrap.innerHTML = s.materials.map(m => {
+    const practice = m.category === 'exam';
+    const size = m.page_count ? `${m.page_count} pages` : `${(m.char_count / 1000).toFixed(1)}k chars`;
+    return `
     <div class="study-row study-mat-row">
       <span class="study-mat-name" title="${esc(m.name)}"><b>${esc(m.name)}</b>
-        <span class="study-subtle"> · ${m.kind} · ${(m.char_count / 1000).toFixed(1)}k chars · ${m.question_count} questions extracted</span></span>
+        <span class="study-subtle"> · ${m.kind} · ${size} · ${m.question_count} questions${m.thin_text ? ' · <span title="Almost no text layer (scan or formula images). Transcribe it so notes, consult and search can read it.">scan</span>' : ''}</span></span>
       <span class="study-row-actions">
-        <select class="study-cat" data-cat="${m.id}" title="How Consult and Explain-further treat this file. Theory files are searched for the relevant content; exam/answer-key files are not.">
-          <option value="theory" ${m.category === 'theory' ? 'selected' : ''}>Theory</option>
-          <option value="exam" ${m.category === 'exam' ? 'selected' : ''}>Exam / answer key</option>
+        <select class="study-cat" data-cat="${m.id}" title="Theory (notes, slides, textbook): new questions are generated from it, and Consult / Explain-further search it for theory. Practice (exam, problem set): its real questions are extracted faithfully.">
+          <option value="theory" ${!practice ? 'selected' : ''}>Theory</option>
+          <option value="exam" ${practice ? 'selected' : ''}>Practice (exam / problem set)</option>
         </select>
         ${s.extracting.has(m.id)
-          ? '<span class="study-subtle">Extracting… (vision can take a few minutes)</span>'
+          ? '<span class="study-subtle">Working… (vision can take a few minutes)</span>'
           : `${m.file_id ? `<button class="study-btn small" data-openfile="${m.id}" title="Open this file in a new browser tab">Open</button>` : ''}
+             ${m.thin_text ? `<button class="study-btn small" data-transcribe="${m.id}" title="Vision OCR: transcribe the pages to text so notes, search and text extraction can read them">Transcribe</button>` : ''}
              <button class="study-btn small" data-notes="${m.id}" title="${m.has_summary ? 'View AI study notes for this material' : 'Generate AI study notes to consult while practising'}">${m.has_summary ? 'Notes' : 'Make notes'}</button>
-             <button class="study-btn small primary" data-extract="${m.id}" title="Pull the actual questions out of a past paper / problem set">Extract questions</button>
-             ${m.kind === 'pdf' ? `<button class="study-btn small" data-vextract="${m.id}" title="Renders the PDF pages as images for a vision model — use for formula-heavy or scanned exams. Also runs automatically when text extraction finds nothing.">Extract (vision)</button>` : ''}
-             <button class="study-btn small" data-author="${m.id}" title="Write new exam-style questions from notes">Author questions</button>
-             <button class="study-btn small danger" data-delmat="${m.id}">✕</button>`}
+             ${practice
+               ? `<button class="study-btn small primary" data-extract="${m.id}" title="Pull the actual questions out of this paper, faithfully. PDFs are read page-by-page by the vision model when one is configured (formulas and scans included).">Extract questions</button>`
+               : `<button class="study-btn small primary" data-author="${m.id}" title="Write new exam-style questions from this theory material">Generate questions</button>`}
+             ${m.question_count ? `<button class="study-btn small" data-pracmat="${m.id}" title="Practice only the questions of this material">Practice</button>` : ''}
+             <button class="study-btn small danger" data-delmat="${m.id}" title="Remove this material (its questions stay in the bank)">✕</button>`}
       </span>
-    </div>`).join('');
+    </div>`;
+  }).join('');
   wrap.onchange = async (e) => {
     const sel = e.target.closest('[data-cat]');
     if (!sel) return;
@@ -1078,16 +1136,18 @@ function renderMaterialList() {
       await jput(`/api/study/materials/${id}/category`, { category: sel.value });
       const m = s.materials.find(x => x.id === id);
       if (m) m.category = sel.value;
-      toast(`Marked as ${sel.value === 'exam' ? 'exam / answer key' : 'theory'}`);
+      toast(sel.value === 'exam' ? 'Practice material — its questions get extracted' : 'Theory material — questions get generated from it');
+      renderMaterialList();   // the action buttons depend on the category
     } catch (err) { toast(err.message, true); }
   };
   wrap.onclick = async (e) => {
     const ex = e.target.closest('[data-extract]')?.dataset.extract;
-    const vx = e.target.closest('[data-vextract]')?.dataset.vextract;
     const au = e.target.closest('[data-author]')?.dataset.author;
-    const del = e.target.closest('[data-delmat]')?.dataset.delmat;
+    const tr = e.target.closest('[data-transcribe]')?.dataset.transcribe;
+    const delBtn = e.target.closest('[data-delmat]');
     const of = e.target.closest('[data-openfile]')?.dataset.openfile;
     const nt = e.target.closest('[data-notes]')?.dataset.notes;
+    const pm = e.target.closest('[data-pracmat]')?.dataset.pracmat;
     if (of) {
       const m = s.materials.find(x => x.id === of);
       if (m) openFileTab(m.file_id);
@@ -1098,34 +1158,50 @@ function renderMaterialList() {
       if (m) openMaterialNotes(m.id, m.name);
       return;
     }
-    if (del) {
-      if (!confirm('Remove this material? (Extracted questions stay.)')) return;
-      try { await jdel(`/api/study/materials/${del}`); reloadSubject(); }
-      catch (err) { toast(err.message, true); }
+    if (pm) {
+      const m = s.materials.find(x => x.id === pm);
+      startPractice(s.deck.id, 12, { materialId: pm, label: m ? m.name : 'material' });
       return;
     }
-    const id = ex || vx || au;
+    if (delBtn) {
+      armThen(delBtn, async () => {
+        try { await jdel(`/api/study/materials/${delBtn.dataset.delmat}`); reloadSubject(); }
+        catch (err) { toast(err.message, true); }
+      }, 'Remove?');
+      return;
+    }
+    const id = ex || au || tr;
     if (!id) return;
     if (S.subject.extracting.has(id)) return;   // already running for this material
-    // Set-based so several materials can extract in parallel without the
-    // single-flag bug that orphaned the earlier task.
+    // Set-based so several materials can run in parallel.
     S.subject.extracting.add(id);
     renderMaterialList();
     try {
-      const res = await jpost(`/api/study/materials/${id}/extract`,
-        { mode: au ? 'author' : 'extract', count: 15, vision: !!vx });
-      const cov = res.coverage;
-      const covNote = cov && cov.missing && cov.missing.length
-        ? ` — could not extract question(s) ${cov.missing.join(', ')}; they may need manual entry`
-        : (cov && cov.matched != null ? ` — all ${cov.expected} detected questions covered` : '');
-      const dupNote = res.duplicates ? ` (${res.duplicates} already in bank, skipped)` : '';
-      const head = res.created === 0 && res.duplicates
-        ? 'No new questions — everything was already in the bank'
-        : `${res.created} questions added`;
-      toast(`${head}${res.vision ? ' (vision)' : ''}${dupNote}${res.chunk_errors ? ` (${res.chunk_errors} batch(es) failed)` : ''}${covNote}`, !!(cov && cov.missing && cov.missing.length));
+      if (tr) {
+        const r = await jpost(`/api/study/materials/${id}/transcribe`, {});
+        toast(`Transcribed ${r.pages} page(s) → ${(r.char_count / 1000).toFixed(1)}k chars`
+          + (r.pages_failed ? ` (${r.pages_failed} page(s) failed)` : ''), !!r.pages_failed);
+      } else {
+        // Practice materials are extracted (vision by default for PDFs, decided
+        // server-side); theory materials get authored questions.
+        const res = await jpost(`/api/study/materials/${id}/extract`,
+          { mode: au ? 'author' : 'extract', count: 15 });
+        const cov = res.coverage;
+        const covNote = cov && cov.missing && cov.missing.length
+          ? ` — could not extract question(s) ${cov.missing.join(', ')}; they may need manual entry`
+          : (cov && cov.matched != null ? ` — all ${cov.expected} detected questions covered` : '');
+        const pageNote = res.pages && res.pages.truncated
+          ? ` — only the first ${res.pages.pages} of ${res.pages.total_pages} pages were read` : '';
+        const dupNote = res.duplicates ? ` (${res.duplicates} already in bank, skipped)` : '';
+        const head = res.created === 0 && res.duplicates
+          ? 'No new questions — everything was already in the bank'
+          : `${res.created} questions added`;
+        toast(`${head}${res.vision ? ' (vision)' : ''}${dupNote}${res.chunk_errors ? ` (${res.chunk_errors} batch(es) failed)` : ''}${covNote}${pageNote}`,
+          !!((cov && cov.missing && cov.missing.length) || pageNote));
+      }
     } catch (err) { toast(err.message, true); }
-    S.subject.extracting.delete(id);
-    reloadSubject();   // leaves S.subject.extracting intact for still-running ones
+    S.subject?.extracting.delete(id);
+    if (S.subject) reloadSubject();   // leaves S.subject.extracting intact for still-running ones
   };
 }
 
@@ -1155,7 +1231,22 @@ function _disarmDel(btn) {
   if (!btn) return;
   btn.dataset.armed = '';
   btn.classList.remove('armed');
-  btn.textContent = '✕';
+  btn.textContent = btn._label || '✕';
+}
+
+// Two-click confirm for destructive buttons. After a few native dialogs
+// browsers offer "prevent additional dialogs", after which confirm() silently
+// returns false and deletes appear to do nothing — so no window.confirm here.
+// First click arms the button (label changes), second click within 3.5s runs fn.
+function armThen(btn, fn, label = 'Sure?') {
+  if (!btn) return;
+  if (btn.dataset.armed === '1') { clearTimeout(btn._disarmT); _disarmDel(btn); return fn(); }
+  btn._label = btn._label || btn.textContent;
+  btn.dataset.armed = '1';
+  btn.classList.add('armed');
+  btn.textContent = label;
+  btn._disarmT = setTimeout(() => _disarmDel(btn), 3500);
+  return undefined;
 }
 
 function renderQuestionList() {
@@ -1163,8 +1254,8 @@ function renderQuestionList() {
   const s = S.subject;
   if (!wrap || !s) return;
   const f = s.qFilter.toLowerCase();
-  const rows = s.questions.filter(q => !f ||
-    q.question.toLowerCase().includes(f) || (q.topic || '').toLowerCase().includes(f));
+  const rows = s.questions.filter(q => (!s.qMaterial || q.material_id === s.qMaterial) && (!f ||
+    q.question.toLowerCase().includes(f) || (q.topic || '').toLowerCase().includes(f)));
   if (!rows.length) {
     wrap.innerHTML = '<div class="study-empty">No questions yet — extract some from a material above.</div>';
     return;
@@ -1299,9 +1390,10 @@ function renderCardList() {
         await jput(`/api/study/cards/${suspId}`, { suspended: !c.suspended });
         reloadSubject();
       } else if (delId) {
-        if (!confirm('Delete this card?')) return;
-        await jdel(`/api/study/cards/${delId}`);
-        reloadSubject();
+        armThen(e.target.closest('[data-delc]'), async () => {
+          try { await jdel(`/api/study/cards/${delId}`); reloadSubject(); }
+          catch (err) { toast(err.message, true); }
+        });
       }
     } catch (err) { toast(err.message, true); }
   };
@@ -1446,14 +1538,39 @@ function reviewKeydown(e) {
   }
 }
 
+// Practice shortcuts: 1-9 pick an MCQ option, Enter checks the answer (or
+// goes to the next question once graded); inside the answer box Ctrl/Cmd+Enter
+// submits so Enter can still add a newline.
+function practiceKeydown(e) {
+  const p = S.practice;
+  if (!p || p.loading) return;
+  const el = body();
+  if (!el) return;
+  if (e.target.closest('input, select')) return;
+  const inText = !!e.target.closest('textarea');
+  if (e.key === 'Enter') {
+    if (inText && !(e.ctrlKey || e.metaKey)) return;
+    e.preventDefault();
+    (el.querySelector('#study-prac-next') || el.querySelector('#study-prac-submit'))?.click();
+    return;
+  }
+  if (inText) return;
+  if (/^[1-9]$/.test(e.key) && !p.result) {
+    const opt = el.querySelector(`[data-opt="${parseInt(e.key, 10) - 1}"]`);
+    if (opt) { e.preventDefault(); opt.click(); }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // PRACTICE (question bank)
 // ---------------------------------------------------------------------------
 
-async function startPractice(deckId = null, limit = 12) {
+// `scope`: optional {materialId, topics (array|csv), label} — practice only one
+// material's questions, or an exam-plan block's topics.
+async function startPractice(deckId = null, limit = 12, scope = null) {
   setTabSilent('practice');
-  S.practice = { queue: [], idx: 0, deckId, loading: true,
-                 phase: 'answer', confidence: null, choice: null,
+  S.practice = { queue: [], idx: 0, deckId, scope: scope || null, loading: true,
+                 phase: 'answer', confidence: null, choice: null, emptyArmed: false,
                  hints: [], hintBusy: false, answerDraft: '', result: null,
                  consulted: false, consult: null, consultBusy: false,
                  prereqs: null, prereqsFor: null, prereqsBusy: false,
@@ -1461,8 +1578,13 @@ async function startPractice(deckId = null, limit = 12) {
                  log: [], startTs: Date.now(), qShownTs: Date.now() };
   renderPractice();
   try {
-    const res = await jget(`/api/study/practice/queue?limit=${limit}${deckId ? `&deck_id=${deckId}` : ''}`);
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (deckId) params.set('deck_id', deckId);
+    if (scope?.materialId) params.set('material_id', scope.materialId);
+    if (scope?.topics) params.set('topics', Array.isArray(scope.topics) ? scope.topics.join(',') : scope.topics);
+    const res = await jget(`/api/study/practice/queue?${params}`);
     S.practice.queue = res.queue;
+    if (res.topic_fallback) toast('No questions matched those topics — practising the whole subject instead');
   } catch (e) { toast(e.message, true); }
   S.practice.loading = false;
   renderPractice();
@@ -1533,6 +1655,7 @@ async function renderPractice() {
         <span class="study-qchip ${q.qtype}">${q.qtype}</span>
         ${q.topic ? `<span class="study-qchip">${esc(q.topic)}</span>` : ''}
         <span class="study-qchip ${q.difficulty === 'hard' ? 'hard' : ''}">${esc(q.difficulty)}</span>
+        ${p.scope?.label ? `<span class="study-qchip" title="Practice scope">${esc(p.scope.label)}</span>` : ''}
         <span style="flex:1;"></span>
         <span class="study-subtle">${p.idx + 1}/${p.queue.length}</span>
       </div>
@@ -1601,6 +1724,7 @@ async function renderPractice() {
           ${isMcq && !p.explainText ? `<button class="study-btn" id="study-prac-explain" ${p.explainBusy ? 'disabled' : ''}>${p.explainBusy ? 'Explaining…' : 'Explain options'}</button>` : ''}
           <button class="study-btn" id="study-prac-explain-further" title="Pull the underlying theory from your material, with where to review it">Explain further</button>
           <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it (free now that you've answered)">${consultLabel}</button>
+          <button class="study-btn" id="study-prac-ask" title="Discuss this question with the Study agent (tutor grounded in your materials)">Ask the tutor</button>
         </div>`}
     </div>`;
 
@@ -1640,10 +1764,21 @@ async function renderPractice() {
     openExplainFurther('question', q.id);
   });
 
+  el.querySelector('#study-prac-ask')?.addEventListener('click', () => {
+    const r = p.result || {};
+    const mine = isMcq ? (q.options || [])[p.choice] : p.answerDraft;
+    const outcome = isMcq ? (r.correct ? 'correct' : 'wrong') : `${r.score ?? '?'}/100`;
+    openAgent(q.deck_id || p.deckId,
+      `About this practice question (id ${q.id}):\n\n${q.question}\n\nMy answer: ${mine || '(empty)'} — graded ${outcome}.`
+      + `\n\nHelp me understand it from my materials: where do I go wrong, and what is the method?`);
+  });
+
   el.querySelector('#study-prac-submit')?.addEventListener('click', async () => {
     if (isMcq && p.choice == null) { toast('Pick an option first', true); return; }
-    if (!isMcq && !p.answerDraft.trim()) {
-      if (!confirm('Empty answer counts as a failed recall. Submit anyway?')) return;
+    if (!isMcq && !p.answerDraft.trim() && !p.emptyArmed) {
+      p.emptyArmed = true;
+      toast('Empty answer counts as a failed recall — press Check again to submit it anyway', true);
+      return;
     }
     const btn = el.querySelector('#study-prac-submit');
     btn.disabled = true; btn.textContent = isMcq ? 'Checking…' : 'Grading…';
@@ -1685,7 +1820,7 @@ async function renderPractice() {
 function advancePractice() {
   const p = S.practice;
   p.idx += 1;
-  p.result = null; p.choice = null; p.confidence = null;
+  p.result = null; p.choice = null; p.confidence = null; p.emptyArmed = false;
   p.hints = []; p.answerDraft = ''; p.explainText = null;
   p.consulted = false; p.consult = null; p.consultBusy = false;
   p.prereqs = null; p.prereqsFor = null; p.prereqsBusy = false;
@@ -1730,7 +1865,7 @@ function renderPracticeSummary() {
         <button class="study-btn primary" id="study-prac-home">Back to Today</button>
       </div>
     </div>`;
-  el.querySelector('#study-prac-more').addEventListener('click', () => startPractice(p.deckId));
+  el.querySelector('#study-prac-more').addEventListener('click', () => startPractice(p.deckId, 12, p.scope));
   el.querySelector('#study-prac-home').addEventListener('click', () => { S.practice = null; setTab('today'); });
 }
 
@@ -1759,7 +1894,7 @@ async function renderPlan() {
   for (const x of S.exams) {
     const wrap = document.createElement('div');
     wrap.style.marginBottom = '20px';
-    const daysLeft = Math.ceil((new Date(x.exam_date) - Date.now()) / 86400000);
+    const daysLeft = Math.ceil((new Date(x.exam_date + 'T00:00:00') - Date.now()) / 86400000);
     wrap.innerHTML = `
       <div class="study-row">
         <span class="grow"><b>${esc(x.title)}</b>
@@ -1792,9 +1927,10 @@ async function renderPlan() {
         await jpost(`/api/study/exams/${genId}/generate-plan`);
         renderPlan();
       } else if (delId) {
-        if (!confirm('Delete this exam and its plan?')) return;
-        await jdel(`/api/study/exams/${delId}`);
-        renderPlan();
+        armThen(e.target.closest('[data-del]'), async () => {
+          try { await jdel(`/api/study/exams/${delId}`); renderPlan(); }
+          catch (err) { toast(err.message, true); }
+        });
       }
     } catch (err) { toast(err.message, true); renderPlan(); }
   });
@@ -1816,15 +1952,22 @@ function renderPlanDays(container, exam) {
         ${d.blocks.map((b, i) => {
           const key = `${d.date}:${i}`;
           return `
+          <div class="study-block-row">
           <label class="study-block ${done.has(key) ? 'done' : ''}">
             <input type="checkbox" data-key="${esc(key)}" ${done.has(key) ? 'checked' : ''}>
             <span class="study-block-type ${esc(b.type)}">${esc(b.type.replace('_', ' '))}</span>
             <span class="study-block-text">${b.topics.map(esc).join(', ')} · ${b.minutes}min
               <span class="study-block-note">${esc(b.note || '')}</span></span>
-          </label>`;
+          </label>
+          ${exam.deck_id && b.type !== 'mock' && d.date >= today ? `<button class="study-btn small" data-plan-practice="${esc(exam.deck_id)}" data-topics="${esc(b.topics.join(','))}" title="Practice this block's topics from the linked subject">Practice</button>` : ''}
+          </div>`;
         }).join('')}
       </div>`).join('')}
   `;
+  container.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-plan-practice]');
+    if (btn) startPractice(btn.dataset.planPractice, 12, { topics: btn.dataset.topics, label: btn.dataset.topics });
+  });
   container.addEventListener('change', async (e) => {
     const cb = e.target.closest('input[data-key]');
     if (!cb) return;
@@ -1838,9 +1981,10 @@ function renderPlanDays(container, exam) {
     ?.scrollIntoView({ block: 'nearest' }), 50);
 }
 
-function renderExamEditor() {
+async function renderExamEditor() {
   const el = body();
   const x = S.examEditing;
+  if (!S.decks.length) { try { S.decks = (await jget('/api/study/decks')).decks; } catch { /* optional */ } }
   const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
   el.innerHTML = `
     <div style="max-width:620px;">
@@ -1857,6 +2001,13 @@ function renderExamEditor() {
         <label class="study-subtle">h/week
           <input class="study-input" id="study-ex-hours" type="number" min="1" max="60" step="0.5"
             value="${x.hours_per_week}" style="width:64px;"></label>
+      </div>
+      <div class="study-form-row">
+        <label class="study-subtle">Subject
+          <select class="study-select" id="study-ex-deck" title="Link the exam to a subject: its plan blocks get a Practice button that drills that subject's questions on the block's topics">
+            <option value="">— none —</option>
+            ${(S.decks || []).map(d => `<option value="${esc(d.id)}" ${x.deck_id === d.id ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}
+          </select></label>
       </div>
       <div class="study-form-row" style="font-size:11.5px;">
         <span style="opacity:0.6;">Rest days:</span>
@@ -1911,6 +2062,7 @@ function renderExamEditor() {
       hours_per_week: parseFloat(el.querySelector('#study-ex-hours').value || '7'),
       rest_days: [...el.querySelectorAll('[data-rest]:checked')].map(c => +c.dataset.rest),
       topics: x.topics.filter(t => t.name.trim()),
+      deck_id: el.querySelector('#study-ex-deck')?.value || '',
     };
     if (!payload.title || !payload.exam_date) { toast('Title and date are required', true); return; }
     if (!payload.topics.length) { toast('Add at least one topic', true); return; }
@@ -1939,9 +2091,11 @@ async function renderFocus() {
 
   if (f) {
     const tick = () => {
-      if (!_open || _tab !== 'focus' || !S.focus) return;
+      if (!S.focus) return;
       const sec = focusRemainingSec();
-      const clock = el.querySelector('#study-focus-clock');
+      // Keep counting while the pane is closed or another tab is open, so the
+      // session still auto-finishes; only the clock update needs the DOM.
+      const clock = (_open && _tab === 'focus') ? body()?.querySelector('#study-focus-clock') : null;
       if (clock) clock.textContent =
         `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`;
       if (sec <= 0) { finishFocus(true); }

@@ -18,6 +18,10 @@ services:
       # land under /app/.local for the odysseus user. Persist them so a
       # container recreate does not silently remove installed serve engines.
       - ./data/local:/app/.local:z
+      # Study agent code tools (opt-in): bind-mount your checkout so the agent
+      # edits the real repo instead of the image's baked copy (which is lost on
+      # rebuild). Uncomment both this mount and ODYSSEUS_CODE_DIR below.
+      # - .:/app/code:z
     extra_hosts:
       # Lets the container reach local services on the Docker host, including
       # Ollama at http://host.docker.internal:11434.
@@ -69,6 +73,9 @@ services:
       #   PUID=1001
       #   PGID=1001
       # Find yours with:  id -u  /  id -g
+      # Where the Study agent's read/write/edit/bash tools are confined.
+      # Default (unset) = the app directory inside the container.
+      # - ODYSSEUS_CODE_DIR=/app/code
       - PUID=${PUID:-1000}
       - PGID=${PGID:-1000}
     depends_on:

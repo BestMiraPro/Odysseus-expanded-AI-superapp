@@ -750,6 +750,11 @@ def _migrate_add_study_summary_columns():
             conn.execute("ALTER TABLE study_questions ADD COLUMN prereq_ids TEXT")
         if "context" not in q_cols:
             conn.execute("ALTER TABLE study_questions ADD COLUMN context TEXT")
+        if "page_count" not in mat_cols:
+            conn.execute("ALTER TABLE study_materials ADD COLUMN page_count INTEGER")
+        exam_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_exams)")]
+        if exam_cols and "deck_id" not in exam_cols:
+            conn.execute("ALTER TABLE study_exams ADD COLUMN deck_id TEXT")
         if "category" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
             # Backfill existing rows from the filename classifier (single source
@@ -1713,6 +1718,7 @@ class StudyExam(TimestampMixin, Base):
     plan           = Column(Text, nullable=True)      # JSON output of generate_plan()
     done_blocks    = Column(Text, nullable=True)      # JSON list of "date:idx" checked off
     archived       = Column(Boolean, default=False)
+    deck_id        = Column(String, nullable=True, index=True)  # linked subject (plan blocks -> practice)
 
 
 class StudyFocusSession(TimestampMixin, Base):
@@ -1744,6 +1750,7 @@ class StudyMaterial(TimestampMixin, Base):
     question_count = Column(Integer, default=0)        # questions extracted so far
     summary        = Column(Text, nullable=True)       # AI study notes (markdown), for consultation
     category       = Column(String, default="theory")  # "theory" | "exam" — drives consult/explain-further search
+    page_count     = Column(Integer, nullable=True)    # PDF pages (thin-text detection, transcription)
 
 
 class StudyQuestion(TimestampMixin, Base):
@@ -1801,6 +1808,30 @@ class StudyAttempt(TimestampMixin, Base):
     grading      = Column(Text, nullable=True)        # JSON grade payload (open)
     duration_ms  = Column(Integer, nullable=True)
     attempted_at = Column(DateTime, default=utcnow_naive, index=True)
+
+
+class StudyAgentThread(TimestampMixin, Base):
+    """A conversation with the in-app Study agent (one per chat thread)."""
+    __tablename__ = "study_agent_threads"
+
+    id       = Column(String, primary_key=True, index=True)
+    owner    = Column(String, nullable=True, index=True)
+    title    = Column(String, nullable=True)
+    deck_id  = Column(String, nullable=True, index=True)   # subject the thread is scoped to
+
+
+class StudyAgentMessage(TimestampMixin, Base):
+    """One message of a Study-agent thread (user / assistant / tool)."""
+    __tablename__ = "study_agent_messages"
+
+    id           = Column(String, primary_key=True, index=True)
+    owner        = Column(String, nullable=True, index=True)
+    thread_id    = Column(String, index=True, nullable=False)
+    role         = Column(String, nullable=False)          # user | assistant | tool
+    content      = Column(Text, nullable=True)
+    tool_calls   = Column(Text, nullable=True)             # JSON list (assistant turns that called tools)
+    tool_call_id = Column(String, nullable=True)           # tool turns: the call they answer
+    name         = Column(String, nullable=True)           # tool turns: tool name
 
 
 class CalendarCal(TimestampMixin, Base):
