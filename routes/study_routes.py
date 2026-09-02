@@ -14,7 +14,8 @@ Endpoints:
   /api/study/questions/{id}/...    attempt (AI-graded), hint, explain, explain-further, locate
   /api/study/exams ...             exam CRUD + deterministic plan generation
   /api/study/focus ...             focus timer sessions
-  /api/study/stats, /history       review/attempt history
+  /api/study/stats, /history       retrieval chart (cards + attempts), history
+  /api/study/calibration           confidence calibration (Brier, sure-but-wrong)
   /api/study/agent/...             in-app Study agent (routes/study_agent_routes.py)
 
 Design notes:
@@ -2379,6 +2380,106 @@ def stats_payload(user, days: int = 42) -> Dict:
         db.close()
 
 
+# What each confidence tag claims as a probability of being right. Used to
+# score the tags: "sure" is a near-certain call, "guess" sits above an MCQ's
+# chance floor because a guess with elimination still beats random.
+CONFIDENCE_P = {"sure": 0.9, "unsure": 0.6, "guess": 0.3}
+
+
+def calibration_payload(user, days: int = 90) -> Dict:
+    """Confidence calibration over the last ``days`` days.
+
+    Every practice answer carries a sure/unsure/guess tag, so each attempt is a
+    probability forecast that can be scored. Reports the Brier score (mean
+    squared error of those forecasts — lower is better, 0.25 is what you would
+    get by saying 50% to everything), stated-vs-actual accuracy per bucket, and
+    the "sure but wrong" rate per subject: the misses worth re-testing first.
+    Shared by the /calibration route and the Study agent."""
+    days = max(7, min(365, days))
+    db = SessionLocal()
+    try:
+        now = _utcnow_naive()
+        since = now - timedelta(days=days)
+        att_q = db.query(StudyAttempt).filter(StudyAttempt.attempted_at >= since)
+        if user is not None:
+            att_q = att_q.filter(StudyAttempt.owner == user)
+        attempts = att_q.all()
+
+        # Only tagged attempts with an actual outcome can be scored.
+        graded = [a for a in attempts
+                  if (a.confidence or "").lower() in CONFIDENCE_P
+                  and (a.correct is not None or a.score is not None)]
+
+        def _brier(rows) -> Optional[float]:
+            if not rows:
+                return None
+            total = sum((CONFIDENCE_P[(a.confidence or "").lower()]
+                         - (1.0 if _attempt_ok(a) else 0.0)) ** 2 for a in rows)
+            return round(total / len(rows), 3)
+
+        def _rate(hit: int, n: int) -> Optional[float]:
+            return round(hit / n, 3) if n else None
+
+        buckets = []
+        for label, expected in CONFIDENCE_P.items():
+            rows = [a for a in graded if (a.confidence or "").lower() == label]
+            correct = sum(1 for a in rows if _attempt_ok(a))
+            accuracy = _rate(correct, len(rows))
+            buckets.append({
+                "confidence": label,
+                "expected": expected,
+                "attempts": len(rows),
+                "correct": correct,
+                "accuracy": accuracy,
+                # Negative = overconfident (claimed more than delivered).
+                "gap": round(accuracy - expected, 3) if accuracy is not None else None,
+            })
+
+        sure_rows = [a for a in graded if (a.confidence or "").lower() == "sure"]
+        sure_wrong_rows = [a for a in sure_rows if not _attempt_ok(a)]
+
+        by_deck_rows: Dict[str, List] = {}
+        for a in graded:
+            by_deck_rows.setdefault(a.deck_id or "", []).append(a)
+        names = {}
+        if by_deck_rows:
+            dq = db.query(StudyDeck).filter(StudyDeck.id.in_(list(by_deck_rows)))
+            names = {d.id: d.name for d in dq.all()}
+        by_deck = []
+        for did, rows in by_deck_rows.items():
+            d_sure = [a for a in rows if (a.confidence or "").lower() == "sure"]
+            d_sure_wrong = [a for a in d_sure if not _attempt_ok(a)]
+            by_deck.append({
+                "deck_id": did or None,
+                "name": names.get(did, "(subject deleted)"),
+                "attempts": len(rows),
+                "correct": sum(1 for a in rows if _attempt_ok(a)),
+                "sure": len(d_sure),
+                "sure_wrong": len(d_sure_wrong),
+                "sure_wrong_rate": _rate(len(d_sure_wrong), len(d_sure)),
+                "brier": _brier(rows),
+            })
+        # Worst calibration first — that is where the re-tests belong.
+        by_deck.sort(key=lambda r: (-(r["sure_wrong_rate"] or 0), -r["attempts"]))
+
+        return {
+            "days": days,
+            "overall": {
+                "attempts": len(attempts),
+                "graded": len(graded),
+                "correct": sum(1 for a in graded if _attempt_ok(a)),
+                "brier": _brier(graded),
+                "sure": len(sure_rows),
+                "sure_wrong": len(sure_wrong_rows),
+                "sure_wrong_rate": _rate(len(sure_wrong_rows), len(sure_rows)),
+            },
+            "buckets": buckets,
+            "by_deck": by_deck,
+        }
+    finally:
+        db.close()
+
+
 def run_dedup(user) -> Dict:
     """Remove duplicate questions across the caller's decks (same notation-
     insensitive key); keeps the best copy of each cluster. {deleted, by_deck}."""
@@ -3494,6 +3595,12 @@ def setup_study_routes():
     @router.get("/stats")
     def stats(request: Request, days: int = 42):
         return stats_payload(_owner(request), days=days)
+
+    @router.get("/calibration")
+    def calibration(request: Request, days: int = 90):
+        """Confidence calibration: Brier score, per-bucket stated vs actual
+        accuracy, and the sure-but-wrong rate per subject."""
+        return calibration_payload(_owner(request), days=days)
 
     @router.get("/history")
     def history(request: Request, limit: int = 100):

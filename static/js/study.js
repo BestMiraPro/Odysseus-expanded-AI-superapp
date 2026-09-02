@@ -2085,6 +2085,45 @@ function focusRemainingSec() {
   return Math.max(0, f.plannedMin * 60 - Math.floor((Date.now() - f.startTs) / 1000));
 }
 
+// Confidence calibration over weeks — the per-session version lives in the
+// practice summary, but the habit only becomes visible over a long window.
+// `gap` is actual minus claimed accuracy: negative means overconfident.
+function _calibrationHtml(c) {
+  if (!c || !c.overall || !c.overall.graded) {
+    return `<div class="study-section-title" style="margin-top:26px;">Calibration</div>
+      <div class="study-subtle">Tag your confidence when you answer — after a few
+      sessions this shows how often "sure" really means right.</div>`;
+  }
+  const o = c.overall;
+  const pct = (v) => v === null || v === undefined ? '—' : `${Math.round(v * 100)}%`;
+  const swr = o.sure_wrong_rate;
+  const rows = (c.buckets || []).filter(b => b.attempts).map(b => `
+    <div class="study-row">
+      <span class="grow">Said <b>${esc(b.confidence)}</b> <span class="study-subtle">(${b.attempts})</span></span>
+      <span class="study-subtle">claimed ${pct(b.expected)} · actual ${pct(b.accuracy)}</span>
+      <span style="min-width:54px;text-align:right;color:${b.gap < -0.1 ? 'var(--danger,#e5534b)' : 'inherit'};">
+        ${b.gap === null ? '' : (b.gap > 0 ? '+' : '') + Math.round(b.gap * 100) + 'pt'}</span>
+    </div>`).join('');
+  const decks = (c.by_deck || []).filter(d => d.sure).slice(0, 6).map(d => `
+    <div class="study-row">
+      <span class="grow">${esc(d.name)}</span>
+      <span class="study-subtle">${d.sure_wrong}/${d.sure} sure but wrong</span>
+      <span style="min-width:54px;text-align:right;">${pct(d.sure_wrong_rate)}</span>
+    </div>`).join('');
+  return `
+    <div class="study-section-title" style="margin-top:26px;">Calibration (last ${c.days} days)</div>
+    <div class="study-chips" style="margin-bottom:10px;">
+      <div class="study-chip"><b>${o.brier === null ? '—' : o.brier}</b><span>Brier score</span></div>
+      <div class="study-chip"><b>${pct(swr)}</b><span>sure but wrong</span></div>
+      <div class="study-chip"><b>${o.graded}</b><span>tagged answers</span></div>
+    </div>
+    <div class="study-subtle" style="margin-bottom:8px;">
+      Lower Brier is better — 0.25 is what saying "50%" to everything scores.
+    </div>
+    ${rows}
+    ${decks ? `<div class="study-section-title" style="margin-top:18px;">Sure but wrong, by subject</div>${decks}` : ''}`;
+}
+
 async function renderFocus() {
   const el = body();
   const f = S.focus;
@@ -2119,11 +2158,12 @@ async function renderFocus() {
   }
 
   el.innerHTML = '<div class="study-empty">Loading…</div>';
-  let stats = null;
+  let stats = null, calib = null;
   try {
-    [S.focusHistory, stats] = await Promise.all([
+    [S.focusHistory, stats, calib] = await Promise.all([
       jget('/api/study/focus/recent?days=14').then(r => r.sessions),
       jget('/api/study/stats?days=14'),
+      jget('/api/study/calibration?days=90').catch(() => null),
     ]);
   } catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
   if (_tab !== 'focus' || S.focus) return;
@@ -2137,6 +2177,7 @@ async function renderFocus() {
   const t = stats.totals || {};
   const okPct = (t.success_rate === null || t.success_rate === undefined)
     ? null : Math.round(t.success_rate * 100);
+  const calibHtml = _calibrationHtml(calib);
   el.innerHTML = `
     <div style="max-width:560px;">
       <div class="study-section-title">Start a focus session</div>
@@ -2161,6 +2202,7 @@ async function renderFocus() {
       <div class="study-subtle" style="margin-top:6px;">
         ${t.attempts || 0} practice answers · ${t.reviews || 0} card reviews${okPct === null ? '' : ` · ${okPct}% recalled`}
       </div>
+      ${calibHtml}
       <div class="study-section-title" style="margin-top:34px;">Recent sessions</div>
       <div>
         ${S.focusHistory.length ? S.focusHistory.slice(0, 12).map(s => `

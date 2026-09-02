@@ -158,3 +158,112 @@ def test_stats_scoped_to_owner(db):
 
     assert stats_payload("alice", days=7)["totals"]["attempts"] == 0
     assert stats_payload("bob", days=7)["totals"]["attempts"] == 1
+
+
+# ---------------------------------------------------------------- #3 calibration
+
+def _tagged_attempts(SessionLocal, owner="alice"):
+    """Four confidence-tagged attempts in subject dA:
+    sure+right, sure+right, sure+WRONG, guess+right."""
+    from core.database import StudyAttempt
+    from routes.study_routes import _utcnow_naive
+
+    now = _utcnow_naive()
+    s = SessionLocal()
+    s.add_all([
+        StudyAttempt(id="c1", owner=owner, question_id="a0", deck_id="dA",
+                     qtype="mcq", correct=True, confidence="sure", attempted_at=now),
+        StudyAttempt(id="c2", owner=owner, question_id="a1", deck_id="dA",
+                     qtype="mcq", correct=True, confidence="sure", attempted_at=now),
+        StudyAttempt(id="c3", owner=owner, question_id="a2", deck_id="dA",
+                     qtype="mcq", correct=False, confidence="sure", attempted_at=now),
+        StudyAttempt(id="c4", owner=owner, question_id="b0", deck_id="dA",
+                     qtype="open", score=90, confidence="guess", attempted_at=now),
+    ])
+    s.commit()
+    s.close()
+
+
+def test_calibration_brier_score(db):
+    """Brier = mean squared gap between stated confidence and outcome.
+    sure/right .01 + .01, sure/wrong .81, guess/right .49 -> 1.32/4."""
+    from routes.study_routes import calibration_payload
+
+    _two_subjects(db)
+    _tagged_attempts(db)
+    out = calibration_payload("alice", days=90)
+
+    assert out["overall"]["graded"] == 4
+    assert out["overall"]["brier"] == 0.33
+
+
+def test_calibration_buckets_expose_overconfidence(db):
+    """The "sure" bucket must show stated vs actual accuracy — that gap is the
+    whole point of tagging confidence."""
+    from routes.study_routes import calibration_payload
+
+    _two_subjects(db)
+    _tagged_attempts(db)
+    buckets = {b["confidence"]: b for b in calibration_payload("alice", days=90)["buckets"]}
+
+    assert buckets["sure"]["attempts"] == 3
+    assert buckets["sure"]["correct"] == 2
+    assert buckets["sure"]["accuracy"] == 0.667
+    assert buckets["sure"]["expected"] == 0.9
+    # Claimed 90%, delivered 67% -> overconfident.
+    assert buckets["sure"]["gap"] == round(0.667 - 0.9, 3)
+    assert buckets["guess"]["attempts"] == 1
+
+
+def test_calibration_sure_but_wrong_rate_per_subject(db):
+    """"Sure but wrong" is the headline number, reported per subject."""
+    from routes.study_routes import calibration_payload
+
+    _two_subjects(db)
+    _tagged_attempts(db)
+    out = calibration_payload("alice", days=90)
+
+    rows = {r["deck_id"]: r for r in out["by_deck"]}
+    assert rows["dA"]["name"] == "Micro"
+    assert rows["dA"]["sure_wrong"] == 1
+    assert rows["dA"]["sure_wrong_rate"] == 0.333
+    assert out["overall"]["sure_wrong"] == 1
+
+
+def test_calibration_ignores_untagged_attempts(db):
+    """Attempts answered without a confidence tag cannot be scored."""
+    from core.database import StudyAttempt
+    from routes.study_routes import _utcnow_naive, calibration_payload
+
+    _two_subjects(db)
+    _tagged_attempts(db)
+    s = db()
+    s.add(StudyAttempt(id="c5", owner="alice", question_id="a0", deck_id="dA",
+                       qtype="mcq", correct=False, confidence=None,
+                       attempted_at=_utcnow_naive()))
+    s.commit()
+    s.close()
+
+    out = calibration_payload("alice", days=90)
+    assert out["overall"]["attempts"] == 5
+    assert out["overall"]["graded"] == 4
+    assert out["overall"]["brier"] == 0.33
+
+
+def test_calibration_empty_is_reported_not_crashed(db):
+    from routes.study_routes import calibration_payload
+
+    _two_subjects(db)
+    out = calibration_payload("alice", days=90)
+    assert out["overall"]["graded"] == 0
+    assert out["overall"]["brier"] is None
+    assert out["by_deck"] == []
+
+
+def test_calibration_scoped_to_owner(db):
+    from routes.study_routes import calibration_payload
+
+    _two_subjects(db)
+    _tagged_attempts(db, owner="bob")
+    assert calibration_payload("alice", days=90)["overall"]["graded"] == 0
+    assert calibration_payload("bob", days=90)["overall"]["graded"] == 4

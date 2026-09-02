@@ -747,6 +747,14 @@ async def _study_stats(owner, args):
             "subjects": ov.get("decks"), "recent": entries}
 
 
+@tool("study_calibration",
+      "Confidence calibration over a window (default 90 days): Brier score, stated vs actual accuracy per sure/unsure/guess bucket, and the sure-but-wrong rate per subject.",
+      {"days": _i("Window in days (7-365, default 90)")})
+async def _study_calibration(owner, args):
+    days = int(args.get("days") or 90)
+    return await asyncio.to_thread(_sr().calibration_payload, owner, days)
+
+
 # ------------------------------------------------------------------ AI pipelines
 
 @tool("extract_questions", "Run the AI question pipeline on a material: mode 'extract' pulls the real questions out of a practice/exam material (vision by default for PDFs); mode 'author' writes new questions from a theory material. Slow (minutes).",
