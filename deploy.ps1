@@ -18,12 +18,17 @@
 .PARAMETER DataRepo     Repo dir whose ./data holds your real DB. Auto-detected
                         as git's PRIMARY worktree if omitted.
 .PARAMETER BuildTree    Dedicated build worktree (detached HEAD on origin/<Branch>).
+.PARAMETER CodeTools    Bind-mount your checkout at /app/code and point the Study
+                        agent's code tools at it (docker-compose.code.yml), so
+                        its edits land in a real file instead of the image's
+                        baked copy. Python edits still need this restart.
 .PARAMETER DryRun       Print the resolved compose config and stop.
 
 .EXAMPLE
   pwsh ./deploy.ps1                 # build & deploy origin/dev onto your data
   pwsh ./deploy.ps1 -Branch main    # deploy a different branch
   pwsh ./deploy.ps1 -DryRun         # show resolved paths only, change nothing
+  pwsh ./deploy.ps1 -CodeTools      # deploy with the Study agent's code tools on your checkout
 #>
 [CmdletBinding()]
 param(
@@ -32,6 +37,7 @@ param(
   [string]$BuildTree = (Join-Path $env:USERPROFILE '.odysseus-deploy'),
   [string]$Project   = 'odysseus',
   [string]$Service   = 'odysseus',
+  [switch]$CodeTools,
   [switch]$DryRun
 )
 
@@ -67,13 +73,22 @@ if (-not (Test-Path (Join-Path $DataRepo 'data'))) {
   throw "No 'data' folder under $DataRepo - pass -DataRepo with your live deployment dir."
 }
 $composeFile = Join-Path $BuildTree 'docker-compose.yml'
+# The overlay only adds a volume + env var, so it applies to the runtime
+# invocations (project directory = your real repo), not to the image build.
+$runFiles = @('-f', $composeFile)
+if ($CodeTools) {
+  $codeOverlay = Join-Path $BuildTree 'docker-compose.code.yml'
+  if (-not (Test-Path $codeOverlay)) { throw "Missing $codeOverlay - is the branch too old?" }
+  $runFiles += @('-f', $codeOverlay)
+}
 Step "Branch     : $Branch @ $(git -C $BuildTree rev-parse --short HEAD)"
 Step "Data/DB    : $DataRepo"
 Step "Build src  : $BuildTree"
+if ($CodeTools) { Step "Code tools : ON - agent edits $DataRepo via /app/code" }
 
 if ($DryRun) {
   Step "Resolved compose config (project-directory = $DataRepo):"
-  Run docker @('compose', '-p', $Project, '--project-directory', $DataRepo, '-f', $composeFile, 'config')
+  Run docker (@('compose', '-p', $Project, '--project-directory', $DataRepo) + $runFiles + @('config'))
   Write-Host "Dry run only - nothing built or recreated." -ForegroundColor Yellow
   return
 }
@@ -84,8 +99,8 @@ Run docker @('compose', '-p', $Project, '-f', $composeFile, 'build', $Service)
 
 # --- 4. Recreate the container on your real data --------------------------------
 Step "Recreating '$Service' on your data ..."
-Run docker @('compose', '-p', $Project, '--project-directory', $DataRepo,
-             '-f', $composeFile, 'up', '-d', '--no-build', $Service)
+Run docker (@('compose', '-p', $Project, '--project-directory', $DataRepo) +
+            $runFiles + @('up', '-d', '--no-build', $Service))
 
 # --- 5. Verify ------------------------------------------------------------------
 Step "Waiting for health ..."

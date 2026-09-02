@@ -856,10 +856,19 @@ Conventions: owner-scoped queries (`if user is not None: filter(owner == user)`)
 
 def _how_changes_apply() -> str:
     if running_in_docker():
+        if os.environ.get("ODYSSEUS_CODE_DIR"):
+            # Started with the docker-compose.code.yml overlay: the code root is
+            # a bind-mounted checkout, so edits are real files on the host.
+            return ("Running in Docker with the repo bind-mounted: edits land in the user's real checkout, "
+                    "so they survive an image rebuild and can be reviewed and committed. JS/CSS edits are "
+                    "served immediately (hard-refresh the browser); Python edits need a server restart. "
+                    "deploy.ps1 builds from origin/<branch>, so tell the user to commit and push before "
+                    "redeploying, or the next build will not contain the change.")
         return ("Running in Docker: the code root is the container's copy of the app. JS/CSS edits are "
                 "served immediately (hard-refresh the browser); Python edits need a server restart; ALL edits "
-                "are lost when the image is rebuilt unless the repo is bind-mounted (see docker-compose.yml "
-                "ODYSSEUS_CODE_DIR note). Tell the user this whenever you change code.")
+                "are lost when the image is rebuilt, because nothing is bind-mounted. Tell the user this "
+                "whenever you change code — to keep edits, redeploy with `pwsh ./deploy.ps1 -CodeTools` "
+                "(docker-compose.code.yml).")
     return ("Running natively: the code root is the live checkout. JS/CSS edits apply on browser refresh; "
             "Python edits need the server restarted (uvicorn without --reload). Tell the user.")
 

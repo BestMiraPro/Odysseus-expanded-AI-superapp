@@ -1,0 +1,23 @@
+# Study agent code tools — opt-in overlay.
+#
+# Without this, the Study agent's code tools edit the copy of the repo baked
+# into the image: the edits are live for JS/CSS until the next rebuild, and then
+# they are gone. This overlay bind-mounts a real checkout at /app/code and
+# points the tools there instead, so what the agent writes is a file you can
+# review, test and commit.
+#
+#   pwsh ./deploy.ps1 -CodeTools
+#   # or, driving compose directly:
+#   docker compose -f docker-compose.yml -f docker-compose.code.yml up -d odysseus
+#
+# The mount is relative to the compose *project directory*, which deploy.ps1
+# points at your canonical repo (the one holding ./data) — not at the throwaway
+# build worktree. Python changes still need a container restart to take effect;
+# deploy.ps1 builds from origin/<branch>, so commit and push before redeploying
+# or the next build will not contain them.
+services:
+  odysseus:
+    volumes:
+      - .:/app/code:z
+    environment:
+      - ODYSSEUS_CODE_DIR=/app/code

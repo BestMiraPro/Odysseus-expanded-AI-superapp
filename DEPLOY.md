@@ -41,6 +41,32 @@ directory**. The script:
 The build worktree uses a **detached HEAD**, so it never clashes with the same
 branch being checked out in your working tree.
 
+## Study agent code tools (`-CodeTools`)
+
+The Study agent's code tools (admin, and only with *Allow code changes* ticked)
+are confined to `ODYSSEUS_CODE_DIR`, which defaults to the app directory inside
+the container — the copy baked into the image. Edits there are live for JS/CSS
+until the next build and then **gone**, and there is no file on your disk to
+review or commit.
+
+`docker-compose.code.yml` is the opt-in overlay that fixes that: it mounts your
+checkout at `/app/code` and points the tools at it.
+
+```powershell
+pwsh ./deploy.ps1 -CodeTools
+```
+
+The mount is relative to the compose project directory, which is your canonical
+repo (the one holding `./data`) — not the throwaway build worktree — so the
+agent edits the same files you do.
+
+Two caveats worth knowing before you use it:
+
+- **Python edits need a restart.** JS/CSS are served per request; route and
+  service changes are only picked up when the container restarts.
+- **`deploy.ps1` builds from `origin/<Branch>`.** Commit and push what the agent
+  wrote before redeploying, or the next build will not contain it.
+
 ## Notes
 
 - First build is a full image build (minutes); later builds reuse layer cache.
