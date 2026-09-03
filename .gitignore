@@ -12,7 +12,7 @@ venv/
 
 # Environment
 .env
-.env.bak.*
+.env.bak*
 
 # Secrets that must never be committed (e.g. downloaded OAuth client JSON)
 client_secret_*.json
