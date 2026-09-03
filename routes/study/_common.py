@@ -1563,11 +1563,37 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
     return collected, raw_count, len(batches), errors, coverage, page_info
 
 
+# Below this the material's notes are a stub or an error line, not a summary,
+# and the raw text is the better card source.
+CARD_NOTES_MIN_CHARS = 400
+
+
+def card_source_text(user, material_id: str) -> Dict:
+    """Pick the best source text for card generation.
+
+    Prefers the material's AI study notes when they are substantial: they are
+    denser and already structured, so cards come out cleaner than from raw
+    prose or OCR. Falls back to the material text.
+    Returns {text, source: "notes"|"material", material_id, name}."""
+    db = SessionLocal()
+    try:
+        m = study_service.get_material(db, material_id, user)
+        notes = (m.summary or "").strip()
+        if len(notes) >= CARD_NOTES_MIN_CHARS:
+            return {"text": notes, "source": "notes",
+                    "material_id": m.id, "name": m.name}
+        return {"text": (m.content or "").strip(), "source": "material",
+                "material_id": m.id, "name": m.name}
+    finally:
+        db.close()
+
+
 CARD_AUTHOR_SYSTEM = """You write flashcards for spaced repetition, following the minimum-information principle.
 
 Rules:
 - Each card tests exactly ONE atomic fact, distinction, or step. Split compound ideas into several cards.
-- "front" is a specific retrieval cue phrased as a question (or a cloze-style prompt) — never a topic heading.
+- Default to atomic cloze deletions: "front" is the full sentence with the one tested term replaced by _____, "back" is just the missing term. Cloze keeps the retrieval cue in context and forces one fact per card.
+- Use a direct question on the "front" instead only where a cloze would be clumsy — why/how/compare/apply cards, or when the sentence would give the answer away. Never a bare topic heading.
 - "back" is the shortest complete answer. No filler, no restating the question.
 - Prefer why/how/compare/apply cards over pure definitions when the material allows it; understanding beats recognition.
 - For formulas: one card for the formula, separate cards for what each symbol means and when to use it.

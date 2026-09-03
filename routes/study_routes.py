@@ -25,6 +25,7 @@ from routes.study._common import (  # noqa: F401  (explicit for underscore names
     _optimize_status,
     _read_pref,
     _resolve_uploaded_file,
+    card_source_text,
     _same_or_later_study_part,
     _same_study_question,
     fsrs,
@@ -48,6 +49,12 @@ from routes.study.materials import (  # noqa: F401
 from routes.study.insights import (  # noqa: F401
     history_entries,
     overview_payload,
+)
+from routes.study.maintenance import (  # noqa: F401
+    run_audit_questions,
+    run_backfill_context,
+    run_dedup,
+    run_reformat,
 )
 
 _common = sys.modules["routes.study._common"]

@@ -15,15 +15,10 @@ def register(router: APIRouter) -> None:
             raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         text = (body.text or "").strip()
+        source = "text"
         if body.material_id:
-            db = _common.SessionLocal()
-            try:
-                m = db.query(StudyMaterial).filter(StudyMaterial.id == body.material_id).first()
-                if not m or (user is not None and m.owner != user):
-                    raise HTTPException(404, "Material not found")
-                text = (m.content or "").strip()
-            finally:
-                db.close()
+            picked = _common.card_source_text(user, body.material_id)
+            text, source = picked["text"], picked["source"]
         if len(text) < 30:
             raise HTTPException(400, "Provide more source material (at least a paragraph).")
         count = max(1, min(40, body.count))
@@ -44,4 +39,4 @@ def register(router: APIRouter) -> None:
                               "back": str(item["back"]).strip()})
         if not cards:
             raise HTTPException(502, "No usable cards in model reply. Try again.")
-        return {"cards": cards}
+        return {"cards": cards, "source": source}
