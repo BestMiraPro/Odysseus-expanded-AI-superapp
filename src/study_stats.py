@@ -14,6 +14,23 @@ from sqlalchemy.orm import Session
 from core.database import StudyAttempt, StudyCard, StudyFocusSession, StudyQuestion, StudyReview
 
 
+def confidence_value(raw) -> Optional[int]:
+    """Confidence as an int 0-100, or None when absent/unusable.
+
+    Databases created before the numeric migration declared this column as
+    String, so the physical SQLite column keeps TEXT affinity and hands back
+    '85' rather than 85 no matter what the model says today. Arithmetic on that
+    raises TypeError, which is what made /stats and /calibration 500 on a real
+    DB while passing every test (fresh test DBs get INTEGER affinity and SQLite
+    quietly converts). Coerce on read rather than trusting the column."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return None
+
+
 def attempt_ok(a) -> bool:
     """Did a practice attempt count as a successful retrieval?
 
@@ -69,7 +86,7 @@ def get_calibration(
     rows = q.all()
     buckets: Dict[int, Dict[str, Any]] = {}
     for r in rows:
-        conf = r.confidence or 0
+        conf = confidence_value(r.confidence) or 0
         bucket = min(conf // 20, 4)
         if bucket not in buckets:
             buckets[bucket] = {
@@ -116,7 +133,7 @@ def get_calibration_curve(
     rows = q.all()
     raw: Dict[int, Dict[str, Any]] = {}
     for r in rows:
-        conf = r.confidence or 0
+        conf = confidence_value(r.confidence) or 0
         # clamp to valid range, cap at max bin=9 (90-99) except 100 goes to bin 9
         conf = max(0, min(100, conf))
         bucket = min(conf // 10, 9)  # 0..9

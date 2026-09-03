@@ -103,6 +103,7 @@ _get_question = study_service.get_question
 from src.study_source import build_original_question_link, infer_source_page
 from src.study_plan import generate_plan, compute_mastery_scores, migrate_done_blocks, _semantic_interleave  # noqa: F401
 from src.study_stats import (
+    confidence_value,
     get_stats as _get_stats,
     get_calibration_curve,
     get_weak_question_signals,

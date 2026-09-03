@@ -240,10 +240,9 @@ def calibration_payload(user, days: int = 90) -> Dict:
         attempts = aq.all()
 
         def _conf(a):
-            """Numeric confidence as a probability, or None when untagged."""
-            try:
-                c = float(a.confidence)
-            except (TypeError, ValueError):
+            """Stated confidence as a probability, or None when untagged."""
+            c = confidence_value(a.confidence)
+            if c is None:
                 return None
             return min(1.0, max(0.0, c / 100.0))
 

@@ -527,3 +527,59 @@ def test_agent_service_surface_resolves_through_the_shim():
     missing = sorted(n for n in used if not hasattr(sr, n))
 
     assert not missing, f"study_agent.py calls routes.study_routes.{missing} which do not exist"
+
+
+# ------------------------------------------- legacy TEXT confidence (live-DB bug)
+
+class _TextConfRow:
+    """An attempt row as a pre-migration SQLite DB actually returns it.
+
+    The confidence column was declared String before the numeric migration, so
+    the physical column keeps TEXT affinity and SQLite hands back '85', not 85 —
+    even though the model now says Integer. Any arithmetic on it explodes."""
+
+    def __init__(self, conf, correct=True):
+        self.confidence = conf
+        self.correct = correct
+        self.score = None
+
+
+def test_confidence_value_coerces_text_and_rejects_junk():
+    from src.study_stats import confidence_value
+
+    assert confidence_value("85") == 85
+    assert confidence_value(85) == 85
+    assert confidence_value("49") == 49
+    assert confidence_value(None) is None
+    assert confidence_value("") is None
+    assert confidence_value("sure") is None
+
+
+def test_calibration_buckets_survive_text_confidence(db, monkeypatch):
+    """Both Focus and Stats 500'd on a live DB because these two helpers did
+    `conf // 20` on a string."""
+    from src import study_stats
+
+    rows = [_TextConfRow("85"), _TextConfRow("25", correct=False),
+            _TextConfRow("49"), _TextConfRow(None)]
+
+    class _Q:
+        def filter(self, *a, **k):
+            return self
+
+        def all(self):
+            return rows
+
+    class _DB:
+        def query(self, *a, **k):
+            return _Q()
+
+    from routes.study_routes import _utcnow_naive
+    since = _utcnow_naive() - timedelta(days=30)
+
+    buckets = study_stats.get_calibration(_DB(), "alice", since)
+    curve = study_stats.get_calibration_curve(_DB(), "alice", since, min_bin_n=1)
+
+    assert buckets, "text confidence must still bucket"
+    assert curve, "text confidence must still build a curve"
+    assert all(isinstance(b["bucket"], int) for b in buckets)
