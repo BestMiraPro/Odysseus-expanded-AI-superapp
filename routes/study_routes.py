@@ -45,6 +45,10 @@ from routes.study.materials import (  # noqa: F401
     run_extraction,
     run_transcribe_material,
 )
+from routes.study.insights import (  # noqa: F401
+    history_entries,
+    overview_payload,
+)
 
 _common = sys.modules["routes.study._common"]
 

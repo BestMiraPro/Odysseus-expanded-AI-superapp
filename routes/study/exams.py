@@ -38,6 +38,7 @@ def register(router: APIRouter) -> None:
                 hours_per_week=str(body.hours_per_week),
                 rest_days=json.dumps(body.rest_days) if body.rest_days else None,
                 topics=json.dumps(body.topics or []),
+                deck_id=_vet_exam_deck(db, body.deck_id, user),
             )
             db.add(exam)
             db.commit()
@@ -67,6 +68,8 @@ def register(router: APIRouter) -> None:
                 exam.rest_days = json.dumps(body.rest_days)
             if body.topics is not None:
                 exam.topics = json.dumps(body.topics)
+            if body.deck_id is not None:
+                exam.deck_id = _vet_exam_deck(db, body.deck_id, user)
             if body.archived is not None:
                 exam.archived = body.archived
             db.commit()

@@ -187,6 +187,7 @@ class ExamCreate(BaseModel):
     hours_per_week: float = 7.0
     rest_days: Optional[List[int]] = None
     topics: List[Dict[str, Any]] = []
+    deck_id: Optional[str] = None   # subject to practise from
 
 
 class ExamUpdate(BaseModel):
@@ -197,6 +198,7 @@ class ExamUpdate(BaseModel):
     rest_days: Optional[List[int]] = None
     topics: Optional[List[Dict[str, Any]]] = None
     archived: Optional[bool] = None
+    deck_id: Optional[str] = None
 
 
 class ToggleBlockIn(BaseModel):
@@ -328,6 +330,14 @@ def _card_to_dict(card: StudyCard, with_preview: bool = False) -> Dict:
     return out
 
 
+def _vet_exam_deck(db, deck_id, user):
+    """Validate an exam's linked subject; "" / None clears the link."""
+    deck_id = (deck_id or "").strip()
+    if not deck_id:
+        return None
+    return study_service.get_deck(db, deck_id, user).id
+
+
 def _exam_to_dict(exam: StudyExam) -> Dict:
     return {
         "id": exam.id,
@@ -339,6 +349,7 @@ def _exam_to_dict(exam: StudyExam) -> Dict:
         "topics": json.loads(exam.topics) if exam.topics else [],
         "plan": json.loads(exam.plan) if exam.plan else None,
         "done_blocks": json.loads(exam.done_blocks) if exam.done_blocks else [],
+        "deck_id": exam.deck_id,
         "archived": bool(exam.archived),
     }
 

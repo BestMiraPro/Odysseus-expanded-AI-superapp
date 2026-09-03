@@ -755,6 +755,9 @@ def _migrate_add_study_summary_columns():
         mat_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_materials)")]
         if mat_cols and "page_count" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN page_count INTEGER")
+        exam_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_exams)")]
+        if exam_cols and "deck_id" not in exam_cols:
+            conn.execute("ALTER TABLE study_exams ADD COLUMN deck_id TEXT")
         if "category" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
             # Backfill existing rows from the filename classifier (single source
@@ -1810,6 +1813,7 @@ class StudyExam(TimestampMixin, Base):
     topics         = Column(Text, nullable=True)      # JSON [{name, importance, mastery}]
     plan           = Column(Text, nullable=True)      # JSON output of generate_plan()
     done_blocks    = Column(Text, nullable=True)      # JSON list of "date:idx" checked off
+    deck_id        = Column(String, nullable=True, index=True)  # linked subject, so plan blocks can launch practice
     archived       = Column(Boolean, default=False)
     deck_id        = Column(String, nullable=True, index=True)  # linked subject (plan blocks -> practice)
 
