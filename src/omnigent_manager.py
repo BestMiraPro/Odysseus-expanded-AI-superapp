@@ -28,6 +28,360 @@ INSTALL_GUIDANCE = {
 }
 
 _PICKER_PATCH_MARKER = "ODYSSEUS_GENERATED_CREW_PICKER_PATCH"
+_CODEX_TOP_LEVEL_DEFAULTS_PATCH_MARKER = "ODYSSEUS_CODEX_TOP_LEVEL_DEFAULTS_PATCH"
+_CODEX_REASONING_ARGV_PATCH_MARKER = "ODYSSEUS_CODEX_REASONING_ARGV_PATCH"
+_CODEX_MCP_ROTATION_PATCH_MARKER = "ODYSSEUS_CODEX_MCP_ROTATION_PATCH"
+_CODEX_ROTATION_FORCE_SETTLE_PATCH_MARKER = "ODYSSEUS_CODEX_ROTATION_FORCE_SETTLE_PATCH"
+_CODEX_STARTUP_THREAD_GUARD_PATCH_MARKER = "ODYSSEUS_CODEX_STARTUP_THREAD_GUARD_PATCH"
+_CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH_MARKER = (
+    "ODYSSEUS_CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH"
+)
+_CODEX_IDLE_RELEASE_PATCH_MARKER = "ODYSSEUS_CODEX_IDLE_RELEASE_PATCH"
+
+
+def _patch_codex_session_route_source(source: str) -> tuple[str, bool]:
+    """Propagate bundled Codex coordinator defaults into native sessions.
+
+    Omnigent 0.10.0 only derives native launch flags for named sub-agents.
+    Top-level custom ``codex-native`` bundles therefore lose both their
+    ``llm.reasoning_effort`` and explicit ``executor.config.yolo`` values.
+    """
+    legacy_launch_defaults = (
+        "            raw_top_level_yolo = (\n"
+        "                top_level_spec.executor.config.get(\"yolo\")\n"
+        "                if top_level_spec is not None\n"
+        "                and top_level_spec.executor is not None\n"
+        "                and _spec_harness(top_level_spec) == \"codex-native\"\n"
+        "                else None\n"
+        "            )\n"
+        "            top_level_yolo = body.terminal_launch_args is None and (\n"
+        "                raw_top_level_yolo is True\n"
+        "                or (\n"
+        "                    isinstance(raw_top_level_yolo, str)\n"
+        "                    and raw_top_level_yolo.lower() == \"true\"\n"
+        "                )\n"
+        "            )\n"
+        "            validated_launch_args = _validate_terminal_launch_args(\n"
+        "                [\"--dangerously-bypass-approvals-and-sandbox\"]\n"
+        "                if top_level_yolo\n"
+        "                else body.terminal_launch_args\n"
+        "            )\n"
+    )
+    enhanced_launch_defaults = (
+        "            top_level_codex = (\n"
+        "                top_level_spec is not None\n"
+        "                and top_level_spec.executor is not None\n"
+        "                and _spec_harness(top_level_spec) == \"codex-native\"\n"
+        "            )\n"
+        "            raw_top_level_yolo = (\n"
+        "                top_level_spec.executor.config.get(\"yolo\")\n"
+        "                if top_level_codex\n"
+        "                else None\n"
+        "            )\n"
+        "            top_level_yolo = body.terminal_launch_args is None and (\n"
+        "                raw_top_level_yolo is True\n"
+        "                or (\n"
+        "                    isinstance(raw_top_level_yolo, str)\n"
+        "                    and raw_top_level_yolo.lower() == \"true\"\n"
+        "                )\n"
+        "            )\n"
+        "            top_level_launch_args = []\n"
+        "            if top_level_yolo:\n"
+        "                top_level_launch_args.append(\n"
+        "                    \"--dangerously-bypass-approvals-and-sandbox\"\n"
+        "                )\n"
+        f"            # {_CODEX_REASONING_ARGV_PATCH_MARKER}: the remote TUI\n"
+        "            # owns the live thread settings, so persist the validated effort\n"
+        "            # there as well as on the Omnigent conversation row.\n"
+        "            if (\n"
+        "                body.terminal_launch_args is None\n"
+        "                and top_level_codex\n"
+        "                and reasoning_effort is not None\n"
+        "            ):\n"
+        "                top_level_launch_args.extend([\"-c\", f'model_reasoning_effort=\"{reasoning_effort}\"'])\n"
+        "            validated_launch_args = _validate_terminal_launch_args(\n"
+        "                top_level_launch_args\n"
+        "                if body.terminal_launch_args is None and top_level_launch_args\n"
+        "                else body.terminal_launch_args\n"
+        "            )\n"
+    )
+
+    if _CODEX_TOP_LEVEL_DEFAULTS_PATCH_MARKER in source:
+        upgraded = source.replace(
+            "_spec_harness(top_level_spec) == _CODEX_NATIVE_HARNESS",
+            '_spec_harness(top_level_spec) == "codex-native"',
+        )
+        if _CODEX_REASONING_ARGV_PATCH_MARKER not in upgraded:
+            legacy_variants = (
+                legacy_launch_defaults,
+                legacy_launch_defaults.replace(
+                    "                and top_level_spec.executor is not None\n",
+                    "",
+                    1,
+                ),
+            )
+            for legacy in legacy_variants:
+                candidate = upgraded.replace(legacy, enhanced_launch_defaults, 1)
+                if candidate != upgraded:
+                    upgraded = candidate
+                    break
+        return upgraded, upgraded != source
+
+    effort_needle = "        reasoning_effort=body.reasoning_effort,\n"
+    metadata_needle = "    model_override, reasoning_effort = validate_session_model_metadata(\n"
+    launch_needle = (
+        "    else:\n"
+        "        try:\n"
+        "            validated_launch_args = _validate_terminal_launch_args(body.terminal_launch_args)\n"
+    )
+    if (
+        metadata_needle not in source
+        or effort_needle not in source
+        or launch_needle not in source
+    ):
+        return source, False
+
+    spec_loader = (
+        f"    # {_CODEX_TOP_LEVEL_DEFAULTS_PATCH_MARKER}: inherit trusted bundle defaults.\n"
+        "    top_level_spec = None\n"
+        "    if body.sub_agent_name is None and agent_cache is not None:\n"
+        "        try:\n"
+        "            top_level_spec = agent_cache.load(\n"
+        "                agent.id, agent.bundle_location, expand_env=agent.session_id is None\n"
+        "            ).spec\n"
+        "        except (KeyError, AttributeError, ValueError, ImportError, OSError):\n"
+        "            _logger.debug(\n"
+        "                \"top-level Codex defaults: agent %r failed to load\",\n"
+        "                agent.name,\n"
+        "                exc_info=True,\n"
+        "            )\n"
+        "\n"
+    )
+    effort_replacement = (
+        "        reasoning_effort=(\n"
+        "            body.reasoning_effort\n"
+        "            if body.reasoning_effort is not None\n"
+        "            else (\n"
+        "                top_level_spec.llm.extra.get(\"reasoning_effort\")\n"
+        "                if top_level_spec is not None and top_level_spec.llm is not None\n"
+        "                else None\n"
+        "            )\n"
+        "        ),\n"
+    )
+    launch_replacement = "    else:\n        try:\n" + enhanced_launch_defaults
+
+    patched = source.replace(
+        metadata_needle,
+        spec_loader + metadata_needle,
+        1,
+    )
+    patched = patched.replace(effort_needle, effort_replacement, 1)
+    patched = patched.replace(launch_needle, launch_replacement, 1)
+    return patched, patched != source
+
+
+def _patch_codex_forwarder_source(source: str) -> tuple[str, bool]:
+    """Clear a synthesized MCP-startup band on its original conversation.
+
+    Codex can start a replacement native thread before MCP startup settles.
+    Omnigent mutates the target session first, so the eventual clear event is
+    posted to the replacement while the original browser remains on
+    ``Starting MCP servers`` indefinitely.
+    """
+    patched = source
+    changed = False
+
+    state_call_needle = (
+        "                        app_server_url=app_server_url,\n"
+        "                        event=event,\n"
+    )
+    state_signature_needle = (
+        "    app_server_url: str,\n"
+        "    event: CodexMessage,\n"
+    )
+    if (
+        _CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH_MARKER not in patched
+        and state_call_needle in patched
+        and state_signature_needle in patched
+    ):
+        patched = patched.replace(
+            state_call_needle,
+            (
+                "                        app_server_url=app_server_url,\n"
+                "                        forwarder_state=forwarder_state,\n"
+                "                        event=event,\n"
+            ),
+            1,
+        )
+        patched = patched.replace(
+            state_signature_needle,
+            (
+                "    app_server_url: str,\n"
+                "    forwarder_state: _CodexForwarderState,\n"
+                "    event: CodexMessage,\n"
+            ),
+            1,
+        )
+        changed = True
+
+    guard_needle = (
+        "    new_thread_id = _thread_id_from_started_event(event)\n"
+        "    if new_thread_id is None or new_thread_id == target.thread_id:\n"
+        "        return False\n"
+    )
+    if (
+        _CODEX_STARTUP_THREAD_GUARD_PATCH_MARKER not in patched
+        and guard_needle in patched
+    ):
+        state_guard = ""
+        guard_condition = "    if pending_mcp_servers(read_mcp_startup(bridge_dir)):\n"
+        if "    forwarder_state: _CodexForwarderState,\n" in patched:
+            state_guard = (
+                f"    # {_CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH_MARKER}: ignore\n"
+                "    # startup scratch threads until the producing thread emits output.\n"
+            )
+            guard_condition = (
+                "    if (\n"
+                "        not forwarder_state.mcp_startup_settled\n"
+                "        or pending_mcp_servers(read_mcp_startup(bridge_dir))\n"
+                "    ):\n"
+            )
+        guard_replacement = guard_needle + "".join(
+            (
+                f"    # {_CODEX_STARTUP_THREAD_GUARD_PATCH_MARKER}: the remote TUI may\n",
+                "    # announce an unused scratch thread while the web-started first turn\n",
+                "    # is still waiting for MCP. Keep ownership on the producing thread.\n",
+                state_guard,
+                guard_condition,
+                "        _logger.info(\n",
+                "            \"Codex forwarder ignored scratch thread during MCP startup: \"\n",
+                "            \"current=%s candidate=%s\",\n",
+                "            target.thread_id,\n",
+                "            new_thread_id,\n",
+                "        )\n",
+                "        return False\n",
+            )
+        )
+        patched = patched.replace(guard_needle, guard_replacement, 1)
+        changed = True
+
+    old_guard_condition = "    if pending_mcp_servers(read_mcp_startup(bridge_dir)):\n"
+    if (
+        _CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH_MARKER not in patched
+        and "    forwarder_state: _CodexForwarderState,\n" in patched
+        and old_guard_condition in patched
+    ):
+        patched = patched.replace(
+            old_guard_condition,
+            (
+                f"    # {_CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH_MARKER}: ignore\n"
+                "    # startup scratch threads until the producing thread emits output.\n"
+                "    if (\n"
+                "        not forwarder_state.mcp_startup_settled\n"
+                "        or pending_mcp_servers(read_mcp_startup(bridge_dir))\n"
+                "    ):\n"
+            ),
+            1,
+        )
+        changed = True
+
+    settle_tail = (
+        "                            await _settle_mcp_startup(\n"
+        "                                ap_client,\n"
+        "                                session_id=pre_rotation_session_id,\n"
+        "                                bridge_dir=bridge_dir,\n"
+        "                                reason=\"thread rotated\",\n"
+        "                            )\n"
+    )
+    forced_settle_tail = settle_tail + (
+        f"                            # {_CODEX_ROTATION_FORCE_SETTLE_PATCH_MARKER}:\n"
+        "                            # bridge state may already be settled even though the\n"
+        "                            # original browser still owns a pending startup band.\n"
+        "                            await _post_mcp_startup(\n"
+        "                                ap_client,\n"
+        "                                session_id=pre_rotation_session_id,\n"
+        "                                servers=read_mcp_startup(bridge_dir),\n"
+        "                            )\n"
+    )
+    if (
+        _CODEX_ROTATION_FORCE_SETTLE_PATCH_MARKER not in patched
+        and settle_tail in patched
+    ):
+        patched = patched.replace(settle_tail, forced_settle_tail, 1)
+        changed = True
+
+    idle_settle_needle = (
+        "        await _settle_mcp_startup(\n"
+        "            client, session_id=session_id, bridge_dir=bridge_dir, reason=\"thread went idle\"\n"
+        "        )\n"
+    )
+    if (
+        _CODEX_IDLE_RELEASE_PATCH_MARKER not in patched
+        and idle_settle_needle in patched
+    ):
+        patched = patched.replace(
+            idle_settle_needle,
+            idle_settle_needle
+            + (
+                f"        # {_CODEX_IDLE_RELEASE_PATCH_MARKER}: an idle/cancelled first\n"
+                "        # turn also ends startup ownership even without model output.\n"
+                "        if forwarder_state is not None:\n"
+                "            forwarder_state.mcp_startup_settled = True\n"
+            ),
+            1,
+        )
+        changed = True
+
+    if _CODEX_MCP_ROTATION_PATCH_MARKER in patched:
+        return patched, changed
+
+    rotate_needle = (
+        "                    rotated = await _maybe_rotate_session_on_thread_started(\n"
+    )
+    rotated_branch = (
+        "                    if rotated:\n"
+        "                        forwarder_state.note_parent_rotation(target.session_id)\n"
+    )
+    if rotate_needle not in patched or rotated_branch not in patched:
+        return patched, changed
+
+    patched = patched.replace(
+        rotate_needle,
+        (
+            f"                    # {_CODEX_MCP_ROTATION_PATCH_MARKER}: remember the band owner.\n"
+            "                    pre_rotation_session_id = target.session_id\n"
+            + rotate_needle
+        ),
+        1,
+    )
+    patched = patched.replace(
+        rotated_branch,
+        (
+            "                    if rotated:\n"
+            "                        if mcp_settle_timer is not None:\n"
+            "                            mcp_settle_timer.cancel()\n"
+            "                            with contextlib.suppress(asyncio.CancelledError):\n"
+            "                                await mcp_settle_timer\n"
+            "                            mcp_settle_timer = None\n"
+            "                        try:\n"
+            "                            await _settle_mcp_startup(\n"
+            "                                ap_client,\n"
+            "                                session_id=pre_rotation_session_id,\n"
+            "                                bridge_dir=bridge_dir,\n"
+            "                                reason=\"thread rotated\",\n"
+            "                            )\n"
+            "                        except Exception:\n"
+            "                            _logger.warning(\n"
+            "                                \"Codex MCP startup settlement failed during thread rotation\",\n"
+            "                                exc_info=True,\n"
+            "                            )\n"
+            "                        forwarder_state.note_parent_rotation(target.session_id)\n"
+        ),
+        1,
+    )
+    if _CODEX_ROTATION_FORCE_SETTLE_PATCH_MARKER not in patched:
+        patched = patched.replace(settle_tail, forced_settle_tail, 1)
+    return patched, patched != source
 
 
 def _patch_builtin_agent_route_source(source: str) -> tuple[str, bool]:
@@ -77,7 +431,7 @@ def _patch_builtin_agent_route_source(source: str) -> tuple[str, bool]:
     return patched, patched != source
 
 
-def _builtin_agent_route_candidates(command: str) -> list[Path]:
+def _omnigent_source_candidates(command: str, relative_path: Path) -> list[Path]:
     candidates: list[Path] = []
     try:
         resolved = Path(command).resolve()
@@ -89,7 +443,7 @@ def _builtin_agent_route_candidates(command: str) -> list[Path]:
         resolved.parent.parent / "tools" / "omnigent" / "lib",
         resolved.parent.parent.parent / "tools" / "omnigent" / "lib",
     ]
-    rel = Path("site-packages") / "omnigent" / "server" / "routes" / "builtin_agents.py"
+    rel = Path("site-packages") / "omnigent" / relative_path
     seen: set[Path] = set()
     for root in lib_roots:
         try:
@@ -105,6 +459,13 @@ def _builtin_agent_route_candidates(command: str) -> list[Path]:
                 seen.add(key)
                 candidates.append(match)
     return candidates
+
+
+def _builtin_agent_route_candidates(command: str) -> list[Path]:
+    return _omnigent_source_candidates(
+        command,
+        Path("server") / "routes" / "builtin_agents.py",
+    )
 
 
 @dataclass(slots=True)
@@ -147,6 +508,28 @@ class OmnigentManager:
                     path.write_text(patched)
             except Exception:
                 continue
+
+    def _patch_codex_native_runtime(self, command: str) -> None:
+        patches = (
+            (
+                Path("server") / "routes" / "_sessions" / "orchestration.py",
+                _patch_codex_session_route_source,
+            ),
+            (Path("codex_native_forwarder.py"), _patch_codex_forwarder_source),
+        )
+        for relative_path, patcher in patches:
+            for path in _omnigent_source_candidates(command, relative_path):
+                try:
+                    source = path.read_text()
+                    patched, changed = patcher(source)
+                    if changed:
+                        compile(patched, str(path), "exec")
+                        backup = path.with_suffix(path.suffix + ".bak-odysseus-codex")
+                        if not backup.exists():
+                            shutil.copyfile(path, backup)
+                        path.write_text(patched)
+                except Exception:
+                    continue
 
     def _cli_worker(
         self,
@@ -300,6 +683,7 @@ class OmnigentManager:
         if not command:
             raise RuntimeError("Omnigent CLI not found on PATH")
         self._patch_picker_metadata(command)
+        self._patch_codex_native_runtime(command)
         result = self._run([command, "server", "start"], timeout=30, env_extra=env_extra)
         # Learn the URL Omnigent actually bound (it prints e.g. "Started
         # background server at http://127.0.0.1:6767") so the probe matches.

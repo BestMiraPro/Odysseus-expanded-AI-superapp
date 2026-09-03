@@ -10,7 +10,7 @@ __pycache__/
 dist/
 build/
 .env
-.env.bak.*
+.env.bak*
 /data/
 /logs/
 .git/

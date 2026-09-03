@@ -57,9 +57,23 @@ COPY . .
 
 # The app runs as a non-root UID, so apply the generated-crew picker metadata
 # patch while building and keep Omnigent's installed package read-only at runtime.
-RUN python -c "from src.omnigent_manager import OmnigentManager; OmnigentManager(command='/usr/local/bin/omnigent')._patch_picker_metadata('/usr/local/bin/omnigent')" \
+RUN python -c "from src.omnigent_manager import OmnigentManager; m=OmnigentManager(command='/usr/local/bin/omnigent'); m._patch_picker_metadata('/usr/local/bin/omnigent'); m._patch_codex_native_runtime('/usr/local/bin/omnigent')" \
     && grep -R -q "ODYSSEUS_GENERATED_CREW_PICKER_PATCH" \
-        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/server/routes/builtin_agents.py
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/server/routes/builtin_agents.py \
+    && grep -R -q "ODYSSEUS_CODEX_TOP_LEVEL_DEFAULTS_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/server/routes/_sessions/orchestration.py \
+    && grep -R -q "ODYSSEUS_CODEX_REASONING_ARGV_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/server/routes/_sessions/orchestration.py \
+    && grep -R -q "ODYSSEUS_CODEX_MCP_ROTATION_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+    && grep -R -q "ODYSSEUS_CODEX_STARTUP_THREAD_GUARD_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+    && grep -R -q "ODYSSEUS_CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+    && grep -R -q "ODYSSEUS_CODEX_ROTATION_FORCE_SETTLE_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+    && grep -R -q "ODYSSEUS_CODEX_IDLE_RELEASE_PATCH" \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py
 
 # Turn-2 crash fix for API-model crews: openai-agents 0.17.7 treats assistant
 # string content as list of parts (iterates char-by-char). Patch at build time

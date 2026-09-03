@@ -382,6 +382,10 @@ def test_generate_crew_writes_broad_and_curated_crew_variants(tmp_path, monkeypa
     assert crew_codex["executor"]["config"]["yolo"] is True
     assert crew_codex["executor"]["model"] == "gpt-5.6-sol"
     assert crew_codex["executor"]["config"]["reasoning_effort"] == "xhigh"
+    assert crew_codex["llm"] == {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+    }
 
     glm_crew = yaml.safe_load((agents_root / "crew-glm-5-2" / "config.yaml").read_text())
     assert glm_crew["executor"]["config"]["harness"] == "openai-agents"

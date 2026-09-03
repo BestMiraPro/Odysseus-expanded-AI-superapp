@@ -442,12 +442,20 @@ def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str |
     codex_dir = agents_root / "crew-codex"
     for slug, spec in api_specs.items():
         _write_worker(codex_dir / "agents", slug, spec)
-    _write_crew_file(codex_dir, _crew_config(
+    codex_crew = _crew_config(
         "crew-codex",
         "Codex-brained crew that can use its own tools and delegate to your W&B API-model workers.",
         codex_executor,
         api_slugs,
-    ))
+    )
+    # Canonical Omnigent LLM metadata. Keep the executor mirrors above for
+    # 0.10 compatibility, while the llm block is what session creation uses
+    # to persist Codex's requested reasoning effort.
+    codex_crew["llm"] = {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh",
+    }
+    _write_crew_file(codex_dir, codex_crew)
     written += 1
 
     # Per-model crews: API-model-brained, no Codex/Claude sub-agents to avoid
