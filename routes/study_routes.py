@@ -44,6 +44,8 @@ from routes.study.materials import (  # noqa: F401
     create_material_record,
     material_rows_with_counts,
     run_extraction,
+    run_generate_notes,
+    run_generate_overview,
     run_transcribe_material,
 )
 from routes.study.insights import (  # noqa: F401

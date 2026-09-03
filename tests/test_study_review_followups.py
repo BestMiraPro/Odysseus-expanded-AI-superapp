@@ -4,6 +4,7 @@ Covers the service layer added/changed for the ranked recommendations:
 cross-subject interleaving (#4), stats folding in question attempts (#6),
 the calibration payload (#3) and mock-mode practice sessions (#2).
 """
+import io
 import os
 from datetime import timedelta
 
@@ -506,3 +507,23 @@ def test_mock_respects_the_topic_filter(db):
                                  mock=True)
 
     assert {q["topic"] for q in out["queue"]} == {"t3"}
+
+
+# --------------------------------------------------- agent <-> package contract
+
+def test_agent_service_surface_resolves_through_the_shim():
+    """The Study agent reaches the service layer through routes.study_routes.
+
+    After the routes/study package split these live in the sub-modules and are
+    re-exported by the shim, so a missing re-export breaks an agent tool at
+    runtime with an AttributeError that no other test catches — exactly how
+    run_generate_notes and run_generate_overview shipped broken once."""
+    import re
+
+    from routes import study_routes as sr
+
+    src = io.open("src/study_agent.py", encoding="utf-8").read()
+    used = set(re.findall(r"(?:_sr\(\)|\bsr)\.([A-Za-z_][A-Za-z0-9_]*)", src))
+    missing = sorted(n for n in used if not hasattr(sr, n))
+
+    assert not missing, f"study_agent.py calls routes.study_routes.{missing} which do not exist"

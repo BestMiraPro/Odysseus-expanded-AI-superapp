@@ -419,6 +419,83 @@ async def run_transcribe_material(user, material_id: str) -> Dict:
     return {"ok": True, "char_count": len(full), "pages": len(urls), "pages_failed": failed}
 
 
+async def run_generate_notes(user, material_id: str) -> Dict:
+    """Generate (or regenerate) consultable study notes for one material.
+    Shared by the route and the Study agent."""
+    if not _ai_limiter.check(request.client.host):
+        raise HTTPException(429, "Too many requests — try again later")
+    db = _common.SessionLocal()
+    try:
+        m = study_service.get_material(db, material_id, user)
+        content = (m.content or "").strip()
+        name, file_id, kind = m.name, m.file_id, m.kind
+    finally:
+        db.close()
+    if len(content) < 200:
+        raise HTTPException(400, "Not enough text in this material to write "
+                                 "notes. If it is a scanned PDF, run vision "
+                                 "extraction or re-extract its text first.")
+    notes = await _common._llm_text(
+        user, STUDY_NOTES_SYSTEM,
+        f"Material name: {name}\n\n--- MATERIAL ---\n{content[:120000]}",
+        temperature=0.3, max_tokens=8000, timeout=240)
+
+    figures_md = ""
+    pdf_path = None
+    if file_id and (kind == "pdf" or str(file_id).lower().endswith(".pdf")):
+        try:
+            pdf_path = _common._resolve_uploaded_file(file_id)
+        except HTTPException:
+            pdf_path = None
+    if pdf_path:
+        figures_md = await _build_figures_section(user, material_id, file_id, pdf_path)
+
+    full = notes.strip() + figures_md
+    db = _common.SessionLocal()
+    try:
+        m = study_service.get_material(db, material_id, user)
+        m.summary = full
+        db.commit()
+    finally:
+        db.close()
+    return {"summary": full, "has_figures": bool(figures_md)}
+
+
+async def run_generate_overview(user, deck_id: str) -> Dict:
+    """Generate a short subject overview from the chapter notes (preferred) or
+    the raw materials. Shared by the route and the Study agent."""
+    if not _ai_limiter.check(request.client.host):
+        raise HTTPException(429, "Too many requests — try again later")
+    db = _common.SessionLocal()
+    try:
+        deck = study_service.get_deck(db, deck_id, user)
+        deck_name = deck.name
+        q = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
+        if user is not None:
+            q = q.filter(StudyMaterial.owner == user)
+        parts = []
+        for m in q.order_by(StudyMaterial.created_at.asc()).all():
+            src = (m.summary or m.content or "")[:4000].strip()
+            if src:
+                parts.append(f"### {m.name}\n{src}")
+    finally:
+        db.close()
+    if not parts:
+        raise HTTPException(400, "Add materials (and ideally generate chapter "
+                                 "notes) before generating a subject overview.")
+    prompt = (f"Subject: {deck_name}\n\n" + "\n\n".join(parts))[:60000]
+    overview = await _common._llm_text(user, SUBJECT_OVERVIEW_SYSTEM, prompt,
+                               temperature=0.3, max_tokens=4000, timeout=180)
+    db = _common.SessionLocal()
+    try:
+        deck = study_service.get_deck(db, deck_id, user)
+        deck.overview = overview
+        db.commit()
+    finally:
+        db.close()
+    return {"overview": overview}
+
+
 def register(router: APIRouter) -> None:
     # ------------------------------------------------------------------ materials (v2)
 
@@ -563,47 +640,8 @@ def register(router: APIRouter) -> None:
 
     @router.post("/materials/{material_id}/notes")
     async def generate_material_notes(request: Request, material_id: str):
-        """Generate (or regenerate) consultable study notes for one material:
-        a Markdown summary from the full text, plus a Key-figures section with
-        figures pulled from the source PDF and cited to their page."""
-        if not _ai_limiter.check(request.client.host):
-            raise HTTPException(429, "Too many requests — try again later")
-        user = _owner(request)
-        db = _common.SessionLocal()
-        try:
-            m = study_service.get_material(db, material_id, user)
-            content = (m.content or "").strip()
-            name, file_id, kind = m.name, m.file_id, m.kind
-        finally:
-            db.close()
-        if len(content) < 200:
-            raise HTTPException(400, "Not enough text in this material to write "
-                                     "notes. If it is a scanned PDF, run vision "
-                                     "extraction or re-extract its text first.")
-        notes = await _common._llm_text(
-            user, STUDY_NOTES_SYSTEM,
-            f"Material name: {name}\n\n--- MATERIAL ---\n{content[:120000]}",
-            temperature=0.3, max_tokens=8000, timeout=240)
-
-        figures_md = ""
-        pdf_path = None
-        if file_id and (kind == "pdf" or str(file_id).lower().endswith(".pdf")):
-            try:
-                pdf_path = _common._resolve_uploaded_file(file_id)
-            except HTTPException:
-                pdf_path = None
-        if pdf_path:
-            figures_md = await _build_figures_section(user, material_id, file_id, pdf_path)
-
-        full = notes.strip() + figures_md
-        db = _common.SessionLocal()
-        try:
-            m = study_service.get_material(db, material_id, user)
-            m.summary = full
-            db.commit()
-        finally:
-            db.close()
-        return {"summary": full, "has_figures": bool(figures_md)}
+        """Generate (or regenerate) consultable study notes for one material."""
+        return await run_generate_notes(_owner(request), material_id)
 
     @router.get("/decks/{deck_id}/overview")
     def get_deck_overview(request: Request, deck_id: str):
@@ -617,39 +655,8 @@ def register(router: APIRouter) -> None:
 
     @router.post("/decks/{deck_id}/overview")
     async def generate_deck_overview(request: Request, deck_id: str):
-        """Generate a short subject overview from the chapter notes (preferred)
-        or raw material text, tying the chapters together."""
-        if not _ai_limiter.check(request.client.host):
-            raise HTTPException(429, "Too many requests — try again later")
-        user = _owner(request)
-        db = _common.SessionLocal()
-        try:
-            deck = study_service.get_deck(db, deck_id, user)
-            deck_name = deck.name
-            q = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
-            if user is not None:
-                q = q.filter(StudyMaterial.owner == user)
-            parts = []
-            for m in q.order_by(StudyMaterial.created_at.asc()).all():
-                src = (m.summary or m.content or "")[:4000].strip()
-                if src:
-                    parts.append(f"### {m.name}\n{src}")
-        finally:
-            db.close()
-        if not parts:
-            raise HTTPException(400, "Add materials (and ideally generate chapter "
-                                     "notes) before generating a subject overview.")
-        prompt = (f"Subject: {deck_name}\n\n" + "\n\n".join(parts))[:60000]
-        overview = await _common._llm_text(user, SUBJECT_OVERVIEW_SYSTEM, prompt,
-                                   temperature=0.3, max_tokens=4000, timeout=180)
-        db = _common.SessionLocal()
-        try:
-            deck = study_service.get_deck(db, deck_id, user)
-            deck.overview = overview
-            db.commit()
-        finally:
-            db.close()
-        return {"overview": overview}
+        """Generate a short subject overview from the chapter notes (preferred) or"""
+        return await run_generate_overview(_owner(request), deck_id)
 
     @router.post("/materials/{material_id}/extract")
     async def extract_questions(request: Request, material_id: str,
