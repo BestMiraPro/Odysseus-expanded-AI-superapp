@@ -752,6 +752,9 @@ def _migrate_add_study_summary_columns():
             conn.execute("ALTER TABLE study_questions ADD COLUMN context TEXT")
         if "source_page" not in q_cols:
             conn.execute("ALTER TABLE study_questions ADD COLUMN source_page INTEGER")
+        mat_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_materials)")]
+        if mat_cols and "page_count" not in mat_cols:
+            conn.execute("ALTER TABLE study_materials ADD COLUMN page_count INTEGER")
         if "category" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN category TEXT DEFAULT 'theory'")
             # Backfill existing rows from the filename classifier (single source
@@ -1922,6 +1925,30 @@ class StudyUserParams(TimestampMixin, Base):
     w_json       = Column(Text, nullable=True)       # JSON list of 17 floats
     review_count = Column(Integer, default=0)         # count used during last fit
     fitted_at    = Column(DateTime, nullable=True, index=True)
+
+
+class StudyAgentThread(TimestampMixin, Base):
+    """A conversation with the in-app Study agent (one per chat thread)."""
+    __tablename__ = "study_agent_threads"
+
+    id       = Column(String, primary_key=True, index=True)
+    owner    = Column(String, nullable=True, index=True)
+    title    = Column(String, nullable=True)
+    deck_id  = Column(String, nullable=True, index=True)   # subject the thread is scoped to
+
+
+class StudyAgentMessage(TimestampMixin, Base):
+    """One message of a Study-agent thread (user / assistant / tool)."""
+    __tablename__ = "study_agent_messages"
+
+    id           = Column(String, primary_key=True, index=True)
+    owner        = Column(String, nullable=True, index=True)
+    thread_id    = Column(String, index=True, nullable=False)
+    role         = Column(String, nullable=False)          # user | assistant | tool
+    content      = Column(Text, nullable=True)
+    tool_calls   = Column(Text, nullable=True)             # JSON list (assistant turns that called tools)
+    tool_call_id = Column(String, nullable=True)           # tool turns: the call they answer
+    name         = Column(String, nullable=True)           # tool turns: tool name
 
 
 class CalendarCal(TimestampMixin, Base):
