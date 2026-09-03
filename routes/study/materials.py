@@ -37,7 +37,7 @@ def create_material_record(user, deck_id: str, *, name=None, text=None,
             kind = "pdf" if file_id.lower().endswith(".pdf") else "file"
             name = (name or file_id).strip()
             try:
-                text = _extract_file_text(file_id, user)
+                text = _common._extract_file_text(file_id, user)
             except HTTPException as e:
                 # Scanned/image-only PDFs have no text layer - keep the
                 # material anyway; vision extraction reads the pages.
@@ -48,7 +48,7 @@ def create_material_record(user, deck_id: str, *, name=None, text=None,
             if kind == "pdf":
                 try:
                     from src.study_vision import pdf_page_count
-                    page_count = pdf_page_count(_resolve_uploaded_file(file_id)) or None
+                    page_count = pdf_page_count(_common._resolve_uploaded_file(file_id)) or None
                 except Exception:
                     page_count = None
         else:
@@ -99,14 +99,21 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
     pdf_path = None
     if file_id and (kind == "pdf" or str(file_id).lower().endswith(".pdf")):
         try:
-            pdf_path = _resolve_uploaded_file(file_id)
+            pdf_path = _common._resolve_uploaded_file(file_id)
         except HTTPException:
             pdf_path = None
 
+    # Vision by default whenever the original PDF is on disk and a vision-
+    # capable model is configured; an explicit ``vision`` flag forces a path.
+    use_vision = should_use_vision(
+        has_pdf=bool(pdf_path),
+        vision_available=bool(pdf_path) and bool(_common._vision_candidates(user)),
+        explicit=vision)
     # Thin text layer (formula images / scans): go vision-first instead of
     # wasting a text pass on cover-page scraps.
+    page_info = None
     auto_vision = False
-    if pdf_path and not vision:
+    if pdf_path and not use_vision:
         try:
             from src.study_vision import pdf_page_count, text_layer_is_thin
             auto_vision = text_layer_is_thin(len(content), pdf_page_count(pdf_path))
@@ -169,20 +176,20 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
 
     used_vision = False
     coverage = None
-    if vision or auto_vision:
+    if use_vision or auto_vision:
         if not pdf_path:
             raise HTTPException(400, "Vision extraction needs the original PDF "
                                      "file. Re-upload the PDF to this subject.")
-        collected, raw_count, n_batches, errors, coverage = \
-            await _extract_questions_vision(user, mode, types, pdf_path)
+        collected, raw_count, n_batches, errors, coverage, page_info = \
+            await _common._extract_questions_vision(user, mode, types, pdf_path)
         used_vision = True
         chunks = [None] * n_batches  # for the response chunk count
     else:
         chunks = chunk_material(content)
         if not chunks and pdf_path:
             # No text layer at all - skip straight to vision.
-            collected, raw_count, n_batches, errors, coverage = \
-                await _extract_questions_vision(user, mode, types, pdf_path)
+            collected, raw_count, n_batches, errors, coverage, page_info = \
+                await _common._extract_questions_vision(user, mode, types, pdf_path)
             used_vision = True
             chunks = [None] * n_batches
         elif not chunks:
@@ -229,8 +236,8 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
         logger.info("study extract: text pass empty for material %s — "
                     "falling back to vision extraction", material_id)
         try:
-            v_collected, v_raw, v_batches, v_errors, v_coverage = \
-                await _extract_questions_vision(user, mode, types, pdf_path)
+            v_collected, v_raw, v_batches, v_errors, v_coverage, page_info = \
+                await _common._extract_questions_vision(user, mode, types, pdf_path)
             if v_collected:
                 collected, raw_count, errors = v_collected, v_raw, v_errors
                 chunks = [None] * v_batches
@@ -335,6 +342,8 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
             "chunks": len(chunks),
             "chunk_errors": errors,
             "vision": used_vision,
+            # How much of a long PDF was actually read (MAX_PAGES cap).
+            "pages": page_info,
             "coverage": coverage,
             "questions": [_question_to_dict(r, original=original_links.get(r.id))
                           for r in saved],
@@ -348,7 +357,7 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
     # must never fail because grouping did.
     if created_n:
         try:
-            await _link_deck_parts(user, deck_id, only_material=material_id)
+            await _common._link_deck_parts(user, deck_id, only_material=material_id)
         except Exception as e:
             logger.warning("study: auto link-parts after extraction failed: %s", e)
     return resp
@@ -370,7 +379,7 @@ async def run_transcribe_material(user, material_id: str) -> Dict:
         file_id = m.file_id
     finally:
         db.close()
-    pdf_path = _resolve_uploaded_file(file_id)
+    pdf_path = _common._resolve_uploaded_file(file_id)
     try:
         urls = pages_to_data_urls(render_pdf_pages(pdf_path))
     except RuntimeError as e:
@@ -476,7 +485,7 @@ def register(router: APIRouter) -> None:
             file_id = m.file_id
         finally:
             db.close()
-        text = _extract_file_text(file_id, user)  # max_chars=None -> full text
+        text = _common._extract_file_text(file_id, user)  # max_chars=None -> full text
         db = _common.SessionLocal()
         try:
             m = study_service.get_material(db, material_id, user)
@@ -551,7 +560,7 @@ def register(router: APIRouter) -> None:
         pdf_path = None
         if file_id and (kind == "pdf" or str(file_id).lower().endswith(".pdf")):
             try:
-                pdf_path = _resolve_uploaded_file(file_id)
+                pdf_path = _common._resolve_uploaded_file(file_id)
             except HTTPException:
                 pdf_path = None
         if pdf_path:

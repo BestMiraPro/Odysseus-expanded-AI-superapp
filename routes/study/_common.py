@@ -47,6 +47,8 @@ from core.database import (
 )
 from src.study_vision import text_layer_is_thin
 from src.study_ai import (
+    should_use_vision,
+    offset_manifest,
     ADD_CONTEXT_SYSTEM,
     ASK_COACH_SYSTEM,
     ASK_ELABORATE_SYSTEM,
@@ -1319,32 +1321,55 @@ async def _llm_json_vision(owner, system: str, instruction: str,
 PAGES_PER_BATCH = 3
 
 
-async def _discover_questions_vision(owner, pdf_path: str) -> tuple:
+# A whole 40-page exam in one vision request blows most context
+# windows, so discovery runs in batches this size and offsets each
+# batch's page numbers back onto the document.
+DISCOVERY_PAGES_PER_CALL = 12
+
+
+async def _discover_questions_vision(owner, page_urls: List[str]) -> tuple:
     """Discovery pass: list every question label + the answer-key pages.
 
-    ALL pages in ONE call, so the coverage check sees the whole document,
-    not one batch at a time. Full render scale — low-res renders proved
-    illegible to the vision model (degenerate repetition replies).
-    Best-effort: returns ([], []) on any failure rather than blocking.
+    Runs over the already-rendered pages in batches of DISCOVERY_PAGES_PER_CALL
+    (a whole 40-page exam in one request blows most vision context windows);
+    every batch's page numbers are shifted by its offset so the merged manifest
+    covers the whole document and the coverage check sees all of it. Full
+    render scale — low-res renders proved illegible to the vision model.
+    Best-effort: a failed batch is skipped rather than blocking extraction.
     (Study Bench's manifest approach.)
 
     Returns (manifest, answer_key_pages).
     """
-    from src.study_vision import pages_to_data_urls, render_pdf_pages
-
-    try:
-        urls = pages_to_data_urls(render_pdf_pages(pdf_path))
-        value = await _llm_json_vision(
-            owner, DISCOVER_QUESTIONS_SYSTEM,
-            f"List every explicit question in these {len(urls)} pages.",
-            urls, max_tokens=8000, timeout=240)
-        return parse_question_manifest(value), parse_answer_key_pages(value)
-    except HTTPException as e:
-        logger.warning("study discovery: vision manifest failed: %s", e.detail)
-        return [], []
-    except Exception as e:
-        logger.warning("study discovery: vision manifest failed: %s", e)
-        return [], []
+    manifest: List[Dict] = []
+    key_pages: List[int] = []
+    for start in range(0, len(page_urls), DISCOVERY_PAGES_PER_CALL):
+        urls = page_urls[start:start + DISCOVERY_PAGES_PER_CALL]
+        try:
+            value = await _llm_json_vision(
+                owner, DISCOVER_QUESTIONS_SYSTEM,
+                f"List every explicit question in these {len(urls)} pages "
+                f"(they are pages {start + 1}-{start + len(urls)} of the document; "
+                f"number pages 1-{len(urls)} relative to this batch).",
+                urls, max_tokens=8000, timeout=240)
+        except HTTPException as e:
+            logger.warning("study discovery: vision manifest batch %d failed: %s",
+                           start // DISCOVERY_PAGES_PER_CALL + 1, e.detail)
+            continue
+        except Exception as e:
+            logger.warning("study discovery: vision manifest batch %d failed: %s",
+                           start // DISCOVERY_PAGES_PER_CALL + 1, e)
+            continue
+        manifest.extend(offset_manifest(parse_question_manifest(value), start))
+        key_pages.extend(p + start for p in parse_answer_key_pages(value))
+    # Dedupe manifest numbers across batches (a question spanning a batch
+    # boundary can be listed twice); first occurrence wins.
+    seen, merged = set(), []
+    for m in manifest:
+        key = canonical_qnum(m.get("number"))
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(m)
+    return merged, sorted(set(key_pages))
 
 
 async def _discover_questions_text(owner, content: str) -> List[Dict]:
@@ -1416,6 +1441,15 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
         page_urls = pages_to_data_urls(render_pdf_pages(pdf_path))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
+    # render_pdf_pages caps at MAX_PAGES; say so rather than silently reading
+    # only the front of a long exam.
+    from src.study_vision import MAX_PAGES, pdf_page_count
+    total_pages = pdf_page_count(pdf_path) or len(page_urls)
+    page_info = {"pages": len(page_urls), "total_pages": total_pages,
+                 "truncated": total_pages > len(page_urls)}
+    if page_info["truncated"]:
+        logger.warning("study vision: %s has %d pages; only the first %d are read "
+                       "(MAX_PAGES=%d)", pdf_path, total_pages, len(page_urls), MAX_PAGES)
     system = EXTRACT_QUESTIONS_SYSTEM if mode == "extract" else AUTHOR_QUESTIONS_SYSTEM
     type_note = ("Only produce questions of type: " + ", ".join(types) + ". ")         if len(types) == 1 else ""
     verb = ("Extract every practice question visible in these exam pages, "
@@ -1424,8 +1458,9 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
             if mode == "extract" else
             "Write practice questions from the content visible in these pages.")
 
-    manifest, answer_key_pages = await _discover_questions_vision(owner, pdf_path) \
-        if mode == "extract" else ([], [])
+    manifest, answer_key_pages = (
+        await _discover_questions_vision(owner, page_urls)
+        if mode == "extract" else ([], []))
     page_by_number = _manifest_page_map(manifest)
     n_pages = len(page_urls)
     key_set = {p for p in answer_key_pages if 1 <= p <= n_pages}
@@ -1514,7 +1549,7 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
                                page_num, e.detail)
         coverage = _coverage_report(manifest, collected)
 
-    return collected, raw_count, len(batches), errors, coverage
+    return collected, raw_count, len(batches), errors, coverage, page_info
 
 
 CARD_AUTHOR_SYSTEM = """You write flashcards for spaced repetition, following the minimum-information principle.
