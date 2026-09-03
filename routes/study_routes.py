@@ -31,6 +31,21 @@ from routes.study._common import (  # noqa: F401  (explicit for underscore names
 )
 from routes.study.setup import setup_study_routes  # noqa: F401
 
+# Service functions the Study agent (src/study_agent.py) calls through this
+# module. They live in the sub-modules after the split; re-exported here so the
+# agent keeps one import surface.
+from routes.study.practice import (  # noqa: F401
+    _round_robin,
+    _split_topics,
+    practice_queue_payload,
+)
+from routes.study.materials import (  # noqa: F401
+    create_material_record,
+    material_rows_with_counts,
+    run_extraction,
+    run_transcribe_material,
+)
+
 _common = sys.modules["routes.study._common"]
 
 

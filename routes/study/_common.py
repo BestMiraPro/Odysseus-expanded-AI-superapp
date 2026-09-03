@@ -8,8 +8,6 @@ Endpoints:
   /api/study/queue                 FSRS review queue (due + capped new)
   /api/study/cards/{id}/review     apply a rating (FSRS schedule + review log)
   /api/study/ai/generate-cards     LLM: source text -> proposed flashcards
-  /api/study/ai/quiz               LLM/deck: free-recall quiz questions
-  /api/study/ai/grade              LLM: grade a free-recall answer
   /api/study/exams ...             exam CRUD + deterministic plan generation
   /api/study/focus ...             focus timer sessions
   /api/study/stats                 review/focus history for charts
@@ -47,6 +45,7 @@ from core.database import (
     StudyReview,
     StudyUserParams,
 )
+from src.study_vision import text_layer_is_thin
 from src.study_ai import (
     ADD_CONTEXT_SYSTEM,
     ASK_COACH_SYSTEM,
@@ -89,6 +88,16 @@ from src.rate_limiter import RateLimiter
 from src import fsrs
 from src import fsrs_optimizer
 from src import study_service
+
+# The Study agent (src/study_agent.py) reaches the ownership getters through
+# routes.study_routes, which re-exports this module. phase0 renamed them into
+# src/study_service without the underscore; keep the original names bound here
+# so the agent and the older tests keep resolving them.
+_get_deck = study_service.get_deck
+_get_card = study_service.get_card
+_get_exam = study_service.get_exam
+_get_material = study_service.get_material
+_get_question = study_service.get_question
 from src.study_source import build_original_question_link, infer_source_page
 from src.study_plan import generate_plan, compute_mastery_scores, migrate_done_blocks, _semantic_interleave  # noqa: F401
 from src.study_stats import (
@@ -528,11 +537,21 @@ async def _llm_text(owner: Optional[str], system: str, user: str, *,
     return text
 
 
-def _material_to_dict(m: StudyMaterial) -> Dict:
+def _material_to_dict(m: StudyMaterial, question_count: Optional[int] = None) -> Dict:
+    """Serialize a material. ``question_count`` is the LIVE count of questions
+    that still reference it (pass it from a grouped query); the stored column is
+    only a fallback because it never decremented on delete."""
+    pages = m.page_count or 0
+    chars = m.char_count or 0
     return {
         "id": m.id, "deck_id": m.deck_id, "name": m.name, "kind": m.kind,
-        "file_id": m.file_id, "char_count": m.char_count or 0,
-        "question_count": m.question_count or 0,
+        "file_id": m.file_id, "char_count": chars,
+        "page_count": pages or None,
+        # Thin text layer (scanned / formula-image PDF): notes, consult and
+        # text extraction cannot see the content until it is transcribed.
+        "thin_text": bool(m.file_id and pages and text_layer_is_thin(chars, pages)),
+        "question_count": (question_count if question_count is not None
+                           else (m.question_count or 0)),
         "has_summary": bool(m.summary),
         "category": _material_category(m),
         "created_at": _iso(m.created_at),
@@ -1611,3 +1630,38 @@ def _deck_counts(db, user, deck: StudyDeck) -> Dict:
 import sys as _sys
 _public = [n for n in dir(_sys.modules[__name__]) if not n.startswith("__")]
 __all__ = _public
+
+
+async def _llm_text_vision(owner, system: str, instruction: str, image_urls: List[str], *,
+                           temperature: float = 0.1, max_tokens: int = EXTRACTION_MAX_TOKENS,
+                           timeout: int = 300) -> str:
+    """One-shot vision call returning plain text; iterates model candidates."""
+    from src.llm_core import llm_call_async
+
+    candidates = _vision_candidates(owner)
+    if not candidates:
+        raise HTTPException(503, "No vision-capable model available. Pick a vision "
+                                 "model in the Study model selector, or configure "
+                                 "one in Settings -> Vision.")
+    content = [{"type": "text", "text": instruction}] + [
+        {"type": "image_url", "image_url": {"url": u}} for u in image_urls
+    ]
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": content}]
+    last_detail = None
+    for url, model, headers in candidates:
+        try:
+            raw = await llm_call_async(url=url, model=model, messages=messages,
+                                       temperature=temperature, max_tokens=max_tokens,
+                                       headers=headers, timeout=timeout,
+                                       extra_body=THINKING_OFF_BODY)
+            text = _strip_think_safe(raw, prose=True).strip()
+            if text:
+                return text
+            last_detail = f"Vision model {model} returned an empty reply."
+        except HTTPException as e:
+            last_detail = f"Vision model {model} failed: {e.detail}"
+        except Exception as e:
+            last_detail = f"Vision model {model} failed ({type(e).__name__}): {e}."
+        logger.warning("study vision text: %s", last_detail)
+    raise HTTPException(502, last_detail or "All vision model candidates failed.")

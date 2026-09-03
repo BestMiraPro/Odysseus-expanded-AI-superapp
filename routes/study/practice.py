@@ -5,6 +5,187 @@ import routes.study._common as _common  # noqa: F401
 from fastapi import APIRouter  # noqa: F401  (re-exported via _common but explicit)
 
 
+def _split_topics(topics) -> List[str]:
+    """Normalize a topics filter (list or comma-separated string) to lowercase
+    non-empty labels."""
+    if not topics:
+        return []
+    items = topics if isinstance(topics, (list, tuple)) else str(topics).split(",")
+    return [t.strip().lower() for t in items if t and t.strip()]
+
+
+def _round_robin(rows: List, key) -> List:
+    """Reorder rows so consecutive items come from different groups, preserving
+    each group's internal order. Groups are visited in first-appearance order,
+    so the highest-priority group still leads."""
+    groups: Dict[str, List] = {}
+    for r in rows:
+        groups.setdefault(key(r), []).append(r)
+    out: List = []
+    while groups:
+        for k in list(groups.keys()):
+            out.append(groups[k].pop(0))
+            if not groups[k]:
+                del groups[k]
+    return out
+
+
+def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
+                           limit: int = 20, mock: bool = False,
+                           mode=None, adaptive: bool = False) -> Dict:
+    """Build the practice queue. Shared by the /practice/queue route and the
+    Study agent.
+
+    Scope: all subjects, one subject, one material, and/or a topic filter
+    (case-insensitive substring, OR-ed). A topic filter matching nothing is
+    dropped (``topic_fallback``) rather than returning an empty session — exam
+    plan topics rarely spell the extractor's labels exactly.
+
+    Unscoped sessions round-robin *subjects* as well as topics, so a large
+    backlog in one subject cannot crowd the others out of the session.
+
+    ``mock=True`` builds a timed full-format paper instead: a fixed number of
+    questions drawn from the whole scope regardless of FSRS state. A mock
+    measures where you stand today, so it must be able to ask questions that
+    are not due yet.
+
+    ``mode="pretest"`` lifts one unseen question per topic ahead of the rest
+    (errorful generation); ``adaptive`` reweights toward weak areas."""
+    limit = max(1, min(100, limit))
+    wanted = _split_topics(topics)
+    db = _common.SessionLocal()
+    try:
+        now = _common._utcnow_naive()
+        base = db.query(StudyQuestion).filter(
+            StudyQuestion.suspended == False)  # noqa: E712
+        if material_id:
+            m = study_service.get_material(db, material_id, user)
+            base = base.filter(StudyQuestion.material_id == m.id)
+            deck_id = deck_id or m.deck_id
+        if deck_id:
+            study_service.get_deck(db, deck_id, user)
+            base = base.filter(StudyQuestion.deck_id == deck_id)
+        if user is not None:
+            base = base.filter(StudyQuestion.owner == user)
+
+        scoped_to_one = bool(material_id or deck_id)
+
+        def _pull(q):
+            if mock:
+                # A mock ignores the schedule: draw the whole scope, oldest
+                # first, and let the round-robin below shape the paper.
+                return [], q.order_by(StudyQuestion.created_at.asc()).limit(
+                    max(limit * 4, 100)).all()
+            due_base = q.filter(StudyQuestion.state != "new",
+                                StudyQuestion.due <= now)
+            if scoped_to_one:
+                due_rows = due_base.order_by(
+                    StudyQuestion.due.asc()).limit(limit).all()
+            else:
+                # Take each subject's most-overdue questions and round-robin
+                # them, so one subject's backlog cannot crowd out the others.
+                deck_ids = [r[0] for r in due_base.with_entities(
+                    StudyQuestion.deck_id).distinct().all()]
+                pooled = []
+                for did in deck_ids:
+                    pooled.extend(
+                        due_base.filter(StudyQuestion.deck_id == did)
+                        .order_by(StudyQuestion.due.asc()).limit(limit).all())
+                pooled.sort(key=lambda r: (r.due or now))
+                due_rows = _round_robin(pooled, lambda r: r.deck_id or "")[:limit]
+            new_r = q.filter(StudyQuestion.state == "new").order_by(
+                StudyQuestion.created_at.asc()).limit(limit * 3).all()
+            return due_rows, new_r
+
+        topic_fallback = False
+        if wanted:
+            from sqlalchemy import or_
+            tq = base.filter(or_(*[StudyQuestion.topic.ilike("%" + t + "%")
+                                   for t in wanted]))
+            due, new_rows = _pull(tq)
+            if not due and not new_rows:
+                topic_fallback = True
+                due, new_rows = _pull(base)
+        else:
+            due, new_rows = _pull(base)
+
+        # Interleave across subject *and* topic (within one subject the deck
+        # part of the key is constant, leaving the old topic round-robin).
+        def _key(r):
+            return (r.deck_id or "") + "|" + (r.topic or "general")
+
+        interleaved = _round_robin(new_rows, _key)[:limit]
+
+        # Ordering mode (per-user pref `study_order`): the default sinks
+        # answered questions behind unseen ones; "review" puts due reviews
+        # first. A mock is a fixed paper, so it keeps its drawn order.
+        if mock or _common._read_pref(user, "study_order") == "review":
+            queue = due + interleaved
+        else:
+            queue = interleaved + due
+
+        weak_area_weights = None
+        if adaptive:
+            since = now - timedelta(days=42)
+            candidate_ids = [r.id for r in queue]
+            signals = get_weak_question_signals(db, user, since,
+                                                question_ids=candidate_ids)
+            stab_map = get_question_stability_signal(db, user,
+                                                     question_ids=candidate_ids)
+            queue = _adaptive_question_priority(
+                queue, signals["by_question"], signals["by_topic"], stab_map)
+            rows = queue[:limit]
+            weak_area_weights = []
+            for r in rows:
+                topic = getattr(r, "topic", None) or "general"
+                weak_area_weights.append({
+                    "question_id": r.id,
+                    "topic": topic,
+                    "accuracy": signals["by_question"].get(r.id, {}).get("accuracy"),
+                    "topic_accuracy": signals["by_topic"].get(topic, {}).get("accuracy"),
+                    "stability": stab_map.get(r.id),
+                })
+        else:
+            rows = queue[:limit]
+
+        pretest_ids = set()
+        if mode == "pretest":
+            unseen = {}
+            for r in new_rows:
+                if (r.state == "new") and (r.reps == 0):
+                    unseen.setdefault(r.topic or "general", []).append(r)
+            pretest = []
+            for _topic, items in unseen.items():
+                items.sort(key=lambda x: x.created_at or now)
+                pretest.append(items[0])
+            pretest_ids = set(r.id for r in pretest)
+            rows = [r for r in rows if r.id not in pretest_ids]
+            rows = (pretest + rows)[:limit]
+
+        original_links = _question_original_links(db, rows)
+        out = []
+        for r in rows:
+            d = _question_to_dict(r, with_answer=False,
+                                  original=original_links.get(r.id))
+            if mode == "pretest" and r.id in pretest_ids:
+                d["pretest"] = True
+            out.append(d)
+
+        resp = {
+            "queue": out,
+            "due": len(due),
+            "total": len(queue),
+            "mock": bool(mock),
+            "topic_fallback": topic_fallback,
+            "pretest": sum(1 for r in rows if r.id in pretest_ids),
+        }
+        if adaptive:
+            resp["adaptive_weights"] = weak_area_weights
+        return resp
+    finally:
+        db.close()
+
+
 def register(router: APIRouter) -> None:
     # ------------------------------------------------------------------ question bank (v2)
 
@@ -120,125 +301,18 @@ def register(router: APIRouter) -> None:
 
     @router.get("/practice/queue")
     def practice_queue(request: Request, deck_id: Optional[str] = None,
-                       limit: int = 20, mode: Optional[str] = None,
-                       adaptive: bool = False):
+                       material_id: Optional[str] = None,
+                       topics: Optional[str] = None,
+                       limit: int = 20, mock: bool = False,
+                       mode: Optional[str] = None, adaptive: bool = False):
         """Due questions first (spaced retrieval), then new ones interleaved
-        across topics (round-robin) instead of blocked by topic.
-
-        When ``mode=pretest`` is set, one *unseen* (new, reps==0) question per
-        topic is lifted ahead of the rest as a pretest item (errorful-generation
-        effect, d~0.35).  Pretest items are marked with ``"pretest": true`` in
-        the response so the frontend can label them.  No new schema, no DB
-        writes — pure queue ordering over existing questions."""
-        user = _owner(request)
-        limit = max(1, min(100, limit))
-        db = _common.SessionLocal()
-        try:
-            now = _common._utcnow_naive()
-            base = db.query(StudyQuestion).filter(
-                StudyQuestion.suspended == False)  # noqa: E712
-            if deck_id:
-                study_service.get_deck(db, deck_id, user)
-                base = base.filter(StudyQuestion.deck_id == deck_id)
-            if user is not None:
-                base = base.filter(StudyQuestion.owner == user)
-            due = base.filter(StudyQuestion.state != "new",
-                              StudyQuestion.due <= now) \
-                .order_by(StudyQuestion.due.asc()).limit(limit).all()
-            new_rows = base.filter(StudyQuestion.state == "new") \
-                .order_by(StudyQuestion.created_at.asc()).limit(limit * 3).all()
-            # Interleave new questions across topics: round-robin over topic groups.
-            groups: Dict[str, List[StudyQuestion]] = {}
-            for r in new_rows:
-                groups.setdefault(r.topic or "general", []).append(r)
-            interleaved: List[StudyQuestion] = []
-            while groups and len(interleaved) < limit:
-                for key in list(groups.keys()):
-                    if groups[key]:
-                        interleaved.append(groups[key].pop(0))
-                    if not groups[key]:
-                        del groups[key]
-            # Ordering mode (per-user pref `study_order`):
-            #   default / "completed" → already-answered (due/review) questions
-            #                 sink behind every new/unseen one (clear new first).
-            #   "review"  → due reviews first (immediate spaced retrieval).
-            if _common._read_pref(user, "study_order") == "review":
-                queue = due + interleaved
-            else:
-                queue = interleaved + due
-            # --- adaptive weak-area weighting (Phase 2.4) ---
-            weak_area_weights: Optional[List[Dict]] = None
-            if adaptive:
-                since = now - timedelta(days=42)
-                candidate_ids = [r.id for r in queue]
-                signals = get_weak_question_signals(db, user, since, question_ids=candidate_ids)
-                stab_map = get_question_stability_signal(db, user, question_ids=candidate_ids)
-                queue = _adaptive_question_priority(
-                    queue,
-                    signals["by_question"],
-                    signals["by_topic"],
-                    stab_map,
-                )
-                rows = queue[:limit]
-                # expose transparent weights for returned rows
-                weak_area_weights = []
-                for r in rows:
-                    qid = r.id
-                    topic = getattr(r, "topic", None) or "general"
-                    weak_area_weights.append({
-                        "question_id": qid,
-                        "topic": topic,
-                        "accuracy": signals["by_question"].get(qid, {}).get("accuracy"),
-                        "topic_accuracy": signals["by_topic"].get(topic, {}).get("accuracy"),
-                        "stability": stab_map.get(qid),
-                    })
-            else:
-                rows = queue[:limit]
-                weak_area_weights = None
-            pretest_ids: set = set()
-            if mode == "pretest":
-                # Pick one new, truly-unseen (reps==0) question per topic.
-                # Exclude already-seen (reps>0) and non-new (due, review, etc).
-                unseen: Dict[str, List[StudyQuestion]] = {}
-                for r in new_rows:
-                    if (r.state == "new") and (r.reps == 0):
-                        unseen.setdefault(r.topic or "general", []).append(r)
-                pretest: List[StudyQuestion] = []
-                for _topic, items in unseen.items():
-                    # oldest first (smallest created_at) for stability
-                    items.sort(key=lambda x: x.created_at or now)
-                    pick = items[0]
-                    pretest.append(pick)
-                # Remove pretest picks from rows so they don't duplicate.
-                pretest_ids = {r.id for r in pretest}
-                rows = [r for r in rows if r.id not in pretest_ids]
-                # Pretests always come first, then the normal queue order.
-                rows = pretest + rows
-                rows = rows[:limit]
-            original_links = _question_original_links(db, rows)
-            out = []
-            for r in rows:
-                d = _question_to_dict(
-                    r,
-                    with_answer=False,
-                    original=original_links.get(r.id),
-                )
-                if mode == "pretest" and r.id in pretest_ids:
-                    d["pretest"] = True
-                out.append(d)
-            # pretest count = how many of the *limited* rows are pretests
-            actual_pretest = sum(1 for r in rows if r.id in pretest_ids)
-            resp: Dict[str, Any] = {
-                "queue": out,
-                "due": len(due),
-                "total": len(queue),
-                "pretest": actual_pretest,
-            }
-            if adaptive:
-                resp["adaptive_weights"] = weak_area_weights
-            return resp
-        finally:
-            db.close()
+        across subject and topic. Optional scope: one subject, one material,
+        and/or a comma-separated topic list. ``mock=true`` draws a fixed-size
+        paper regardless of the schedule (timed mock exams); ``mode=pretest``
+        lifts one unseen question per topic ahead of the rest."""
+        return practice_queue_payload(
+            _owner(request), deck_id=deck_id, material_id=material_id,
+            topics=topics, limit=limit, mock=mock, mode=mode, adaptive=adaptive)
 
     @router.post("/questions/{question_id}/attempt")
     async def attempt_question(request: Request, question_id: str, body: AttemptIn):
