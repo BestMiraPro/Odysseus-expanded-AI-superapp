@@ -14,12 +14,12 @@ def material_rows_with_counts(db, deck_id: str, user) -> List[Dict]:
     if user is not None:
         q = q.filter(StudyMaterial.owner == user)
     mats = q.order_by(StudyMaterial.created_at.desc()).all()
-    from sqlalchemy import func as _func
-    cq = db.query(StudyQuestion.material_id, _func.count(StudyQuestion.id)) \
-        .filter(StudyQuestion.deck_id == deck_id)
+    cq = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck_id)
     if user is not None:
         cq = cq.filter(StudyQuestion.owner == user)
-    counts = {mid: n for mid, n in cq.group_by(StudyQuestion.material_id).all()}
+    counts: Dict[str, int] = {}
+    for row in cq.all():
+        counts[row.material_id] = counts.get(row.material_id, 0) + 1
     return [_material_to_dict(m, counts.get(m.id, 0)) for m in mats]
 
 

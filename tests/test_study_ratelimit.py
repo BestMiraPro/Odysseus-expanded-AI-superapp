@@ -2,7 +2,7 @@
 
 Assertions:
   - After the configured limit is exceeded, the next request returns 429.
-  - A representative endpoint (/ai/grade) is used as the canary.
+  - A representative endpoint (/ai/generate-cards) is used as the canary.
 """
 
 from __future__ import annotations
@@ -156,22 +156,22 @@ def _question(**overrides):
     return StudyQuestion(**data)
 
 
-def test_ai_grade_returns_429_after_limit(rl_client):
+def test_ai_generate_cards_returns_429_after_limit(rl_client):
+    """The canary moved off /ai/grade, which was removed as dead code (no UI or
+    test used it; practice covers grading). /ai/generate-cards carries the same
+    limiter."""
     client, session = rl_client
 
     # Seed enough state for the endpoint to reach the rate-check
     session.rows[StudyDeck].append(_deck())
     session.rows[StudyQuestion].append(_question(qtype="open"))
 
-    # Exceed the limit (20 requests in 60 seconds) on /ai/grade
+    # Exceed the limit (20 requests in 60 seconds)
     for _ in range(21):
         resp = client.post(
-            "/api/study/ai/grade",
-            json={
-                "question": "What is ATP?",
-                "answer": "It stores energy.",
-                "reference": "Cellular energy currency.",
-            },
+            "/api/study/ai/generate-cards",
+            json={"text": "Adenosine triphosphate stores cellular energy. " * 4,
+                  "count": 3},
         )
 
     # The last request must be rate-limited

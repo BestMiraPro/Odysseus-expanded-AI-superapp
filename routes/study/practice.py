@@ -82,16 +82,11 @@ def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
                 due_rows = due_base.order_by(
                     StudyQuestion.due.asc()).limit(limit).all()
             else:
-                # Take each subject's most-overdue questions and round-robin
-                # them, so one subject's backlog cannot crowd out the others.
-                deck_ids = [r[0] for r in due_base.with_entities(
-                    StudyQuestion.deck_id).distinct().all()]
-                pooled = []
-                for did in deck_ids:
-                    pooled.extend(
-                        due_base.filter(StudyQuestion.deck_id == did)
-                        .order_by(StudyQuestion.due.asc()).limit(limit).all())
-                pooled.sort(key=lambda r: (r.due or now))
+                # Round-robin subjects so one subject's backlog cannot crowd the
+                # others out. Take a generous window of the most-overdue rows
+                # and deal them out per subject, rather than one query per deck.
+                pooled = due_base.order_by(StudyQuestion.due.asc()).limit(
+                    max(limit * 10, 100)).all()
                 due_rows = _round_robin(pooled, lambda r: r.deck_id or "")[:limit]
             new_r = q.filter(StudyQuestion.state == "new").order_by(
                 StudyQuestion.created_at.asc()).limit(limit * 3).all()

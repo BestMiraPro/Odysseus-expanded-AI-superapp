@@ -14,6 +14,15 @@ from sqlalchemy.orm import Session
 from core.database import StudyAttempt, StudyCard, StudyFocusSession, StudyQuestion, StudyReview
 
 
+def attempt_ok(a) -> bool:
+    """Did a practice attempt count as a successful retrieval?
+
+    MCQs are graded right/wrong in ``correct``; open answers are AI-scored in
+    ``score`` and pass at the same 60% mark the dashboard uses. Counting only
+    ``correct`` would score every open-answer subject at zero."""
+    return (a.correct is True) or ((getattr(a, "score", None) or 0) >= 60)
+
+
 def get_review_counts(db: Session, owner: Optional[str], since: datetime) -> Dict[str, Any]:
     """Return review totals in the given window."""
     q = db.query(StudyReview).filter(StudyReview.reviewed_at >= since)
@@ -313,7 +322,7 @@ def get_daily_breakdown(
         k = a.attempted_at.date().isoformat() if a.attempted_at else None
         if k in by_day:
             by_day[k]["attempts"] += 1
-            if a.correct:
+            if attempt_ok(a):
                 by_day[k]["attempts_correct"] += 1
 
     daily = sorted(by_day.values(), key=lambda v: v["date"])

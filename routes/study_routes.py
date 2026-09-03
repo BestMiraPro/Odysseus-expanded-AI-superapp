@@ -47,8 +47,10 @@ from routes.study.materials import (  # noqa: F401
     run_transcribe_material,
 )
 from routes.study.insights import (  # noqa: F401
+    calibration_payload,
     history_entries,
     overview_payload,
+    stats_payload,
 )
 from routes.study.maintenance import (  # noqa: F401
     run_audit_questions,
