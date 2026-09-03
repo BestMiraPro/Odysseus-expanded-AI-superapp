@@ -744,8 +744,14 @@ function _forecastChart(forecast) {
 async function renderStats() {
   const el = body();
   el.innerHTML = '<div class="study-empty">Loading…</div>';
-  let s;
-  try { s = await jget('/api/study/stats?days=42'); }
+  let s, calib = null;
+  try {
+    [s, calib] = await Promise.all([
+      jget('/api/study/stats?days=42'),
+      // Brier + sure-but-wrong: the curve shows the shape, this scores it.
+      jget('/api/study/calibration?days=90').catch(() => null),
+    ]);
+  }
   catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
   if (_tab !== 'stats') return;
   const t = s.totals || {};
@@ -766,6 +772,7 @@ async function renderStats() {
       <div class="study-card-box">
         <h4>Calibration — confidence vs accuracy</h4>
         ${_calibrationChart(s.calibration_curve)}
+        ${_calibrationHtml(calib)}
       </div>
       <div class="study-card-box">
         <h4>Daily activity — last 6 weeks</h4>
@@ -2235,8 +2242,9 @@ async function renderPractice() {
           <button class="study-btn" id="study-prac-hint" ${p.hints.length >= 3 || p.hintBusy ? 'disabled' : ''}>
             ${p.hintBusy ? 'Thinking…' : `Hint (${p.hints.length}/3)`}</button>
           ${_originalQuestionButton(q)}
-          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>
+          <button class="study-btn" id="study-prac-consult" title="Find which of your files (and page) covers this, then open it. Consulting before you answer counts like a hint.">${consultLabel}</button>`}
           <button class="study-btn" id="study-prac-skip">Skip</button>
+          ${p.mock ? `<span style="flex:1;"></span><button class="study-btn" id="study-prac-endmock" title="Stop answering and predict your score">Finish early</button>` : ''}
         </div>
         <div class="study-tip" style="text-align:left;font-size:11px;">Keyboard: <b>1–9</b> select option, <b>Enter</b> check, <b>H</b> hint, <b>C</b> consult, <b>N</b> next.</div>` : `
         <div class="study-grade ${res.correct === true || (res.score ?? 0) >= 85 ? 'correct' : (res.correct === false || (res.score ?? 0) < 60 ? 'incorrect' : '')}">
@@ -2759,16 +2767,14 @@ function focusRemainingSec() {
 // `gap` is actual minus claimed accuracy: negative means overconfident.
 function _calibrationHtml(c) {
   if (!c || !c.overall || !c.overall.graded) {
-    return `<div class="study-section-title" style="margin-top:26px;">Calibration</div>
-      <div class="study-subtle">Tag your confidence when you answer — after a few
-      sessions this shows how often "sure" really means right.</div>`;
+    return '';   // the curve above already explains the empty state
   }
   const o = c.overall;
   const pct = (v) => v === null || v === undefined ? '—' : `${Math.round(v * 100)}%`;
   const swr = o.sure_wrong_rate;
   const rows = (c.buckets || []).filter(b => b.attempts).map(b => `
     <div class="study-row">
-      <span class="grow">Said <b>${esc(b.confidence)}</b> <span class="study-subtle">(${b.attempts})</span></span>
+      <span class="grow">Said <b>${esc(b.label)}%</b> <span class="study-subtle">(${b.attempts})</span></span>
       <span class="study-subtle">claimed ${pct(b.expected)} · actual ${pct(b.accuracy)}</span>
       <span style="min-width:54px;text-align:right;color:${b.gap < -0.1 ? 'var(--danger,#e5534b)' : 'inherit'};">
         ${b.gap === null ? '' : (b.gap > 0 ? '+' : '') + Math.round(b.gap * 100) + 'pt'}</span>
@@ -2780,8 +2786,7 @@ function _calibrationHtml(c) {
       <span style="min-width:54px;text-align:right;">${pct(d.sure_wrong_rate)}</span>
     </div>`).join('');
   return `
-    <div class="study-section-title" style="margin-top:26px;">Calibration (last ${c.days} days)</div>
-    <div class="study-chips" style="margin-bottom:10px;">
+    <div class="study-chips" style="margin:14px 0 10px;">
       <div class="study-chip"><b>${o.brier === null ? '—' : o.brier}</b><span>Brier score</span></div>
       <div class="study-chip"><b>${pct(swr)}</b><span>sure but wrong</span></div>
       <div class="study-chip"><b>${o.graded}</b><span>tagged answers</span></div>

@@ -517,6 +517,35 @@ def register(router: APIRouter) -> None:
                             headers={"X-Content-Type-Options": "nosniff"},
                             content_disposition_type="inline")
 
+    @router.get("/materials/{material_id}/file")
+    def material_file(request: Request, material_id: str):
+        """Serve a material's source file inline so the in-pane viewer can frame
+        it (see SecurityHeadersMiddleware). Deliberately narrow: the caller must
+        own the material, and only PDFs and images are served - anything else
+        would be an HTML/script payload rendered on our own origin."""
+        import mimetypes as _mt
+
+        from fastapi.responses import FileResponse
+
+        user = _owner(request)
+        db = _common.SessionLocal()
+        try:
+            m = study_service.get_material(db, material_id, user)
+            file_id, name = m.file_id, m.name
+        finally:
+            db.close()
+        if not file_id:
+            raise HTTPException(404, "This material has no source file")
+        path = _common._resolve_uploaded_file(file_id)
+        mime = _mt.guess_type(path)[0] or "application/octet-stream"
+        if mime != "application/pdf" and not mime.startswith("image/"):
+            raise HTTPException(415, "Only PDFs and images can be previewed")
+        return FileResponse(
+            path, media_type=mime, filename=name,
+            headers={"X-Content-Type-Options": "nosniff"},
+            content_disposition_type="inline",
+        )
+
     @router.post("/materials/{material_id}/transcribe")
     async def transcribe_material(request: Request, material_id: str):
         """Vision OCR for scanned / formula PDFs (see run_transcribe_material)."""
