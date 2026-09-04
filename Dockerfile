@@ -86,7 +86,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
 # entrypoint) bridges its loopback-only web UI to the published :6868.
 ENV UV_TOOL_DIR=/opt/uv/tools \
     UV_TOOL_BIN_DIR=/usr/local/bin
-ARG OMNIGENT_VERSION=0.10.0
+# Keep at or above whatever migrated the persisted chat DB
+# (data/omnigent-home/.omnigent/chat.db): Omnigent refuses to start against a
+# database newer than the binary, and alembic cannot walk revisions backwards.
+ARG OMNIGENT_VERSION=0.12.0
 RUN pip install --no-cache-dir uv \
     && uv tool install "omnigent==${OMNIGENT_VERSION}" \
     && chmod -R a+rX /opt/uv \
