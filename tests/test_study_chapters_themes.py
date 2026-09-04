@@ -359,3 +359,38 @@ def test_agent_can_reach_the_new_services():
 
     for name in ("run_detect_chapters", "run_cluster_themes", "groupings_payload"):
         assert hasattr(sr, name), f"routes.study_routes.{name} not re-exported"
+
+
+def test_extraction_stores_a_chapter_when_one_is_given():
+    """New extractions carry their chapter straight through, so a freshly added
+    workbook is practisable by chapter without a separate backfill pass."""
+    from routes.study._common import _question_row_kwargs
+
+    row = _question_row_kwargs({"question": "q", "reference": "r",
+                                "chapter": "2 - Limits", "chapter_index": 2})
+    assert row["chapter"] == "2 - Limits"
+    assert row["chapter_index"] == 2
+
+
+def test_extraction_leaves_chapter_empty_for_a_flat_document():
+    """A document with no chapter structure must store nothing rather than a
+    blank string, or groupings would offer an unnamed chapter."""
+    from routes.study._common import _question_row_kwargs
+
+    for item in ({}, {"chapter": "   "}, {"chapter": "x", "chapter_index": "bad"}):
+        row = _question_row_kwargs(item)
+        assert row["chapter"] in (None, "x")
+        assert row["chapter_index"] is None
+
+
+def test_normalize_questions_preserves_the_chapter():
+    """The extraction sanitiser rebuilds each item field by field, so a chapter
+    the model returned is dropped unless it is carried explicitly."""
+    from src.study_ai import normalize_questions
+
+    out = normalize_questions([{"qtype": "open", "question": "Derive it.",
+                                "reference": "r", "chapter": "2 - Limits",
+                                "chapter_index": 2}])
+    assert len(out) == 1, "the question itself should survive"
+    assert out[0]["chapter"] == "2 - Limits"
+    assert out[0]["chapter_index"] == 2

@@ -279,6 +279,14 @@ def normalize_questions(value) -> List[Dict]:
         if ctx and context_is_redundant(question, ctx):
             ctx = None  # the setup is already in the question — don't repeat it
 
+        # Chapter is optional: only documents with real headings carry one,
+        # and a blank must stay None or the picker gains a nameless chapter.
+        try:
+            chapter_index = int(item.get("chapter_index") or 0) or None
+        except (TypeError, ValueError):
+            chapter_index = None
+        chapter = str(item.get("chapter") or "").strip() or None
+
         out.append({
             "qtype": qtype,
             "question": question,
@@ -290,6 +298,8 @@ def normalize_questions(value) -> List[Dict]:
             "number": number or None,
             "source_page": source_page,
             "context": ctx,
+            "chapter": chapter,
+            "chapter_index": chapter_index,
         })
     return out
 
@@ -607,13 +617,14 @@ Rules:
 - "reference" for open questions must be a complete model answer (the steps + the result), concise enough to grade against.
 - "topic": a short topic label (2-4 words). "difficulty": "easy"|"medium"|"hard" judged against a typical exam.
 - "number": the question's visible label in the source ("3", "16a"); null if unnumbered.
+- "chapter"/"chapter_index": when the document is divided into chapters or numbered sections, set "chapter" to the heading the question sits under, exactly as it appears and prefixed by its number ("3 - Joint distributions"), and "chapter_index" to that heading's position starting at 1. Use the SAME string for every question under one heading. Omit BOTH fields entirely when the document has no chapter structure (a single exam paper, one problem set) - never invent divisions.
 - Skip pure definitions of administrative text (deadlines, grading policy, etc.).
 - The QUESTION text must ask something the learner has to work out, and must NOT state the answer. "Prove that f is concave", "Show that g is continuous", "Verify that the constraints are differentiable" are fine (they ask for the work). But NEVER emit a question that already gives away its own result: a conclusion ("Conclude that (3,3) is the solution", "Therefore the point is optimal"), or a verify/show/compute instruction that names the specific result ("Verify that the gradient is $(-4(x-6),-4(y-4))$", "Show that the Hessian is $-4I$, hence concave", "Solve the system to get (3,3,2,6,0)"). When the source is a solution walkthrough, recover the underlying QUESTION it answers and move the result + steps into "reference"; never leave the answer in the question text.
 - Use the language of the source material.
 
 Output ONLY a JSON array:
 [{"number":"1","type":"mcq","question":"...","options":["...","..."],"correct_index":0,"reference":"...","topic":"...","difficulty":"medium"},
- {"number":"2a","type":"open","question":"...","context":"...","reference":"...","topic":"...","difficulty":"hard"}]
+ {"number":"2a","type":"open","question":"...","context":"...","reference":"...","topic":"...","difficulty":"hard","chapter":"3 - Joint distributions","chapter_index":3}]
 No markdown fences or commentary around the JSON (LaTeX inside the field values is expected)."""
 EXTRACT_QUESTIONS_SYSTEM += _MATH_JSON_NOTE
 

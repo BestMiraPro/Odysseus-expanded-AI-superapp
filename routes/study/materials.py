@@ -1,6 +1,7 @@
 """Study route sub-module: materials handlers (Phase 4.2 split)."""
 from routes.study._common import *  # noqa: F401,F403
 import routes.study._common as _common  # noqa: F401
+from routes.study._common import _question_row_kwargs
 
 from fastapi import APIRouter  # noqa: F401  (re-exported via _common but explicit)
 
@@ -328,6 +329,7 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
                 source_page=q.get("source_page"),
                 origin="extracted" if mode == "extract" else "authored",
                 state="new", due=now,
+                **_question_row_kwargs(q),
             )
             db.add(row)
             saved.append(row)

@@ -272,6 +272,20 @@ class AskIn(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _question_row_kwargs(item: Dict) -> Dict:
+    """Chapter fields carried from an extracted item onto its StudyQuestion row.
+
+    Kept in one place so extraction and the chapter backfill agree on the shape.
+    Both come back None on a document with no chapter structure - an empty
+    string would surface in the picker as an unnamed chapter."""
+    try:
+        idx = int(item.get("chapter_index") or 0) or None
+    except (TypeError, ValueError):
+        idx = None
+    label = str(item.get("chapter") or "").strip() or None
+    return {"chapter": label, "chapter_index": idx}
+
+
 def _utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
