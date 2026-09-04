@@ -1715,6 +1715,12 @@ const TIDY_ACTIONS = [
   { key: 'audit', label: 'Suspend leaked answers', arm: true,
     hint: 'Suspends "questions" that state their own answer. Reversible in the bank. Slow (AI).',
     path: 'audit-questions', report: r => `${r.suspended} suspended of ${r.scanned} scanned` },
+  { key: 'detect_chapters', label: 'Detect chapters', arm: false, perMaterial: true,
+    hint: 'Split each document that has several chapters, so you can practise one at a time. Documents with a single chapter are left alone. Slow (AI).',
+    report: r => `${r.split} document(s) split, ${r.single} single-chapter, ${r.skipped} too small` },
+  { key: 'group_themes', label: 'Group themes', arm: false,
+    hint: 'Cluster this subject\u2019s topics into a handful of themes you can drill across every document. Slow (AI).',
+    path: 'group-themes', report: r => `${r.themes} themes over ${r.labelled} questions` },
   { key: 'reformat', label: 'Reformat maths', arm: false,
     hint: 'Rewrites questions and cards to LaTeX + Markdown. Idempotent. Slow (AI).',
     path: 'reformat', report: r => `${r.questions_reformatted} question(s), ${r.cards_reformatted} card(s)` },
@@ -1744,10 +1750,28 @@ function renderTidyBank() {
       const out = box.querySelector(`[data-tidy-out="${act.key}"]`);
       btn.disabled = true; btn.textContent = 'Running…'; out.textContent = '';
       try {
-        const url = act.key === 'link_parts'
-          ? `/api/study/decks/${encodeURIComponent(s.deck.id)}/link-parts`
-          : `/api/study/${act.path}?deck_id=${encodeURIComponent(s.deck.id)}`;
-        const res = await jpost(url, {});
+        let res;
+        if (act.perMaterial) {
+          // Chapters belong to a document, so this pass walks the subject's
+          // materials and rolls the outcomes up into one line.
+          const roll = { split: 0, single: 0, skipped: 0 };
+          for (const m of (s.materials || [])) {
+            try {
+              const r = await jpost(`/api/study/materials/${encodeURIComponent(m.id)}/detect-chapters`, {});
+              if (r.skipped) roll.skipped += 1;
+              else if ((r.chapters || 0) >= 2) roll.split += 1;
+              else roll.single += 1;
+            } catch { roll.skipped += 1; }
+          }
+          res = roll;
+        } else {
+          const url = act.key === 'link_parts'
+            ? `/api/study/decks/${encodeURIComponent(s.deck.id)}/link-parts`
+            : (act.key === 'group_themes'
+              ? `/api/study/decks/${encodeURIComponent(s.deck.id)}/group-themes`
+              : `/api/study/${act.path}?deck_id=${encodeURIComponent(s.deck.id)}`);
+          res = await jpost(url, {});
+        }
         const msg = act.report(res || {});
         (S.subject.tidyOut ||= {})[act.key] = msg;
         out.textContent = msg;
@@ -2079,6 +2103,8 @@ async function startPractice(deckId = null, limit = 12, scope = null, mock = nul
     if (deckId) params.set('deck_id', deckId);
     if (scope?.materialId) params.set('material_id', scope.materialId);
     if (scope?.topics) params.set('topics', Array.isArray(scope.topics) ? scope.topics.join(',') : scope.topics);
+    if (scope?.chapter) params.set('chapter', scope.chapter);
+    if (scope?.theme) params.set('theme', scope.theme);
     const res = await jget(`/api/study/practice/queue?${params}`);
     S.practice.queue = res.queue;
     if (res.topic_fallback) toast('No questions matched those topics — practising the whole subject instead');
@@ -2130,6 +2156,62 @@ function fmtClock(sec) {
   return `${String(Math.floor(sec / 60)).padStart(2, '0')}:${String(sec % 60).padStart(2, '0')}`;
 }
 
+// What to practise, for one subject. The two axes answer different questions:
+// a chapter is one document in its own order, a theme is one idea across every
+// document. Each section is omitted when empty, so a subject of plain exam
+// papers looks exactly as it did before any of this existed.
+async function renderPracticePicker(deckId) {
+  const el = body();
+  el.innerHTML = '<div class="study-empty">Loading\u2026</div>';
+  const deck = (S.decks || []).find(d => d.id === deckId);
+  let g = { chapters: [], themes: [] };
+  try { g = await jget(`/api/study/decks/${deckId}/groupings`); }
+  catch { /* the picker still offers Everything */ }
+  if (_tab !== 'practice' || S.practice) return;
+
+  const chapterRows = (g.chapters || []).map(doc => `
+    <div style="margin-bottom:12px;">
+      <div class="study-subtle" style="margin-bottom:4px;">${esc(doc.material)}</div>
+      ${doc.chapters.map(c => `
+        <div class="study-row">
+          <span class="grow">${esc(c.label)}</span>
+          <span class="study-badge q">${c.count} q</span>
+          <button class="study-btn small" data-chapter="${esc(c.label)}">Practice</button>
+        </div>`).join('')}
+    </div>`).join('');
+
+  const themeRows = (g.themes || []).map(t => `
+    <div class="study-row">
+      <span class="grow">${esc(t.name)}</span>
+      <span class="study-subtle">${t.count} q \u00b7 ${t.materials} document${t.materials === 1 ? '' : 's'}</span>
+      <button class="study-btn small" data-theme="${esc(t.name)}">Practice</button>
+    </div>`).join('');
+
+  el.innerHTML = `
+    <div style="max-width:620px;">
+      <div class="study-form-row">
+        <button class="study-btn small" id="study-pick-back">\u2190 Subjects</button>
+        <b style="font-size:14px;">${esc(deck?.name || 'Practice')}</b>
+      </div>
+      <div class="study-rate-row" style="margin:14px 0 6px;">
+        <button class="study-btn primary" id="study-pick-all">Everything \u00b7 ${deck?.q_due ?? 0} due</button>
+      </div>
+      ${chapterRows ? `<div class="study-section-title" style="margin-top:22px;">By chapter</div>
+        <div class="study-subtle" style="margin-bottom:8px;">One document, in its own order.</div>${chapterRows}` : ''}
+      ${themeRows ? `<div class="study-section-title" style="margin-top:22px;">By theme</div>
+        <div class="study-subtle" style="margin-bottom:8px;">One idea, across every document in this subject.</div>${themeRows}` : ''}
+      ${!chapterRows && !themeRows ? `<div class="study-subtle" style="margin-top:18px;">
+        Nothing grouped yet \u2014 run \u201cDetect chapters\u201d or \u201cGroup themes\u201d from Tidy bank in the subject view.</div>` : ''}
+    </div>`;
+
+  el.querySelector('#study-pick-back').addEventListener('click', () => { S.practice = null; renderPractice(); });
+  el.querySelector('#study-pick-all').addEventListener('click', () => startPractice(deckId));
+  el.querySelectorAll('[data-chapter]').forEach(b => b.addEventListener('click', () =>
+    startPractice(deckId, 12, { chapter: b.dataset.chapter, label: b.dataset.chapter })));
+  el.querySelectorAll('[data-theme]').forEach(b => b.addEventListener('click', () =>
+    startPractice(deckId, 12, { theme: b.dataset.theme, label: b.dataset.theme })));
+}
+
 async function renderPractice() {
   const el = body();
   const p = S.practice;
@@ -2152,14 +2234,14 @@ async function renderPractice() {
             <span class="grow" style="text-align:left;">${esc(d.name)}</span>
             <span class="study-badge q">${d.q_due ?? 0} due</span>
             <span class="study-badge new">${d.q_new ?? 0} new</span>
-            <button class="study-btn small" data-prac="${d.id}" ${(d.q_due ?? 0) + (d.q_new ?? 0) === 0 ? 'disabled' : ''}>Start</button>
+            <button class="study-btn small" data-prac="${d.id}" ${(d.q_due ?? 0) + (d.q_new ?? 0) === 0 ? 'disabled' : ''}>Choose\u2026</button>
           </div>`).join('')}</div>
         ${totalQ === 0 ? '<div class="study-empty" style="margin-top:14px;">No questions yet — go to Subjects, add a material, and extract questions from it.</div>' : ''}
       </div>`;
     el.querySelector('#study-practice-all')?.addEventListener('click', () => startPractice(null));
     el.onclick = (e) => {
       const id = e.target.closest('[data-prac]')?.dataset.prac;
-      if (id) startPractice(id);
+      if (id) renderPracticePicker(id);
     };
     return;
   }
