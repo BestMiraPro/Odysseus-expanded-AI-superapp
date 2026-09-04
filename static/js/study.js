@@ -2184,7 +2184,7 @@ async function renderPracticePicker(deckId) {
     <div class="study-row">
       <span class="grow">${esc(t.name)}</span>
       <span class="study-subtle">${t.count} q \u00b7 ${t.materials} document${t.materials === 1 ? '' : 's'}</span>
-      <button class="study-btn small" data-theme="${esc(t.name)}">Practice</button>
+      <button class="study-btn small" data-study-theme="${esc(t.name)}">Practice</button>
     </div>`).join('');
 
   el.innerHTML = `
@@ -2208,8 +2208,8 @@ async function renderPracticePicker(deckId) {
   el.querySelector('#study-pick-all').addEventListener('click', () => startPractice(deckId));
   el.querySelectorAll('[data-chapter]').forEach(b => b.addEventListener('click', () =>
     startPractice(deckId, 12, { chapter: b.dataset.chapter, label: b.dataset.chapter })));
-  el.querySelectorAll('[data-theme]').forEach(b => b.addEventListener('click', () =>
-    startPractice(deckId, 12, { theme: b.dataset.theme, label: b.dataset.theme })));
+  el.querySelectorAll('[data-study-theme]').forEach(b => b.addEventListener('click', () =>
+    startPractice(deckId, 12, { theme: b.dataset.studyTheme, label: b.dataset.studyTheme })));
 }
 
 async function renderPractice() {
@@ -2219,7 +2219,7 @@ async function renderPractice() {
   if (!p) {
     el.innerHTML = '<div class="study-empty">Loading…</div>';
     let decks = [];
-    try { decks = (await jget('/api/study/decks')).decks; } catch { }
+    try { decks = (await jget('/api/study/decks')).decks; S.decks = decks; } catch { }
     if (_tab !== 'practice' || S.practice) return;
     const totalQ = decks.reduce((a, d) => a + (d.q_due ?? 0) + (d.q_new ?? 0), 0);
     el.innerHTML = `

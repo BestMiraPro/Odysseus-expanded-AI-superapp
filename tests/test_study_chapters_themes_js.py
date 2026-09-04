@@ -17,8 +17,10 @@ def test_picker_sections_are_conditional():
 
 
 def test_every_scope_the_picker_sets_reaches_the_queue():
+    # the theme attribute is namespaced: the app uses bare data-theme for its
+    # own light/dark switcher, and the two must never be confused
     for attr, param in (("data-chapter=", "params.set('chapter'"),
-                        ("data-theme=", "params.set('theme'")):
+                        ("data-study-theme=", "params.set('theme'")):
         assert attr in _STUDY, f"{attr} button missing"
         assert param in _STUDY, f"{attr} is set but never forwarded to the queue"
 
