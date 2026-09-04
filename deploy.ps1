@@ -22,6 +22,9 @@
                         agent's code tools at it (docker-compose.code.yml), so
                         its edits land in a real file instead of the image's
                         baked copy. Python edits still need this restart.
+.PARAMETER HealthTimeoutSec  Seconds to wait for /api/health after the container
+                        is recreated (default 300). Startup grew past the old
+                        60s ceiling, which made good deploys report failure.
 .PARAMETER DryRun       Print the resolved compose config and stop.
 
 .EXAMPLE
@@ -38,6 +41,7 @@ param(
   [string]$Project   = 'odysseus',
   [string]$Service   = 'odysseus',
   [switch]$CodeTools,
+  [int]$HealthTimeoutSec = 300,
   [switch]$DryRun
 )
 
@@ -105,13 +109,22 @@ Run docker (@('compose', '-p', $Project, '--project-directory', $DataRepo) +
 # --- 5. Verify ------------------------------------------------------------------
 Step "Waiting for health ..."
 $port = if ($env:APP_PORT) { $env:APP_PORT } else { '7000' }
+# Wall-clock budget rather than a loop count: the old 20 x 3s gave ~60s, which
+# the image outgrew once the upstream sync pulled in heavier startup work
+# (FastEmbed model load, vector store warm-up). The deploy then reported
+# failure for a container that was in fact coming up fine.
+$sw = [Diagnostics.Stopwatch]::StartNew()
 $ok = $false
-for ($i = 0; $i -lt 20; $i++) {
-  try { if ((Invoke-WebRequest "http://127.0.0.1:$port/api/health" -UseBasicParsing -TimeoutSec 5).StatusCode -eq 200) { $ok = $true; break } }
-  catch { Start-Sleep -Seconds 3 }
+while ($sw.Elapsed.TotalSeconds -lt $HealthTimeoutSec) {
+  try {
+    $resp = Invoke-WebRequest "http://127.0.0.1:$port/api/health" -UseBasicParsing -TimeoutSec 5
+    if ($resp.StatusCode -eq 200) { $ok = $true; break }
+  } catch { }
+  Start-Sleep -Seconds 3
 }
+$took = [int]$sw.Elapsed.TotalSeconds
 if ($ok) {
-  Write-Host "Deployed. Health OK on :$port. Source = $Branch @ $(git -C $BuildTree rev-parse --short HEAD)." -ForegroundColor Green
+  Write-Host "Deployed. Health OK on :$port after ${took}s. Source = $Branch @ $(git -C $BuildTree rev-parse --short HEAD)." -ForegroundColor Green
 } else {
-  throw "Container recreated but /api/health did not return 200. Check: docker logs $Project-$Service-1"
+  throw "Container recreated but /api/health did not return 200 within ${took}s. Raise -HealthTimeoutSec, or check: docker logs $Project-$Service-1"
 }
