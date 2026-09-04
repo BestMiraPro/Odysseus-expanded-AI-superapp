@@ -939,6 +939,15 @@ def _migrate_add_study_summary_columns():
             conn.execute("ALTER TABLE study_questions ADD COLUMN context TEXT")
         if "source_page" not in q_cols:
             conn.execute("ALTER TABLE study_questions ADD COLUMN source_page INTEGER")
+        if "chapter" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN chapter TEXT")
+        if "chapter_index" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN chapter_index INTEGER")
+        if "theme" not in q_cols:
+            conn.execute("ALTER TABLE study_questions ADD COLUMN theme TEXT")
+        chap_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_materials)")]
+        if chap_cols and "chapter_count" not in chap_cols:
+            conn.execute("ALTER TABLE study_materials ADD COLUMN chapter_count INTEGER")
         mat_cols = [r[1] for r in conn.execute("PRAGMA table_info(study_materials)")]
         if mat_cols and "page_count" not in mat_cols:
             conn.execute("ALTER TABLE study_materials ADD COLUMN page_count INTEGER")
@@ -2099,6 +2108,8 @@ class StudyMaterial(TimestampMixin, Base):
     summary        = Column(Text, nullable=True)       # AI study notes (markdown), for consultation
     category       = Column(String, default="theory")  # "theory" | "exam" — drives consult/explain-further search
     page_count     = Column(Integer, nullable=True)    # PDF pages (thin-text detection, transcription)
+    # 0/1 = not split (single chapter, or detection never run); >= 2 = offer chapters.
+    chapter_count  = Column(Integer, nullable=True)
 
 
 class StudyQuestion(TimestampMixin, Base):
@@ -2124,6 +2135,12 @@ class StudyQuestion(TimestampMixin, Base):
     deep_explanation = Column(Text, nullable=True)      # cached "explain further" (theory + location)
     number          = Column(String, nullable=True)     # source part label ("16a"), for multi-part grouping
     source_page     = Column(Integer, nullable=True)    # page of the original extracted question, when known
+    # Where the question sits in its source document. Written by chapter
+    # detection; null means the document was never split (see chapter_count).
+    chapter         = Column(String, nullable=True, index=True)
+    chapter_index   = Column(Integer, nullable=True)   # ordinal, so chapters sort
+    # Coarse subject-wide grouping, clustered from `topic`. Independent of chapter.
+    theme           = Column(String, nullable=True, index=True)
     prereq_ids      = Column(Text, nullable=True)        # JSON list of earlier-part question ids this part needs
     topic           = Column(String, nullable=True, index=True)
     difficulty      = Column(String, default="medium")  # easy | medium | hard
