@@ -32,7 +32,8 @@ def _round_robin(rows: List, key) -> List:
 
 def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
                            limit: int = 20, mock: bool = False,
-                           mode=None, adaptive: bool = False) -> Dict:
+                           mode=None, adaptive: bool = False,
+                           chapter=None, theme=None) -> Dict:
     """Build the practice queue. Shared by the /practice/queue route and the
     Study agent.
 
@@ -48,6 +49,12 @@ def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
     questions drawn from the whole scope regardless of FSRS state. A mock
     measures where you stand today, so it must be able to ask questions that
     are not due yet.
+
+    ``chapter`` scopes to one chapter of one document; ``theme`` scopes to one
+    subject-wide theme, which may span several documents. Both are exact
+    matches - unlike the fuzzy topic filter they never fall back to the whole
+    subject, because an empty chapter is a real answer and quietly widening it
+    would hide that.
 
     ``mode="pretest"`` lifts one unseen question per topic ahead of the rest
     (errorful generation); ``adaptive`` reweights toward weak areas."""
@@ -67,6 +74,10 @@ def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
             base = base.filter(StudyQuestion.deck_id == deck_id)
         if user is not None:
             base = base.filter(StudyQuestion.owner == user)
+        if chapter:
+            base = base.filter(StudyQuestion.chapter == chapter)
+        if theme:
+            base = base.filter(StudyQuestion.theme == theme)
 
         scoped_to_one = bool(material_id or deck_id)
 
@@ -171,6 +182,8 @@ def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
             "due": len(due),
             "total": len(queue),
             "mock": bool(mock),
+            "chapter": chapter,
+            "theme": theme,
             "topic_fallback": topic_fallback,
             "pretest": sum(1 for r in rows if r.id in pretest_ids),
         }
@@ -299,7 +312,9 @@ def register(router: APIRouter) -> None:
                        material_id: Optional[str] = None,
                        topics: Optional[str] = None,
                        limit: int = 20, mock: bool = False,
-                       mode: Optional[str] = None, adaptive: bool = False):
+                       mode: Optional[str] = None, adaptive: bool = False,
+                       chapter: Optional[str] = None,
+                       theme: Optional[str] = None):
         """Due questions first (spaced retrieval), then new ones interleaved
         across subject and topic. Optional scope: one subject, one material,
         and/or a comma-separated topic list. ``mock=true`` draws a fixed-size
@@ -307,7 +322,8 @@ def register(router: APIRouter) -> None:
         lifts one unseen question per topic ahead of the rest."""
         return practice_queue_payload(
             _owner(request), deck_id=deck_id, material_id=material_id,
-            topics=topics, limit=limit, mock=mock, mode=mode, adaptive=adaptive)
+            topics=topics, limit=limit, mock=mock, mode=mode, adaptive=adaptive,
+            chapter=chapter, theme=theme)
 
     @router.post("/questions/{question_id}/attempt")
     async def attempt_question(request: Request, question_id: str, body: AttemptIn):

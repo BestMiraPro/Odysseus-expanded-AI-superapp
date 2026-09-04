@@ -81,8 +81,10 @@ re-run. Re-running re-clusters cleanly because it only ever rewrites `theme`.
 due-first-then-new ordering, cross-subject interleaving, the topic fallback and
 mock mode all keep working unchanged inside a chapter or a theme.
 
-Spaced repetition still applies within a slice: picking Chapter 3 gives that
-chapter's due questions first, then its unseen ones.
+Spaced repetition still applies within a slice, and the slice does not change
+the order: the user's `study_order` preference decides it exactly as for an
+unscoped session (default sinks already-seen questions behind unseen ones;
+`review` puts due retrievals first).
 
 ## API
 
