@@ -93,3 +93,53 @@ def pytest_collection_modifyitems(config, items):
         path = getattr(item, "path", None) or item.fspath
         for marker_name in markers_for_path(path):
             item.add_marker(getattr(pytest.mark, marker_name))
+
+
+# ---------------------------------------------------------------------------
+# Windows: give spawned processes a real stdin handle
+# ---------------------------------------------------------------------------
+# The JS tests shell out to `node` with capture_output=True, which pipes stdout
+# and stderr but leaves stdin inherited. Under pytest's default fd capture the
+# inherited stdin is not a valid OS handle on Windows, so CreateProcess fails
+# before node ever runs:
+#
+#     OSError: [WinError 6] The handle is invalid
+#       ... _make_inheritable -> _winapi.DuplicateHandle
+#
+# It is nondeterministic (it depends on what else has touched fd 0 in the
+# session), which made 40-100 tests across 63 files flip between runs and forced
+# every regression comparison in this repo to diff failing *sets* rather than
+# read totals.
+#
+# None of these subprocesses read stdin, so defaulting it to DEVNULL is the fix.
+# Done here rather than at 104 call sites, and only when the caller passed
+# neither stdin nor input, so anything that genuinely feeds a process is
+# untouched.
+_ODYSSEUS_SUBPROCESS_STDIN_SHIM = True
+
+def _install_subprocess_stdin_default():
+    import subprocess
+
+    if getattr(subprocess, "_odysseus_stdin_default", False):
+        return
+    _run, _popen_init = subprocess.run, subprocess.Popen.__init__
+
+    def _needs_default(kwargs):
+        return kwargs.get("stdin") is None and kwargs.get("input") is None
+
+    def run(*args, **kwargs):
+        if _needs_default(kwargs):
+            kwargs["stdin"] = subprocess.DEVNULL
+        return _run(*args, **kwargs)
+
+    def popen_init(self, *args, **kwargs):
+        if _needs_default(kwargs):
+            kwargs["stdin"] = subprocess.DEVNULL
+        return _popen_init(self, *args, **kwargs)
+
+    subprocess.run = run
+    subprocess.Popen.__init__ = popen_init
+    subprocess._odysseus_stdin_default = True
+
+
+_install_subprocess_stdin_default()

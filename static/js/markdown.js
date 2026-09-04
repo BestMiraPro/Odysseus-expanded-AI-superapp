@@ -984,7 +984,11 @@ export function renderMath(container) {
           // Sanitise here too: this path writes straight into outerHTML, so
           // rendering unsanitised KaTeX output would reintroduce the injection
           // the sanitiser exists to stop.
-          el.outerHTML = renderSafeKatex(el.textContent || '', displayMode);
+          // Sanitise here too — this writes straight into outerHTML. Uses the
+          // katex resolved by ensureKatex() rather than renderSafeKatex, which
+          // reads the module-global and is not bound on this path.
+          el.outerHTML = sanitizeAllowedHtml(
+            katex.renderToString(el.textContent || '', { displayMode, throwOnError: false }));
         } catch (e) {
           // Leave the source visible — readable, just not typeset.
           el.classList.remove(MATH_PENDING_CLASS);
