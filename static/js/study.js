@@ -2291,6 +2291,7 @@ async function renderPractice() {
           <button class="study-btn" id="study-prac-ask" title="Discuss this question with the Study agent (tutor grounded in your materials)">Ask the tutor</button>
         </div>`}
 
+        ${p.mock ? '' : `
       <div class="study-ask">
         <div class="study-ask-head">${res
           ? '💬 Ask AI — anything about this question'
@@ -2303,6 +2304,7 @@ async function renderPractice() {
           <button class="study-btn" id="study-ask-send" ${p.askBusy ? 'disabled' : ''}>${p.askBusy ? '…' : 'Ask'}</button>
         </div>
       </div>
+        `}
     </div>`;
 
   // handlers
