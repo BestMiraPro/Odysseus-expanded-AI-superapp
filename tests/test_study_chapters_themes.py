@@ -350,3 +350,12 @@ def test_cluster_themes_is_idempotent(db, monkeypatch):
     s = db()
     assert {q.theme for q in s.query(StudyQuestion).all()} == {"Everything"}
     s.close()
+
+
+def test_agent_can_reach_the_new_services():
+    """The agent reaches the service layer through routes.study_routes; a missing
+    re-export breaks a tool at runtime with nothing else to catch it."""
+    from routes import study_routes as sr
+
+    for name in ("run_detect_chapters", "run_cluster_themes", "groupings_payload"):
+        assert hasattr(sr, name), f"routes.study_routes.{name} not re-exported"

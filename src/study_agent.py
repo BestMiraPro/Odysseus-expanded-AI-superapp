@@ -814,10 +814,12 @@ async def _generate_overview(owner, args):
     return {"chars": len(ov), "preview": ov[:600]}
 
 
-@tool("maintain_bank", "Question-bank maintenance: dedup (remove duplicate questions), audit (suspend 'questions' that state their own answer), link_parts (group multi-part problems so practice shows earlier parts), backfill_context (recover shared problem setups), reformat (LaTeX/Markdown pass). Pass deck_id to confine the pass to one subject.",
-      {"action": _s("dedup | audit | link_parts | backfill_context | reformat",
-                    enum=["dedup", "audit", "link_parts", "backfill_context", "reformat"]),
-       "deck_id": _s("Subject id (required for link_parts, optional elsewhere)")}, ["action"])
+@tool("maintain_bank", "Question-bank maintenance: dedup (remove duplicate questions), audit (suspend 'questions' that state their own answer), link_parts (group multi-part problems so practice shows earlier parts), backfill_context (recover shared problem setups), reformat (LaTeX/Markdown pass), detect_chapters (split one document's questions into its own chapters, so the user can practise one chapter at a time), group_themes (cluster a subject's topics into coarse themes that span its documents). Pass deck_id to confine a pass to one subject; detect_chapters takes material_id.",
+      {"action": _s("dedup | audit | link_parts | backfill_context | reformat | detect_chapters | group_themes",
+                    enum=["dedup", "audit", "link_parts", "backfill_context", "reformat",
+                          "detect_chapters", "group_themes"]),
+       "deck_id": _s("Subject id (required for link_parts and group_themes, optional elsewhere)"),
+       "material_id": _s("Material id (required for detect_chapters)")}, ["action"])
 async def _maintain_bank(owner, args):
     _require(args, "action")
     sr = _sr()
@@ -831,6 +833,12 @@ async def _maintain_bank(owner, args):
         return await sr.run_backfill_context(owner, deck_id=deck_id)
     if action == "reformat":
         return await sr.run_reformat(owner, deck_id=deck_id)
+    if action == "detect_chapters":
+        _require(args, "material_id")
+        return await sr.run_detect_chapters(owner, args["material_id"])
+    if action == "group_themes":
+        _require(args, "deck_id")
+        return await sr.run_cluster_themes(owner, args["deck_id"])
     if action == "link_parts":
         _require(args, "deck_id")
         db = SessionLocal()
