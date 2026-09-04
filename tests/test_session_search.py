@@ -321,4 +321,6 @@ def test_search_chats_formats_shared_results(monkeypatch):
     assert "Design notes" in out["results"]
     assert "Match (assistant): We discussed session search." in out["results"]
     assert "Before (user): Can you find old chats?" in out["results"]
-    assert "After (user): That helps." not in out["results"]
+    # Upstream now shows the following message as trailing context too
+    # (src/tools/search.py emits "After (...)"); this fork used to omit it.
+    assert "After (user): That helps." in out["results"]

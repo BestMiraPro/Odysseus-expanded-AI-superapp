@@ -17,8 +17,8 @@ from pathlib import Path
 import httpx
 
 from core.atomic_io import atomic_write_json, atomic_write_text
-from core.auth import AuthManager
-from src.constants import DEEP_RESEARCH_DIR, MEMORY_FILE, SKILLS_DIR
+from core.auth import AuthManager, RESERVED_USERNAMES, SetAdminResult, TOKEN_TTL
+from src.constants import DEEP_RESEARCH_DIR, MEMORY_FILE, PASSWORD_MIN_LENGTH, SKILLS_DIR
 from src.rate_limiter import RateLimiter
 from src.settings_scrub import scrub_settings
 from src.settings import (
@@ -27,6 +27,8 @@ from src.settings import (
     load_features as _load_features,
     save_features as _save_features,
     DEFAULT_SETTINGS,
+    RETIRED_SETTING_KEYS,
+    without_retired_settings,
 )
 from src.integrations import (
     load_integrations,
@@ -78,10 +80,42 @@ class DeleteUserRequest(BaseModel):
 class RenameUserRequest(BaseModel):
     username: str
 
+
+class SetAdminRequest(BaseModel):
+    is_admin: bool
+
+
 class SetOpenRegistrationRequest(BaseModel):
     enabled: bool
 
 SESSION_COOKIE = "odysseus_session"
+
+
+def _secure_cookie(request: Request) -> bool:
+    """Decide the ``Secure`` attribute of the session cookie.
+
+    ``SECURE_COOKIES`` stays authoritative when it holds an explicit value:
+    ``true`` always marks the cookie Secure (the documented knob for a TLS
+    proxy), ``false`` never does, which is the escape hatch for an install
+    that still answers on plain HTTP alongside HTTPS. Anything else —
+    unset, or the present-but-empty value docker-compose injects for a
+    variable the host has not defined — derives it from the request, so an
+    HTTPS login gets a Secure cookie without any configuration.
+
+    Either the connection scheme or ``X-Forwarded-Proto`` saying https is
+    enough, which is the same test ``core/middleware.py`` applies before it
+    sends HSTS. Uvicorn's proxy-headers middleware already folds that header
+    into the scheme for the proxies it trusts, so reading it here only adds
+    the case of a terminator that is not on a trusted address; the cost is
+    that a client talking to the app directly can set the header and lock
+    its own session out over plain HTTP.
+    """
+    configured = os.getenv("SECURE_COOKIES", "").strip().lower()
+    if configured in ("true", "false"):
+        return configured == "true"
+    # A chained proxy sends a list — the client-facing hop comes first.
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",")[0]
+    return request.url.scheme == "https" or forwarded_proto.strip().lower() == "https"
 
 
 def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
@@ -102,8 +136,12 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(429, "Too many requests — try again later")
         if auth_manager.is_configured:
             raise HTTPException(400, "Already configured")
-        if len(body.password) < 8:
-            raise HTTPException(400, "Password must be at least 8 characters")
+        if len(body.password) < PASSWORD_MIN_LENGTH:
+            raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
+        if len(body.username.strip()) < 1:
+            raise HTTPException(400, "Username is required")
+        if body.username.lower() in RESERVED_USERNAMES:
+            raise HTTPException(403, "Username is reserved")
         ok = await asyncio.to_thread(auth_manager.setup, body.username, body.password)
         if not ok:
             raise HTTPException(500, "Setup failed")
@@ -118,10 +156,12 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             raise HTTPException(400, "Run setup first")
         if not auth_manager.signup_enabled:
             raise HTTPException(403, "Registration is disabled. Ask an admin for an account.")
-        if len(body.password) < 8:
-            raise HTTPException(400, "Password must be at least 8 characters")
+        if len(body.password) < PASSWORD_MIN_LENGTH:
+            raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
         if len(body.username.strip()) < 1:
             raise HTTPException(400, "Username is required")
+        if body.username.lower() in RESERVED_USERNAMES:
+            raise HTTPException(403, "Username is reserved")
         ok = await asyncio.to_thread(auth_manager.create_user, body.username, body.password, is_admin=False)
         if not ok:
             raise HTTPException(409, "Username already taken")
@@ -144,24 +184,20 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 raise HTTPException(401, "Invalid 2FA code")
         # All checks passed — create session (password already verified above)
         token = await asyncio.to_thread(auth_manager.create_session_trusted, username)
+        if not token:
+            raise HTTPException(401, "Invalid credentials")
         cookie_kwargs = dict(
             key=SESSION_COOKIE,
             value=token,
             httponly=True,
             samesite="lax",
-            # Mark the cookie Secure when the request is HTTPS (e.g. behind a
-            # Cloudflare tunnel / reverse proxy — see the X-Forwarded-Proto
-            # middleware in app.py), so the session token is never sent over
-            # plaintext. SECURE_COOKIES=true forces it on regardless. We don't
-            # force it unconditionally so plain-HTTP LAN access still works.
-            secure=(os.getenv("SECURE_COOKIES", "false").lower() == "true"
-                    or request.url.scheme == "https"),
+            secure=_secure_cookie(request),
             path="/",
         )
         if body.remember:
-            # Match the server session TTL so "remember me" actually persists
-            # (default 1 year) — log in once, stay in. Override via SESSION_TTL_DAYS.
-            cookie_kwargs["max_age"] = int(os.getenv("SESSION_TTL_DAYS", "365")) * 60 * 60 * 24
+            # TOKEN_TTL is itself SESSION_TTL_DAYS-driven (core/auth.py), so
+            # "remember me" matches the server session lifetime — default 1 year.
+            cookie_kwargs["max_age"] = TOKEN_TTL
         response.set_cookie(**cookie_kwargs)
         return {"ok": True, "username": username}
 
@@ -196,10 +232,6 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
     def _google_enabled() -> bool:
         cid, csec, allowed, _ = _google_cfg()
         return bool(cid and csec and allowed)
-
-    def _secure_cookie(request: Request) -> bool:
-        return (os.getenv("SECURE_COOKIES", "false").lower() == "true"
-                or request.url.scheme == "https")
 
     def _oauth_redirect_uri(request: Request) -> str:
         # Google requires an exact match against a registered redirect URI.
@@ -315,13 +347,18 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             pass
         return result
 
+    @router.get("/policy")
+    async def auth_policy():
+        """Return public auth policy constants for the frontend."""
+        return auth_manager.policy()
+
     @router.post("/change-password")
     async def change_password(body: ChangePasswordRequest, request: Request):
         user = _get_current_user(request)
         if not user:
             raise HTTPException(401, "Not authenticated")
-        if len(body.new_password) < 8:
-            raise HTTPException(400, "Password must be at least 8 characters")
+        if len(body.new_password) < PASSWORD_MIN_LENGTH:
+            raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
         current_token = request.cookies.get(SESSION_COOKIE)
         ok = await asyncio.to_thread(auth_manager.change_password, user, body.current_password, body.new_password)
         if not ok:
@@ -401,8 +438,12 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         user = _get_current_user(request)
         if not user or not auth_manager.is_admin(user):
             raise HTTPException(403, "Admin only")
-        if len(body.password) < 8:
-            raise HTTPException(400, "Password must be at least 8 characters")
+        if len(body.password) < PASSWORD_MIN_LENGTH:
+            raise HTTPException(400, f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
+        if len(body.username.strip()) < 1:
+            raise HTTPException(400, "Username is required")
+        if body.username.lower() in RESERVED_USERNAMES:
+            raise HTTPException(403, "Username is reserved")
         ok = auth_manager.create_user(body.username, body.password, body.is_admin)
         if not ok:
             raise HTTPException(409, "Username already taken")
@@ -461,9 +502,61 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         # docs, email accounts, tasks, etc.
         try:
             from sqlalchemy import func
-            from core.database import Base, SessionLocal
+            from core.database import (
+                Base,
+                EmailAccount,
+                SessionLocal,
+                lock_email_account_owner_mutations,
+            )
             db = SessionLocal()
             try:
+                # Email-account defaults are protected by per-owner mutex rows.
+                # A rename crosses two owner partitions, so lock both in the
+                # shared helper's canonical order before inspecting either.
+                lock_email_account_owner_mutations(
+                    db, old_username, new_username
+                )
+
+                source_default_ids = [
+                    row[0]
+                    for row in (
+                        db.query(EmailAccount.id)
+                        .filter(
+                            func.lower(EmailAccount.owner) == old_username,
+                            EmailAccount.is_default == True,  # noqa: E712
+                        )
+                        .order_by(EmailAccount.created_at.asc(), EmailAccount.id.asc())
+                        .all()
+                    )
+                ]
+                destination_default_ids = [
+                    row[0]
+                    for row in (
+                        db.query(EmailAccount.id)
+                        .filter(
+                            func.lower(EmailAccount.owner) == new_username,
+                            EmailAccount.is_default == True,  # noqa: E712
+                        )
+                        .order_by(EmailAccount.created_at.asc(), EmailAccount.id.asc())
+                        .all()
+                    )
+                ]
+                if destination_default_ids:
+                    clear_default_ids = (
+                        destination_default_ids[1:] + source_default_ids
+                    )
+                else:
+                    clear_default_ids = source_default_ids[1:]
+                if clear_default_ids:
+                    (
+                        db.query(EmailAccount)
+                        .filter(EmailAccount.id.in_(clear_default_ids))
+                        .update(
+                            {EmailAccount.is_default: False},
+                            synchronize_session=False,
+                        )
+                    )
+
                 for mapper in Base.registry.mappers:
                     model = mapper.class_
                     if not hasattr(model, "owner"):
@@ -565,6 +658,23 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         except Exception as e:
             logger.warning("Failed to rename upload owner references %s -> %s: %s", old_username, new_username, e)
 
+        # direct personal RAG uploads live in per-owner directories and the
+        # vector metadata also carries the username used for owner-filtered
+        # search. Keep both in sync with the auth rename.
+        try:
+            from routes.personal_routes import rename_personal_upload_owner
+            personal_docs_manager = getattr(request.app.state, "personal_docs_manager", None)
+            if personal_docs_manager is not None:
+                rag_manager = getattr(personal_docs_manager, "rag_manager", None)
+                rename_personal_upload_owner(
+                    old_username,
+                    new_username,
+                    personal_docs_manager=personal_docs_manager,
+                    rag_manager=rag_manager,
+                )
+        except Exception as e:
+            logger.warning("Failed to rename personal RAG upload owner references %s -> %s: %s", old_username, new_username, e)
+
         # skills: SKILL.md frontmatter carries owner: <username>; the usage
         # sidecar (_usage.json) keys entries as owner::skill-name. Both must
         # be updated or the renamed user's Skills panel goes empty.
@@ -624,6 +734,31 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         if callable(invalidator):
             invalidator()
         return {"ok": True, "username": new_username, "renamed_self": old_username == user}
+
+    @router.put("/users/{username}/admin")
+    async def set_user_admin(username: str, body: SetAdminRequest, request: Request):
+        """Promote/demote a user to/from admin. Admin only.
+
+        The last remaining admin can't be demoted (no lockout). Self-demotion
+        is allowed while another admin exists; the `self` flag tells the UI to
+        reload the acting user into the normal-user view.
+        """
+        user = _get_current_user(request)
+        if not user or not auth_manager.is_admin(user):
+            raise HTTPException(403, "Admin only")
+        result = auth_manager.set_admin(username, body.is_admin, user)
+        if result is SetAdminResult.USER_NOT_FOUND:
+            raise HTTPException(404, "User not found")
+        if result is SetAdminResult.NOT_AUTHORIZED:
+            raise HTTPException(403, "Admin only")
+        if result is SetAdminResult.LAST_ADMIN:
+            raise HTTPException(400, "Cannot demote the last admin")
+        target = (username or "").strip().lower()
+        return {
+            "ok": True,
+            "is_admin": body.is_admin,
+            "self": target == (user or "").strip().lower(),
+        }
 
     @router.post("/signup-toggle", deprecated=True)
     async def toggle_signup(request: Request):
@@ -711,7 +846,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
         a scrubbed copy with secret keys blanked. The frontend uses this
         for keybinds + TTS prefs, so it stays callable without admin."""
         user = _get_current_user(request)
-        settings = _load_settings()
+        settings = without_retired_settings(_load_settings())
         if user and auth_manager.is_admin(user):
             return settings
         return scrub_settings(settings)
@@ -731,6 +866,8 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
             "agent_max_tool_calls": (0, 1000),  # 0 = unlimited
         }
         for key in DEFAULT_SETTINGS:
+            if key in RETIRED_SETTING_KEYS:
+                continue
             if key not in body:
                 continue
             val = body[key]
@@ -743,7 +880,7 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 val = max(lo, min(val, hi))
             current[key] = val
         _save_settings(current)
-        return current
+        return without_retired_settings(current)
 
     # ---- Integrations CRUD ----
 

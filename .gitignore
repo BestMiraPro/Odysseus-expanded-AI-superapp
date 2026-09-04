@@ -22,6 +22,15 @@ client_secret_*.json
 /OmniGen2/
 /OmniGen2-main.zip
 !.env.example
+# Local uv lockfile (optional, per-platform — see "Faster installs with uv" in README)
+requirements.lock
+
+# SOPS workflow — encrypted `secrets.env` is intentionally committable,
+# but every variant (plaintext, manual decrypt copy, editor backup)
+# must stay out of git. Mirrored in .dockerignore so the same artifacts
+# also cannot enter image build layers.
+secrets.env.*
+!secrets.env.example
 
 # Data — all user data stays local
 data/
@@ -69,6 +78,9 @@ output.txt.txt
 *.tiff
 *.pdf
 
+# …except shipped static assets
+!static/icons/*.png
+
 # …except shipped demo assets in docs/ that the README links to.
 !docs/*.jpg
 !docs/*.jpeg
@@ -80,6 +92,24 @@ output.txt.txt
 !docs/**/*.jpg
 !docs/**/*.gif
 !docs/**/*.webp
+
+# …except shipped website and branding media.
+!website/**/*.jpg
+!website/**/*.jpeg
+!website/**/*.png
+!website/**/*.gif
+!website/**/*.bmp
+!website/**/*.webp
+!website/**/*.tiff
+!website/**/*.pdf
+!assets/branding/**/*.jpg
+!assets/branding/**/*.jpeg
+!assets/branding/**/*.png
+!assets/branding/**/*.gif
+!assets/branding/**/*.bmp
+!assets/branding/**/*.webp
+!assets/branding/**/*.tiff
+!assets/branding/**/*.pdf
 
 # Reports and temp files
 reports/

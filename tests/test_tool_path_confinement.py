@@ -57,6 +57,27 @@ def test_non_sensitive_path():
     assert not _is_sensitive_path("/home/user/projects/file.py")
 
 
+def test_sensitive_case_insensitive():
+    """On case-insensitive filesystems (Windows, default macOS) a case-variant
+    name resolves to the same protected file, so the deny-list must match
+    regardless of case. Built with os.path.join so the separator is right on
+    both POSIX and Windows.
+    """
+    from src.tool_execution import _is_sensitive_path
+    # sensitive directory, varied case
+    assert _is_sensitive_path(os.path.join("home", "u", ".SSH", "authorized_keys"))
+    assert _is_sensitive_path(os.path.join("home", "u", ".Gnupg", "pubring.kbx"))
+    # sensitive filename, varied case
+    assert _is_sensitive_path(os.path.join("ws", "AUTHORIZED_KEYS"))
+    assert _is_sensitive_path(os.path.join("ws", "Id_Rsa"))
+    assert _is_sensitive_path(os.path.join("ws", ".ENV"))
+    assert _is_sensitive_path(os.path.join("ws", ".Env"))
+    # both dir and file varied
+    assert _is_sensitive_path(os.path.join("home", "u", ".SSH", "AUTHORIZED_KEYS"))
+    # an ordinary file with none of the sensitive names is still allowed
+    assert not _is_sensitive_path(os.path.join("ws", "Readme.md"))
+
+
 # ── Unit tests on _resolve_tool_path ─────────────────────────────────
 
 def test_blocks_etc_shadow():
@@ -217,10 +238,11 @@ async def test_read_file_dispatch_blocks_etc_shadow(monkeypatch):
         lambda owner: True,
     )
 
-    from src.tool_execution import execute_tool_block
+    from src.tool_execution import NO_TOOL_SECURITY_CONTEXT, execute_tool_block
     desc, result = await execute_tool_block(
         _make_block("read_file", "/etc/shadow"),
         owner="admin-user",
+        security_context=NO_TOOL_SECURITY_CONTEXT,
     )
     assert "outside the allowed roots" in (result.get("error") or "")
     assert result.get("exit_code") == 1
@@ -245,10 +267,11 @@ async def test_write_file_dispatch_blocks_authorized_keys(monkeypatch):
         lambda owner: True,
     )
 
-    from src.tool_execution import execute_tool_block
+    from src.tool_execution import NO_TOOL_SECURITY_CONTEXT, execute_tool_block
     desc, result = await execute_tool_block(
         _make_block("write_file", "~/.ssh/authorized_keys\nssh-rsa AAAAB3..."),
         owner="admin-user",
+        security_context=NO_TOOL_SECURITY_CONTEXT,
     )
     assert "sensitive directory" in (result.get("error") or "")
     assert result.get("exit_code") == 1
@@ -273,10 +296,11 @@ async def test_write_file_dispatch_blocks_cron(monkeypatch):
         lambda owner: True,
     )
 
-    from src.tool_execution import execute_tool_block
+    from src.tool_execution import NO_TOOL_SECURITY_CONTEXT, execute_tool_block
     desc, result = await execute_tool_block(
         _make_block("write_file", "/etc/cron.d/agent-payload\n* * * * * root /tmp/p\n"),
         owner="admin-user",
+        security_context=NO_TOOL_SECURITY_CONTEXT,
     )
     assert "outside the allowed roots" in (result.get("error") or "")
     assert result.get("exit_code") == 1

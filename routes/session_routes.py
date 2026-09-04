@@ -11,8 +11,10 @@ from core.session_manager import SessionManager
 from core.models import ChatMessage
 from src.request_models import SessionResponse
 from core.database import Session as DbSession, SessionLocal, Document, GalleryImage, utcnow_naive
-from src.auth_helpers import get_current_user, effective_user, _auth_disabled, owner_filter
+from src.auth_helpers import effective_user, _auth_disabled, owner_filter
+from src.session_image_cleanup import _generated_image_path_for_cleanup, session_image_refs
 from src.session_actions import is_session_recently_active
+from src.upload_handler import reserve_message_upload_references
 
 
 def _sanitize_export_filename(name: str) -> str:
@@ -162,7 +164,7 @@ def _persist_session_headers(session_id: str, headers: dict | None) -> None:
         db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
         if db_session:
             db_session.headers = headers or {}
-            db_session.updated_at = datetime.utcnow()
+            db_session.updated_at = utcnow_naive()
             db.commit()
     except Exception:
         db.rollback()
@@ -203,16 +205,23 @@ def _pick_endpoint_for_sort(owner=None):
         return url, model, headers
     return None, None, None
 
-def setup_session_routes(session_manager: SessionManager, config: dict, webhook_manager=None):
+def setup_session_routes(
+    session_manager: SessionManager,
+    config: dict,
+    webhook_manager=None,
+    upload_handler=None,
+):
     """Setup session routes with the provided manager and config"""
 
     REQUEST_TIMEOUT = config.get("REQUEST_TIMEOUT", 20)
+    SESSION_MODEL_VALIDATION_TIMEOUT = min(float(REQUEST_TIMEOUT or 20), 3.0)
     OPENAI_API_KEY = config.get("OPENAI_API_KEY")
     SESSIONS_FILE = config.get("SESSIONS_FILE")
     
     @router.get("/sessions")
     def list_sessions(request: Request):
         user = effective_user(request)
+        active_incognito_id = str(request.query_params.get("active_incognito_id") or "").strip()
         # Lazy purge: incognito sessions are ephemeral by design — wipe leftovers
         # from the DB and session_manager so they vanish on the next page refresh.
         # BUT: skip sessions that were created within the last 10 minutes.
@@ -223,8 +232,8 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         # purge exists only to catch ghosts the frontend missed (tab close,
         # crash). Only clean up rows old enough to be definitely orphaned.
         try:
-            from datetime import datetime as _dt, timedelta as _td
-            _cutoff = _dt.utcnow() - _td(minutes=10)
+            from datetime import timedelta as _td
+            _cutoff = utcnow_naive() - _td(minutes=10)
             _purge_db = SessionLocal()
             try:
                 from core.database import ChatMessage as _DbMsg
@@ -233,6 +242,8 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                     DbSession.created_at < _cutoff,
                 ).all()
                 for _g in _ghosts:
+                    if active_incognito_id and _g.id == active_incognito_id:
+                        continue
                     _purge_db.query(_DbMsg).filter(_DbMsg.session_id == _g.id).delete()
                     _purge_db.delete(_g)
                     if hasattr(session_manager, "delete_session"):
@@ -328,7 +339,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         endpoint_id: str = Form(""),
     ):
         skip_val = str(skip_validation).lower() == "true"
-        user = get_current_user(request)
+        user = effective_user(request)
         endpoint_api_key = ""
         endpoint_base_url = ""
         _reject_raw_endpoint_url_for_non_admin(request, user, endpoint_id, endpoint_url)
@@ -374,7 +385,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             from src.llm_core import list_model_ids
             ids = list_model_ids(
                 endpoint_url,
-                timeout=REQUEST_TIMEOUT,
+                timeout=SESSION_MODEL_VALIDATION_TIMEOUT,
                 headers=validation_headers,
                 owner=user,
                 endpoint_id=endpoint_id.strip() if endpoint_id else None,
@@ -394,7 +405,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             req_base = _os.path.basename(model_to_use.rstrip("/"))
             avail = list_model_ids(
                 endpoint_url,
-                timeout=REQUEST_TIMEOUT,
+                timeout=SESSION_MODEL_VALIDATION_TIMEOUT,
                 headers=validation_headers,
                 owner=user,
                 endpoint_id=endpoint_id.strip() if endpoint_id else None,
@@ -470,14 +481,14 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                 db_session = db.query(DbSession).filter(DbSession.id == sid).first()
                 if db_session:
                     db_session.folder = folder if folder else None
-                    db_session.updated_at = datetime.utcnow()
+                    db_session.updated_at = utcnow_naive()
                     db.commit()
                     result["folder"] = folder if folder else None
             finally:
                 db.close()
         # Switch model/endpoint mid-session
         if model is not None and endpoint_url is not None:
-            user = get_current_user(request)
+            user = effective_user(request)
             _reject_raw_endpoint_url_for_non_admin(request, user, endpoint_id, endpoint_url)
             endpoint_api_key = ""
             endpoint_base_url = ""
@@ -517,7 +528,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                     db_session.model = model
                     db_session.endpoint_url = endpoint_url
                     db_session.headers = session.headers or {}
-                    db_session.updated_at = datetime.utcnow()
+                    db_session.updated_at = utcnow_naive()
                     db.commit()
             finally:
                 db.close()
@@ -536,6 +547,22 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         body = await request.json()
         messages = body.get("messages", [])
         from core.models import ChatMessage
+        owner = effective_user(request)
+        try:
+            for message in messages:
+                missing_id = reserve_message_upload_references(
+                    upload_handler,
+                    owner,
+                    message.get("content"),
+                    message.get("metadata"),
+                )
+                if missing_id:
+                    raise HTTPException(
+                        409,
+                        f"Referenced upload is no longer available: {missing_id}",
+                    )
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise HTTPException(400, "Invalid message attachment metadata") from exc
         for m in messages:
             sess.add_message(ChatMessage(m["role"], m["content"], metadata=m.get("metadata")))
         session_manager.save_sessions()
@@ -618,13 +645,43 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         db = SessionLocal()
         try:
             from core.database import ChatMessage as DbChatMessage
+            session_ids = [row[0] for row in db.query(DbSession.id).all()]
             count = db.query(DbSession).count()
+            image_ids: set[str] = set()
+            filenames: set[str] = set()
+            for sid in session_ids:
+                ids, names = session_image_refs(db, sid)
+                image_ids.update(ids)
+                filenames.update(names)
+            image_query = db.query(GalleryImage).filter(GalleryImage.session_id.in_(session_ids)) if session_ids else db.query(GalleryImage).filter(False)
+            if image_ids or filenames:
+                from sqlalchemy import or_
+                clauses = []
+                if session_ids:
+                    clauses.append(GalleryImage.session_id.in_(session_ids))
+                if image_ids:
+                    clauses.append(GalleryImage.id.in_(list(image_ids)))
+                if filenames:
+                    clauses.append(GalleryImage.filename.in_(list(filenames)))
+                image_query = db.query(GalleryImage).filter(or_(*clauses))
+            images = image_query.all()
+            removed_images = 0
+            for img in images:
+                img.is_active = False
+                if img.filename:
+                    path = _generated_image_path_for_cleanup(img.filename)
+                    if path and path.exists():
+                        try:
+                            path.unlink()
+                        except Exception as exc:
+                            logger.warning("Could not remove generated image %s during all-session delete: %s", img.filename, exc)
+                removed_images += 1
             db.query(DbChatMessage).delete()
             db.query(DbSession).delete()
             db.commit()
             session_manager.sessions.clear()
-            logger.info(f"Admin deleted all {count} sessions")
-            return {"status": "deleted", "count": count}
+            logger.info(f"Admin deleted all {count} sessions and {removed_images} linked images")
+            return {"status": "deleted", "count": count, "images_deleted": removed_images}
         except Exception as e:
             db.rollback()
             logger.error(f"Error deleting all sessions: {e}")
@@ -646,7 +703,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                 db_session = db.query(DbSession).filter(DbSession.id == sid).first()
                 if db_session:
                     db_session.archived = True
-                    db_session.updated_at = datetime.utcnow()
+                    db_session.updated_at = utcnow_naive()
                     db.commit()
                     
                     # Update in memory if it exists
@@ -680,7 +737,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             if not db_session:
                 raise HTTPException(404, f"Session {sid} not found")
             db_session.archived = False
-            db_session.updated_at = datetime.utcnow()
+            db_session.updated_at = utcnow_naive()
             db.commit()
             # Reload into session manager so it appears in the active list
             try:
@@ -744,15 +801,6 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         finally:
             db.close()
 
-    @router.get("/history/{sid}")
-    def get_history(request: Request, sid: str):
-        _verify_session_owner(request, sid)
-        try:
-            session = session_manager.get_session(sid)
-        except KeyError:
-            raise HTTPException(404, f"Session {sid} not found")
-        return {"history": [msg.to_dict() for msg in session.history]}
-    
     @router.get("/session/{sid}/export")
     def export_session(request: Request, sid: str, fmt: str = "md", filename: str = ""):
         """Export conversation history as a downloadable file.
@@ -890,7 +938,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
                 db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
                 if db_session:
                     db_session.is_important = important
-                    db_session.updated_at = datetime.utcnow()
+                    db_session.updated_at = utcnow_naive()
                     db.commit()
 
                     # Update in memory if it exists
@@ -979,7 +1027,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
             metadata={
                 "compacted": True,
                 "summarized_count": len(older),
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": utcnow_naive().isoformat(),
             },
         )
         new_history = [summary_msg] + recent
@@ -1004,6 +1052,7 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         """
         from src.llm_core import llm_call
         user = effective_user(request)
+        single_user_mode = not user and _auth_disabled()
         user_sessions = session_manager.get_sessions_for_user(user)
 
         # Delete empty and throwaway sessions before sorting
@@ -1022,7 +1071,12 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         }
         _THROWAWAY_MAX_MESSAGES = 4  # only delete if <= this many messages
         try:
-            rows = db.query(DbSession).filter(DbSession.archived == False, DbSession.owner == user).limit(2000).all()
+            rows_q = db.query(DbSession).filter(DbSession.archived == False)
+            if user:
+                rows_q = rows_q.filter(DbSession.owner == user)
+            elif not single_user_mode:
+                rows_q = rows_q.filter(DbSession.owner == user)
+            rows = rows_q.limit(2000).all()
             folder_map = {r.id: r.folder for r in rows}
             # Precompute per-session message counts in TWO aggregate queries
             # instead of 1–3 queries PER session — with many chats the per-row
@@ -1242,10 +1296,15 @@ def setup_session_routes(session_manager: SessionManager, config: dict, webhook_
         db = SessionLocal()
         try:
             for sid, folder_name in assignments.items():
-                db_session = db.query(DbSession).filter(DbSession.id == sid, DbSession.owner == user).first()
+                db_session_q = db.query(DbSession).filter(DbSession.id == sid)
+                if user:
+                    db_session_q = db_session_q.filter(DbSession.owner == user)
+                elif not single_user_mode:
+                    db_session_q = db_session_q.filter(DbSession.owner == user)
+                db_session = db_session_q.first()
                 if db_session:
                     db_session.folder = folder_name
-                    db_session.updated_at = datetime.utcnow()
+                    db_session.updated_at = utcnow_naive()
                     updated += 1
             db.commit()
         except Exception as e:

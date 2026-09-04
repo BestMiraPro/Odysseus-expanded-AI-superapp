@@ -34,6 +34,10 @@ fi
 # values (APP_PORT / APP_BIND), then built-in defaults.
 PORT="${ODYSSEUS_PORT:-${APP_PORT:-7860}}"   # 7860, not 7000 — macOS AirPlay Receiver holds 7000.
 HOST="${ODYSSEUS_HOST:-${APP_BIND:-127.0.0.1}}" # Set APP_BIND=0.0.0.0 in .env for LAN/Tailscale access.
+# The port only reaches uvicorn as a flag, so export it too: everything that
+# builds a URL for this instance — internal_api_base(), the companion pairing
+# code, the MCP OAuth callback — reads APP_PORT and would otherwise assume 7000.
+export APP_PORT="$PORT"
 PROBE_HOST="$HOST"
 if [ "$PROBE_HOST" = "0.0.0.0" ] || [ "$PROBE_HOST" = "::" ]; then
     PROBE_HOST="127.0.0.1"
@@ -130,11 +134,12 @@ fi
 # 3. Python environment + dependencies (kept inside the repo, in venv/).
 #    Named `venv` to match the manual steps and build-macos-app.sh, so the
 #    clickable .app reuses this same environment.
-if [ ! -d venv ]; then
+VENV_PY="./venv/bin/python3"
+if [ ! -x "$VENV_PY" ] || ! "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+    [ -d venv ] && { echo "▶ Existing venv is incomplete (no working pip) — rebuilding…"; rm -rf venv; }
     echo "▶ Creating Python environment…"
     "$PY" -m venv venv
 fi
-VENV_PY="./venv/bin/python3"
 REQ_HASH="$(md5 -q requirements.txt 2>/dev/null || md5sum requirements.txt | cut -d' ' -f1)"
 REQ_HASH_FILE="venv/.requirements_hash"
 if [ ! -f "$REQ_HASH_FILE" ] || [ "$REQ_HASH" != "$(cat "$REQ_HASH_FILE" 2>/dev/null)" ]; then

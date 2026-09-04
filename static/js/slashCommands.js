@@ -16,12 +16,13 @@ import modelsModule from './models.js';
 import chatRenderer from './chatRenderer.js';
 import spinnerModule from './spinner.js';
 import themeModule from './theme.js';
-import documentModule from './document.js';
+import documentModule from './document.js?v=20260815approvalsave1';
 import workspaceModule from './workspace.js';
 import settingsModule from './settings.js';
 import cookbookModule from './cookbook.js';
 import { EVAL_PROMPTS } from './compare/index.js';
 import { PROVIDER_DEVICE_FLOWS, formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
+import { getSettings } from './appConfig.js';
 
 // ── Module state ──────────────────────────────────────────────────────
 
@@ -101,6 +102,8 @@ function _setupProviderFromInput(input) {
     xai: 'xai',
     grok: 'xai',
     nvidia: 'nvidia',
+    opencodezen: 'opencode-zen',
+    opencodego: 'opencode-go',
   };
   return SETUP_PROVIDER_URLS[aliases[raw] || raw] || null;
 }
@@ -129,6 +132,8 @@ function _extractSetupProviderCredential(input) {
     ['google', 'gemini'], ['gemini', 'gemini'],
     ['x ai', 'xai'], ['xai', 'xai'], ['grok', 'xai'],
     ['nvidia', 'nvidia'],
+    ['opencode zen', 'opencode-zen'], ['opencode-zen', 'opencode-zen'],
+    ['opencode go', 'opencode-go'], ['opencode-go', 'opencode-go'],
   ];
   for (const [alias, key] of providerAliases) {
     const re = new RegExp('(^|\\s|[,;:])(' + alias.replace(/\s+/g, '\\s+') + ')(?=$|\\s|[,;:])', 'i');
@@ -204,6 +209,8 @@ function _showSetupEndpointChoices() {
         '<pre style="margin:4px 0 0;"><code class="setup-clickable-code" style="cursor:pointer;text-decoration:underline;" title="Click to fill in chat">http://localhost:11434/v1</code></pre>' +
         '<div style="margin-top:4px;">or</div>' +
         '<pre style="margin:2px 0 0;"><code class="setup-clickable-code" style="cursor:pointer;text-decoration:underline;" title="Click to fill in chat">http://llm-host.local:8000/v1</code></pre>' +
+        '<div style="margin-top:4px;">or llama.cpp (llama-server):</div>' +
+        '<pre style="margin:2px 0 0;"><code class="setup-clickable-code" style="cursor:pointer;text-decoration:underline;" title="Click to fill in chat">http://localhost:8080/v1</code></pre>' +
       '</div>' +
       '<div style="border:1px solid var(--border);border-radius:8px;padding:10px 12px;background:color-mix(in srgb,var(--bg) 88%,var(--fg) 12%);">' +
         '<div style="font-weight:700;margin-bottom:6px;">' + SETUP_API_ICON + 'API setup</div>' +
@@ -233,6 +240,12 @@ function _showSetupEndpointChoicesStreamed(options = {}) {
       kind: 'code',
       text: 'http://llm-host.local:8000/v1',
       copyText: 'http://llm-host.local:8000/v1',
+    },
+    { kind: 'p', text: 'or llama.cpp (llama-server):' },
+    {
+      kind: 'code',
+      text: 'http://localhost:8080/v1',
+      copyText: 'http://localhost:8080/v1',
     },
     { kind: 'heading', html: SETUP_API_ICON + 'API setup' },
     { kind: 'p', text: 'Paste provider name then API key (example):' },
@@ -275,8 +288,14 @@ function _setupProviderPrompt() {
 // -----------------------------------------------------------------------
 
 /** Persist a message to the current session (fire-and-forget) */
-function _persistMsg(role, content, metadata) {
-  const sid = sessionModule.getCurrentSessionId();
+async function _persistMsg(role, content, metadata) {
+  let sid = sessionModule.getCurrentSessionId();
+  if (!sid && sessionModule.hasPendingChat?.()) {
+    try {
+      await sessionModule.materializePendingSession?.();
+      sid = sessionModule.getCurrentSessionId();
+    } catch (_) {}
+  }
   if (!sid || !content) return;
   const payload = { role, content };
   if (metadata) payload.metadata = metadata;
@@ -288,6 +307,7 @@ function _persistMsg(role, content, metadata) {
 }
 
 function slashReply(text) {
+  _hideWelcomeScreen();
   const chatBox = document.getElementById('chat-history');
   const div = document.createElement('div');
   div.className = 'msg msg-ai';
@@ -339,10 +359,13 @@ function _submitComposedMessage(text) {
   const msgInput = document.getElementById('message');
   const form = document.getElementById('chat-form');
   if (!msgInput || !form) return false;
-  msgInput.value = text;
-  msgInput.dispatchEvent(new Event('input', { bubbles: true }));
-  if (typeof form.requestSubmit === 'function') form.requestSubmit();
-  else form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+  // The slash handler and app-level form debounce must both release before
+  // sending the pinned prompt, otherwise the follow-up submit is dropped.
+  setTimeout(() => {
+    msgInput.value = text;
+    msgInput.dispatchEvent(new Event('input', { bubbles: true }));
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+  }, 350);
   return true;
 }
 
@@ -988,7 +1011,7 @@ async function _cmdSessionNew(args, ctx) {
   if (res.ok) {
     const data = await res.json();
     await sessionModule.loadSessions();
-    await sessionModule.selectSession(data.id);
+    await sessionModule.selectSession(data.id, { showLoading: false });
     _hideWelcomeScreen();
     const shortModel = (model || '').split('/').pop();
     await typewriterReply(`New session — ${shortModel || 'ready'}.`);
@@ -1247,7 +1270,7 @@ async function _cmdWorkspace(args, ctx) {
     // folder, sensitive dir, filesystem root).
     workspaceModule.vetAndSetWorkspace(rest).then(({ ok, path }) => {
       if (ok) slashReply(`Workspace set: <code>${uiModule.esc(path)}</code>`);
-      else slashReply(`Not a usable workspace folder: <code>${uiModule.esc(rest)}</code>. It must be an existing directory, not a filesystem root or sensitive path.`);
+      else slashReply(`Not a usable workspace folder on the Odysseus backend: <code>${uiModule.esc(rest)}</code>. If Odysseus is running in Docker, use the container path, usually <code>/app</code>, or use <code>/workspace pick</code>.`);
     });
     return true;
   }
@@ -2005,12 +2028,12 @@ async function _cmdUsage(args, ctx) {
   const messageCount = Number(session?.message_count || 0);
   const totalTokens = Number(session?.total_tokens || 0);
   const costTracked = chatRenderer.isCostTrackedEndpoint ? chatRenderer.isCostTrackedEndpoint(endpointUrl) : true;
-  const cost = costTracked && chatRenderer.getSessionCost ? Number(chatRenderer.getSessionCost(sid) || 0) : 0;
-  const costLine = costTracked
-    ? (cost > 0
-      ? `Estimated local cost: $${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`
-      : 'Estimated local cost: unavailable or zero')
-    : 'Estimated local cost: not tracked for this endpoint';
+  const cost = chatRenderer.getSessionCost ? Number(chatRenderer.getSessionCost(sid) || 0) : 0;
+  const costLine = cost > 0
+    ? `Estimated local cost: $${cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3)}`
+    : costTracked
+      ? 'Estimated local cost: unavailable or zero'
+      : 'Estimated local cost: no billable usage recorded';
 
   slashReply(`<pre>${[
     `Session: ${ctx.esc(session?.name || 'Current chat')}`,
@@ -5198,8 +5221,7 @@ async function _cmdShortcuts(args, ctx) {
   };
 
   try {
-    const res = await fetch(`${API_BASE}/api/auth/settings`, { credentials: 'same-origin' });
-    const settings = await res.json();
+    const settings = await getSettings();
     if (settings.keybinds) {
       keybinds = { ...keybinds, ...settings.keybinds };
     }

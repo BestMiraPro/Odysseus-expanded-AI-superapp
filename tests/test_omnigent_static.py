@@ -7,6 +7,8 @@ _REPO = Path(__file__).resolve().parent.parent
 _INDEX = (_REPO / "static" / "index.html").read_text(encoding="utf-8")
 _APP = (_REPO / "static" / "app.js").read_text(encoding="utf-8")
 _SETTINGS = (_REPO / "static" / "js" / "settings.js").read_text(encoding="utf-8")
+# Upstream moved UI_VIS_MAP out of app.js into its own module.
+_UI_VIS = (_REPO / "static" / "js" / "ui_visibility.js").read_text(encoding="utf-8")
 
 
 def test_omnigent_has_sidebar_rail_modal_and_script_hooks():
@@ -21,7 +23,7 @@ def test_omnigent_has_sidebar_rail_modal_and_script_hooks():
 
 def test_omnigent_visibility_can_be_managed_with_other_tools():
     assert "data-ui-key=\"tool-omnigent\"" in _INDEX
-    assert "'tool-omnigent':" in _APP
+    assert "'tool-omnigent':" in _UI_VIS
 
 
 def test_integrations_picker_includes_omnigent_agent_not_paid_glm_duplicate():
