@@ -1,6 +1,7 @@
 """Study route sub-module: maintenance handlers (Phase 4.2 split)."""
 from routes.study._common import *  # noqa: F401,F403
 import routes.study._common as _common  # noqa: F401
+import json
 
 from fastapi import APIRouter  # noqa: F401  (re-exported via _common but explicit)
 
@@ -197,6 +198,163 @@ async def run_audit_questions(user, deck_id=None) -> Dict:
     return {"flagged": len(flagged), "suspended": suspended, "scanned": len(items)}
 
 
+# Below this a split leaves chapters too small to practise, and the
+# whole-material Practice button already covers the document.
+CHAPTER_MIN_QUESTIONS = 8
+
+CHAPTER_SYSTEM = """You map exam/exercise questions to the chapters of the document they came from.
+
+You are given the document text and a list of its questions. Group the questions under the document's OWN chapter or section headings, using the heading text as it appears, prefixed by its number (e.g. "3 - Joint distributions").
+
+Rules:
+- Only use headings that genuinely appear in the document. Never invent a structure.
+- If the document has no chapter structure - a single exam paper, one problem set - return exactly ONE chapter covering everything. Do not manufacture divisions.
+- Every question id you were given must appear under exactly one chapter.
+- "index" is the chapter's position in the document, starting at 1.
+
+Output ONLY JSON: {"chapters": [{"index": 1, "label": "...", "questions": ["id", ...]}, ...]}"""
+
+
+async def run_detect_chapters(user, material_id: str) -> Dict:
+    """Assign a material's questions to the chapters of its source document.
+
+    Writes ``chapter``/``chapter_index`` on the questions and ``chapter_count``
+    on the material. A document the model reports as a single chapter is left
+    completely unsplit - that is the rule the picker keys off, and it keeps a
+    one-chapter exam paper looking exactly as it does today. Idempotent:
+    re-running reassigns rather than accumulating. {chapters, assigned}."""
+    db = _common.SessionLocal()
+    try:
+        m = study_service.get_material(db, material_id, user)
+        qq = db.query(StudyQuestion).filter(StudyQuestion.material_id == m.id)
+        if user is not None:
+            qq = qq.filter(StudyQuestion.owner == user)
+        rows = qq.order_by(StudyQuestion.created_at.asc()).all()
+        items = [{"id": r.id, "number": r.number,
+                  "question": (r.question or "")[:200]} for r in rows]
+        content = (m.content or "")[:60000]
+    finally:
+        db.close()
+
+    if len(items) < CHAPTER_MIN_QUESTIONS:
+        return {"chapters": 0, "assigned": 0, "skipped": "too_few_questions"}
+
+    value = await _llm_json(
+        user, CHAPTER_SYSTEM,
+        "--- DOCUMENT ---\n" + content + "\n\n--- QUESTIONS ---\n" + json.dumps(items),
+        temperature=0.2, max_tokens=8000, timeout=180, thinking_off=True)
+    chapters = (value or {}).get("chapters") if isinstance(value, dict) else None
+    if not isinstance(chapters, list):
+        raise HTTPException(502, "Model reply was not a chapter list. Try again.")
+
+    valid = {it["id"] for it in items}
+    mapping = {}
+    for ch in chapters:
+        if not isinstance(ch, dict):
+            continue
+        label = str(ch.get("label") or "").strip()
+        if not label:
+            continue
+        try:
+            idx = int(ch.get("index") or 0)
+        except (TypeError, ValueError):
+            idx = 0
+        for qid in ch.get("questions") or []:
+            if qid in valid:
+                mapping[qid] = (label, idx)
+
+    distinct = {v[0] for v in mapping.values()}
+    db = _common.SessionLocal()
+    try:
+        mat = study_service.get_material(db, material_id, user)
+        if len(distinct) < 2:
+            # One chapter is not a split: record it and change nothing else.
+            mat.chapter_count = 1
+            db.commit()
+            return {"chapters": 1, "assigned": 0}
+        assigned = 0
+        for r in db.query(StudyQuestion).filter(
+                StudyQuestion.id.in_(list(mapping))).all():
+            label, idx = mapping[r.id]
+            r.chapter, r.chapter_index = label, idx
+            assigned += 1
+        mat.chapter_count = len(distinct)
+        db.commit()
+        return {"chapters": len(distinct), "assigned": assigned}
+    finally:
+        db.close()
+
+
+THEME_SYSTEM = """You group fine-grained question topics into a handful of coarse study themes.
+
+You are given the topic labels used across one subject. Group them into 6-10 themes a student would recognise as areas of the course ("Integration", "Hypothesis testing") - not restatements of individual topics.
+
+Rules:
+- Every topic you were given must appear under exactly one theme.
+- Use the topic strings EXACTLY as given. Do not reword them.
+- Prefer fewer, broader themes over many narrow ones.
+
+Output ONLY JSON: {"themes": [{"name": "...", "topics": ["...", ...]}, ...]}"""
+
+
+async def run_cluster_themes(user, deck_id: str) -> Dict:
+    """Group a subject's topic labels into coarse themes, and write the theme
+    onto every question carrying those topics.
+
+    Themes span the subject, so one theme reaches every document that uses the
+    topic. Reads no PDFs - it clusters labels already stored, which is what
+    makes it cheap enough to re-run. Idempotent: only ``theme`` is rewritten.
+    {themes, labelled}."""
+    db = _common.SessionLocal()
+    try:
+        study_service.get_deck(db, deck_id, user)
+        qq = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck_id)
+        if user is not None:
+            qq = qq.filter(StudyQuestion.owner == user)
+        topics = sorted({(r.topic or "").strip() for r in qq.all()
+                         if (r.topic or "").strip()})
+    finally:
+        db.close()
+
+    if not topics:
+        return {"themes": 0, "labelled": 0, "skipped": "no_topics"}
+
+    value = await _llm_json(user, THEME_SYSTEM, json.dumps({"topics": topics}),
+                            temperature=0.2, max_tokens=4000, timeout=120,
+                            thinking_off=True)
+    groups = (value or {}).get("themes") if isinstance(value, dict) else None
+    if not isinstance(groups, list):
+        raise HTTPException(502, "Model reply was not a theme list. Try again.")
+
+    by_topic = {}
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        name = str(g.get("name") or "").strip()
+        if not name:
+            continue
+        for t in g.get("topics") or []:
+            key = str(t).strip()
+            if key in topics:
+                by_topic[key] = name
+
+    labelled = 0
+    db = _common.SessionLocal()
+    try:
+        qq = db.query(StudyQuestion).filter(StudyQuestion.deck_id == deck_id)
+        if user is not None:
+            qq = qq.filter(StudyQuestion.owner == user)
+        for r in qq.all():
+            name = by_topic.get((r.topic or "").strip())
+            if name:
+                r.theme = name
+                labelled += 1
+        db.commit()
+    finally:
+        db.close()
+    return {"themes": len(set(by_topic.values())), "labelled": labelled}
+
+
 def register(router: APIRouter) -> None:
     @router.post("/reformat")
     async def reformat_text(request: Request, deck_id: Optional[str] = None):
@@ -219,6 +377,17 @@ def register(router: APIRouter) -> None:
         finally:
             db.close()
         return await _common._link_deck_parts(user, deck_id)
+
+    @router.post("/materials/{material_id}/detect-chapters")
+    async def detect_chapters(request: Request, material_id: str):
+        """Split one document's questions into its own chapters. A document with
+        fewer than two headings is left unsplit."""
+        return await run_detect_chapters(_owner(request), material_id)
+
+    @router.post("/decks/{deck_id}/group-themes")
+    async def group_themes(request: Request, deck_id: str):
+        """Cluster this subject's topic labels into coarse, subject-wide themes."""
+        return await run_cluster_themes(_owner(request), deck_id)
 
     @router.post("/dedup")
     def dedup_questions_route(request: Request, deck_id: Optional[str] = None):

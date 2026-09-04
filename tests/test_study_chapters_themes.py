@@ -184,3 +184,169 @@ def test_groupings_empty_when_nothing_grouped(db):
     s.close()
 
     assert groupings_payload("alice", "d9") == {"chapters": [], "themes": []}
+
+
+# --------------------------------------------------------------- chapter detection
+
+def _clear_grouping(SessionLocal):
+    """Strip the seeded grouping so detection/clustering has real work to do."""
+    from core.database import StudyMaterial, StudyQuestion
+
+    s = SessionLocal()
+    for q in s.query(StudyQuestion).all():
+        q.chapter = q.chapter_index = q.theme = None
+    for m in s.query(StudyMaterial).all():
+        m.chapter_count = None
+    s.commit()
+    s.close()
+
+
+def _seed_detectable(SessionLocal, owner="alice", n=10):
+    """A document with enough questions to be worth splitting (>= the
+    CHAPTER_MIN_QUESTIONS floor), and no grouping yet."""
+    from core.database import StudyDeck, StudyMaterial, StudyQuestion
+
+    s = SessionLocal()
+    s.add(StudyDeck(id="dd", owner=owner, name="Book", new_per_day=15, retention="0.9"))
+    s.add(StudyMaterial(id="md", owner=owner, deck_id="dd", name="Big.pdf",
+                        kind="pdf", content="Chapter 1 ... Chapter 2 ...",
+                        char_count=26))
+    for i in range(n):
+        s.add(StudyQuestion(id=f"b{i}", owner=owner, deck_id="dd", material_id="md",
+                            qtype="open", question=f"q{i}", reference="r",
+                            topic="T", state="new"))
+    s.commit()
+    s.close()
+
+
+def test_detect_chapters_assigns_and_counts(db, monkeypatch):
+    import asyncio
+
+    from core.database import StudyMaterial, StudyQuestion
+    from routes.study import maintenance as mnt
+
+    _seed_detectable(db)
+
+    async def fake_llm(owner, system, user, **kw):
+        return {"chapters": [
+            {"index": 1, "label": "1 — Probability", "questions": [f"b{i}" for i in range(6)]},
+            {"index": 2, "label": "2 — Random variables", "questions": [f"b{i}" for i in range(6, 10)]},
+        ]}
+
+    monkeypatch.setattr(mnt, "_llm_json", fake_llm)
+    out = asyncio.run(mnt.run_detect_chapters("alice", "md"))
+
+    assert out["chapters"] == 2
+    assert out["assigned"] == 10
+    s = db()
+    assert s.query(StudyMaterial).filter_by(id="md").first().chapter_count == 2
+    assert s.query(StudyQuestion).filter_by(id="b0").first().chapter == "1 — Probability"
+    assert s.query(StudyQuestion).filter_by(id="b9").first().chapter_index == 2
+    s.close()
+
+
+def test_detect_chapters_refuses_to_split_one_chapter(db, monkeypatch):
+    """The rule the whole feature turns on: fewer than two headings means the
+    document is never split, so it never shows up as a chapter picker."""
+    import asyncio
+
+    from core.database import StudyMaterial, StudyQuestion
+    from routes.study import maintenance as mnt
+
+    _seed_detectable(db)
+
+    async def one_chapter(owner, system, user, **kw):
+        return {"chapters": [{"index": 1, "label": "The whole paper",
+                              "questions": [f"b{i}" for i in range(10)]}]}
+
+    monkeypatch.setattr(mnt, "_llm_json", one_chapter)
+    out = asyncio.run(mnt.run_detect_chapters("alice", "md"))
+
+    assert out["chapters"] == 1
+    assert out["assigned"] == 0
+    s = db()
+    assert s.query(StudyMaterial).filter_by(id="md").first().chapter_count == 1
+    assert s.query(StudyQuestion).filter_by(id="b0").first().chapter is None
+    s.close()
+
+
+def test_detect_chapters_skips_tiny_documents_without_calling_the_model(db, monkeypatch):
+    """Under the threshold a split leaves chapters too small to practise, and it
+    must not cost an AI call."""
+    import asyncio
+
+    from core.database import StudyDeck, StudyMaterial, StudyQuestion
+    from routes.study import maintenance as mnt
+
+    s = db()
+    s.add(StudyDeck(id="d2", owner="alice", name="Tiny", new_per_day=15, retention="0.9"))
+    s.add(StudyMaterial(id="mt", owner="alice", deck_id="d2", name="Short.pdf",
+                        kind="pdf", content="x", char_count=1))
+    for i in range(3):
+        s.add(StudyQuestion(id=f"t{i}", owner="alice", deck_id="d2", material_id="mt",
+                            qtype="open", question="q", reference="r", state="new"))
+    s.commit()
+    s.close()
+
+    called = {"n": 0}
+
+    async def counter(owner, system, user, **kw):
+        called["n"] += 1
+        return {"chapters": []}
+
+    monkeypatch.setattr(mnt, "_llm_json", counter)
+    out = asyncio.run(mnt.run_detect_chapters("alice", "mt"))
+
+    assert out["skipped"] == "too_few_questions"
+    assert called["n"] == 0
+
+
+# ------------------------------------------------------------------ theme clustering
+
+def test_cluster_themes_labels_every_question_with_that_topic(db, monkeypatch):
+    import asyncio
+
+    from core.database import StudyQuestion
+    from routes.study import maintenance as mnt
+
+    _seed_chaptered(db)
+    _clear_grouping(db)
+
+    async def fake(owner, system, user, **kw):
+        return {"themes": [
+            {"name": "Probability", "topics": ["Bernoulli"]},
+            {"name": "Distributions", "topics": ["Covariance"]},
+        ]}
+
+    monkeypatch.setattr(mnt, "_llm_json", fake)
+    out = asyncio.run(mnt.run_cluster_themes("alice", "d1"))
+
+    assert out["themes"] == 2
+    assert out["labelled"] == 6
+    s = db()
+    assert s.query(StudyQuestion).filter_by(id="c10").first().theme == "Probability"
+    # a theme must reach every document carrying that topic, not just one
+    assert s.query(StudyQuestion).filter_by(id="e0").first().theme == "Distributions"
+    s.close()
+
+
+def test_cluster_themes_is_idempotent(db, monkeypatch):
+    """Re-running re-clusters cleanly instead of accumulating."""
+    import asyncio
+
+    from core.database import StudyQuestion
+    from routes.study import maintenance as mnt
+
+    _seed_chaptered(db)
+
+    async def fake(owner, system, user, **kw):
+        return {"themes": [{"name": "Everything", "topics": ["Bernoulli", "Covariance"]}]}
+
+    monkeypatch.setattr(mnt, "_llm_json", fake)
+    asyncio.run(mnt.run_cluster_themes("alice", "d1"))
+    second = asyncio.run(mnt.run_cluster_themes("alice", "d1"))
+
+    assert second["themes"] == 1
+    s = db()
+    assert {q.theme for q in s.query(StudyQuestion).all()} == {"Everything"}
+    s.close()
