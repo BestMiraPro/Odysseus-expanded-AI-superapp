@@ -140,3 +140,47 @@ def test_unknown_chapter_returns_empty_not_everything(db):
     _seed_chaptered(db)
     out = practice_queue_payload("alice", deck_id="d1", chapter="99 — Nope", limit=20)
     assert out["queue"] == []
+
+
+def test_groupings_lists_chapters_and_themes(db):
+    from routes.study.insights import groupings_payload
+
+    _seed_chaptered(db)
+    out = groupings_payload("alice", "d1")
+
+    assert len(out["chapters"]) == 1                       # only the multi-chapter doc
+    doc = out["chapters"][0]
+    assert doc["material"] == "Workbook.pdf"
+    assert [c["label"] for c in doc["chapters"]] == ["1 — Probability", "2 — Random variables"]
+    assert [c["count"] for c in doc["chapters"]] == [3, 2]
+
+    themes = {t["name"]: t for t in out["themes"]}
+    assert themes["Distributions"]["count"] == 3
+    assert themes["Distributions"]["materials"] == 2
+
+
+def test_groupings_omits_single_chapter_documents(db):
+    """Exam.pdf has chapter_count=1, so it must never appear as a chapter row."""
+    from routes.study.insights import groupings_payload
+
+    _seed_chaptered(db)
+    names = [d["material"] for d in groupings_payload("alice", "d1")["chapters"]]
+    assert "Exam.pdf" not in names
+
+
+def test_groupings_empty_when_nothing_grouped(db):
+    """A subject of plain exam papers must look exactly as it does today: both
+    lists empty is the signal to hide both sections."""
+    from core.database import StudyDeck, StudyMaterial, StudyQuestion
+    from routes.study.insights import groupings_payload
+
+    s = db()
+    s.add(StudyDeck(id="d9", owner="alice", name="Plain", new_per_day=15, retention="0.9"))
+    s.add(StudyMaterial(id="m9", owner="alice", deck_id="d9", name="Paper.pdf",
+                        kind="pdf", content="x", char_count=1))
+    s.add(StudyQuestion(id="p1", owner="alice", deck_id="d9", material_id="m9",
+                        qtype="open", question="q", reference="r", state="new"))
+    s.commit()
+    s.close()
+
+    assert groupings_payload("alice", "d9") == {"chapters": [], "themes": []}

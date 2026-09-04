@@ -332,6 +332,65 @@ def calibration_payload(user, days: int = 90) -> Dict:
         db.close()
 
 
+def groupings_payload(user, deck_id: str) -> Dict:
+    """The two ways to slice a subject's bank, with counts, for the practice picker.
+
+    Chapters belong to one document and only appear when that document actually
+    has several (``chapter_count >= 2``) - a single-chapter exam paper is not a
+    thing you pick a chapter of. Themes span the subject, so one theme can reach
+    several documents. Either list comes back empty when nothing has been
+    grouped, which is the signal to hide that whole section."""
+    db = _common.SessionLocal()
+    try:
+        study_service.get_deck(db, deck_id, user)
+
+        mq = db.query(StudyMaterial).filter(StudyMaterial.deck_id == deck_id)
+        qq = db.query(StudyQuestion).filter(
+            StudyQuestion.deck_id == deck_id,
+            StudyQuestion.suspended == False)  # noqa: E712
+        if user is not None:
+            mq = mq.filter(StudyMaterial.owner == user)
+            qq = qq.filter(StudyQuestion.owner == user)
+
+        multi = {m.id: m.name for m in mq.all() if (m.chapter_count or 0) >= 2}
+        rows = qq.all()
+
+        chapters = []
+        for mid, mname in multi.items():
+            buckets = {}
+            for r in rows:
+                if r.material_id != mid or not r.chapter:
+                    continue
+                b = buckets.setdefault(r.chapter, {"label": r.chapter,
+                                                   "index": r.chapter_index or 0,
+                                                   "count": 0})
+                b["count"] += 1
+            if buckets:
+                chapters.append({
+                    "material_id": mid,
+                    "material": mname,
+                    "chapters": sorted(buckets.values(),
+                                       key=lambda c: (c["index"], c["label"])),
+                })
+        chapters.sort(key=lambda d: d["material"])
+
+        themes = {}
+        for r in rows:
+            if not r.theme:
+                continue
+            t = themes.setdefault(r.theme, {"name": r.theme, "count": 0, "mats": set()})
+            t["count"] += 1
+            if r.material_id:
+                t["mats"].add(r.material_id)
+        out_themes = [{"name": t["name"], "count": t["count"],
+                       "materials": len(t["mats"])} for t in themes.values()]
+        out_themes.sort(key=lambda t: (-t["count"], t["name"]))
+
+        return {"chapters": chapters, "themes": out_themes}
+    finally:
+        db.close()
+
+
 def register(router: APIRouter) -> None:
     # ------------------------------------------------------------------ overview + stats
 
@@ -344,6 +403,12 @@ def register(router: APIRouter) -> None:
     def stats(request: Request, days: int = 42):
         """Daily retrieval chart (card reviews + practice attempts) and totals."""
         return stats_payload(_owner(request), days=days)
+
+    @router.get("/decks/{deck_id}/groupings")
+    def deck_groupings(request: Request, deck_id: str):
+        """Chapters (per document, only where it has several) and themes (subject
+        wide) with counts - everything the practice picker needs in one call."""
+        return groupings_payload(_owner(request), deck_id)
 
     @router.get("/calibration")
     def calibration(request: Request, days: int = 90):
