@@ -140,8 +140,14 @@ RUN python -c "from src.omnigent_manager import OmnigentManager; m=OmnigentManag
 # Turn-2 crash fix for API-model crews: openai-agents 0.17.7 treats assistant
 # string content as list of parts (iterates char-by-char). Patch at build time
 # so every fresh image is fixed; also hot-patchable live via the same script.
-RUN python3 scripts/patch_omnigent_turn2_fix.py /opt/uv/tools/omnigent/lib/python3.12/site-packages/omnigent/inner/open_responses_sdk.py \
-    && grep -q "turn-2 re-seed crash" /opt/uv/tools/omnigent/lib/python3.12/site-packages/omnigent/inner/open_responses_sdk.py
+# Resolve the interpreter version rather than pinning it: the omnigent venv
+# lives under lib/python<X.Y>/, which moves whenever the base image bumps
+# Python (3.12 -> 3.14 broke this build). The picker/codex step above already
+# globs for the same reason.
+RUN set -eu; \
+    sdk="$(ls -d /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/inner/open_responses_sdk.py)"; \
+    python3 scripts/patch_omnigent_turn2_fix.py "$sdk" \
+    && grep -q "turn-2 re-seed crash" "$sdk"
 
 # Create data directory (mount a volume here for persistence)
 RUN mkdir -p data logs services/cache/search
