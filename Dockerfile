@@ -72,11 +72,22 @@ RUN ARCH="$(dpkg --print-architecture)" \
 
 WORKDIR /app
 
-# Install Python deps first (layer cache). Optional extras (PyMuPDF AGPL, etc.)
-# are opt-in so the default image stays MIT-core; see requirements-optional.txt.
+# Install Python deps first (layer cache).
+#
+# The lock is a pinned resolution generated against this same base image by
+# scripts/lock_requirements.sh, so image builds are reproducible instead of
+# picking up whatever pip resolves that day. Change requirements.txt and
+# re-run the script to update it.
+#
+# Optional extras carry their own licences — notably PyMuPDF, which is AGPL —
+# so they stay opt-in and out of the default image; see
+# requirements-optional.txt. The project itself is AGPL-3.0 (see LICENSE).
+#
+# Test-only dependencies are deliberately absent: the runtime image ships no
+# test framework. See requirements-dev.txt.
 ARG INSTALL_OPTIONAL=false
-COPY requirements.txt requirements-optional.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
+COPY requirements.txt requirements.lock.txt requirements-optional.txt ./
+RUN pip install --no-cache-dir -r requirements.lock.txt \
     && if [ "$INSTALL_OPTIONAL" = "true" ]; then pip install --no-cache-dir -r requirements-optional.txt; fi
 
 # Bundle the Omnigent agent CLI in its OWN isolated venv — its deps conflict

@@ -19,23 +19,60 @@ The sources below are under permissive licenses (MIT / Apache-2.0), which permit
 this use as long as their original copyright and license notices are preserved.
 The full license texts are kept in [`licenses/`](licenses/).
 
-- **[opencode](https://github.com/anomalyco/opencode)** — open-source AI coding
-  agent (originally [opencode-ai/opencode](https://github.com/opencode-ai/opencode),
-  archived Sep 2025; now maintained at `anomalyco/opencode`). Copyright © the
-  opencode authors. **MIT License.** Adapted for agent-loop / tool-execution
-  patterns and UI concepts.
-- **[llmfit](https://github.com/AlexsJones/llmfit)** by **Alex Jones** — the
-  engine behind the Cookbook's model download / serve / "What Fits?" feature.
-  Copyright © Alex Jones. **MIT License.** Adapted in `services/hwfit/`
-  (hardware detection, quant-aware fit scoring, model catalog),
-  `routes/cookbook_*.py`, `routes/hwfit_routes.py`, `static/js/cookbook*.js`,
-  and `scripts/odysseus-cookbook`.
-- **[Tongyi DeepResearch](https://github.com/Alibaba-NLP/DeepResearch)** by
-  **Alibaba-NLP / Tongyi Lab** — the multi-step deep-research agent pipeline.
-  Copyright © Alibaba-NLP / Tongyi Lab. **Apache-2.0.** Adapted for Odysseus's
-  Deep Research feature (`services/research/`, `src/research_handler.py`,
-  `routes/research_routes.py`, `services/search/`). Full text in
+Odysseus itself is licensed **AGPL-3.0** (see [`LICENSE`](LICENSE)); the
+permissive terms above describe the adapted upstream code, not this project.
+
+**Provenance policy.** Each entry records the upstream revision it was adapted
+from and what was changed locally, so a later upstream fix can be diffed against
+the correct baseline. Components adapted before this policy existed are marked
+*not recorded*: their upstream revision was not captured at the time and is not
+reconstructible after the fact, so it is left blank rather than guessed. When
+adapting new upstream code, or when next re-syncing one of these components,
+fill in the commit SHA or release tag and the date.
+
+### opencode
+
+- **Upstream:** [anomalyco/opencode](https://github.com/anomalyco/opencode) —
+  open-source AI coding agent. Originally
+  [opencode-ai/opencode](https://github.com/opencode-ai/opencode), archived
+  September 2025; now maintained at `anomalyco/opencode`.
+- **Upstream revision adapted:** *not recorded* (predates the provenance policy).
+- **License:** MIT. Copyright © the opencode authors.
+- **Present in this repository since:** 2026-05-31 (`e5c99a5e`, initial import).
+- **Local files:** `src/agent_loop.py`, `src/tool_execution.py`.
+- **Local adaptation:** agent-loop and tool-execution patterns and UI concepts,
+  reworked for Odysseus's own tool registry, approval gating, and workspace
+  confinement. Not a vendored copy — no upstream file is reproduced verbatim,
+  so upstream changes cannot be merged directly and must be re-applied by hand.
+
+### llmfit
+
+- **Upstream:** [AlexsJones/llmfit](https://github.com/AlexsJones/llmfit) by
+  **Alex Jones** — the engine behind the Cookbook's model download / serve /
+  "What Fits?" feature.
+- **Upstream revision adapted:** *not recorded* (predates the provenance policy).
+- **License:** MIT. Copyright © Alex Jones.
+- **Present in this repository since:** 2026-05-31 (`e5c99a5e`, initial import).
+- **Local files:** `services/hwfit/` (hardware detection, quant-aware fit
+  scoring, model catalog), `routes/cookbook_*.py`, `routes/hwfit_routes.py`,
+  `static/js/cookbook*.js`, `scripts/odysseus-cookbook`.
+- **Local adaptation:** fit scoring and the model catalog follow upstream's
+  approach; the serve/download orchestration, tmux session handling, remote-SSH
+  path, and endpoint auto-registration are Odysseus-specific additions.
+
+### Tongyi DeepResearch
+
+- **Upstream:** [Alibaba-NLP/DeepResearch](https://github.com/Alibaba-NLP/DeepResearch)
+  by **Alibaba-NLP / Tongyi Lab** — the multi-step deep-research agent pipeline.
+- **Upstream revision adapted:** *not recorded* (predates the provenance policy).
+- **License:** Apache-2.0. Copyright © Alibaba-NLP / Tongyi Lab. Full text in
   [`licenses/DeepResearch-Apache-2.0.txt`](licenses/DeepResearch-Apache-2.0.txt).
+- **Present in this repository since:** 2026-05-31 (`e5c99a5e`, initial import).
+- **Local files:** `services/research/`, `src/research_handler.py`,
+  `routes/research_routes.py`, `services/search/`.
+- **Local adaptation:** the planner/searcher/writer decomposition follows
+  upstream; search backends, provider routing, and report rendering are
+  Odysseus's own.
 
 ---
 
@@ -157,14 +194,14 @@ concerns from earlier are resolved:
 - **PyMuPDF (AGPL-3.0)** is no longer a core dependency. It is **optional** and
   used *only* by the PDF form-filling feature (`src/pdf_forms.py` and the form
   endpoints in `routes/document_routes.py`), lazy-imported and listed in
-  `requirements-optional.txt`. The MIT core runs without it. If you choose to
+  `requirements-optional.txt`. The default install runs without it. If you choose to
   install it, AGPL's network clause then applies to *that feature* for your
   deployment (Artifex also sells a commercial PyMuPDF license that lifts this).
 - **`caldav`** (Python lib) is **dual-licensed GPL-3.0-or-later OR Apache-2.0**.
   Odysseus uses it under **Apache-2.0**, which is permissive and MIT-compatible.
 - **`markitdown`** (Microsoft) is **MIT** and used only as an *optional* dependency for Office/EPUB text
-  extraction (`src/markitdown_runtime.py`), lazy-imported with graceful fallback — the MIT core runs without
-  it. The cloud `az-doc-intel` extra is deliberately **not** installed, keeping extraction fully local.
+  extraction (`src/markitdown_runtime.py`), lazy-imported with graceful fallback — the default
+  install runs without it. The cloud `az-doc-intel` extra is deliberately **not** installed, keeping extraction fully local.
 
 ---
 

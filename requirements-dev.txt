@@ -1,0 +1,14 @@
+# Development and test dependencies.
+#
+# Deliberately kept out of requirements.txt so the runtime image does not ship
+# a test framework. CI installs this on top of the runtime requirements; the
+# Docker image never does.
+
+-r requirements.txt
+
+pytest
+pytest-asyncio
+# starlette.testclient prefers httpx2 since Starlette 1.2.0 and warns on every
+# TestClient import when only classic httpx is present. Runtime code keeps
+# using `httpx`; this is test-client only.
+httpx2

@@ -1,3 +1,14 @@
+# Runtime dependencies for the Odysseus application image.
+#
+# This file is the human-maintained source of truth: add and remove entries
+# here. It is intentionally loose so a dependency can be bumped deliberately.
+# Docker and CI install requirements.lock.txt instead — a pinned resolution
+# actually tested on the shipped runtime (Linux, CPython 3.14). Regenerate it
+# with scripts/lock_requirements.sh after changing this file.
+#
+# Test-only dependencies live in requirements-dev.txt and are NOT installed
+# into the runtime image.
+
 fastapi
 uvicorn
 python-multipart
@@ -47,12 +58,6 @@ mcp<2
 pyotp
 qrcode[pil]
 croniter
-pytest
-pytest-asyncio
-# starlette.testclient prefers httpx2 since Starlette 1.2.0 and warns on every
-# TestClient import when only classic httpx is present. Runtime code keeps
-# using `httpx` above; this is test-client only.
-httpx2
 # DATABASE_URL defaults to sqlite (core/database.py), but when pointed at an
 # external Postgres, SQLAlchemy's postgresql dialect imports psycopg2 inside
 # create_engine() and raises ModuleNotFoundError if missing. -binary avoids

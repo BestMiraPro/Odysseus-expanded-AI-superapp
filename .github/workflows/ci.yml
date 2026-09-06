@@ -101,9 +101,27 @@ jobs:
           done
 
   python-tests:
-    name: Python tests (pytest)
+    name: Python tests (Linux, py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     # Make Python test validation authoritative for the configured scope.
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor the project still supports; 3.14 is what the
+        # Dockerfile actually ships, and was previously untested in CI.
+        python-version: ["3.11", "3.14"]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -136,11 +154,76 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         if: steps.docs-check.outputs.docs_only != 'true'
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: pip install -r requirements.txt
+      # The Linux lanes install the pinned lock, which is the resolution the
+      # Docker image ships (scripts/lock_requirements.sh). requirements-dev.txt
+      # adds the test framework, which the runtime image deliberately lacks.
+      - run: pip install -r requirements.lock.txt -r requirements-dev.txt
         if: steps.docs-check.outputs.docs_only != 'true'
       - run: mkdir -p data  # sqlite DB lives at ./data/app.db
         if: steps.docs-check.outputs.docs_only != 'true'
       - run: python -m pytest -q
         if: steps.docs-check.outputs.docs_only != 'true'
+        env:
+          # Exercises the dialect-aware schema reconciliation against a real
+          # server; without this the PostgreSQL parity cases skip.
+          TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/postgres
+
+  windows-tests:
+    name: Python tests (Windows, py3.14)
+    runs-on: windows-latest
+    # The project supports Windows and its shell discovery, process
+    # completion, and path handling differ materially from Linux — the
+    # September 5 review found real Windows-only defects (Git Bash vs the WSL
+    # stub, native temp roots, PYTEST_CURRENT_TEST length limits) that a
+    # Linux-only CI could not have caught.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+          cache: pip
+      # The lock is resolved for linux/amd64, so Windows installs the loose
+      # runtime requirements. Keeping the lane green is what tells us the
+      # unpinned set still resolves on the other supported platform.
+      - run: pip install -r requirements-dev.txt
+      - name: Install ripgrep
+        run: choco install ripgrep -y --no-progress
+      - run: mkdir data
+      - name: Run tests
+        run: python -m pytest -q
+
+  docker-build:
+    name: Docker image builds
+    runs-on: ubuntu-latest
+    # The image installs requirements.lock.txt; building here is what proves
+    # the committed lock still resolves on the runtime it was generated for.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the lock installs on the shipped runtime
+        run: |
+          docker run --rm \
+            -v "$PWD/requirements.lock.txt:/tmp/requirements.lock.txt:ro" \
+            python:3.14-slim \
+            sh -c 'pip install --no-cache-dir --dry-run -r /tmp/requirements.lock.txt >/dev/null && echo "lock resolves"'
+
+  lock-freshness:
+    name: Dependency lock is current
+    runs-on: ubuntu-latest
+    # A lock nobody regenerates is worse than none: it silently diverges from
+    # requirements.txt. This fails when a runtime dependency was added or
+    # removed without re-running scripts/lock_requirements.sh.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Every runtime requirement appears in the lock
+        run: python .github/scripts/check_lock_covers_requirements.py
