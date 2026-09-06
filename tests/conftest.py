@@ -37,6 +37,15 @@ def _has_module(mod_name: str) -> bool:
         return False
 
 
+# Modules that were replaced with a MagicMock below, reported at session start.
+# Nearly every name on the stub list is a *declared runtime dependency*, so a
+# silent stub means the suite is testing a mock of SQLAlchemy or FastAPI and
+# passing. The September 5, 2026 review hit exactly this: 18 of 60 declared
+# packages were missing from a working checkout while the suite reported green.
+# tests/test_conftest_import_hygiene.py fails loudly on the same condition.
+_STUBBED_MODULES = []
+
+
 # Stub optional dependencies only when they are not installed. Do not replace
 # real FastAPI/Starlette/Pydantic modules: route tests import their subpackages.
 for mod_name in [
@@ -49,6 +58,7 @@ for mod_name in [
 ]:
     if mod_name not in sys.modules and not _has_module(mod_name):
         sys.modules[mod_name] = MagicMock()
+        _STUBBED_MODULES.append(mod_name)
 
 if "src.database" not in sys.modules:
     _db = types.ModuleType("src.database")
@@ -140,6 +150,37 @@ def _install_subprocess_stdin_default():
     subprocess.run = run
     subprocess.Popen.__init__ = popen_init
     subprocess._odysseus_stdin_default = True
+    subprocess._odysseus_stdin_originals = (_run, _popen_init)
+
+
+def _uninstall_subprocess_stdin_default():
+    """Restore the real subprocess entry points.
+
+    The shim has to be global — it exists precisely because the failure is a
+    process-wide fd-0 problem, and scoping it per test would not fix that. But
+    an import-time mutation with no way back is untestable and impossible to
+    reason about, so make the restoration explicit and exercised.
+    """
+    import subprocess
+
+    originals = getattr(subprocess, "_odysseus_stdin_originals", None)
+    if not originals:
+        return
+    subprocess.run, subprocess.Popen.__init__ = originals
+    subprocess._odysseus_stdin_default = False
+    subprocess._odysseus_stdin_originals = None
 
 
 _install_subprocess_stdin_default()
+
+
+def pytest_report_header(config):
+    """Say plainly when core libraries are mocks rather than the real thing."""
+    if not _STUBBED_MODULES:
+        return None
+    return (
+        "WARNING: these modules are NOT installed and were replaced with "
+        f"MagicMock stubs: {', '.join(sorted(_STUBBED_MODULES))}. Tests that "
+        "touch them are running against mocks, not real behaviour. "
+        "Install them with: pip install -r requirements-dev.txt"
+    )
