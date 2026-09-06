@@ -7,7 +7,7 @@ def test_mcp_dependency_stays_on_decorator_compatible_major_version():
     requirements = Path(__file__).resolve().parents[1] / "requirements.txt"
     mcp_requirement = next(
         Requirement(line)
-        for line in requirements.read_text().splitlines()
+        for line in requirements.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#") and Requirement(line).name == "mcp"
     )
 

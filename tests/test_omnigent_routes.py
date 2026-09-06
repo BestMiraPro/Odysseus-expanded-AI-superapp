@@ -368,16 +368,16 @@ def test_generate_crew_writes_broad_and_curated_crew_variants(tmp_path, monkeypa
     assert not stale_worker.exists()
     assert not list(agents_root.glob("crew-api-*"))
 
-    crew = yaml.safe_load((agents_root / "crew" / "config.yaml").read_text())
+    crew = yaml.safe_load((agents_root / "crew" / "config.yaml").read_text(encoding="utf-8"))
     assert crew["executor"]["config"]["harness"] == "claude-sdk"
     assert {"claude-code", "codex", "glm-5-2", "deepseek-v4-flash", "deepseek-v4-pro"} <= set(
         crew["tools"]["agents"]
     )
 
-    crew_claude = yaml.safe_load((agents_root / "crew-claude" / "config.yaml").read_text())
+    crew_claude = yaml.safe_load((agents_root / "crew-claude" / "config.yaml").read_text(encoding="utf-8"))
     assert crew_claude["executor"]["config"]["harness"] == "claude-sdk"
 
-    crew_codex = yaml.safe_load((agents_root / "crew-codex" / "config.yaml").read_text())
+    crew_codex = yaml.safe_load((agents_root / "crew-codex" / "config.yaml").read_text(encoding="utf-8"))
     assert crew_codex["executor"]["config"]["harness"] == "codex-native"
     assert crew_codex["executor"]["config"]["yolo"] is True
     assert crew_codex["executor"]["model"] == "gpt-5.6-sol"
@@ -387,7 +387,7 @@ def test_generate_crew_writes_broad_and_curated_crew_variants(tmp_path, monkeypa
         "reasoning_effort": "xhigh",
     }
 
-    glm_crew = yaml.safe_load((agents_root / "crew-glm-5-2" / "config.yaml").read_text())
+    glm_crew = yaml.safe_load((agents_root / "crew-glm-5-2" / "config.yaml").read_text(encoding="utf-8"))
     assert glm_crew["executor"]["config"]["harness"] == "openai-agents"
     assert glm_crew["executor"]["model"] == "zai-org/GLM-5.2"
     assert glm_crew["executor"]["auth"]["api_key"] == "wandb_key"
@@ -401,7 +401,7 @@ def test_generate_crew_writes_broad_and_curated_crew_variants(tmp_path, monkeypa
     assert not (agents_root / "crew-glm-5-2" / "agents" / "codex").exists()
     assert not (agents_root / "crew-glm-5-2" / "agents" / "claude-code").exists()
 
-    glm_worker = yaml.safe_load((agents_root / "crew" / "agents" / "glm-5-2" / "config.yaml").read_text())
+    glm_worker = yaml.safe_load((agents_root / "crew" / "agents" / "glm-5-2" / "config.yaml").read_text(encoding="utf-8"))
     assert glm_worker["executor"]["config"]["harness"] == "openai-agents"
     assert glm_worker["executor"]["model"] == "zai-org/GLM-5.2"
     assert glm_worker["executor"]["auth"]["api_key"] == "wandb_key"
@@ -432,14 +432,14 @@ def test_generate_crew_creates_qwen_27b_variant_without_codex_subagent(tmp_path,
             qwen_crew_path = p
             break
     assert qwen_crew_path is not None, "Qwen 27B crew not created"
-    cfg = yaml.safe_load((qwen_crew_path / "config.yaml").read_text())
+    cfg = yaml.safe_load((qwen_crew_path / "config.yaml").read_text(encoding="utf-8"))
     # Must run directly on Qwen model and have no Codex/Claude sub-agents
     assert cfg["executor"]["model"] in ("Qwen/Qwen3-27B", "Qwen/Qwen2.5-27B-Instruct")
     assert cfg["tools"]["agents"] == []
     assert not (qwen_crew_path / "agents" / "codex").exists()
     assert not (qwen_crew_path / "agents" / "claude-code").exists()
     # Broad crews still retain Codex/Claude for deep work
-    crew = yaml.safe_load((agents_root / "crew" / "config.yaml").read_text())
+    crew = yaml.safe_load((agents_root / "crew" / "config.yaml").read_text(encoding="utf-8"))
     assert "codex" in crew["tools"]["agents"]
     assert "claude-code" in crew["tools"]["agents"]
 
@@ -503,7 +503,7 @@ def test_purge_generated_builtin_agent_rows_removes_stale_crews_and_raw_workers(
     with sqlite3.connect(db_path) as con:
         remaining = set(con.execute("SELECT name, session_id FROM agents").fetchall())
     assert remaining == {("glm-5-2", "conv_keep"), ("polly", None), ("codex", None)}
-    repoints = json.loads((root / "generated_agent_repoints.json").read_text())
+    repoints = json.loads((root / "generated_agent_repoints.json").read_text(encoding="utf-8"))
     assert repoints == {"legacy_api": "crew-glm-5-2"}
 
 
@@ -639,7 +639,7 @@ def test_purge_generated_builtin_agent_rows_supports_kind_schema_and_blob_ids(tm
     with sqlite3.connect(db_path) as con:
         remaining = set(con.execute("SELECT name, kind FROM agents").fetchall())
     assert remaining == {("glm-5-2", 2), ("polly", 1), ("codex", 1)}
-    repoints = json.loads((root / "generated_agent_repoints.json").read_text())
+    repoints = json.loads((root / "generated_agent_repoints.json").read_text(encoding="utf-8"))
     assert repoints == {f"hex:{legacy_id.hex()}": "crew-glm-5-2"}
 
 
