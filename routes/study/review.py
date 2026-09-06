@@ -53,6 +53,23 @@ def register(router: APIRouter) -> None:
 
     @router.post("/cards/{card_id}/review")
     def review_card(request: Request, card_id: str, body: ReviewIn):
+        """Apply an FSRS rating to a card.
+
+        Idempotency policy (``body.idempotency_key``):
+
+        * Keys are scoped to the owner. Two users may pick the same key; the
+          UNIQUE index is ``(COALESCE(owner,''), idempotency_key)``, built by
+          ``core.database.apply_study_idempotency_indexes``.
+        * Replaying a key against a *different* card is a 409. The key
+          identifies one intended write, so a mismatch is a client bug rather
+          than a retry.
+        * Replaying a key against the *same* card returns the first result and
+          ignores the retry's payload — first write wins. A client that
+          resends after a timeout cannot tell rejection from a lost response,
+          so the retry must not re-advance the schedule.
+        * Omitting the key keeps the legacy behaviour: every request is a new
+          review.
+        """
         user = _owner(request)
         if body.rating not in (1, 2, 3, 4):
             raise HTTPException(400, "rating must be 1-4")
@@ -66,6 +83,8 @@ def register(router: APIRouter) -> None:
                     StudyReview.idempotency_key == body.idempotency_key,
                 ).first()
                 if prior is not None:
+                    if prior.card_id != card_id:
+                        raise HTTPException(409, "Idempotency key already used for another card")
                     return {
                         "card": _card_to_dict(card),
                         "interval_days": prior.interval_days,
@@ -103,6 +122,8 @@ def register(router: APIRouter) -> None:
                     StudyReview.idempotency_key == body.idempotency_key,
                 ).first()
                 if prior is not None:
+                    if prior.card_id != card_id:
+                        raise HTTPException(409, "Idempotency key already used for another card")
                     return {
                         "card": _card_to_dict(card),
                         "interval_days": prior.interval_days,

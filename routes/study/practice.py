@@ -328,7 +328,15 @@ def register(router: APIRouter) -> None:
     @router.post("/questions/{question_id}/attempt")
     async def attempt_question(request: Request, question_id: str, body: AttemptIn):
         """Submit an answer. MCQ is checked locally; open answers are AI-graded.
-        The outcome maps to an FSRS rating so practice is spaced automatically."""
+        The outcome maps to an FSRS rating so practice is spaced automatically.
+
+        Idempotency policy (``body.idempotency_key``) matches the review
+        endpoint: keys are owner-scoped, replaying against a different
+        question is a 409, replaying against the same question returns the
+        first result and ignores the retry's payload, and omitting the key
+        records every request as a new attempt. See ``review_card`` for the
+        reasoning.
+        """
         if not _ai_limiter.check(request.client.host):
             raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
@@ -346,6 +354,8 @@ def register(router: APIRouter) -> None:
                     StudyAttempt.idempotency_key == body.idempotency_key,
                 ).first()
                 if prior is not None:
+                    if prior.question_id != question_id:
+                        raise HTTPException(409, "Idempotency key already used for another question")
                     return {
                         "qtype": prior.qtype,
                         "correct": prior.correct,
@@ -432,6 +442,8 @@ def register(router: APIRouter) -> None:
                     StudyAttempt.idempotency_key == body.idempotency_key,
                 ).first()
                 if prior is not None:
+                    if prior.question_id != question_id:
+                        raise HTTPException(409, "Idempotency key already used for another question")
                     return {
                         "qtype": prior.qtype,
                         "correct": prior.correct,
@@ -478,6 +490,8 @@ def register(router: APIRouter) -> None:
                     StudyAttempt.idempotency_key == body.idempotency_key,
                 ).first()
                 if prior is not None:
+                    if prior.question_id != question_id:
+                        raise HTTPException(409, "Idempotency key already used for another question")
                     prior_grading = json.loads(prior.grading) if prior.grading else None
                     return {
                         "qtype": prior.qtype,

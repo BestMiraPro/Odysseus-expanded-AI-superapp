@@ -75,7 +75,8 @@ DATABASE_URL = _normalize_sqlite_url(os.getenv("DATABASE_URL", _default_database
 # Create engine
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+    connect_args={"check_same_thread": False}
+    if make_url(DATABASE_URL).get_backend_name() == "sqlite" else {}
 )
 
 
@@ -1185,35 +1186,63 @@ def _migrate_add_study_composite_indexes():
             pass
 
 
-def _migrate_add_study_idempotency_keys():
-    """Add nullable idempotency keys plus UNIQUE indexes to study logs."""
-    import sqlite3
-    db_path = DATABASE_URL.replace("sqlite:///", "")
-    if not os.path.exists(db_path):
+_STUDY_IDEMPOTENCY_TABLES = ("study_reviews", "study_attempts")
+
+
+def apply_study_idempotency_indexes(engine) -> None:
+    """Scope study idempotency-key uniqueness to the owner.
+
+    Replay lookups in ``routes/study`` are owner-scoped
+    (``StudyReview.owner == user``), so the constraint has to match. Under the
+    original global UNIQUE index, one owner reusing another owner's key raised
+    ``IntegrityError``, the owner-scoped replay lookup found nothing, and the
+    error escaped the handler as a 500.
+
+    ``COALESCE(owner, '')`` keeps the constraint effective for single-user
+    installs, where ``owner`` is NULL: both SQLite and PostgreSQL treat NULLs
+    as distinct in a unique index, so a plain ``UNIQUE(owner, key)`` would
+    silently stop constraining those rows. The partial ``WHERE`` clause leaves
+    key-less reviews — the common case — unconstrained.
+
+    Dialect-aware and idempotent; safe to run on every startup.
+    """
+    log = logging.getLogger(__name__)
+    dialect = engine.dialect.name
+    if dialect not in ("sqlite", "postgresql"):
+        log.info("study idempotency index: dialect %r not supported, skipped", dialect)
         return
-    conn = None
     try:
-        conn = sqlite3.connect(db_path)
-        for table_name in ("study_reviews", "study_attempts"):
-            cursor = conn.execute(f"PRAGMA table_info({table_name})")
-            columns = [row[1] for row in cursor.fetchall()]
-            if columns and "idempotency_key" not in columns:
-                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN idempotency_key VARCHAR")
-            conn.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS ux_{table_name}_idempotency_key "
-                f"ON {table_name}(idempotency_key)"
-            )
-        conn.commit()
-        logging.getLogger(__name__).info(
-            "Migrated: added idempotency_key column + UNIQUE index to study logs"
-        )
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"study idempotency_key migration failed: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        inspector = inspect(engine)
+        with engine.begin() as conn:
+            for table in _STUDY_IDEMPOTENCY_TABLES:
+                if not inspector.has_table(table):
+                    continue
+                columns = {c["name"] for c in inspector.get_columns(table)}
+                if "idempotency_key" not in columns:
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN idempotency_key VARCHAR"
+                    ))
+                # The index keys on owner, so a pre-multiuser table needs it
+                # before the index can be built.
+                if "owner" not in columns:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN owner VARCHAR"))
+                # Drop the legacy global index; it is what made cross-owner
+                # keys collide. Existing installs carry it.
+                conn.execute(text(f"DROP INDEX IF EXISTS ux_{table}_idempotency_key"))
+                conn.execute(text(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS "
+                    f"ux_{table}_owner_idempotency_key "
+                    f"ON {table} (COALESCE(owner, ''), idempotency_key) "
+                    f"WHERE idempotency_key IS NOT NULL"
+                ))
+        log.info("Migrated: owner-scoped idempotency_key UNIQUE index on study logs")
+    except Exception:
+        log.warning("study idempotency_key migration failed", exc_info=True)
+
+
+def _migrate_add_study_idempotency_keys():
+    """Startup entry point for :func:`apply_study_idempotency_indexes`."""
+    apply_study_idempotency_indexes(engine)
 
 
 def _migrate_add_model_type_column():

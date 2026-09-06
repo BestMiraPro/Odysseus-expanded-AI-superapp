@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
@@ -28,9 +29,9 @@ def study_app(tmp_path, monkeypatch):
         poolclass=NullPool,
     )
     Base.metadata.create_all(bind=engine)
-    with engine.begin() as conn:
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_study_reviews_idempotency_key ON study_reviews(idempotency_key)"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_study_attempts_idempotency_key ON study_attempts(idempotency_key)"))
+    # Build the constraint the way production does, so these tests keep
+    # tracking the shipped schema instead of a hand-written copy of it.
+    cdb.apply_study_idempotency_indexes(engine)
     TestSessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 
     app = FastAPI()
@@ -276,22 +277,110 @@ def test_study_idempotency_migration_is_idempotent(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
 
-    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db_path}")
-    cdb._migrate_add_study_idempotency_keys()
-    cdb._migrate_add_study_idempotency_keys()
+    legacy_engine = create_engine(f"sqlite:///{db_path}", poolclass=NullPool)
+    cdb.apply_study_idempotency_indexes(legacy_engine)
+    cdb.apply_study_idempotency_indexes(legacy_engine)
 
+    index_name = "ux_{}_owner_idempotency_key"
     conn = sqlite3.connect(db_path)
     try:
         for table_name in ("study_reviews", "study_attempts"):
             columns = [row[1] for row in conn.execute(f"PRAGMA table_info({table_name})")]
+            # A pre-multiuser table gains both columns the index keys on.
             assert "idempotency_key" in columns
+            assert "owner" in columns
+            name = index_name.format(table_name)
             indexes = conn.execute(f"PRAGMA index_list({table_name})").fetchall()
-            assert sum(1 for row in indexes if row[1] == f"ux_{table_name}_idempotency_key") == 1
-            assert any(row[1] == f"ux_{table_name}_idempotency_key" and row[2] for row in indexes)
+            assert sum(1 for row in indexes if row[1] == name) == 1
+            assert any(row[1] == name and row[2] for row in indexes)
         conn.execute("INSERT INTO study_reviews (id) VALUES ('r2')")
         conn.execute("INSERT INTO study_reviews (id) VALUES ('r3')")
         conn.execute("INSERT INTO study_reviews (id, idempotency_key) VALUES ('r4', 'same')")
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute("INSERT INTO study_reviews (id, idempotency_key) VALUES ('r5', 'same')")
+        # ...but a different owner may reuse the key.
+        conn.execute(
+            "INSERT INTO study_reviews (id, owner, idempotency_key) VALUES ('r6', 'bob', 'same')"
+        )
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("kind", ["review", "attempt"])
+def test_same_key_for_different_target_is_a_conflict(study_app, kind):
+    client, session_local = study_app
+    if kind == "review":
+        model, log_model, make_row, collection = StudyCard, StudyReview, _card, "cards"
+        body = {"rating": 3, "idempotency_key": "target-conflict"}
+    else:
+        model, log_model, make_row, collection = StudyQuestion, StudyAttempt, _question, "questions"
+        body = {"choice_index": 0, "idempotency_key": "target-conflict"}
+    _seed(session_local, _deck(), make_row("first"), make_row("second"))
+
+    first = client.post(f"/api/study/{collection}/first/{kind}", json=body)
+    conflict = client.post(f"/api/study/{collection}/second/{kind}", json=body)
+
+    assert first.status_code == 200
+    assert conflict.status_code == 409
+    assert _count(session_local, log_model) == 1
+    with session_local() as db:
+        assert db.get(model, "first").reps == 5
+        untouched = db.get(model, "second")
+        assert untouched.reps == 4
+        assert untouched.due == datetime(2026, 1, 1)
+
+
+@pytest.mark.parametrize("kind", ["review", "attempt"])
+def test_concurrent_same_key_for_different_target_is_a_conflict(study_app, monkeypatch, kind):
+    client, session_local = study_app
+    if kind == "review":
+        model, log_model, make_row, collection = StudyCard, StudyReview, _card, "cards"
+        body = {"rating": 3, "idempotency_key": "racing-target-conflict"}
+    else:
+        model, log_model, make_row, collection = StudyQuestion, StudyAttempt, _question, "questions"
+        body = {"choice_index": 0, "idempotency_key": "racing-target-conflict"}
+    _seed(session_local, _deck(), make_row("first"), make_row("second"))
+    _schedule_spy(monkeypatch, barrier=threading.Barrier(2))
+
+    def post(target):
+        # Run each request on its own event loop so both async attempts can
+        # reach the scheduling barrier.
+        with TestClient(client.app) as worker_client:
+            return worker_client.post(f"/api/study/{collection}/{target}/{kind}", json=body)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(post, ["first", "second"]))
+
+    assert sorted(r.status_code for r in responses) == [200, 409]
+    assert _count(session_local, log_model) == 1
+    with session_local() as db:
+        for target, response in zip(["first", "second"], responses):
+            row = db.get(model, target)
+            assert row.reps == (5 if response.status_code == 200 else 4)
+            if response.status_code == 409:
+                assert row.due == datetime(2026, 1, 1)
+
+
+def test_attempt_key_claimed_by_another_question_during_grading_is_a_conflict(study_app, monkeypatch):
+    client, session_local = study_app
+    _seed(session_local, _deck(), _question("first"),
+          _question("second", qtype="open", options=None, correct_index=None))
+    key = "grading-target-conflict"
+
+    async def grade(*_args, **_kwargs):
+        response = client.post("/api/study/questions/first/attempt", json={
+            "choice_index": 0, "idempotency_key": key,
+        })
+        assert response.status_code == 200
+        return {"score": 88, "verdict": "correct", "feedback": "Good.", "followup": None}
+
+    monkeypatch.setattr(study_routes, "_llm_json", grade)
+    response = client.post("/api/study/questions/second/attempt", json={
+        "answer": "ATP stores energy.", "idempotency_key": key,
+    })
+
+    assert response.status_code == 409
+    assert _count(session_local, StudyAttempt) == 1
+    with session_local() as db:
+        assert db.get(StudyQuestion, "second").reps == 4
+        assert db.get(StudyQuestion, "second").due == datetime(2026, 1, 1)
