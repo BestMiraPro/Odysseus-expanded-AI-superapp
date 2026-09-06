@@ -1186,6 +1186,119 @@ def _migrate_add_study_composite_indexes():
             pass
 
 
+def _column_ddl(column, dialect) -> str:
+    """Render one model column as ALTER TABLE ADD COLUMN body text.
+
+    NOT NULL is only emitted alongside a usable default: adding a mandatory
+    column to a table that already has rows fails otherwise, and refusing the
+    whole reconciliation over one column would be worse than adding it
+    nullable and leaving the model's own validation to catch bad rows.
+    """
+    type_sql = column.type.compile(dialect)
+    parts = [f"{column.name} {type_sql}"]
+
+    default = None
+    if column.server_default is not None:
+        arg = getattr(column.server_default, "arg", None)
+        if arg is not None:
+            default = str(getattr(arg, "text", arg))
+    elif column.default is not None and not column.default.is_callable:
+        value = column.default.arg
+        if isinstance(value, bool):
+            default = "1" if value else "0"
+            if dialect.name == "postgresql":
+                default = "true" if value else "false"
+        elif isinstance(value, (int, float)):
+            default = str(value)
+        elif isinstance(value, str):
+            default = "'" + value.replace("'", "''") + "'"
+
+    if default is not None:
+        parts.append(f"DEFAULT {default}")
+        if not column.nullable:
+            parts.append("NOT NULL")
+    return " ".join(parts)
+
+
+def reconcile_schema_with_models(engine) -> list:
+    """Add model columns and indexes missing from the live schema.
+
+    The hand-written ``_migrate_*`` functions inspect the schema with
+    ``PRAGMA table_info(...)``, which only exists on SQLite, inside a
+    ``try/except`` that logs and continues. On PostgreSQL the PRAGMA raises,
+    the guard swallows it, and the column is never added — the upgrade
+    silently no-ops and the application then queries columns that do not
+    exist.
+
+    ``Base.metadata`` already describes the current schema authoritatively, so
+    reconciling against it is dialect-agnostic by construction and covers every
+    table at once instead of needing one bespoke migration per column. It runs
+    after the legacy migrations, which keep their data backfills; on SQLite
+    they have normally already added the columns, so this is a no-op there.
+
+    Returns the list of applied changes ("table.column", "index:name"), which
+    is empty on an up-to-date schema.
+    """
+    log = logging.getLogger(__name__)
+    applied = []
+    try:
+        inspector = inspect(engine)
+        live_tables = set(inspector.get_table_names())
+    except Exception:
+        log.warning("schema reconciliation: could not inspect the database", exc_info=True)
+        return applied
+
+    for table in Base.metadata.sorted_tables:
+        if table.name not in live_tables:
+            # Fresh tables are create_all's job; a table absent here is either
+            # brand new or belongs to a build that never created it.
+            continue
+        try:
+            live_columns = {c["name"] for c in inspector.get_columns(table.name)}
+            live_indexes = {i["name"] for i in inspector.get_indexes(table.name)}
+        except Exception:
+            log.warning("schema reconciliation: cannot read %s", table.name, exc_info=True)
+            continue
+
+        for column in table.columns:
+            if column.name in live_columns:
+                continue
+            ddl = _column_ddl(column, engine.dialect)
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {table.name} ADD COLUMN {ddl}"))
+                applied.append(f"{table.name}.{column.name}")
+                log.info("Schema reconciliation: added %s.%s", table.name, column.name)
+            except Exception:
+                log.warning(
+                    "schema reconciliation: could not add %s.%s",
+                    table.name, column.name, exc_info=True,
+                )
+
+        for index in table.indexes:
+            if index.name in live_indexes:
+                continue
+            cols = ", ".join(c.name for c in index.columns)
+            unique = "UNIQUE " if index.unique else ""
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        f"CREATE {unique}INDEX IF NOT EXISTS {index.name} "
+                        f"ON {table.name} ({cols})"
+                    ))
+                applied.append(f"index:{index.name}")
+                log.info("Schema reconciliation: created index %s", index.name)
+            except Exception:
+                log.warning(
+                    "schema reconciliation: could not create index %s",
+                    index.name, exc_info=True,
+                )
+
+    if applied:
+        log.info("Schema reconciliation applied %d change(s): %s", len(applied), applied)
+    return applied
+
+
 _STUDY_IDEMPOTENCY_TABLES = ("study_reviews", "study_attempts")
 
 
@@ -2477,6 +2590,14 @@ def init_db():
     """
     _migrate_model_endpoints()
     Base.metadata.create_all(bind=engine)
+    # Bring an existing schema up to the models before the hand-written
+    # migrations run. Those inspect the schema with PRAGMA table_info(...),
+    # which only exists on SQLite, so on PostgreSQL they log a warning and
+    # add nothing; running first means every dialect has the columns present
+    # before any backfill below tries to read or write them. On SQLite the
+    # legacy migrations have normally already applied them, so this is a
+    # no-op there.
+    reconcile_schema_with_models(engine)
     # Lock the DB file (and any SQLite sidecars) to 0o600 — it holds bearer-token
     # + bcrypt hashes and encrypted provider keys. POSIX only; safe_chmod no-ops
     # on Windows (ACL-restricted profile dir) and the path helper returns None for
