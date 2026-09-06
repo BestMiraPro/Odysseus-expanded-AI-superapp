@@ -196,8 +196,8 @@ jobs:
       - name: Run tests
         run: python -m pytest -q
 
-  docker-build:
-    name: Docker image builds
+  lock-installs-on-runtime:
+    name: Lock installs on the shipped runtime
     runs-on: ubuntu-latest
     # The image installs requirements.lock.txt; building here is what proves
     # the committed lock still resolves on the runtime it was generated for.
