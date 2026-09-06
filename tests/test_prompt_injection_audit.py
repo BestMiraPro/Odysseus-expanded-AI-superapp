@@ -179,7 +179,7 @@ def test_integration_description_lands_in_untrusted_message(monkeypatch):
 
 
 def test_integration_description_suppressed_with_local_context(monkeypatch):
-    """suppress_local_context=True, encoding="utf-8" must prevent integration injection."""
+    """suppress_local_context=True must prevent integration injection."""
     _patch_integrations(monkeypatch, "## SensitiveAPI\nDo not expose.")
 
     from src.agent_loop import _build_system_prompt
@@ -188,7 +188,7 @@ def test_integration_description_suppressed_with_local_context(monkeypatch):
     out, _ = _build_system_prompt(
         messages=messages, model="test-model",
         active_document=None, mcp_mgr=None, owner=None,
-        suppress_local_context=True, encoding="utf-8",
+        suppress_local_context=True,
     )
 
     all_text = "\n".join(m.get("content") or "" for m in out)
