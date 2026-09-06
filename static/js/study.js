@@ -244,6 +244,11 @@ function injectStyles() {
 .study-backdrop { position: fixed; inset: 0; z-index: 159; background: rgba(0,0,0,0.35); }
 .study-pane.hidden, .study-backdrop.hidden { display: none !important; }
 .study-model-wrap { display: flex; gap: 4px; align-items: center; }
+.study-model-status { font-size: 10.5px; opacity: 0.75; }
+.study-model-status.error { color: var(--danger, #c0392b); opacity: 1; }
+.study-model-status.ok { color: var(--ok, #2e7d32); }
+.study-model-retry { margin-left: 4px; font-size: 10.5px; padding: 1px 6px; cursor: pointer;
+  background: none; color: inherit; border: 1px solid currentColor; border-radius: 5px; }
 .study-model-wrap select { max-width: 150px; font-size: 10.5px; padding: 3px 5px;
   background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; }
 @media (max-width: 900px) { .study-model-wrap { display: none; } }
@@ -496,8 +501,9 @@ export function openPanel() {
       </div>
       <span class="study-header-spacer"></span>
       <span class="study-model-wrap" id="study-model-wrap" title="Model used for extraction, grading and hints. 'Same as chat' falls back to the utility/default model.">
-        <select id="study-ep-select"><option value="">Same as chat</option></select>
-        <select id="study-model-select"><option value="">model…</option></select>
+        <select id="study-ep-select" aria-label="Study model endpoint"><option value="">Same as chat</option></select>
+        <select id="study-model-select" aria-label="Study model"><option value="">model…</option></select>
+        <span class="study-model-status" id="study-model-status" role="status"></span>
       </span>
       <button class="study-x" id="study-min-btn" title="Minimize">–</button>
       <button class="study-x" id="study-close-btn" title="Close (Esc)">✕</button>
@@ -567,16 +573,111 @@ function _forceClose() {
 
 let _endpoints = [];
 
+// ---------------------------------------------------------------------------
+// MODEL SELECTOR PERSISTENCE
+// ---------------------------------------------------------------------------
+// The last selection the server confirmed, plus the single-flight queue state.
+// Kept at module scope so a reload can be checked against what was actually
+// persisted rather than what the control happens to display.
+let _modelSavePending = null;
+let _modelSaveRunning = false;
+let _studyModelConfirmed = { endpointId: '', model: '' };
+
+// Read JSON from an endpoint, treating a non-2xx as the failure it is.
+// fetch() resolves normally for 403/422/500, so `.then(r => r.json())` parsed
+// error bodies as settings.
+async function fetchStudyJson(path, fetchImpl = fetch) {
+  const res = await fetchImpl(`${API}${path}`, { credentials: 'same-origin' });
+  if (!res.ok) {
+    const err = new Error(`${path} failed (HTTP ${res.status})`);
+    err.status = res.status;
+    throw err;
+  }
+  return res.json();
+}
+
+// POST the study model choice. Returns a result rather than throwing, so the
+// caller can render a pending/failed state instead of announcing success.
+async function sendStudyModelSave(desired, fetchImpl = fetch) {
+  try {
+    const res = await fetchImpl(`${API}/api/auth/settings`, {
+      method: 'POST', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        study_endpoint_id: desired.endpointId || '',
+        study_model: desired.model || '',
+      }),
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = await res.json();
+        if (body && body.detail) detail = String(body.detail);
+      } catch { /* error body was not JSON */ }
+      return { ok: false, status: res.status, detail };
+    }
+    return { ok: true, status: res.status };
+  } catch (e) {
+    return { ok: false, status: 0, detail: (e && e.message) || String(e) };
+  }
+}
+
+// Single-flight queue. Two POSTs racing could complete in either order and
+// leave the server holding the *older* selection, so only one is ever in
+// flight and a burst collapses to the latest desired value.
+async function queueStudyModelSave(desired, fetchImpl = fetch) {
+  _modelSavePending = desired;
+  if (_modelSaveRunning) return { ok: true, coalesced: true };
+  _modelSaveRunning = true;
+  let last = { ok: true, coalesced: true };
+  try {
+    while (_modelSavePending) {
+      const next = _modelSavePending;
+      _modelSavePending = null;
+      last = await sendStudyModelSave(next, fetchImpl);
+      if (!last.ok) { _modelSavePending = null; return last; }
+      _studyModelConfirmed = {
+        endpointId: next.endpointId || '', model: next.model || '',
+      };
+    }
+  } finally {
+    _modelSaveRunning = false;
+  }
+  return last;
+}
+
+// Inline, persistent status beside the selector. A toast disappears; a failed
+// save needs to stay visible and offer a retry.
+function setModelStatus(kind, text, onRetry) {
+  const el = _pane?.querySelector('#study-model-status');
+  if (!el) return;
+  el.className = `study-model-status ${kind}`;
+  el.textContent = text || '';
+  if (kind === 'error' && onRetry) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'study-model-retry';
+    btn.textContent = 'Retry';
+    btn.addEventListener('click', onRetry);
+    el.appendChild(btn);
+  }
+  el.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+}
+
 async function initModelSelector() {
   const epSel = _pane?.querySelector('#study-ep-select');
   const mSel = _pane?.querySelector('#study-model-select');
   if (!epSel || !mSel) return;
   try {
     const [eps, settings] = await Promise.all([
-      fetch(`${API}/api/model-endpoints`, { credentials: 'same-origin' }).then(r => r.json()),
-      fetch(`${API}/api/auth/settings`, { credentials: 'same-origin' }).then(r => r.json()),
+      fetchStudyJson('/api/model-endpoints'),
+      fetchStudyJson('/api/auth/settings'),
     ]);
     _endpoints = Array.isArray(eps) ? eps : [];
+    _studyModelConfirmed = {
+      endpointId: settings.study_endpoint_id || '',
+      model: settings.study_model || '',
+    };
     epSel.innerHTML = '<option value="">Same as chat</option>' + _endpoints.map(ep =>
       `<option value="${esc(ep.id)}">${esc(ep.name)}${ep.online === false ? ' (offline)' : ''}</option>`).join('');
     epSel.value = settings.study_endpoint_id || '';
@@ -587,17 +688,18 @@ async function initModelSelector() {
   }
 
   const save = async () => {
-    try {
-      await fetch(`${API}/api/auth/settings`, {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          study_endpoint_id: epSel.value || '',
-          study_model: mSel.value || '',
-        }),
-      });
-      toast(epSel.value ? 'Study model saved' : 'Study model: same as chat');
-    } catch (e) { toast('Could not save model (admin only?): ' + e.message, true); }
+    const desired = { endpointId: epSel.value || '', model: mSel.value || '' };
+    setModelStatus('pending', 'Saving…');
+    const result = await queueStudyModelSave(desired);
+    if (result.coalesced) return;      // a later change owns the outcome
+    if (result.ok) {
+      setModelStatus('ok', desired.endpointId ? 'Saved' : 'Same as chat');
+      return;
+    }
+    // Announce nothing as saved: the server refused, and the last confirmed
+    // selection is still what a reload will show.
+    setModelStatus('error', `Not saved: ${result.detail}. `, save);
+    toast(`Could not save the study model: ${result.detail}`, true);
   };
   epSel.addEventListener('change', () => { fillStudyModels(''); save(); });
   mSel.addEventListener('change', save);
