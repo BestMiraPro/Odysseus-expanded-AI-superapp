@@ -16,6 +16,93 @@ _CODENAV_SKIP_DIRS = frozenset({
 })
 _CODENAV_MAX_HITS = 200
 _CODENAV_MAX_LINE = 400
+# Room for multi-byte UTF-8 inside one displayed line. Anything longer is a
+# minified bundle or a binary-ish blob; keep the head and discard the tail as
+# it streams rather than materialising the whole line.
+_CODENAV_LINE_READ_CAP = _CODENAV_MAX_LINE * 4
+_CODENAV_RG_TIMEOUT = 20
+
+
+def _run_ripgrep_bounded(cmd: list, max_hits: int):
+    """Run ripgrep, reading at most ``max_hits`` lines of stdout.
+
+    Returns ``(lines, None)`` or ``(None, error_message)``.
+
+    The previous ``subprocess.run(capture_output=True)`` buffered the entire
+    result set before Python sliced it: ``--max-count`` bounds matches per
+    file, not across files, so a broad pattern over a large tree allocated tens
+    of megabytes to return 200 lines.
+
+    stderr goes to a temporary file rather than a pipe. Reading only stdout
+    while ripgrep fills a stderr pipe (many "permission denied" warnings, say)
+    would deadlock both sides.
+    """
+    import subprocess
+    import tempfile
+    import threading
+
+    lines = []
+    capped = False
+    with tempfile.TemporaryFile() as errf:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf)
+        # A killed process's return code is ambiguous (Windows reports 1, which
+        # ripgrep also uses for "no matches"), so record the timeout directly.
+        expired = []
+
+        def _on_timeout():
+            expired.append(True)
+            p.kill()
+
+        timer = threading.Timer(_CODENAV_RG_TIMEOUT, _on_timeout)
+        timer.start()
+        try:
+            pending = b""       # current line, not yet terminated
+            skipping = False    # current line already past the display width
+            while len(lines) < max_hits:
+                chunk = p.stdout.read(65536)
+                if not chunk:
+                    break
+                start = 0
+                while len(lines) < max_hits:
+                    nl = chunk.find(b"\n", start)
+                    if nl == -1:
+                        if not skipping:
+                            pending += chunk[start:]
+                            if len(pending) > _CODENAV_LINE_READ_CAP:
+                                pending = pending[:_CODENAV_LINE_READ_CAP]
+                                skipping = True
+                        break
+                    if not skipping:
+                        pending += chunk[start:nl]
+                    text = pending.decode("utf-8", errors="replace").rstrip("\r")
+                    if text:
+                        lines.append(text[:_CODENAV_MAX_LINE])
+                    pending = b""
+                    skipping = False
+                    start = nl + 1
+            capped = len(lines) >= max_hits
+        finally:
+            if capped:
+                # We have everything we will show; don't drain the rest.
+                p.kill()
+            try:
+                p.stdout.close()
+            except Exception:
+                pass
+            p.wait()
+            timer.cancel()
+
+        if expired and not capped:
+            return None, "grep: timed out"
+        # A cap-kill makes the return code meaningless; only judge a run we
+        # let finish on its own.
+        if not capped and p.returncode not in (0, 1):
+            from src.tool_execution import _truncate
+            errf.seek(0)
+            detail = errf.read(65536).decode("utf-8", errors="replace").strip()
+            detail = detail or f"ripgrep exited with code {p.returncode}"
+            return None, f"grep: {_truncate(detail)}"
+    return lines, None
 
 
 def _glob_to_regex(pat: str) -> "re.Pattern":
@@ -608,13 +695,11 @@ class GrepTool:
                 for _d in _CODENAV_SKIP_DIRS:
                     cmd += ["--glob", f"!**/{_d}/**"]
                 cmd += ["--regexp", pattern, root]
+                # --max-count is per file, so a broad pattern over a large tree
+                # still produces max_hits lines *per file*. Stream stdout and
+                # stop at the global cap instead of buffering every match.
                 try:
-                    import subprocess
-                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-                    lines = [ln for ln in (p.stdout or "").splitlines() if ln][:max_hits]
-                    return lines, None
-                except subprocess.TimeoutExpired:
-                    return None, "grep: timed out"
+                    return _run_ripgrep_bounded(cmd, max_hits)
                 except Exception as _e:
                     return None, f"grep: {_e}"
             try:

@@ -73,6 +73,65 @@ _HF_TOKEN_STATUS_SNIPPET = (
 )
 
 
+def _probe_endpoint_alive(url: str, timeout: float = 3) -> bool:
+    """Blocking reachability probe for a served OpenAI-compatible endpoint.
+
+    Split out so the crash watchdog can run it in a worker thread: it is
+    synchronous by nature and was previously called straight from a coroutine.
+    """
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= getattr(resp, "status", 0) < 300
+    except Exception:
+        return False
+
+
+def _drop_endpoint_after_crash(endpoint_id: str, session_id: str, exit_code: int) -> bool:
+    """Delete a crashed serve's endpoint row unless it is still reachable.
+
+    Blocking: it opens a DB session and probes over HTTP. Call it through
+    :func:`_run_endpoint_cleanup` from async code. Returns True when the
+    endpoint row was deleted.
+    """
+    try:
+        from core.database import SessionLocal as _SL, ModelEndpoint as _ME
+        db = _SL()
+        try:
+            ep = db.query(_ME).filter(_ME.id == endpoint_id).first()
+            if not ep:
+                return False
+            # A scheduled serve can leave old non-zero exit markers in tmux
+            # scrollback while the current OpenAI endpoint is actually alive.
+            # Verify reachability before deleting the endpoint row; otherwise
+            # chats fall back even though the served model is ready.
+            probe_url = ep.base_url.rstrip("/") + "/models"
+            if _probe_endpoint_alive(probe_url, timeout=3):
+                logger.info(
+                    f"crash-watchdog: serve {session_id} has exit marker {exit_code} "
+                    f"but endpoint {ep.id} is reachable; leaving it registered"
+                )
+                return False
+            logger.info(
+                f"crash-watchdog: dropping endpoint {endpoint_id} "
+                f"({ep.name} @ {ep.base_url}) — serve exited {exit_code}"
+            )
+            db.delete(ep)
+            db.commit()
+            return True
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning(f"crash-watchdog: endpoint cleanup failed: {e!r}")
+        return False
+
+
+async def _run_endpoint_cleanup(endpoint_id: str, session_id: str, exit_code: int) -> bool:
+    """Await :func:`_drop_endpoint_after_crash` without stalling the loop."""
+    return await asyncio.to_thread(
+        _drop_endpoint_after_crash, endpoint_id, session_id, exit_code
+    )
+
+
 def _windows_local_pid_record_line(pid_path: Path, ready_path: Path) -> str:
     """Build the Git Bash prelude that records a Win32-stoppable PID.
 
@@ -1720,39 +1779,10 @@ def setup_cookbook_routes() -> APIRouter:
                 # let the probe layer mark it offline if nothing's listening.
                 logger.info(f"crash-watchdog: serve {session_id} exited cleanly (0); leaving endpoint {endpoint_id}")
                 return
-            # Non-zero exit — drop the endpoint.
-            try:
-                from core.database import SessionLocal as _SL, ModelEndpoint as _ME
-                db = _SL()
-                try:
-                    ep = db.query(_ME).filter(_ME.id == endpoint_id).first()
-                    if ep:
-                        # A scheduled serve can leave old non-zero exit markers
-                        # in tmux scrollback while the current OpenAI endpoint is
-                        # actually alive. Verify reachability before deleting the
-                        # endpoint row; otherwise chats fall back even though the
-                        # served model is ready.
-                        try:
-                            probe_url = ep.base_url.rstrip("/") + "/models"
-                            with urllib.request.urlopen(probe_url, timeout=3) as resp:
-                                if 200 <= getattr(resp, "status", 0) < 300:
-                                    logger.info(
-                                        f"crash-watchdog: serve {session_id} has exit marker {exit_code} "
-                                        f"but endpoint {ep.id} is reachable; leaving it registered"
-                                    )
-                                    return
-                        except Exception:
-                            pass
-                        logger.info(
-                            f"crash-watchdog: dropping endpoint {endpoint_id} "
-                            f"({ep.name} @ {ep.base_url}) — serve exited {exit_code}"
-                        )
-                        db.delete(ep)
-                        db.commit()
-                finally:
-                    db.close()
-            except Exception as e:
-                logger.warning(f"crash-watchdog: endpoint cleanup failed: {e!r}")
+            # Non-zero exit — drop the endpoint. The probe and the DB session
+            # are both blocking, so they run in a worker thread; a blackholed
+            # endpoint used to stall every other request for the probe timeout.
+            await _run_endpoint_cleanup(endpoint_id, session_id, exit_code)
             return
         logger.debug(f"crash-watchdog: no exit marker for {session_id} within window; leaving endpoint {endpoint_id}")
 
