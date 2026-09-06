@@ -125,19 +125,31 @@ def migrate_settings(path: Path) -> bool:
         # file belongs to searxng:searxng — which every retained settings file
         # does, because searxng's entrypoint chowns /etc/searxng — root can no
         # longer chmod it and the migration dies with EPERM.
-        os.fchmod(fd, stat.S_IMODE(source_stat.st_mode))
-        os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
+        #
+        # Guarded on the capability rather than sys.platform: a platform-name
+        # check would silently skip these on any POSIX-like target the string
+        # did not anticipate, dropping the ownership guarantee exactly where it
+        # is needed. Windows has neither this owner/mode model nor a searxng
+        # container to hand the file to, so there is nothing to preserve there.
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, stat.S_IMODE(source_stat.st_mode))
+        if hasattr(os, "fchown"):
+            os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
         with os.fdopen(fd, "wb") as handle:
             fd = -1
             handle.write(updated)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        # Atomic replace is guaranteed on both platforms; the directory fsync
+        # that makes it durable across power loss is POSIX-only. Windows has no
+        # directory handle to sync, so the replace stands on its own there.
+        if hasattr(os, "O_DIRECTORY"):
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if fd >= 0:
             os.close(fd)

@@ -63,8 +63,14 @@ def test_retained_settings_gain_defaults_without_changing_custom_content(tmp_pat
         + retained.removeprefix(b"# retained deployment settings\n")
     )
     after = settings.stat()
-    assert stat.S_IMODE(after.st_mode) == 0o640
-    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+    # Mode and ownership preservation is a POSIX guarantee: it exists because
+    # the Compose cap set leaves root unable to chmod a searxng-owned file.
+    # Windows has no such model (chmod cannot even produce 0o640 there), so
+    # only these two assertions are scoped — the content and idempotency
+    # assertions above and below still run on every platform.
+    if hasattr(os, "fchown"):
+        assert stat.S_IMODE(after.st_mode) == 0o640
+        assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
 
     migrated = settings.read_bytes()
     second = _run(settings)
@@ -245,6 +251,11 @@ def test_invalid_utf8_is_not_replaced(tmp_path):
     assert after.st_ino == before.st_ino
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "fchown"),
+    reason="chmod-before-chown ordering is a POSIX-only guarantee; "
+           "tests/test_searxng_migration_portability.py asserts it on POSIX too",
+)
 def test_temporary_file_is_chmodded_before_it_is_chowned(tmp_path, monkeypatch):
     # The Compose cap set is `cap_drop: ALL` plus CHOWN/SETGID/SETUID/
     # DAC_OVERRIDE and carries no FOWNER, and searxng's entrypoint chowns
