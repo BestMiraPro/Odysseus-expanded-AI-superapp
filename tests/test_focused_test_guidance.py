@@ -91,7 +91,7 @@ def test_format_report_handles_no_changed_test_paths():
     assert "No directly runnable pytest files changed." in report
 
 def _git(repo: Path, *args: str) -> str:
-    return subprocess.check_output(["git", *args], cwd=repo, text=True).strip()
+    return subprocess.check_output(["git", *args], cwd=repo, text=True, encoding="utf-8").strip()
 
 
 def _write(path: Path, content: str) -> None:

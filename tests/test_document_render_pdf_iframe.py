@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from starlette.requests import Request
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -22,19 +23,6 @@ from core.middleware import SecurityHeadersMiddleware
 # ---------------------------------------------------------------------------
 
 
-class _FakeURL:
-    def __init__(self, path: str):
-        self.path = path
-        self.scheme = "http"
-
-
-class _FakeRequest:
-    def __init__(self, path: str):
-        self.url = _FakeURL(path)
-        self.headers = {}
-        self.state = SimpleNamespace()
-
-
 class _FakeResponse:
     def __init__(self):
         self.headers: dict[str, str] = {}
@@ -44,7 +32,8 @@ async def _dispatch(path: str) -> _FakeResponse:
     mw = SecurityHeadersMiddleware(MagicMock())
     resp = _FakeResponse()
     call_next = AsyncMock(return_value=resp)
-    await mw.dispatch(_FakeRequest(path), call_next)
+    request = Request({"type": "http", "path": path, "headers": [], "scheme": "http"})
+    await mw.dispatch(request, call_next)
     return resp
 
 

@@ -415,7 +415,7 @@ async def test_chat_stream_approval_ignores_research_and_new_attachments(monkeyp
         monkeypatch,
         "agent",
         captured,
-        capture_context=True,
+        capture_context=True, encoding="utf-8",
     )
     monkeypatch.setattr(chat_routes, "get_session_mode", lambda _session_id: "research_pending")
     pending = chat_routes.tool_approval_store.create(

@@ -137,7 +137,9 @@ def test_sqlite_db_path_handles_file_uri_forms(tmp_path):
         == str(db_file)
     )
 
-    localhost_db = tmp_path / "localhost-uri.db"
+    # An authority URI uses slash-delimited paths on every host. Concatenating
+    # a native Windows drive path here produces file://localhostC:\... instead.
+    localhost_db = "/absolute/localhost-uri.db"
     assert (
         _sqlite_db_path(
             make_url(

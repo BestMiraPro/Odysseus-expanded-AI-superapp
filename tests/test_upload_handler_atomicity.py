@@ -319,6 +319,11 @@ def test_upload_index_retries_when_replaced_during_read(tmp_path, monkeypatch):
         handle = real_open(file, mode, *args, **kwargs)
         if os.fspath(file) == db_path and "r" in mode and not replaced:
             replaced = True
+            # Preserve the old reader snapshot without an open OS handle:
+            # Windows refuses to replace the destination while it is open.
+            with handle:
+                snapshot = handle.read()
+            handle = io.StringIO(snapshot)
             replacement = db_path + ".replacement"
             with real_open(replacement, "w", encoding="utf-8") as out:
                 json.dump(new_index, out)

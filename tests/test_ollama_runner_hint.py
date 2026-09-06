@@ -50,7 +50,7 @@ def test_single_quoted_echo_prints_hint_literally():
     out = subprocess.run(
         [bash, "-c", f"echo '{_bash_squote(OLLAMA_MISSING_HINT)}'"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         timeout=30,
     )
     assert out.returncode == 0

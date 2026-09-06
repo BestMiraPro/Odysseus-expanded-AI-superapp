@@ -14,6 +14,7 @@ hardening:
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from core.middleware import SecurityHeadersMiddleware
 
@@ -65,3 +66,34 @@ def test_permissions_policy_locks_camera_and_geolocation_but_allows_self_microph
     # would also block the app's own same-origin voice/STT button.
     assert "microphone=()" not in policy
     assert "microphone=(self)" in policy
+
+
+@pytest.mark.parametrize("root_path", ["", "/odysseus", "/api/research/report/mount"])
+@pytest.mark.parametrize(
+    ("route_path", "frame_options", "policy_fragment"),
+    [
+        ("/api/document/doc-1/render-pdf", "SAMEORIGIN", "frame-ancestors 'self'"),
+        ("/api/study/materials/m-1/file", "SAMEORIGIN", "frame-ancestors 'self'"),
+        ("/api/research/report/r-1", None, "script-src 'self' 'unsafe-inline'"),
+        ("/api/tools/example/render", None, None),
+        ("/api/study/materials/m-1/notes", "DENY", "frame-ancestors 'none'"),
+    ],
+)
+def test_mounted_routes_keep_their_security_policy(root_path, route_path, frame_options, policy_fragment):
+    app = FastAPI()
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    async def endpoint():
+        return {"reached": True}
+
+    app.add_api_route(route_path, endpoint)
+    with TestClient(app, root_path=root_path) as client:
+        response = client.get(root_path + route_path)
+
+    assert response.status_code == 200
+    assert response.json() == {"reached": True}
+    assert response.headers.get("X-Frame-Options") == frame_options
+    if policy_fragment is None:
+        assert "Content-Security-Policy" not in response.headers
+    else:
+        assert policy_fragment in response.headers["Content-Security-Policy"]

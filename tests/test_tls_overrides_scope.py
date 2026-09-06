@@ -48,21 +48,36 @@ def _grep_files(pattern: str) -> set[str]:
     scratch dirs."""
     rx = re.compile(pattern)
     hits: set[str] = set()
-    for path in REPO.rglob("*.py"):
-        rel = path.relative_to(REPO).as_posix()
-        if rel.startswith("tests/"):
-            continue
-        if rel == "src/tls_overrides.py":  # definition site, not a caller
-            continue
-        if rel.startswith(".claude/") or "/.claude/" in rel:
-            continue
-        try:
-            body = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        if rx.search(body):
-            hits.add(rel)
+    excluded = {"tests", ".git", ".claude", "venv", ".venv", ".venv-win",
+                "node_modules", "pytest-tmp", "__pycache__", "build", "dist"}
+    for directory, dirs, files in os.walk(REPO):
+        # Prune before descending so local environments cannot turn this
+        # first-party source check into a scan of every installed dependency.
+        dirs[:] = [name for name in dirs if name not in excluded
+                   and not (Path(directory) / name / "pyvenv.cfg").is_file()]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            path = Path(directory) / name
+            rel = path.relative_to(REPO).as_posix()
+            if rel == "src/tls_overrides.py":  # definition site, not a caller
+                continue
+            try:
+                body = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if rx.search(body):
+                hits.add(rel)
     return hits
+
+
+def test_scope_scan_excludes_dependencies_and_generated_test_data(tmp_path, monkeypatch):
+    monkeypatch.setitem(globals(), "REPO", tmp_path)
+    for directory in ("src", ".venv-win/Lib", "pytest-tmp/run", "node_modules/pkg"):
+        path = tmp_path / directory / "caller.py"
+        path.parent.mkdir(parents=True)
+        path.write_text("llm_verify()\n", encoding="utf-8")
+    assert _grep_files(r"\bllm_verify\s*\(") == {"src/caller.py"}
 
 
 def test_llm_verify_only_used_in_allowlisted_files():

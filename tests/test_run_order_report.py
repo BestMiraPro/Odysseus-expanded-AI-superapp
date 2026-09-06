@@ -186,7 +186,7 @@ def _collect_order(sample_suite: Path, seed: int) -> tuple[list[str], str]:
         ],
         cwd=sample_suite,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     assert result.returncode == 0, result.stderr or result.stdout
     ids = [line for line in result.stdout.splitlines() if "::" in line]
@@ -226,7 +226,7 @@ def test_subprocess_failure_exit_code_and_footer(tmp_path):
         ],
         cwd=tmp_path,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
 
     assert result.returncode == 1

@@ -9,7 +9,7 @@ def test_amd_gpu_check_rejects_unknown_extra_arg_before_diagnostics():
     proc = subprocess.run(
         ["bash", str(SCRIPT), "--bad-option"],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         check=False,
     )
 

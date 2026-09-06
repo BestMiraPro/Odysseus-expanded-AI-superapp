@@ -34,7 +34,7 @@ def _tracked(*paths_under):
     try:
         out = subprocess.run(
             ["git", "ls-files", "--", *paths_under],
-            cwd=REPO, capture_output=True, text=True, timeout=30,
+            cwd=REPO, capture_output=True, text=True, encoding="utf-8", timeout=30,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -174,7 +174,7 @@ def test_managed_site_media_is_not_ignored(path):
         ["git", "check-ignore", "--no-index", "--quiet", path],
         cwd=REPO,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         timeout=30,
     )
     if result.returncode == 128:

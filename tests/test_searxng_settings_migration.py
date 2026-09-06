@@ -23,7 +23,7 @@ def _run(path: Path) -> subprocess.CompletedProcess[str]:
         [sys.executable, str(MIGRATION), str(path)],
         capture_output=True,
         check=False,
-        text=True,
+        text=True, encoding="utf-8",
     )
 
 

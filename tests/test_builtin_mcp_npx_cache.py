@@ -114,8 +114,7 @@ def test_npx_cache_check_detects_scoped_package_in_npx_cache(monkeypatch, tmp_pa
     async def unexpected_exec(*args, **kwargs):
         raise AssertionError("cache hit should not shell out to npx")
 
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("npm_config_cache", raising=False)
+    monkeypatch.setenv("npm_config_cache", str(tmp_path / ".npm"))
     monkeypatch.setattr(builtin_mcp.asyncio, "create_subprocess_exec", unexpected_exec)
 
     assert asyncio.run(

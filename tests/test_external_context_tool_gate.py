@@ -1373,6 +1373,15 @@ def test_document_stream_events_are_derived_from_authorized_block():
 def test_authorized_document_stream_precedes_completed_update(monkeypatch):
     import src.agent_loop as agent_loop
 
+    build_prompt = agent_loop._build_system_prompt
+
+    def isolated_prompt(*args, **kwargs):
+        # This case starts without external context. Saved local integrations
+        # and skills must not silently change that precondition.
+        kwargs["suppress_local_context"] = True
+        return build_prompt(*args, **kwargs)
+
+    monkeypatch.setattr(agent_loop, "_build_system_prompt", isolated_prompt)
     monkeypatch.setattr(
         agent_loop,
         "get_setting",

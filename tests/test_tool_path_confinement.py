@@ -28,33 +28,33 @@ def _make_block(tool_type, content):
 
 def test_sensitive_ssh_dir():
     from src.tool_execution import _is_sensitive_path
-    assert _is_sensitive_path("/home/user/.ssh/authorized_keys")
-    assert _is_sensitive_path(os.path.expanduser("~") + "/.ssh/config")
+    assert _is_sensitive_path(os.path.realpath("/home/user/.ssh/authorized_keys"))
+    assert _is_sensitive_path(os.path.realpath(os.path.expanduser("~") + "/.ssh/config"))
 
 
 def test_sensitive_gnupg_dir():
     from src.tool_execution import _is_sensitive_path
-    assert _is_sensitive_path("/home/user/.gnupg/pubring.kbx")
+    assert _is_sensitive_path(os.path.realpath("/home/user/.gnupg/pubring.kbx"))
 
 
 def test_sensitive_shell_rc():
     from src.tool_execution import _is_sensitive_path
-    assert _is_sensitive_path("/home/user/.bashrc")
-    assert _is_sensitive_path("/home/user/.zshrc")
-    assert _is_sensitive_path("/home/user/.profile")
+    assert _is_sensitive_path(os.path.realpath("/home/user/.bashrc"))
+    assert _is_sensitive_path(os.path.realpath("/home/user/.zshrc"))
+    assert _is_sensitive_path(os.path.realpath("/home/user/.profile"))
 
 
 def test_sensitive_key_filenames():
     from src.tool_execution import _is_sensitive_path
-    assert _is_sensitive_path("/tmp/id_rsa")
-    assert _is_sensitive_path("/tmp/id_ed25519")
-    assert _is_sensitive_path("/tmp/authorized_keys")
+    assert _is_sensitive_path(os.path.realpath("/tmp/id_rsa"))
+    assert _is_sensitive_path(os.path.realpath("/tmp/id_ed25519"))
+    assert _is_sensitive_path(os.path.realpath("/tmp/authorized_keys"))
 
 
 def test_non_sensitive_path():
     from src.tool_execution import _is_sensitive_path
-    assert not _is_sensitive_path("/tmp/notes.txt")
-    assert not _is_sensitive_path("/home/user/projects/file.py")
+    assert not _is_sensitive_path(os.path.realpath("/tmp/notes.txt"))
+    assert not _is_sensitive_path(os.path.realpath("/home/user/projects/file.py"))
 
 
 def test_sensitive_case_insensitive():
@@ -176,13 +176,21 @@ def test_allows_project_data(tmp_path):
         os.unlink(target)
 
 
-def test_allows_tmp(tmp_path):
-    """Paths under /tmp (or its realpath) must resolve cleanly."""
+def test_allows_tmp(tmp_path, monkeypatch):
+    """The OS-selected temporary directory is allowed, including on Windows."""
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
     from src.tool_execution import _resolve_tool_path
     f = tmp_path / "confinement-test.txt"
     f.write_text("ok")
     resolved = _resolve_tool_path(str(f))
     assert resolved == os.path.realpath(str(f))
+
+
+def test_system_temp_still_blocks_sensitive_files(tmp_path, monkeypatch):
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    from src.tool_execution import _resolve_tool_path
+    with pytest.raises(ValueError, match="sensitive directory"):
+        _resolve_tool_path(str(tmp_path / ".ssh" / "config"))
 
 
 def test_rejects_empty_path():

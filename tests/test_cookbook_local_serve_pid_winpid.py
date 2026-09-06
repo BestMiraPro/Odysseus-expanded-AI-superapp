@@ -37,7 +37,7 @@ def _run_pid_line(
     return subprocess.run(
         ["bash", "-c", _windows_local_pid_record_line(pid_path, ready_path)],
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         env=_env_for(fake_bin, **extra_env),
         timeout=10,
     )
@@ -94,7 +94,7 @@ def test_windows_local_pid_line_waits_for_python_fallback_before_replacing(tmp_p
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
+        text=True, encoding="utf-8",
         env=_env_for(fake_bin, FAKE_WINPID="42324"),
     )
 

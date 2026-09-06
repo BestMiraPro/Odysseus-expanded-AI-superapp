@@ -1,11 +1,9 @@
 """Tests for the code-navigation tools (grep, glob, ls) + read_file line range."""
 import os
+import json
 import shutil
 import asyncio
-import tempfile
 import pytest
-
-os.environ.setdefault("DATABASE_URL", "sqlite:////tmp/test_code_nav.db")
 
 from src.tool_execution import _direct_fallback
 
@@ -15,28 +13,18 @@ def _run(tool, content):
 
 
 @pytest.fixture
-def repo():
-    # Built under /tmp, which is on the default tool-path allowlist.
-    root = tempfile.mkdtemp(dir="/tmp", prefix="codenav_")
-    try:
-        with open(os.path.join(root, "a.py"), "w") as f:
-            f.write("import os\n# needle here\nprint('x')\n")
-        os.mkdir(os.path.join(root, "sub"))
-        with open(os.path.join(root, "sub", "b.txt"), "w") as f:
-            f.write("nothing\nNEEDLE upper\n")
-        os.mkdir(os.path.join(root, "sub", "deep"))
-        with open(os.path.join(root, "sub", "deep", "c.py"), "w") as f:
-            f.write("# deep python\n")
-        os.mkdir(os.path.join(root, "node_modules"))
-        with open(os.path.join(root, "node_modules", "dep.py"), "w") as f:
-            f.write("needle in dep\n")
-        g = os.path.join(root, ".git")
-        os.mkdir(g)
-        with open(os.path.join(g, "config"), "w") as f:
-            f.write("needle in git\n")
-        yield root
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+def repo(tmp_path, monkeypatch):
+    # Keep real confinement checks, with a portable and isolated allowed root.
+    monkeypatch.setattr("src.tool_execution._tool_path_roots", lambda: [os.path.realpath(tmp_path)])
+    (tmp_path / "a.py").write_text("import os\n# needle here\nprint('x')\n")
+    (tmp_path / "sub" / "deep").mkdir(parents=True)
+    (tmp_path / "sub" / "b.txt").write_text("nothing\nNEEDLE upper\n")
+    (tmp_path / "sub" / "deep" / "c.py").write_text("# deep python\n")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "dep.py").write_text("needle in dep\n")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("needle in git\n")
+    return tmp_path.as_posix()
 
 
 # ── grep ──────────────────────────────────────────────────────────────────
@@ -187,7 +175,7 @@ def test_read_file_offset_limit(repo):
     p = os.path.join(repo, "lines.txt")
     with open(p, "w") as f:
         f.write("\n".join(f"line{i}" for i in range(1, 11)) + "\n")
-    r = _run("read_file", f'{{"path": "{p}", "offset": 3, "limit": 2}}')
+    r = _run("read_file", json.dumps({"path": p, "offset": 3, "limit": 2}))
     assert r["exit_code"] == 0
     assert r["output"] == "line3\nline4\n"
 

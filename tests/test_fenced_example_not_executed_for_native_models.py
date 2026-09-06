@@ -52,6 +52,15 @@ def _patch_common(monkeypatch, exec_calls):
     monkeypatch.setattr(al, "estimate_tokens", lambda *a, **k: 10, raising=False)
     # These tests exercise tool-channel parsing, not owner authorization.
     monkeypatch.setattr(al, "blocked_tools_for_owner", lambda owner: set(), raising=False)
+    build_prompt = al._build_system_prompt
+
+    def isolated_prompt(*args, **kwargs):
+        # Local skills/integrations are unrelated to tool-channel parsing and
+        # can arm the approval gate depending on the developer's saved data.
+        kwargs["suppress_local_context"] = True
+        return build_prompt(*args, **kwargs)
+
+    monkeypatch.setattr(al, "_build_system_prompt", isolated_prompt)
 
     async def _fake_exec(block, *a, **k):
         exec_calls.append(block)
@@ -59,7 +68,8 @@ def _patch_common(monkeypatch, exec_calls):
     monkeypatch.setattr(al, "execute_tool_block", _fake_exec, raising=False)
 
 
-def _run_loop(monkeypatch, model, deltas, native_calls=None, max_rounds=2, endpoint_url=None):
+def _run_loop(monkeypatch, model, deltas, native_calls=None, max_rounds=2, endpoint_url=None,
+              request="Do not run anything yet, just show me an example."):
     """Drive stream_agent_loop with a fake LLM stream.
 
     `deltas` is a list of text chunks streamed for round 1 (and reused for any
@@ -85,7 +95,7 @@ def _run_loop(monkeypatch, model, deltas, native_calls=None, max_rounds=2, endpo
 
     gen = al.stream_agent_loop(
         endpoint_url or "https://api.openai.com/v1", model,
-        [{"role": "user", "content": "Do not run anything yet, just show me an example."}],
+        [{"role": "user", "content": request}],
         max_rounds=max_rounds,
         relevant_tools={"bash"},
     )
@@ -123,6 +133,7 @@ def test_native_model_real_native_tool_call_is_executed(monkeypatch):
         ["Sure, let me check that for you."],
         native_calls=native_calls,
         max_rounds=2,
+        request="Run echo hi.",
     )
     assert len(exec_calls) == 1, f"expected the native tool call to execute, got: {exec_calls}"
     assert exec_calls[0].tool_type == "bash"
@@ -145,6 +156,7 @@ def test_non_native_model_fenced_tool_call_still_executed(monkeypatch):
         ["```bash\necho hi\n```"],
         max_rounds=2,
         endpoint_url="http://192.168.1.50:8000/v1",
+        request="Run echo hi.",
     )
     assert len(exec_calls) == 1, f"non-native model's fenced tool call should still execute: {exec_calls}"
     assert exec_calls[0].tool_type == "bash"

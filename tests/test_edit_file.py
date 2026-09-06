@@ -1,7 +1,6 @@
 """edit_file: filesystem-write permission policy + behavior."""
 import json
 import os
-import tempfile
 
 import pytest
 
@@ -13,6 +12,12 @@ from src.tool_security import (
 )
 from src.agent_tools.filesystem_tools import EditFileTool
 from src.agent_tools import ToolBlock
+
+
+@pytest.fixture
+def workdir(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.tool_execution._tool_path_roots", lambda: [os.path.realpath(tmp_path)])
+    return tmp_path
 
 
 # ── Permission policy ─────────────────────────────────────────────────────
@@ -32,7 +37,7 @@ def test_blocked_tools_for_owner_includes_edit_file_for_non_admin(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_edit_file_blocked_at_execution_for_non_admin(monkeypatch):
+async def test_edit_file_blocked_at_execution_for_non_admin(monkeypatch, workdir):
     # Execution-level gate: a non-admin owner must be refused even if the tool
     # reaches execute_tool_block. edit_file stays admin-gated by tool_security
     # after #2684 (ALWAYS_AVAILABLE only changed advertisement, not execution).
@@ -44,8 +49,7 @@ async def test_edit_file_blocked_at_execution_for_non_admin(monkeypatch):
     # bypassing the admin gate.
     import src.tool_execution as te
     monkeypatch.setattr(te, "_owner_is_admin", lambda owner: False)
-    ws = tempfile.mkdtemp()
-    p = os.path.join("/tmp", "ef_block.txt")
+    p = os.path.join(workdir, "ef_block.txt")
     open(p, "w").write("a\n")
     _desc, result = await te.execute_tool_block(
         ToolBlock("edit_file", json.dumps({"path": p, "old_string": "a", "new_string": "b"})),
@@ -58,8 +62,8 @@ async def test_edit_file_blocked_at_execution_for_non_admin(monkeypatch):
 
 # ── Behavior ──────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
-async def test_edit_file_success():
-    p = os.path.join("/tmp", "ef_ok.py")
+async def test_edit_file_success(workdir):
+    p = os.path.join(workdir, "ef_ok.py")
     open(p, "w").write("def f():\n    return 1\n")
     res = await EditFileTool().execute(json.dumps({"path": p, "old_string": "return 1", "new_string": "return 2"}), {})
     assert res["exit_code"] == 0
@@ -69,8 +73,8 @@ async def test_edit_file_success():
 
 
 @pytest.mark.asyncio
-async def test_edit_file_not_found():
-    p = os.path.join("/tmp", "ef_nf.txt")
+async def test_edit_file_not_found(workdir):
+    p = os.path.join(workdir, "ef_nf.txt")
     open(p, "w").write("hello\n")
     res = await EditFileTool().execute(json.dumps({"path": p, "old_string": "nope", "new_string": "x"}), {})
     assert res["exit_code"] == 1 and "not found" in res["error"]
@@ -78,8 +82,8 @@ async def test_edit_file_not_found():
 
 
 @pytest.mark.asyncio
-async def test_edit_file_non_unique():
-    p = os.path.join("/tmp", "ef_dup.txt")
+async def test_edit_file_non_unique(workdir):
+    p = os.path.join(workdir, "ef_dup.txt")
     open(p, "w").write("x\nx\n")
     res = await EditFileTool().execute(json.dumps({"path": p, "old_string": "x", "new_string": "y"}), {})
     assert res["exit_code"] == 1 and "not unique" in res["error"]

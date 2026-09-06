@@ -440,7 +440,7 @@ def test_fast_lane_collects_only_unmarked_auth_concurrency_test():
         ],
         cwd=repo_root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
     )
     assert result.returncode == 0, result.stderr or result.stdout
     collected = result.stdout
