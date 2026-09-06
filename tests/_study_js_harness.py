@@ -46,6 +46,27 @@ def extract_function(name: str, source: str | None = None) -> str:
     return match.group(0).replace("export function", "function", 1)
 
 
+def extract_const(name: str, source: str | None = None) -> str:
+    """Return the source of a top-level ``const name = ...;`` declaration.
+
+    Handles the multi-line array/object literals study.js uses; the closing
+    ``];`` or ``};`` sits in column 0.
+    """
+    src = source if source is not None else STUDY_JS.read_text(encoding="utf-8")
+    match = re.search(
+        r"^const\s+" + re.escape(name) + r"\s*=\s*.*?^(?:\]|\})\s*;",
+        src,
+        re.DOTALL | re.MULTILINE,
+    )
+    if not match:
+        match = re.search(
+            r"^const\s+" + re.escape(name) + r"\s*=\s*[^\n]*;", src, re.MULTILINE
+        )
+    if not match:
+        raise AssertionError(f"{name} not found as a top-level const in study.js")
+    return match.group(0)
+
+
 def run_js(prelude: str, *function_names: str, epilogue: str = "") -> dict:
     """Execute the named study.js functions under Node and return parsed JSON.
 

@@ -40,10 +40,13 @@ const S = {
   focusHistory: [],
 };
 
+// Every id here must have a renderer in setTab, or its button is a dead
+// control: the tab variable changes, the old content stays, and the click
+// looks ignored. tests/test_study_agent_tab_js.py pins that invariant.
 const TABS = [
   ['today', 'Today'], ['subjects', 'Subjects'], ['review', 'Cards'],
   ['practice', 'Practice'], ['plan', 'Plan'], ['focus', 'Focus'],
-  ['stats', 'Stats'], ['history', 'History'],
+  ['stats', 'Stats'], ['history', 'History'], ['agent', 'Tutor'],
 ];
 
 const TIPS = [
@@ -638,7 +641,7 @@ function setTab(tab) {
   const render = {
     today: renderToday, subjects: renderSubjects, review: renderReview,
     practice: renderPractice, plan: renderPlan, focus: renderFocus,
-    stats: renderStats, history: renderHistory,
+    stats: renderStats, history: renderHistory, agent: renderAgent,
   }[tab];
   if (render) render();
 }
@@ -654,9 +657,13 @@ function renderAgent() {
 }
 
 // Open the Agent tab focused on a subject, optionally with a drafted message.
+// Both are set unconditionally: guarding on a truthy value meant opening the
+// tutor without a subject or draft silently kept the *previous* subject's
+// scope and half-written question. setAgentScope/setAgentPrefill already
+// normalise null/'' to "unscoped".
 function openAgent(deckId, prefill) {
-  if (deckId) setAgentScope(deckId);
-  if (prefill) setAgentPrefill(prefill);
+  setAgentScope(deckId || null);
+  setAgentPrefill(prefill || '');
   setTab('agent');
 }
 
