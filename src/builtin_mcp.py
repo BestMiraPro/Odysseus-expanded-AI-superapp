@@ -290,7 +290,8 @@ async def _is_npx_package_cached(npx_path, package_spec, timeout_s=5):
         )
     except NotImplementedError:
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 [npx_path, "--no-install", package_spec, "--version"],
                 capture_output=True,
                 timeout=timeout_s,

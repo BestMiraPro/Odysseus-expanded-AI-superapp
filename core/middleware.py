@@ -91,7 +91,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         request.state.csp_nonce = nonce
 
         response = await call_next(request)
-        path = request.url.path
+        path = get_application_route_path(request.scope)
 
         # Tool render endpoints
         is_tool_render = path.startswith("/api/tools/") and path.endswith("/render")

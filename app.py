@@ -197,7 +197,7 @@ _TIMEOUT_EXEMPT_PREFIXES = (
 
 class _RequestTimeoutMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        path = request.url.path or ""
+        path = get_application_route_path(request.scope)
         if any(path.startswith(p) for p in _TIMEOUT_EXEMPT_PREFIXES):
             return await call_next(request)
         try:
@@ -213,7 +213,7 @@ class _InteractiveActivityMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         from src.interactive_gate import should_track_interactive_request, track_interactive_request
 
-        path = request.url.path or ""
+        path = get_application_route_path(request.scope)
         if not should_track_interactive_request(path, request.method):
             return await call_next(request)
         async def _stop_background():

@@ -58,6 +58,7 @@ services/data/
 
 # Test capture artifacts (browser session dumps may contain personal content)
 .playwright-mcp/
+/pytest-tmp/
 
 # OS
 .DS_Store

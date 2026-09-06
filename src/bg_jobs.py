@@ -111,24 +111,26 @@ def launch(command: str, session_id: str, cwd: Optional[str] = None,
         lp, xp, cp = (shlex.quote(git_bash_path(p)) for p in (log_path, exit_path, cmd_path))
         script_path = _JOBS_DIR / f"{job_id}.sh"
         script_path.write_text(
-            f"bash {cp} > {lp} 2>&1\n"
+            f"{shlex.quote(git_bash_path(bash))} {cp} > {lp} 2>&1\n"
             f"echo $? > {xp}\n",
             encoding="utf-8",
         )
         argv = [bash, str(script_path)]
     else:
         # Windows without any bash installed: cmd.exe wrapper. The command runs
-        # in its own child .cmd so %ERRORLEVEL% is the command's real exit code.
+        # in its own cmd.exe so an explicit `exit` cannot stop the wrapper
+        # before it records %ERRORLEVEL%.
+        comspec = os.environ.get("ComSpec", "cmd.exe")
         child_path = _JOBS_DIR / f"{job_id}.child.cmd"
         child_path.write_text("@echo off\r\n" + command + "\r\n", encoding="utf-8")
         script_path = _JOBS_DIR / f"{job_id}.cmd"
         script_path.write_text(
             "@echo off\r\n"
-            f'call "{child_path}" > "{log_path}" 2>&1\r\n'
-            f'echo %ERRORLEVEL%> "{exit_path}"\r\n',
+            f'"{comspec}" /d /s /c ""{child_path}" > "{log_path}" 2>&1"\r\n'
+            f'echo %ERRORLEVEL% > "{exit_path}"\r\n',
             encoding="utf-8",
         )
-        argv = [os.environ.get("ComSpec", "cmd.exe"), "/c", str(script_path)]
+        argv = [comspec, "/c", str(script_path)]
 
     proc = subprocess.Popen(
         argv,
@@ -161,14 +163,22 @@ def launch(command: str, session_id: str, cwd: Optional[str] = None,
 
 def _read_output(rec: Dict[str, Any]) -> str:
     try:
-        txt = Path(rec["log_path"]).read_text(encoding="utf-8", errors="replace")
+        path = Path(rec["log_path"])
+        with path.open(encoding="utf-8", errors="replace") as log:
+            txt = log.read(_MAX_OUTPUT_CHARS + 1)
+        if len(txt) > _MAX_OUTPUT_CHARS:
+            # Read a bounded suffix rather than loading a potentially huge log.
+            # Four bytes per character covers UTF-8 and CRLF normalization;
+            # slicing afterwards discards any partially decoded first character.
+            half = _MAX_OUTPUT_CHARS // 2
+            with path.open("rb") as log:
+                size = log.seek(0, os.SEEK_END)
+                log.seek(max(0, size - half * 4))
+                tail = log.read(half * 4).decode("utf-8", errors="replace")
+            tail = tail.replace("\r\n", "\n").replace("\r", "\n")
+            txt = txt[:half] + "\n…[truncated]…\n" + tail[-half:]
     except Exception:
         return ""
-    if len(txt) > _MAX_OUTPUT_CHARS:
-        # Keep head + tail — the interesting bits are usually at both ends.
-        head = txt[: _MAX_OUTPUT_CHARS // 2]
-        tail = txt[-_MAX_OUTPUT_CHARS // 2:]
-        txt = head + "\n…[truncated]…\n" + tail
     return txt
 
 

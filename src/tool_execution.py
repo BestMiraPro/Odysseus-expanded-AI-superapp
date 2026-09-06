@@ -16,6 +16,7 @@ import os
 import pathlib
 import re
 import sys
+import tempfile
 import time
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
@@ -126,6 +127,9 @@ def _tool_path_roots() -> list[str]:
     # Project data directory — the agent's primary workspace.
     from src.constants import DATA_DIR
     roots.append(DATA_DIR)
+
+    # The native temp root also covers Windows TEMP/TMP and platform defaults.
+    roots.append(tempfile.gettempdir())
 
     # /tmp (and its macOS realpath /private/tmp).
     roots.append("/tmp")
