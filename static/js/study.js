@@ -521,6 +521,8 @@ export function openPanel() {
   });
 
   _keyHandler = (e) => {
+    // Minimized, closed, unfocused or mid-edit: not ours to act on.
+    if (!_studyAcceptsShortcut(e)) return;
     if (e.key === 'Escape') {
       // Close an open file viewer first, leaving the study pane open.
       const v = (_pane || document).querySelector('#study-viewer');
@@ -2037,6 +2039,46 @@ function reviewKeydown(e) {
     e.preventDefault();
     rateCard(parseInt(e.key, 10));
   }
+}
+
+// Decide whether a document-level keydown belongs to Study.
+//
+// The keydown listener is installed on `document` in openPanel and only
+// removed by _forceClose. Minimizing goes through the modal manager, which
+// just adds `hidden`/`modal-minimized` to the pane — so without this guard a
+// minimized Study kept rating cards and answering Escape from anywhere on the
+// page. Visibility is checked through the modal manager's own flag first, and
+// the classes it sets as a fallback for when that module is unavailable.
+function _studyAcceptsShortcut(e) {
+  if (!_open || !_pane) return false;
+
+  // A minimized window is still in the DOM, just hidden.
+  try { if (Modals.isMinimized && Modals.isMinimized('study-pane')) return false; }
+  catch { /* modal manager optional */ }
+  if (_pane.classList?.contains('hidden')
+      || _pane.classList?.contains('modal-minimized')) return false;
+
+  // Ctrl/Cmd/Alt chords belong to the browser or the app, never to a
+  // single-letter study shortcut.
+  if (e.ctrlKey || e.metaKey || e.altKey) return false;
+  // Mid-IME keystrokes are text being composed, not commands.
+  if (e.isComposing || e.keyCode === 229) return false;
+
+  const t = e.target;
+  // A neutral target (nothing focused) means no other surface claimed the
+  // key, so a visible Study may take it. Anything else has to be ours.
+  const neutral = !t || t === document.body || t === document.documentElement;
+  if (neutral) return true;
+  if (!_pane.contains(t)) return false;
+
+  // Inside Study, but still editing: the old guard missed contenteditable,
+  // which is what document editors use.
+  if (t.isContentEditable) return false;
+  if (typeof t.closest === 'function'
+      && t.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) {
+    return false;
+  }
+  return true;
 }
 
 // Click a control inside the Study body on behalf of a keyboard shortcut.
