@@ -2032,6 +2032,16 @@ function reviewKeydown(e) {
   }
 }
 
+// Click a control inside the Study body on behalf of a keyboard shortcut.
+// The pane can be closed or detached (body() is null) while a document-level
+// keydown listener is still installed, so the lookup has to be null-safe; and
+// a shortcut must never activate a control the click path has disabled, which
+// is what guards an in-flight submission.
+function clickControl(selector) {
+  const el = body()?.querySelector(selector);
+  if (el && !el.disabled) el.click();
+}
+
 function practiceKeydown(e) {
   if (!S.practice || S.practice.loading) return;
   if (e.target.closest('input, textarea, select')) return;
@@ -2050,8 +2060,10 @@ function practiceKeydown(e) {
       }
     } else if (e.key === 'Enter' && p.choice != null) {
       e.preventDefault();
-      el = body();
-      el.querySelector('#study-prac-submit')?.click();
+      // Route through the real control so the shortcut inherits the
+      // disabled/in-flight guard the click path already has, instead of
+      // starting a second submission.
+      clickControl('#study-prac-submit');
     }
   }
 
@@ -2059,16 +2071,16 @@ function practiceKeydown(e) {
   if (e.key === 'h' || e.key === 'H') {
     if (!p.result && p.hints.length < 3 && !p.hintBusy) {
       e.preventDefault();
-      body().querySelector('#study-prac-hint')?.click();
+      clickControl('#study-prac-hint');
     }
   }
   if (e.key === 'c' || e.key === 'C') {
     e.preventDefault();
-    body().querySelector('#study-prac-consult')?.click();
+    clickControl('#study-prac-consult');
   }
   if ((e.key === 'n' || e.key === 'N') && p.result) {
     e.preventDefault();
-    body().querySelector('#study-prac-next')?.click();
+    clickControl('#study-prac-next');
   }
 }
 
