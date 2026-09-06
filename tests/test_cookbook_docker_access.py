@@ -9,6 +9,7 @@ from starlette.requests import Request
 import routes.cookbook_routes as cookbook_routes
 from routes.cookbook_helpers import ServeRequest, _validate_serve_cmd
 from src.host_docker_access import HOST_DOCKER_ACCESS_HINT
+from tests._platform import requires_unix_sockets
 
 
 def _model_serve_endpoint():
@@ -57,6 +58,7 @@ async def test_container_cli_only_is_rejected(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+@requires_unix_sockets
 async def test_container_opt_in_with_unix_socket_is_allowed(monkeypatch, tmp_path):
     monkeypatch.setattr(cookbook_routes.shutil, "which", lambda binary: "/usr/bin/docker")
     socket_path = tmp_path / "docker.sock"
@@ -171,6 +173,7 @@ async def test_local_container_serve_returns_host_docker_opt_in_hint(
 
 
 @pytest.mark.asyncio
+@requires_unix_sockets
 async def test_local_container_serve_allows_generated_docker_exec_when_enabled(
     monkeypatch,
     tmp_path,

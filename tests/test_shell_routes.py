@@ -28,6 +28,7 @@ from routes.shell_routes import (
     _venv_activate_prefix,
     DOCKER_IN_CONTAINER_HINT,
 )
+from tests._platform import requires_unix_sockets
 
 
 def test_shell_routes_import_without_posix_pty_modules(monkeypatch):
@@ -177,6 +178,10 @@ class TestAppleSiliconDetection:
     def test_reports_true_on_macos_arm64(self, monkeypatch):
         import core.platform_compat as platform_compat
 
+        # IS_APPLE_SILICON is gated on IS_POSIX, which comes from os.name.
+        # Mocking only platform.system()/machine() leaves the host's own
+        # branch in place, so the fixture has to describe a whole platform.
+        monkeypatch.setattr(platform_compat.os, "name", "posix")
         monkeypatch.setattr(platform_compat.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(platform_compat.platform, "machine", lambda: "arm64")
         importlib.reload(platform_compat)
@@ -187,6 +192,7 @@ class TestAppleSiliconDetection:
     def test_reports_false_off_apple_silicon(self, monkeypatch, machine):
         import core.platform_compat as platform_compat
 
+        monkeypatch.setattr(platform_compat.os, "name", "posix")
         monkeypatch.setattr(platform_compat.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(platform_compat.platform, "machine", lambda: machine)
         importlib.reload(platform_compat)
@@ -196,6 +202,7 @@ class TestAppleSiliconDetection:
     def test_reports_false_on_non_macos(self, monkeypatch):
         import core.platform_compat as platform_compat
 
+        monkeypatch.setattr(platform_compat.os, "name", "posix")
         monkeypatch.setattr(platform_compat.platform, "system", lambda: "Linux")
         monkeypatch.setattr(platform_compat.platform, "machine", lambda: "arm64")
         importlib.reload(platform_compat)
@@ -291,6 +298,7 @@ class TestHostDockerAccess:
         assert _host_docker_access_enabled(str(socket_path)) is False
 
     @pytest.mark.parametrize("flag", [None, "false"])
+    @requires_unix_sockets
     def test_socket_without_explicit_opt_in_is_disabled(
         self,
         monkeypatch,
@@ -307,6 +315,7 @@ class TestHostDockerAccess:
 
             assert _host_docker_access_enabled(str(socket_path)) is False
 
+    @requires_unix_sockets
     def test_explicit_opt_in_with_unix_socket_is_enabled(
         self,
         monkeypatch,
@@ -417,14 +426,24 @@ class TestPackageProbeStatus:
     def test_local_user_install_bin_is_added_to_path(self, monkeypatch, tmp_path):
         user_base = tmp_path / "user-base"
         monkeypatch.setattr("site.USER_BASE", str(user_base))
+        # os.path.expanduser reads HOME on POSIX and USERPROFILE on Windows;
+        # set both so the fixture redirects "~" on either platform.
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path / "home"))
         monkeypatch.setenv("PATH", "/usr/bin")
 
         _prepend_user_install_bins_to_path()
 
-        parts = os.environ["PATH"].split(os.pathsep)
-        assert str(user_base / "bin") in parts
-        assert str(tmp_path / "home" / ".local" / "bin") in parts
+        # expanduser("~/.local/bin") keeps the literal forward slashes it was
+        # given, so on Windows the entry reads "...\home/.local/bin". Both
+        # separators are valid there; compare normalised paths rather than
+        # asserting one spelling.
+        def _norm(value):
+            return os.path.normcase(os.path.normpath(str(value)))
+
+        parts = {_norm(p) for p in os.environ["PATH"].split(os.pathsep)}
+        assert _norm(user_base / "bin") in parts
+        assert _norm(tmp_path / "home" / ".local" / "bin") in parts
 
     def test_remote_package_probe_checks_user_install_bin(self):
         script = _package_probe_script(["vllm"])
