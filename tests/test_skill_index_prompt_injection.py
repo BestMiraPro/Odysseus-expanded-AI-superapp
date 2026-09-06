@@ -109,8 +109,7 @@ def _patch_prefs(monkeypatch, data_dir):
 
     # Bust the base-prompt cache so our test re-reads the skill index.
     from src import agent_loop
-    agent_loop._cached_base_prompt = None
-    agent_loop._cached_base_prompt_key = None
+    agent_loop.reset_base_prompt_cache()
 
 
 def test_skill_index_does_not_leak_to_system_role(tmp_path, monkeypatch):

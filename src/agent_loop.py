@@ -893,8 +893,32 @@ def _assemble_prompt(tool_names: set, disabled_tools: set = None, compact: bool 
 AGENT_SYSTEM_PROMPT = _assemble_prompt(set(TOOL_SECTIONS.keys()))
 
 
-_cached_base_prompt = None
-_cached_base_prompt_key = None
+# Base-prompt cache.
+#
+# Held in a dict rather than two rebindable module globals. A global that
+# callers reset by rebinding (`agent_loop._cached_base_prompt = None`) cannot be
+# re-exported: whoever imports the name gets a snapshot, so a builder moved to
+# another module would read its own binding while the reset cleared the
+# original — the cache would silently never clear. A dict is mutated in place,
+# so every importer shares one object, which is what makes the prompt builders
+# extractable from this 6,400-line module without a split-brain cache.
+#
+# Use reset_base_prompt_cache() rather than touching this directly.
+_BASE_PROMPT_CACHE = {"prompt": None, "key": None}
+
+
+def reset_base_prompt_cache() -> None:
+    """Drop the cached base prompt. Safe to call from any module."""
+    _BASE_PROMPT_CACHE["prompt"] = None
+    _BASE_PROMPT_CACHE["key"] = None
+
+
+def base_prompt_cache_is_empty() -> bool:
+    return _BASE_PROMPT_CACHE["prompt"] is None
+
+
+def base_prompt_cache_key():
+    return _BASE_PROMPT_CACHE["key"]
 
 # Constants — moved out of hot paths to avoid per-request/per-round allocation
 # Hosts whose endpoints natively support OpenAI-style function calling.
@@ -2237,7 +2261,6 @@ def _build_system_prompt(
     workspace: Optional[str] = None,
 ) -> List[Dict]:
     """Build agent system prompt, inject MCP/document context, merge consecutive system msgs."""
-    global _cached_base_prompt, _cached_base_prompt_key
     if suppress_local_context:
         active_document = None
 
@@ -2252,8 +2275,9 @@ def _build_system_prompt(
     except Exception:
         _ov_sig = ""
     cache_key = (frozenset(disabled_tools or []), bool(mcp_mgr), needs_admin, _rt_key, compact, _ov_sig, owner, suppress_local_context, suppress_skills)
-    if _cached_base_prompt and _cached_base_prompt_key == cache_key and not active_document:
-        agent_prompt = _cached_base_prompt
+    _cached = _BASE_PROMPT_CACHE
+    if _cached["prompt"] and _cached["key"] == cache_key and not active_document:
+        agent_prompt = _cached["prompt"]
         # Skill index is user-editable (name + description), so it must never
         # live in the trusted system role and is NOT cached. Always recompute
         # when the cache hits.
@@ -2276,8 +2300,8 @@ def _build_system_prompt(
             suppress_skills=suppress_skills,
         )
         if not active_document:
-            _cached_base_prompt = agent_prompt
-            _cached_base_prompt_key = cache_key
+            _cached["prompt"] = agent_prompt
+            _cached["key"] = cache_key
 
     # Dynamic parts that change per request
     mcp_schemas = []

@@ -419,8 +419,7 @@ def test_guide_only_suppresses_active_document_context(monkeypatch):
 def test_document_my_style_does_not_infer_public_persona(monkeypatch):
     _patch_loop_basics(monkeypatch)
     monkeypatch.setattr(al, "_build_base_prompt", lambda *a, **k: ("BASE", ""), raising=False)
-    monkeypatch.setattr(al, "_cached_base_prompt", None, raising=False)
-    monkeypatch.setattr(al, "_cached_base_prompt_key", None, raising=False)
+    al.reset_base_prompt_cache()
 
     import src.settings as settings
     monkeypatch.setattr(settings, "load_settings", lambda: {"document_writing_style": ""}, raising=False)

@@ -144,8 +144,7 @@ def test_agent_system_prompt_includes_shared_current_time(monkeypatch):
     monkeypatch.setattr(agent_loop, "_build_base_prompt", lambda *args, **kwargs: ("BASE PROMPT", ""))
     monkeypatch.setattr(agent_loop, "set_active_model", lambda model: None)
     monkeypatch.setattr(agent_loop, "get_builtin_overrides", lambda: {})
-    monkeypatch.setattr(agent_loop, "_cached_base_prompt", None)
-    monkeypatch.setattr(agent_loop, "_cached_base_prompt_key", None)
+    agent_loop.reset_base_prompt_cache()
 
     messages, _ = agent_loop._build_system_prompt(
         [{"role": "user", "content": "hi"}],
@@ -170,8 +169,7 @@ def test_route_prompt_rebuild_restores_leading_user_system_message(monkeypatch):
     monkeypatch.setattr(agent_loop, "_build_base_prompt", lambda *args, **kwargs: ("AGENT PROMPT", ""))
     monkeypatch.setattr(agent_loop, "set_active_model", lambda model: None)
     monkeypatch.setattr(agent_loop, "get_builtin_overrides", lambda: {})
-    monkeypatch.setattr(agent_loop, "_cached_base_prompt", None)
-    monkeypatch.setattr(agent_loop, "_cached_base_prompt_key", None)
+    agent_loop.reset_base_prompt_cache()
 
     original = [
         {"role": "system", "content": "USER PERSONA"},

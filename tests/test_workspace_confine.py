@@ -410,8 +410,7 @@ def test_workspace_coding_mode_prompt_is_injected(monkeypatch):
     monkeypatch.setattr(al, "get_setting", lambda key, default=None: default, raising=False)
     monkeypatch.setattr(al, "get_mcp_manager", lambda: None, raising=False)
     monkeypatch.setattr(al, "blocked_tools_for_owner", lambda owner: set(), raising=False)
-    al._cached_base_prompt = None
-    al._cached_base_prompt_key = None
+    al.reset_base_prompt_cache()
 
     messages, _ = al._build_system_prompt(
         messages=[{"role": "user", "content": "fix the bug"}],
