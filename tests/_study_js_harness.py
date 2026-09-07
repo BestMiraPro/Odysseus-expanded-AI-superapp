@@ -36,11 +36,21 @@ def extract_function(name: str, source: str | None = None) -> str:
     the span unambiguous without a JS parser.
     """
     src = source if source is not None else STUDY_JS.read_text(encoding="utf-8")
+    # One-line declarations first. The multi-line pattern runs to the next `}`
+    # in column 0, which for a one-liner is the *following* function's closing
+    # brace — it would swallow that function and declare it twice.
     match = re.search(
-        r"^(?:export\s+)?(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(.*?^\}",
+        r"^(?:export\s+)?(?:async\s+)?function\s+" + re.escape(name)
+        + r"\s*\([^\n]*\}[ \t]*$",
         src,
-        re.DOTALL | re.MULTILINE,
+        re.MULTILINE,
     )
+    if not match:
+        match = re.search(
+            r"^(?:export\s+)?(?:async\s+)?function\s+" + re.escape(name) + r"\s*\(.*?^\}",
+            src,
+            re.DOTALL | re.MULTILINE,
+        )
     if not match:
         raise AssertionError(f"{name} not found as a top-level function")
     return match.group(0).replace("export function", "function", 1)

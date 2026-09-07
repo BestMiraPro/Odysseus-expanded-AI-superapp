@@ -29,6 +29,7 @@ TAB_IDS = ["today", "subjects", "review", "practice", "plan", "focus",
 def _prelude():
     """Stub every collaborator setTab/openAgent touch, recording the calls."""
     return DOM_STUB + extract_const("TABS") + """
+let _viewGen = 0;   // setTab bumps the view generation (B09)
 const rendered = [];
 const scope = [];
 const prefill = [];
@@ -62,7 +63,8 @@ function renderHistory() { rendered.push('history'); }
 
 
 def _run(epilogue):
-    return run_js(_prelude(), "setTab", "renderAgent", "openAgent", epilogue=epilogue)
+    return run_js(_prelude(), "bumpViewGen", "setTab", "renderAgent", "openAgent",
+                  epilogue=epilogue)
 
 
 def _report(extra=""):

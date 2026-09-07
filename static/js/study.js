@@ -669,6 +669,7 @@ function _ensureChipRegistered() {
 
 function _forceClose() {
   _open = false;
+  bumpViewGen();
   if (_keyHandler) { document.removeEventListener('keydown', _keyHandler); _keyHandler = null; }
   document.getElementById('tool-study-btn')?.classList.remove('active');
   try { Modals.unregister('study-pane'); } catch { }
@@ -839,8 +840,42 @@ export function isPanelOpen() { return _open; }
 
 function body() { return _pane?.querySelector('#study-body'); }
 
+// ---------------------------------------------------------------------------
+// VIEW GENERATION
+// ---------------------------------------------------------------------------
+// Every async render writes into one shared body element, so a response that
+// arrives after the user has moved on can replace the current content. Capture
+// a token before awaiting and check it before *both* success and error writes —
+// the error branches were the ones writing unguarded.
+//
+// A guard on tab name alone is not enough: navigating A -> B -> A returns to
+// the same name, so the generation counter is what makes the old visit
+// distinct.
+let _viewGen = 0;
+
+function bumpViewGen() {
+  return ++_viewGen;
+}
+
+function captureView(extra) {
+  return {
+    gen: _viewGen,
+    tab: _tab,
+    subject: S.subject?.deck?.id || null,
+    ...(extra || {}),
+  };
+}
+
+function viewStillCurrent(token) {
+  if (!token) return false;
+  return token.gen === _viewGen
+    && token.tab === _tab
+    && token.subject === (S.subject?.deck?.id || null);
+}
+
 function setTab(tab) {
   _tab = tab;
+  bumpViewGen();   // responses for the previous view are now stale
   const b = body();
   if (b) b.onclick = null; // per-tab delegated handlers are reassigned below
   _pane.querySelectorAll('.study-tab').forEach(btn => {
@@ -879,6 +914,7 @@ function openAgent(deckId, prefill) {
 
 function setTabSilent(tab) {
   _tab = tab;
+  bumpViewGen();
   const b = body();
   if (b) b.onclick = null;
   _pane?.querySelectorAll('.study-tab').forEach(btn => {
@@ -959,6 +995,7 @@ function _forecastChart(forecast) {
 }
 
 async function renderStats() {
+  const _view = captureView();
   const el = body();
   el.innerHTML = '<div class="study-empty">Loading…</div>';
   let s, calib = null;
@@ -969,7 +1006,13 @@ async function renderStats() {
       jget('/api/study/calibration?days=90').catch(() => null),
     ]);
   }
-  catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  catch (e) {
+    // Navigating away while this was in flight must not let the
+    // error replace whatever the user is looking at now.
+    if (!viewStillCurrent(_view)) return;
+    el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`;
+    return;
+  }
   if (_tab !== 'stats') return;
   const t = s.totals || {};
   const ret = s.retention || {};
@@ -1051,11 +1094,18 @@ function renderHistoryEntry(e) {
 }
 
 async function renderHistory() {
+  const _view = captureView();
   const el = body();
   el.innerHTML = '<div class="study-empty">Loading…</div>';
   let entries;
   try { entries = (await jget('/api/study/history?limit=300')).entries; }
-  catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  catch (e) {
+    // Navigating away while this was in flight must not let the
+    // error replace whatever the user is looking at now.
+    if (!viewStillCurrent(_view)) return;
+    el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`;
+    return;
+  }
   if (_tab !== 'history') return;
   if (!entries.length) {
     el.innerHTML = '<div class="study-empty">No history yet — answer some practice questions or review cards and they’ll show up here.</div>';
@@ -1077,10 +1127,17 @@ async function renderHistory() {
 // ---------------------------------------------------------------------------
 
 async function renderToday() {
+  const _view = captureView();
   const el = body();
   el.innerHTML = '<div class="study-empty">Loading…</div>';
   try { S.overview = await jget('/api/study/overview'); }
-  catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  catch (e) {
+    // Navigating away while this was in flight must not let the
+    // error replace whatever the user is looking at now.
+    if (!viewStillCurrent(_view)) return;
+    el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`;
+    return;
+  }
   if (_tab !== 'today') return;
   const o = S.overview;
   const t = o.today;
@@ -1167,11 +1224,18 @@ async function renderToday() {
 // ---------------------------------------------------------------------------
 
 async function renderSubjects() {
+  const _view = captureView();
   if (S.subject) return renderSubjectDetail();
   const el = body();
   el.innerHTML = '<div class="study-empty">Loading…</div>';
   try { S.decks = (await jget('/api/study/decks')).decks; }
-  catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  catch (e) {
+    // Navigating away while this was in flight must not let the
+    // error replace whatever the user is looking at now.
+    if (!viewStillCurrent(_view)) return;
+    el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`;
+    return;
+  }
   if (_tab !== 'subjects' || S.subject) return;
 
   el.innerHTML = `
@@ -1255,51 +1319,75 @@ async function renderSubjects() {
   });
 
   // Phase 5: cross-subject search
-  const doGlobalSearch = async () => {
-    const query = el.querySelector('#study-global-search').value.trim();
-    const resEl = el.querySelector('#study-search-results');
-    if (!query) { resEl.innerHTML = ''; return; }
-    resEl.innerHTML = '<div class="study-subtle">Searching…</div>';
-    try {
-      const r = await jget(`/api/study/search?q=${encodeURIComponent(query)}&limit=20`);
-      const qs = r.questions || [];
-      const cs = r.cards || [];
-      if (!qs.length && !cs.length) {
-        resEl.innerHTML = '<div class="study-empty">No results.</div>';
-        return;
-      }
-      resEl.innerHTML = `
-        ${qs.length ? `<div class="study-section-title">Questions (${qs.length})</div>` : ''}
-        ${qs.map(q => `<div class="study-row"><span class="grow">${esc(q.question.slice(0, 100))}</span><span class="study-subtle">${esc(q.qtype)}</span></div>`).join('')}
-        ${cs.length ? `<div class="study-section-title" style="margin-top:10px;">Cards (${cs.length})</div>` : ''}
-        ${cs.map(c => `<div class="study-row"><span class="grow">${esc(c.front.slice(0, 80))}</span><span class="study-subtle">card</span></div>`).join('')}
-      `;
-    } catch (err) { resEl.innerHTML = `<div class="study-empty">${esc(err.message)}</div>`; }
-  };
+  const doGlobalSearch = () =>
+    runGlobalSearch(el, el.querySelector('#study-global-search').value);
   el.querySelector('#study-global-search-btn')?.addEventListener('click', doGlobalSearch);
   el.querySelector('#study-global-search')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); doGlobalSearch(); }
   });
 }
 
+// Per-search generation: a slow query must never overwrite the results of a
+// query the user issued after it, and neither must its error message.
+let _searchGen = 0;
+
+async function runGlobalSearch(el, rawQuery) {
+  const query = (rawQuery || '').trim();
+  const resEl = el.querySelector('#study-search-results');
+  if (!resEl) return;
+  if (!query) { resEl.innerHTML = ''; return; }
+  const mine = ++_searchGen;
+  const view = captureView();
+  const current = () => mine === _searchGen && viewStillCurrent(view);
+  resEl.innerHTML = '<div class="study-subtle">Searching…</div>';
+  try {
+    const r = await jget(`/api/study/search?q=${encodeURIComponent(query)}&limit=20`);
+    if (!current()) return;
+    const qs = r.questions || [];
+    const cs = r.cards || [];
+    if (!qs.length && !cs.length) {
+      resEl.innerHTML = '<div class="study-empty">No results.</div>';
+      return;
+    }
+    resEl.innerHTML = `
+      ${qs.length ? `<div class="study-section-title">Questions (${qs.length})</div>` : ''}
+      ${qs.map(q => `<div class="study-row"><span class="grow">${esc(q.question.slice(0, 100))}</span><span class="study-subtle">${esc(q.qtype)}</span></div>`).join('')}
+      ${cs.length ? `<div class="study-section-title" style="margin-top:10px;">Cards (${cs.length})</div>` : ''}
+      ${cs.map(c => `<div class="study-row"><span class="grow">${esc(c.front.slice(0, 80))}</span><span class="study-subtle">card</span></div>`).join('')}
+    `;
+  } catch (err) {
+    if (!current()) return;
+    resEl.innerHTML = `<div class="study-empty">${esc(err.message)}</div>`;
+  }
+}
+
 async function openSubject(deckId) {
   const deck = S.decks.find(d => d.id === deckId) || { id: deckId, name: 'Subject' };
   S.subject = { deck, cards: [], materials: [], questions: [], proposals: null,
                 qFilter: '', qMaterial: '', qLimit: 40, extracting: new Set() };
+  bumpViewGen();
   await reloadSubject();
 }
 
 async function reloadSubject() {
   const s = S.subject;
   if (!s) return;
+  // The user can open another subject, or leave Subjects entirely, while these
+  // three requests are in flight.
+  const view = captureView();
   try {
     const [cards, materials, questions] = await Promise.all([
       jget(`/api/study/decks/${s.deck.id}/cards`).then(r => r.cards),
       jget(`/api/study/decks/${s.deck.id}/materials`).then(r => r.materials),
       jget(`/api/study/decks/${s.deck.id}/questions`).then(r => r.questions),
     ]);
+    if (!viewStillCurrent(view)) return;   // another subject/tab is showing now
     s.cards = cards; s.materials = materials; s.questions = questions;
-  } catch (e) { toast(e.message, true); }
+  } catch (e) {
+    if (!viewStillCurrent(view)) return;
+    toast(e.message, true);
+  }
+  if (!viewStillCurrent(view)) return;
   renderSubjectDetail();
 }
 
@@ -2924,11 +3012,18 @@ function renderPracticeSummary() {
 // ---------------------------------------------------------------------------
 
 async function renderPlan() {
+  const _view = captureView();
   const el = body();
   if (S.examEditing) return renderExamEditor();
   el.innerHTML = '<div class="study-empty">Loading…</div>';
   try { S.exams = (await jget('/api/study/exams')).exams; }
-  catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  catch (e) {
+    // Navigating away while this was in flight must not let the
+    // error replace whatever the user is looking at now.
+    if (!viewStillCurrent(_view)) return;
+    el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`;
+    return;
+  }
   if (_tab !== 'plan' || S.examEditing) return;
 
   el.innerHTML = `
@@ -3186,6 +3281,7 @@ function _calibrationHtml(c) {
 }
 
 async function renderFocus() {
+  const _view = captureView();
   const el = body();
   const f = S.focus;
 
@@ -3227,7 +3323,13 @@ async function renderFocus() {
       jget('/api/study/stats?days=14'),
       jget('/api/study/focus/today-blocks').catch(() => ({ decks: [], blocks: [] })),
     ]);
-  } catch (e) { el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`; return; }
+  } catch (e) {
+    // Navigating away while this was in flight must not let the
+    // error replace whatever the user is looking at now.
+    if (!viewStillCurrent(_view)) return;
+    el.innerHTML = `<div class="study-empty">${esc(e.message)}</div>`;
+    return;
+  }
   if (_tab !== 'focus' || S.focus) return;
 
   const last14 = stats.daily.slice(-14);
