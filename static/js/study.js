@@ -383,6 +383,23 @@ function injectStyles() {
 .study-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
 /* Scroll rather than wrap: nine tabs wrapping grows the header until the
    close control is pushed off a narrow screen. */
+/* Search hits are buttons so they are focusable and operable, but they should
+   read as the rows they replaced. */
+.study-search-hit { display: flex; align-items: center; gap: 8px; width: 100%;
+  text-align: left; background: none; color: inherit; font: inherit;
+  border: none; border-bottom: 1px solid var(--border); padding: 7px 4px;
+  cursor: pointer; }
+.study-search-hit:hover { background: rgba(128,128,128,0.10); }
+.study-search-hit:focus-visible { outline: 2px solid var(--accent, currentColor);
+  outline-offset: -2px; }
+.study-highlight { animation: study-flash 1.6s ease-out 1; }
+@keyframes study-flash {
+  from { background: rgba(255, 214, 0, 0.35); }
+  to { background: transparent; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .study-highlight { animation: none; outline: 2px solid var(--accent, currentColor); }
+}
 .study-tabs { display: flex; gap: 2px; margin-left: 8px; overflow-x: auto;
   scrollbar-width: thin; min-width: 0; }
 .study-tab { flex-shrink: 0; }
@@ -1407,10 +1424,49 @@ async function renderSubjects() {
   const doGlobalSearch = () =>
     runGlobalSearch(el, el.querySelector('#study-global-search').value);
   el.querySelector('#study-global-search-btn')?.addEventListener('click', doGlobalSearch);
+  el.querySelector('#study-search-results')?.addEventListener('click', (e) => {
+    const hit = e.target.closest('.study-search-hit');
+    if (!hit) return;
+    openSearchResult(hit.dataset.deckId, hit.dataset.resultKind, hit.dataset.resultId);
+  });
   el.querySelector('#study-global-search')?.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); doGlobalSearch(); }
   });
 }
+
+// A search result is a way to reach the item, not just a fragment of its text.
+// The API already returns id and deck_id for questions and cards; this keeps
+// that identity on the row so the result can be opened.
+function subjectNameFor(deckId) {
+  return S.decks.find(d => d.id === deckId)?.name || 'Unknown subject';
+}
+
+function searchResultRow(kind, id, deckId, text, typeLabel) {
+  const subject = subjectNameFor(deckId);
+  const excerpt = String(text || '').slice(0, kind === 'question' ? 100 : 80);
+  const label = `Open ${kind} in ${subject}: ${excerpt}`;
+  return `<button type="button" class="study-row study-search-hit"
+    data-result-kind="${esc(kind)}" data-result-id="${esc(id)}"
+    data-deck-id="${esc(deckId || '')}" aria-label="${esc(label)}"
+    ><span class="grow">${esc(excerpt)}</span
+    ><span class="study-subtle">${esc(subject)} · ${esc(typeLabel)}</span></button>`;
+}
+
+// Opening a result reveals it in its subject. It deliberately does not start a
+// graded attempt: finding something is not answering it.
+async function openSearchResult(deckId, kind, id) {
+  if (!deckId) { toast('That item is no longer in a subject', true); return; }
+  _searchReturn = { tab: _tab, query: _lastSearchQuery };
+  await openSubject(deckId);
+  const el = body();
+  const target = el?.querySelector(`[data-${kind}-id="${id}"]`);
+  target?.scrollIntoView?.({ block: 'center' });
+  target?.classList?.add('study-highlight');
+}
+
+// Where the search came from, so returning restores the query.
+let _searchReturn = null;
+let _lastSearchQuery = '';
 
 // Per-search generation: a slow query must never overwrite the results of a
 // query the user issued after it, and neither must its error message.
@@ -1422,6 +1478,7 @@ async function runGlobalSearch(el, rawQuery) {
   if (!resEl) return;
   if (!query) { resEl.innerHTML = ''; return; }
   const mine = ++_searchGen;
+  _lastSearchQuery = query;
   const view = captureView();
   const current = () => mine === _searchGen && viewStillCurrent(view);
   resEl.innerHTML = '<div class="study-subtle">Searching…</div>';
@@ -1436,9 +1493,9 @@ async function runGlobalSearch(el, rawQuery) {
     }
     resEl.innerHTML = `
       ${qs.length ? `<div class="study-section-title">Questions (${qs.length})</div>` : ''}
-      ${qs.map(q => `<div class="study-row"><span class="grow">${esc(q.question.slice(0, 100))}</span><span class="study-subtle">${esc(q.qtype)}</span></div>`).join('')}
+      ${qs.map(q => searchResultRow('question', q.id, q.deck_id, q.question, q.qtype)).join('')}
       ${cs.length ? `<div class="study-section-title" style="margin-top:10px;">Cards (${cs.length})</div>` : ''}
-      ${cs.map(c => `<div class="study-row"><span class="grow">${esc(c.front.slice(0, 80))}</span><span class="study-subtle">card</span></div>`).join('')}
+      ${cs.map(c => searchResultRow('card', c.id, c.deck_id, c.front, 'card')).join('')}
     `;
   } catch (err) {
     if (!current()) return;

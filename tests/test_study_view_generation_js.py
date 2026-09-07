@@ -101,7 +101,8 @@ SEARCH_PRELUDE = """
 let _viewGen = 0;
 let _tab = 'subjects';
 let _searchGen = 0;
-const S = { subject: null };
+let _lastSearchQuery = '';
+const S = { subject: null, decks: [] };
 const writes = [];
 function esc(s) { return String(s); }
 const resEl = { set innerHTML(v) { writes.push(v); }, get innerHTML() { return ''; } };
@@ -120,7 +121,9 @@ async function jget(path) {
 
 
 def _run_search(epilogue):
-    return run_js(SEARCH_PRELUDE, *VIEW_FNS, "runGlobalSearch", epilogue=epilogue)
+    # runGlobalSearch renders through the U04 row helpers.
+    return run_js(SEARCH_PRELUDE, *VIEW_FNS, "subjectNameFor",
+                  "searchResultRow", "runGlobalSearch", epilogue=epilogue)
 
 
 def test_a_slow_earlier_query_cannot_replace_a_faster_later_one():
