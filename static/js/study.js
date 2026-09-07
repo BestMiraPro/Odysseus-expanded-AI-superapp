@@ -3560,6 +3560,17 @@ async function renderFocus() {
 
   const last14 = stats.daily.slice(-14);
   const maxMin = Math.max(30, ...last14.map(d => d.focus_min));
+  // Retrievals per day = practice answers + card reviews. The chart below
+  // referenced `retr` and `maxRetr` without ever defining them, so rendering
+  // the Focus tab threw ReferenceError and the retrievals chart never drew.
+  // Floor the divisor at 1 so an all-zero fortnight is 0%, not NaN%.
+  const retr = last14.map(d => (d.attempts || 0) + (d.reviews || 0));
+  const maxRetr = Math.max(1, ...retr);
+  // Totals and recall percentage for the summary line below the charts.
+  // Both were referenced without being bound; renderStats derives them the
+  // same way from the same payload.
+  const t = stats.totals || {};
+  const okPct = t.success_rate == null ? null : Math.round(t.success_rate * 100);
   const calCurve = (stats.calibration_curve || []).filter(b => b.n > 0);
   const calSvg = ((data) => {
     if (!data.length) return '';
@@ -3621,7 +3632,6 @@ async function renderFocus() {
       <div class="study-subtle" style="margin-top:6px;">
         ${t.attempts || 0} practice answers · ${t.reviews || 0} card reviews${okPct === null ? '' : ` · ${okPct}% recalled`}
       </div>
-      ${calibHtml}
       <div class="study-section-title" style="margin-top:34px;">Recent sessions</div>
       <div>
         ${S.focusHistory.length ? S.focusHistory.slice(0, 12).map(s => {
