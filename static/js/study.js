@@ -357,18 +357,41 @@ function injectStyles() {
   background: none; color: inherit; border: 1px solid currentColor; border-radius: 5px; }
 .study-model-wrap select { max-width: 150px; font-size: 10.5px; padding: 3px 5px;
   background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; }
-@media (max-width: 900px) { .study-model-wrap { display: none; } }
+/* The model control is never hidden: hiding it removes the capability rather
+   than relocating it. On narrow screens it lives inside the Study options
+   disclosure, which collapses the header without losing anything. */
+#study-options { position: relative; }
+#study-options > summary { list-style: none; cursor: pointer; font-size: 11px;
+  opacity: 0.72; padding: 4px 8px; border: 1px solid var(--border);
+  border-radius: 6px; white-space: nowrap; }
+#study-options > summary::-webkit-details-marker { display: none; }
+#study-options[open] > summary { opacity: 1; }
+#study-options > .study-options-body { position: absolute; right: 0; top: 100%;
+  z-index: 5; margin-top: 4px; padding: 8px; display: flex; flex-direction: column;
+  gap: 6px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.18); }
+@media (min-width: 901px) {
+  /* Wide: no disclosure, the controls sit inline in the header as before. */
+  #study-options > summary { display: none; }
+  #study-options > .study-options-body { position: static; margin: 0; padding: 0;
+    flex-direction: row; align-items: center; background: none; border: none;
+    box-shadow: none; }
+}
 @media (max-width: 768px) { .study-pane { inset: 0; border-radius: 0; } }
 .study-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
   border-bottom: 1px solid var(--border); flex-shrink: 0; }
 .study-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
-.study-tabs { display: flex; gap: 2px; margin-left: 8px; flex-wrap: wrap; }
+/* Scroll rather than wrap: nine tabs wrapping grows the header until the
+   close control is pushed off a narrow screen. */
+.study-tabs { display: flex; gap: 2px; margin-left: 8px; overflow-x: auto;
+  scrollbar-width: thin; min-width: 0; }
+.study-tab { flex-shrink: 0; }
 .study-tab { background: none; border: none; color: var(--fg); opacity: 0.62; cursor: pointer;
   font-size: 12px; padding: 6px 10px; border-radius: 6px; }
 .study-tab:hover { opacity: 0.9; background: rgba(128,128,128,0.12); }
 .study-tab.active { opacity: 1; background: rgba(128,128,128,0.18); font-weight: 600; }
 .study-header-spacer { flex: 1; }
-.study-x { background: none; border: none; color: var(--fg); opacity: 0.6; cursor: pointer;
+.study-x { flex-shrink: 0; background: none; border: none; color: var(--fg); opacity: 0.6; cursor: pointer;
   font-size: 15px; padding: 4px 8px; border-radius: 6px; }
 .study-x:hover { opacity: 1; background: rgba(128,128,128,0.15); }
 .study-body { flex: 1; overflow-y: auto; padding: 16px 18px 28px; }
@@ -606,11 +629,14 @@ export function openPanel() {
         ${TABS.map(([k, label]) => `<button class="study-tab" data-tab="${k}" role="tab" id="study-tab-${k}" aria-controls="study-body" aria-selected="${_tab === k}" tabindex="${_tab === k ? 0 : -1}">${label}</button>`).join('')}
       </div>
       <span class="study-header-spacer"></span>
-      <span class="study-model-wrap" id="study-model-wrap" title="Model used for extraction, grading and hints. 'Same as chat' falls back to the utility/default model.">
-        <select id="study-ep-select" aria-label="Study model endpoint"><option value="">Same as chat</option></select>
-        <select id="study-model-select" aria-label="Study model"><option value="">model…</option></select>
-        <span class="study-model-status" id="study-model-status" role="status"></span>
-      </span>
+      <details id="study-options">
+        <summary aria-label="Study options">Study options</summary>
+        <span class="study-model-wrap study-options-body" id="study-model-wrap" title="Model used for extraction, grading and hints. 'Same as chat' falls back to the utility/default model.">
+          <select id="study-ep-select" aria-label="Study model endpoint"><option value="">Same as chat</option></select>
+          <select id="study-model-select" aria-label="Study model"><option value="">model…</option></select>
+          <span class="study-model-status" id="study-model-status" role="status"></span>
+        </span>
+      </details>
       <button class="study-x" id="study-min-btn" title="Minimize" aria-label="Minimize Study">–</button>
       <button class="study-x" id="study-close-btn" title="Close (Esc)" aria-label="Close Study">✕</button>
     </div>
