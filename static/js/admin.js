@@ -2831,6 +2831,50 @@ function initCalDAV() {
 }
 
 /* ── Data Backup (export/import) ── */
+// POST JSON to a backup endpoint and always return a usable object, so the
+// caller can render a failure instead of throwing on a non-JSON error body.
+async function postBackupJson(path, data) {
+  const res = await fetch(path, {
+    method: 'POST', credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  const body = await res.json().catch(() => null);
+  if (!body) return { ok: false, detail: `Server returned ${res.status}` };
+  if (!res.ok) return { ok: false, detail: body.detail || body.message || `HTTP ${res.status}` };
+  return body;
+}
+
+// Spell out the scope of the restore: what will be touched, how, and whether
+// it affects data shared with other users.
+function describeBackupPreview(preview) {
+  const lines = [];
+  if (preview.exported_at) lines.push(`Exported ${preview.exported_at}`);
+  lines.push('This will change:');
+  for (const s of preview.sections || []) {
+    const how = s.mode === 'replace-matching' ? 'replace matching entries' : 'merge';
+    const shared = s.shared ? ' — shared with all users' : '';
+    lines.push(`  • ${s.name}: ${s.count} (${how})${shared}`);
+  }
+  if ((preview.ignored || []).length) {
+    lines.push(`Ignored (not recognised): ${preview.ignored.join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+function confirmBackupImport(preview) {
+  return window.confirm(`${describeBackupPreview(preview)}\n\nImport selected data?`);
+}
+
+// Report counts rather than a bare "Import successful".
+function describeImportResult(result) {
+  const parts = (result.sections || []).map(s => {
+    const skipped = s.skipped ? `, ${s.skipped} skipped` : '';
+    return `${s.name}: ${s.added} added${skipped}`;
+  });
+  return parts.length ? `Imported — ${parts.join('; ')}` : (result.message || 'Import successful.');
+}
+
 function initBackup() {
   el('adm-exportDataBtn').addEventListener('click', async () => {
     const btn = el('adm-exportDataBtn');
@@ -2869,19 +2913,30 @@ function initBackup() {
       } catch (e) {
         throw new Error('Invalid backup file: ' + e.message);
       }
-      const res = await fetch('/api/import', {
-        method: 'POST', credentials: 'same-origin',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      const result = await res.json().catch(() => null);
-      if (!result) {
-        throw new Error(`Import failed: server returned ${res.status}`);
+      // Ask the server what this file would change before changing anything.
+      // Selecting a file used to be enough to overwrite settings.
+      const preview = await postBackupJson('/api/import/preview', data);
+      if (!preview.ok) {
+        msg.textContent = preview.detail || preview.message
+          || 'Nothing in this file can be imported.';
+        msg.className = 'admin-error';
+        return;
       }
-      if (res.ok && result.ok) {
-        msg.textContent = result.message || 'Import successful.'; msg.className = 'admin-success';
+      if (!confirmBackupImport(preview)) {
+        msg.textContent = 'Import cancelled — nothing was changed.';
+        msg.className = '';
+        return;
+      }
+
+      const result = await postBackupJson('/api/import', data);
+      if (result.ok) {
+        msg.textContent = describeImportResult(result);
+        msg.className = 'admin-success';
       } else {
-        msg.textContent = result.message || result.detail || 'Import failed'; msg.className = 'admin-error';
+        // A partial import is not a success and not a plain failure; the
+        // server's detail names which sections landed.
+        msg.textContent = result.detail || result.message || 'Import failed';
+        msg.className = 'admin-error';
       }
     } catch (e) { msg.textContent = 'Import failed: ' + e.message; msg.className = 'admin-error'; }
     btn.disabled = false; btn.textContent = 'Import Data';

@@ -151,6 +151,56 @@ def _validate_import_payload(body: dict) -> None:
             _check_str_keyed_object(body, section)
 
 
+
+# How each recognised section is applied, and whether it affects data shared
+# with other users. Surfaced by the preview so an operator sees what a restore
+# will actually change before it changes it.
+_SECTION_BEHAVIOUR = {
+    "memories":    {"mode": "merge",            "shared": False},
+    "skills":      {"mode": "merge",            "shared": False},
+    "presets":     {"mode": "replace-matching", "shared": True},
+    "settings":    {"mode": "merge",            "shared": True},
+    "features":    {"mode": "merge",            "shared": True},
+    "preferences": {"mode": "merge",            "shared": False},
+}
+
+
+def _section_count(body, section):
+    value = body.get(section)
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        return len(value)
+    return 0
+
+
+def summarise_import_payload(body: dict) -> dict:
+    """Describe what an import of this payload would do. Writes nothing."""
+    sections = []
+    for name in _IMPORT_SECTIONS:
+        if name not in body:
+            continue
+        behaviour = _SECTION_BEHAVIOUR[name]
+        sections.append({
+            "name": name,
+            "count": _section_count(body, name),
+            "mode": behaviour["mode"],
+            "shared": behaviour["shared"],
+        })
+    ignored = sorted(
+        key for key in body
+        if key not in _IMPORT_SECTIONS
+        and key not in ("version", "exported_at", "exported_by")
+    )
+    return {
+        "version": body.get("version"),
+        "exported_at": body.get("exported_at"),
+        "exported_by": body.get("exported_by"),
+        "sections": sections,
+        "ignored": ignored,
+    }
+
+
 def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRouter:
     router = APIRouter(tags=["backup"])
 
@@ -198,6 +248,29 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
             headers={"Content-Disposition": f"attachment; filename={filename}"},
         )
 
+    @router.post("/api/import/preview")
+    async def preview_import(request: Request):
+        """Describe what importing this file would change, without writing.
+
+        Uses the same validator as the import, so a file this accepts is a file
+        the import will accept — a preview that disagreed with the real thing
+        would be worse than none.
+        """
+        require_admin(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "Invalid JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Expected a JSON object")
+
+        _validate_import_payload(body)
+        summary = summarise_import_payload(body)
+        summary["ok"] = bool(summary["sections"])
+        if not summary["ok"]:
+            summary["message"] = "No recognized data found in the file"
+        return summary
+
     @router.post("/api/import")
     async def import_data(request: Request):
         """Import user data from a previously exported JSON file. Merges with existing data."""
@@ -218,6 +291,14 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
         _validate_import_payload(body)
 
         imported = []
+        # Updated as rows land, not after a section completes, so a failure
+        # partway through can report what was actually written.
+        progress = {}
+
+        def _progress(name, **counts):
+            progress.setdefault(name, {"name": name, "added": 0, "skipped": 0})
+            progress[name].update(counts)
+
         try:
 
             # ── Memories ──
@@ -250,6 +331,8 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                     existing_texts.add(mem["text"].strip().lower())
                     added += 1
                 memory_manager.save(existing)
+                _progress("memories", added=added,
+                          skipped=len(body["memories"]) - added)
                 imported.append(f"{added} memories")
 
             # ── Skills ──
@@ -323,6 +406,9 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                         existing_ids.add(result["id"])
                     existing_titles.add(title.lower())
                     added += 1
+                    _progress("skills", added=added)
+                _progress("skills", added=added,
+                          skipped=len(body["skills"]) - added)
                 imported.append(f"{added} skills")
 
             # ── Presets ──
@@ -334,6 +420,7 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                     elif isinstance(value, list):
                         current[key] = value
                 preset_manager.save(current)
+                _progress("presets", added=1)
                 imported.append("presets")
 
             # ── Settings ──
@@ -341,6 +428,7 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                 current = load_settings()
                 current.update(body["settings"])
                 save_settings(current)
+                _progress("settings", added=1)
                 imported.append("settings")
 
             # ── Features ──
@@ -348,6 +436,7 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                 current = load_features()
                 current.update(body["features"])
                 save_features(current)
+                _progress("features", added=1)
                 imported.append("features")
 
             # ── Preferences ──
@@ -356,6 +445,7 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
                 current = _load_for_user(user)
                 current.update(body["preferences"])
                 _save_for_user(user, current)
+                _progress("preferences", added=1)
                 imported.append("preferences")
 
         except HTTPException:
@@ -368,17 +458,26 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
             # apply to independent stores with no shared transaction, so name
             # what landed: the restore is incomplete and the operator needs to
             # know where it stopped.
-            logger.exception("Import failed after applying: %s", imported)
-            done = ", ".join(imported) if imported else "nothing"
+            logger.exception("Import failed after applying: %s", progress)
+            landed = ", ".join(
+                f"{p['name']}: {p['added']} saved" for p in progress.values()
+            ) or "nothing"
             raise HTTPException(
                 500,
-                f"Import failed partway through: {e}. Already applied: {done}. "
-                f"Re-run the import once the underlying problem is fixed.",
+                f"Import failed partway through: {e}. Already applied: "
+                f"{landed}. Re-run the import once the underlying problem is "
+                f"fixed; records already saved are skipped as duplicates.",
             )
 
         if not imported:
             return {"ok": False, "message": "No recognized data found in the file"}
 
-        return {"ok": True, "imported": imported, "message": f"Imported: {', '.join(imported)}"}
+        return {
+            "ok": True,
+            # Legacy fields: older clients read these two.
+            "imported": imported,
+            "message": f"Imported: {', '.join(imported)}",
+            "sections": list(progress.values()),
+        }
 
     return router
