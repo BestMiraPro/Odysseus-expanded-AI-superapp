@@ -603,7 +603,7 @@ export function openPanel() {
     <div class="study-header">
       <span class="study-title">${ICON} Study</span>
       <div class="study-tabs" id="study-tabs" role="tablist">
-        ${TABS.map(([k, label]) => `<button class="study-tab" data-tab="${k}" role="tab" aria-selected="${_tab === k}">${label}</button>`).join('')}
+        ${TABS.map(([k, label]) => `<button class="study-tab" data-tab="${k}" role="tab" id="study-tab-${k}" aria-controls="study-body" aria-selected="${_tab === k}" tabindex="${_tab === k ? 0 : -1}">${label}</button>`).join('')}
       </div>
       <span class="study-header-spacer"></span>
       <span class="study-model-wrap" id="study-model-wrap" title="Model used for extraction, grading and hints. 'Same as chat' falls back to the utility/default model.">
@@ -611,10 +611,10 @@ export function openPanel() {
         <select id="study-model-select" aria-label="Study model"><option value="">model…</option></select>
         <span class="study-model-status" id="study-model-status" role="status"></span>
       </span>
-      <button class="study-x" id="study-min-btn" title="Minimize">–</button>
-      <button class="study-x" id="study-close-btn" title="Close (Esc)">✕</button>
+      <button class="study-x" id="study-min-btn" title="Minimize" aria-label="Minimize Study">–</button>
+      <button class="study-x" id="study-close-btn" title="Close (Esc)" aria-label="Close Study">✕</button>
     </div>
-    <div class="study-body" id="study-body"></div>
+    <div class="study-body" id="study-body" role="tabpanel" tabindex="-1"></div>
   `;
   document.body.appendChild(_pane);
 
@@ -624,13 +624,16 @@ export function openPanel() {
   _pane.querySelector('#study-min-btn').addEventListener('click', () => {
     _ensureChipRegistered();
     document.getElementById('study-backdrop')?.classList.add('hidden');
-    if (Modals.minimize) Modals.minimize('study-pane'); else closePanel();
+    if (Modals.minimize) { Modals.minimize('study-pane'); restoreFocusAfterStudy(); }
+    else closePanel();
   });
   initModelSelector();
-  _pane.querySelector('#study-tabs').addEventListener('click', (e) => {
+  const tablist = _pane.querySelector('#study-tabs');
+  tablist.addEventListener('click', (e) => {
     const btn = e.target.closest('.study-tab');
     if (btn) setTab(btn.dataset.tab);
   });
+  tablist.addEventListener('keydown', studyTablistKeydown);
 
   _keyHandler = (e) => {
     // Minimized, closed, unfocused or mid-edit: not ours to act on.
@@ -649,6 +652,30 @@ export function openPanel() {
 
   _ensureChipRegistered();
   setTab(_tab || 'today');
+  // Establish focus inside the pane, and remember where it came from so
+  // closing or minimizing can put it back instead of stranding the keyboard
+  // user on the page underneath.
+  _focusReturn = document.activeElement;
+  focusStudySurface();
+}
+
+// The element focus should return to when Study is dismissed.
+let _focusReturn = null;
+
+function focusStudySurface() {
+  const selected = _pane?.querySelector('.study-tab[aria-selected="true"]')
+    || _pane?.querySelector('.study-tab');
+  (selected || body())?.focus?.();
+}
+
+function restoreFocusAfterStudy() {
+  const target = _focusReturn;
+  _focusReturn = null;
+  // Only restore to something still in the document; otherwise leave focus
+  // where the browser put it rather than throwing.
+  if (target && typeof target.focus === 'function' && target.isConnected !== false) {
+    try { target.focus(); } catch { /* element went away */ }
+  }
 }
 
 function _ensureChipRegistered() {
@@ -670,6 +697,7 @@ function _ensureChipRegistered() {
 function _forceClose() {
   _open = false;
   bumpViewGen();
+  restoreFocusAfterStudy();
   if (_keyHandler) { document.removeEventListener('keydown', _keyHandler); _keyHandler = null; }
   document.getElementById('tool-study-btn')?.classList.remove('active');
   try { Modals.unregister('study-pane'); } catch { }
@@ -873,6 +901,36 @@ function viewStillCurrent(token) {
     && token.subject === (S.subject?.deck?.id || null);
 }
 
+// Roving tabindex: the tablist is a single Tab stop, and Left/Right move
+// between tabs inside it. Without this every tab was its own stop, so tabbing
+// through the header meant nine stops before reaching the content.
+function rovingTabIndex() {
+  _pane?.querySelectorAll('.study-tab').forEach(btn => {
+    btn.tabIndex = btn.dataset.tab === _tab ? 0 : -1;
+  });
+}
+
+// Standard tablist keyboard model. Selection follows focus, which is the
+// expected behaviour for tabs whose panels are cheap to render.
+function studyTablistKeydown(e) {
+  const ids = TABS.map(([id]) => id);
+  const from = e.target?.dataset?.tab;
+  const at = ids.indexOf(from === undefined ? _tab : from);
+  if (at === -1) return;
+  let next = null;
+  if (e.key === 'ArrowRight') next = ids[(at + 1) % ids.length];
+  else if (e.key === 'ArrowLeft') next = ids[(at - 1 + ids.length) % ids.length];
+  else if (e.key === 'Home') next = ids[0];
+  else if (e.key === 'End') next = ids[ids.length - 1];
+  if (next === null) return;
+  e.preventDefault();
+  setTab(next);
+  rovingTabIndex();
+  _pane?.querySelectorAll('.study-tab').forEach(btn => {
+    if (btn.dataset.tab === next) btn.focus();
+  });
+}
+
 function setTab(tab) {
   _tab = tab;
   bumpViewGen();   // responses for the previous view are now stale
@@ -883,6 +941,7 @@ function setTab(tab) {
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-selected', active ? 'true' : 'false');
   });
+  rovingTabIndex();
   const render = {
     today: renderToday, subjects: renderSubjects, review: renderReview,
     practice: renderPractice, plan: renderPlan, focus: renderFocus,

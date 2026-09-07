@@ -63,8 +63,10 @@ function renderHistory() { rendered.push('history'); }
 
 
 def _run(epilogue):
-    return run_js(_prelude(), "bumpViewGen", "setTab", "renderAgent", "openAgent",
-                  epilogue=epilogue)
+    # setTab collaborates with the view generation (B09) and the roving
+    # tabindex (U01); both must come along or it throws.
+    return run_js(_prelude(), "bumpViewGen", "rovingTabIndex", "setTab",
+                  "renderAgent", "openAgent", epilogue=epilogue)
 
 
 def _report(extra=""):
