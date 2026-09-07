@@ -41,6 +41,12 @@ def changed_paths_from_merge_base(base_sha: str, head_sha: str) -> list[str]:
             "--",
             "tests/",
         ],
+        # Redirected for the same reason as the merge-base call above: an
+        # inherited stderr is not always a handle CreateProcess can duplicate
+        # when this runs under pytest's capture on Windows, and git fails to
+        # start with WinError 6/50. Without this the helper's own tests failed
+        # roughly two runs in five.
+        stderr=subprocess.DEVNULL,
     )
     return parse_paths(raw_paths)
 

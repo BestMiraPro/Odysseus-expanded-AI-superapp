@@ -28,6 +28,10 @@ import ast
 import pathlib
 
 TESTS = pathlib.Path(__file__).resolve().parent
+REPO = TESTS.parent
+# Helper scripts the tests import and drive in-process: a call that
+# inherits a stream there fails the same way, and did.
+SCANNED = (TESTS, REPO / ".github" / "scripts")
 
 # Callables that start a child process.
 _RUNNERS = {"run", "check_output", "check_call", "call", "Popen"}
@@ -35,26 +39,27 @@ _RUNNERS = {"run", "check_output", "check_call", "call", "Popen"}
 
 def _unredirected_calls():
     """Yield (file, line, func, kwargs) for calls leaving a stream inherited."""
-    for path in sorted(TESTS.glob("*.py")):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-        except SyntaxError:
-            continue
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+    for root in SCANNED:
+        for path in sorted(root.glob("*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError:
                 continue
-            func = node.func
-            name = getattr(func, "attr", None)
-            base = getattr(getattr(func, "value", None), "id", None)
-            if name not in _RUNNERS or base != "subprocess":
-                continue
-            kwargs = {k.arg for k in node.keywords}
-            captures = "capture_output" in kwargs
-            # check_output pipes stdout for you, but never stderr.
-            out_ok = captures or "stdout" in kwargs or name == "check_output"
-            err_ok = captures or "stderr" in kwargs
-            if not (out_ok and err_ok):
-                yield path.name, node.lineno, name, sorted(kwargs)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = getattr(func, "attr", None)
+                base = getattr(getattr(func, "value", None), "id", None)
+                if name not in _RUNNERS or base != "subprocess":
+                    continue
+                kwargs = {k.arg for k in node.keywords}
+                captures = "capture_output" in kwargs
+                # check_output pipes stdout for you, but never stderr.
+                out_ok = captures or "stdout" in kwargs or name == "check_output"
+                err_ok = captures or "stderr" in kwargs
+                if not (out_ok and err_ok):
+                    yield path.name, node.lineno, name, sorted(kwargs)
 
 
 def test_no_test_subprocess_inherits_a_captured_stream():
