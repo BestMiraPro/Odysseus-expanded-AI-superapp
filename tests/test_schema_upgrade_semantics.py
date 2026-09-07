@@ -67,11 +67,11 @@ def _security_by_id(db: Path):
 # The migration's own contract, on a genuinely old table
 # --------------------------------------------------------------------------
 
-def test_the_backfill_derives_security_from_the_port(tmp_path, monkeypatch):
+def test_the_backfill_derives_security_from_the_port(tmp_path):
     db = _old_email_accounts_db(tmp_path)
-    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db}")
+    engine = create_engine(f"sqlite:///{db}", poolclass=NullPool)
 
-    cdb._migrate_add_email_smtp_security()
+    cdb.apply_email_smtp_security(engine)
 
     values = _security_by_id(db)
     assert values["a"] == "starttls", "port 587 must map to STARTTLS"
@@ -80,29 +80,29 @@ def test_the_backfill_derives_security_from_the_port(tmp_path, monkeypatch):
     assert values["d"] == "ssl", "a null port falls back to ssl"
 
 
-def test_the_backfill_is_idempotent(tmp_path, monkeypatch):
+def test_the_backfill_is_idempotent(tmp_path):
     db = _old_email_accounts_db(tmp_path)
-    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db}")
+    engine = create_engine(f"sqlite:///{db}", poolclass=NullPool)
 
-    cdb._migrate_add_email_smtp_security()
+    cdb.apply_email_smtp_security(engine)
     first = _security_by_id(db)
-    cdb._migrate_add_email_smtp_security()
+    cdb.apply_email_smtp_security(engine)
 
     assert _security_by_id(db) == first
 
 
-def test_an_operator_set_value_is_not_overwritten(tmp_path, monkeypatch):
+def test_an_operator_set_value_is_not_overwritten(tmp_path):
     """Re-running must not clobber a deliberate choice."""
     db = _old_email_accounts_db(tmp_path)
-    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db}")
-    cdb._migrate_add_email_smtp_security()
+    engine = create_engine(f"sqlite:///{db}", poolclass=NullPool)
+    cdb.apply_email_smtp_security(engine)
 
     conn = sqlite3.connect(db)
     conn.execute("UPDATE email_accounts SET smtp_security = 'none' WHERE id = 'a'")
     conn.commit()
     conn.close()
 
-    cdb._migrate_add_email_smtp_security()
+    cdb.apply_email_smtp_security(engine)
     assert _security_by_id(db)["a"] == "none"
 
 
@@ -110,7 +110,7 @@ def test_an_operator_set_value_is_not_overwritten(tmp_path, monkeypatch):
 # The interaction that column-name checks cannot see
 # --------------------------------------------------------------------------
 
-def test_the_backfill_still_runs_when_reconciliation_added_the_column(tmp_path, monkeypatch):
+def test_the_backfill_still_runs_when_reconciliation_added_the_column(tmp_path):
     """The regression D01 predicted.
 
     Reconciliation runs first and adds smtp_security from the model. The
@@ -119,7 +119,6 @@ def test_the_backfill_still_runs_when_reconciliation_added_the_column(tmp_path, 
     out.
     """
     db = _old_email_accounts_db(tmp_path)
-    monkeypatch.setattr(cdb, "DATABASE_URL", f"sqlite:///{db}")
     engine = create_engine(f"sqlite:///{db}", poolclass=NullPool)
 
     cdb.reconcile_schema_with_models(engine)      # startup order: this first
@@ -127,7 +126,7 @@ def test_the_backfill_still_runs_when_reconciliation_added_the_column(tmp_path, 
         c["name"] for c in inspect(engine).get_columns("email_accounts")
     }, "fixture precondition: reconciliation should have added the column"
 
-    cdb._migrate_add_email_smtp_security()        # then the legacy migrations
+    cdb.apply_email_smtp_security(engine)        # then the legacy migrations
 
     values = _security_by_id(db)
     assert values["a"] == "starttls", (

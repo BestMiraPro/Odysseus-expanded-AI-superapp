@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# The runtime requirements.lock.txt is generated for
+# (scripts/lock_requirements.sh). Only that lane may install the lock.
+env:
+  LOCK_TARGET_PYTHON: "3.14"
+
 # Cancel superseded runs on the same ref to save Actions minutes.
 concurrency:
   group: ci-${{ github.ref }}
@@ -156,11 +161,20 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      # The Linux lanes install the pinned lock, which is the resolution the
-      # Docker image ships (scripts/lock_requirements.sh). requirements-dev.txt
-      # adds the test framework, which the runtime image deliberately lacks.
-      - run: pip install -r requirements.lock.txt -r requirements-dev.txt
+      # A lock is a resolution for one runtime. requirements.lock.txt targets
+      # the runtime the Docker image ships (linux/amd64, CPython 3.14) and does
+      # not install on 3.11 at all — numpy 2.5.3 publishes no 3.11 wheel. So
+      # the shipped-runtime lane installs the lock, and the older-Python
+      # compatibility lane installs the loose file, which is exactly what that
+      # lane exists to check.
+      - name: Install dependencies
         if: steps.docs-check.outputs.docs_only != 'true'
+        run: |
+          if [ "${{ matrix.python-version }}" = "${{ env.LOCK_TARGET_PYTHON }}" ]; then
+            pip install -r requirements.lock.txt -r requirements-dev.txt
+          else
+            pip install -r requirements.txt -r requirements-dev.txt
+          fi
       - run: mkdir -p data  # sqlite DB lives at ./data/app.db
         if: steps.docs-check.outputs.docs_only != 'true'
       - run: python -m pytest -q
@@ -205,12 +219,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - name: Verify the lock installs on the shipped runtime
+      - name: Install the lock on the shipped runtime and import it
         run: |
-          docker run --rm \
-            -v "$PWD/requirements.lock.txt:/tmp/requirements.lock.txt:ro" \
-            python:3.14-slim \
-            sh -c 'pip install --no-cache-dir --dry-run -r /tmp/requirements.lock.txt >/dev/null && echo "lock resolves"'
+          # A real install, not --dry-run: resolution says nothing about
+          # native builds, wheels unpacking, or the modules importing. gcc is
+          # present because some pins build from source. Verified locally
+          # against python:3.14-slim before this job was written.
+          docker run --rm -i --platform linux/amd64 python:3.14-slim sh -c '
+            set -e
+            cat > /tmp/lock.txt
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq --no-install-recommends gcc >/dev/null 2>&1 || true
+            pip install --no-cache-dir -q -r /tmp/lock.txt
+            python -c "
+          import importlib
+          for m in (\"fastapi\", \"uvicorn\", \"sqlalchemy\", \"pydantic\", \"httpx\",
+                    \"bcrypt\", \"mcp\", \"psycopg2\", \"cryptography\", \"numpy\",
+                    \"nh3\", \"icalendar\", \"caldav\", \"croniter\", \"pyotp\",
+                    \"qrcode\", \"markdown\", \"pypdf\"):
+              importlib.import_module(m)
+          print(\"lock installs and imports on the shipped runtime\")
+          "
+          ' < requirements.lock.txt
 
   lock-freshness:
     name: Dependency lock is current

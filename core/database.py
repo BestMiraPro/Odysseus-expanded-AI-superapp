@@ -1186,6 +1186,71 @@ def _migrate_add_study_composite_indexes():
             pass
 
 
+#: Ledger of semantic backfills that have been applied to this database.
+#: Adding a column is idempotent by nature — it either exists or it does not —
+#: but deriving values is not: a backfill has to know whether it has run, on
+#: whatever dialect it is running against.
+MIGRATION_LEDGER_TABLE = "odysseus_schema_migrations"
+
+
+def _ensure_migration_ledger(conn) -> None:
+    conn.execute(text(
+        f"CREATE TABLE IF NOT EXISTS {MIGRATION_LEDGER_TABLE} ("
+        f"name VARCHAR PRIMARY KEY, applied_at VARCHAR)"
+    ))
+
+
+def migration_applied(engine, name: str) -> bool:
+    """Has the named semantic backfill already run against this database?"""
+    try:
+        with engine.begin() as conn:
+            _ensure_migration_ledger(conn)
+            row = conn.execute(
+                text(f"SELECT 1 FROM {MIGRATION_LEDGER_TABLE} WHERE name = :n"),
+                {"n": name},
+            ).first()
+            return row is not None
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "could not read the migration ledger", exc_info=True
+        )
+        return False
+
+
+def run_versioned_backfill(engine, name: str, fn, *, required: bool = False) -> str:
+    """Run a semantic backfill once, recording it, on any dialect.
+
+    ``fn(conn)`` is called inside one transaction together with the ledger
+    write, so a failure leaves neither partial data nor a false "applied"
+    record — the backfill is retried on the next startup.
+
+    Returns ``"applied"``, ``"skipped"`` or ``"failed"``.
+
+    ``required=True`` re-raises instead of returning ``"failed"``. That is the
+    actionable failure policy: an invariant the application depends on must
+    stop startup rather than let a half-upgraded database look healthy.
+    """
+    log = logging.getLogger(__name__)
+    if migration_applied(engine, name):
+        return "skipped"
+    try:
+        with engine.begin() as conn:
+            _ensure_migration_ledger(conn)
+            fn(conn)
+            conn.execute(
+                text(f"INSERT INTO {MIGRATION_LEDGER_TABLE} (name, applied_at) "
+                     f"VALUES (:n, :t)"),
+                {"n": name, "t": utcnow_naive().isoformat()},
+            )
+        log.info("Migration %s applied", name)
+        return "applied"
+    except Exception:
+        log.warning("Migration %s failed; it will be retried", name, exc_info=True)
+        if required:
+            raise
+        return "failed"
+
+
 def _scalar_default_sql(column, dialect):
     """Render a model column's scalar Python-side default as SQL, or None."""
     if column.default is None or column.default.is_callable:
@@ -2857,48 +2922,54 @@ def _scrub_legacy_chat_message_fts_media(conn) -> None:
         logging.getLogger(__name__).warning(f"chat_messages FTS media scrub failed: {e}")
 
 
-def _migrate_add_email_smtp_security():
-    """Add explicit SMTP security mode for Proton Bridge/custom local SMTP."""
-    import sqlite3
-    db_path = DATABASE_URL.replace("sqlite:///", "")
-    if not os.path.exists(db_path):
-        return
-    conn = None
+def apply_email_smtp_security(engine) -> None:
+    """Ensure email_accounts.smtp_security exists and is derived from the port.
+
+    Dialect-aware, unlike the raw-sqlite3 migrations around it: on PostgreSQL
+    the old version's PRAGMA raised, the guard swallowed it, and accounts kept
+    whatever default they had.
+
+    Adding the column and deriving its value are separate steps. The column
+    used to be added with DEFAULT 'ssl', which filled every existing row, so
+    the port-based UPDATE (WHERE ... IS NULL) matched nothing and never ran —
+    port 587 accounts silently kept 'ssl'. The column is added without a
+    default so the rows needing derivation stay identifiable.
+
+    The derivation is versioned through the ledger rather than re-derived on
+    every startup, so an operator's later change is never revisited.
+    """
+    log = logging.getLogger(__name__)
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.execute("PRAGMA table_info(email_accounts)")
-        columns = [row[1] for row in cursor.fetchall()]
-        if not columns:
+        inspector = inspect(engine)
+        if not inspector.has_table("email_accounts"):
             return
-        # Adding the column and deriving its value are separate steps. The
-        # column used to be added with DEFAULT 'ssl', which filled every
-        # existing row, so the port-based UPDATE below (WHERE ... IS NULL)
-        # matched nothing and never ran — port 587 accounts silently kept
-        # 'ssl'. The column is added without a default so the rows that need
-        # deriving are still identifiable.
+        columns = {c["name"] for c in inspector.get_columns("email_accounts")}
         if "smtp_security" not in columns:
-            conn.execute("ALTER TABLE email_accounts ADD COLUMN smtp_security TEXT")
-        # Runs on every startup, not only when this call added the column:
-        # schema reconciliation may have added it first, and an operator's
-        # explicit choice is preserved because only NULL/'' rows are touched.
-        conn.execute(
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "ALTER TABLE email_accounts ADD COLUMN smtp_security VARCHAR"
+                ))
+    except Exception:
+        log.warning("smtp_security column check failed", exc_info=True)
+        return
+
+    def _derive(conn):
+        # Portable across SQLite and PostgreSQL. Only NULL/'' rows are touched,
+        # so an explicit operator choice is preserved.
+        conn.execute(text(
             "UPDATE email_accounts SET smtp_security = CASE "
             "WHEN COALESCE(smtp_port, 465) = 587 THEN 'starttls' "
             "WHEN COALESCE(smtp_port, 465) = 465 THEN 'ssl' "
             "ELSE 'ssl' END "
             "WHERE smtp_security IS NULL OR smtp_security = ''"
-        )
-        conn.commit()
-        logging.getLogger(__name__).info(
-            "Migrated: smtp_security present and backfilled on email_accounts"
-        )
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"smtp_security migration skipped: {e}")
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        ))
+
+    run_versioned_backfill(engine, "email_accounts.smtp_security.from_port", _derive)
+
+
+def _migrate_add_email_smtp_security():
+    """Startup entry point for :func:`apply_email_smtp_security`."""
+    apply_email_smtp_security(engine)
 
 
 def _migrate_encrypt_endpoint_keys():
