@@ -417,7 +417,31 @@ function injectStyles() {
 /* The model control is never hidden: hiding it removes the capability rather
    than relocating it. On narrow screens it lives inside the Study options
    disclosure, which collapses the header without losing anything. */
-#study-options { position: relative; }
+@media (max-width: 900px) {
+  /* Two rows: title, sync status and the window actions on the first; the
+     tab strip and the options disclosure on the second. Competing for a
+     single 360px row left the tab strip showing two characters of "Today" —
+     scrollable is reachable, but not usable — and pushed the window controls
+     onto a row of their own. */
+  .study-header { flex-wrap: wrap; row-gap: 6px; }
+  .study-header-spacer { display: none; }
+  /* Row 1: title, window actions, sync status, options. The window actions
+     sit immediately after the title so they never wrap away from it, and the
+     status is capped and ellipsised — it is the only elastic part, and it is
+     announced through its live region regardless of how much text shows. */
+  .study-x { order: 1; }
+  .study-sync-status { order: 2; flex: 0 1 auto; min-width: 0; max-width: 24%;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #study-options { order: 3; }
+  /* Row 2: the full-width tab strip. flex-basis:100% forces the break;
+     anything shrinkable collapses onto row 1 and shows two characters. */
+  .study-tabs { order: 4; flex: 0 0 100%; min-width: 0; margin-left: 0; }
+}
+#study-options { position: relative; flex-shrink: 0; }
+/* The header is a flex row and the tab strip is the flexible part, so
+   the disclosure must keep its intrinsic width. Without this it was
+   squeezed from 109px to 24px at 360px and the label vanished,
+   leaving an unlabelled marker. */
 #study-options > summary { list-style: none; cursor: pointer; font-size: 11px;
   opacity: 0.72; padding: 4px 8px; border: 1px solid var(--border);
   border-radius: 6px; white-space: nowrap; }
