@@ -143,6 +143,13 @@ def test_npx_cache_check_falls_back_when_async_subprocess_is_unsupported(monkeyp
     monkeypatch.setattr(builtin_mcp.subprocess, "run", fake_run)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("npm_config_cache", raising=False)
+    # State the cache-miss precondition instead of simulating it through HOME.
+    # _npm_cache_roots() also consults the Windows npm-cache root, so setting
+    # HOME alone left the real machine's cache answering first:
+    # _is_npx_package_cached returned True before reaching the fallback and
+    # subprocess.run was never called. This test covers the fallback path;
+    # the cache lookup has its own tests.
+    monkeypatch.setattr(builtin_mcp, "_is_package_in_npx_cache", lambda spec: False)
 
     assert asyncio.run(
         builtin_mcp._is_npx_package_cached(
@@ -174,6 +181,13 @@ def test_npx_cache_check_fallback_treats_timeout_as_cache_miss(monkeypatch, tmp_
     monkeypatch.setattr(builtin_mcp.subprocess, "run", fake_run)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.delenv("npm_config_cache", raising=False)
+    # State the cache-miss precondition instead of simulating it through HOME.
+    # _npm_cache_roots() also consults the Windows npm-cache root, so setting
+    # HOME alone left the real machine's cache answering first:
+    # _is_npx_package_cached returned True before reaching the fallback and
+    # subprocess.run was never called. This test covers the fallback path;
+    # the cache lookup has its own tests.
+    monkeypatch.setattr(builtin_mcp, "_is_package_in_npx_cache", lambda spec: False)
 
     assert asyncio.run(
         builtin_mcp._is_npx_package_cached(
