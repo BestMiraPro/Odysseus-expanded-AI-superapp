@@ -189,7 +189,7 @@ jobs:
       # The lock is resolved for linux/amd64, so Windows installs the loose
       # runtime requirements. Keeping the lane green is what tells us the
       # unpinned set still resolves on the other supported platform.
-      - run: pip install -r requirements-dev.txt
+      - run: pip install -r requirements.txt -r requirements-dev.txt
       - name: Install ripgrep
         run: choco install ripgrep -y --no-progress
       - run: mkdir data

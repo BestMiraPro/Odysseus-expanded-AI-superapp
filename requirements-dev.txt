@@ -1,10 +1,15 @@
-# Development and test dependencies.
+# Development and test dependencies — these only.
 #
-# Deliberately kept out of requirements.txt so the runtime image does not ship
-# a test framework. CI installs this on top of the runtime requirements; the
-# Docker image never does.
-
--r requirements.txt
+# Deliberately does NOT `-r requirements.txt`. CI installs the lock and this
+# file together, and re-including the unpinned runtime file would let pip
+# resolve past the lock's pins, making the lock non-authoritative in exactly
+# the lane that is supposed to prove it.
+#
+# Install the runtime alongside it explicitly:
+#   Linux/CI  : pip install -r requirements.lock.txt -r requirements-dev.txt
+#   other OS  : pip install -r requirements.txt      -r requirements-dev.txt
+#
+# The Docker image installs neither: it ships no test framework.
 
 pytest
 pytest-asyncio
