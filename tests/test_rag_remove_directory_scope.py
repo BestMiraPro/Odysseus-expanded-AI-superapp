@@ -52,16 +52,24 @@ def _make_vectorrag(rows):
     return rag
 
 
+# remove_directory() abspath-normalises its argument, so the fixture has to
+# speak the host's path dialect. Hardcoded POSIX literals became "C:\a\docs"
+# on Windows and matched nothing, which read as a scoping failure when it was
+# only the fixture.
+def _p(*parts):
+    return os.path.abspath(os.path.join(os.sep, *parts))
+
+
 def test_vectorrag_remove_is_path_bounded():
     rows = [
-        ("a", {"source": "/a/docs/f1.md"}),
-        ("b", {"source": "/a/docs/sub/f2.md"}),   # nested -> must be removed
-        ("c", {"source": "/a/docs2/f3.md"}),       # sibling prefix -> must survive
-        ("d", {"source": "/a/docs_personal/f4.md"}),  # sibling prefix -> must survive
-        ("e", {"filename": "no-source.md"}),       # sourceless dict -> must not crash/survive
+        ("a", {"source": _p("a", "docs", "f1.md")}),
+        ("b", {"source": _p("a", "docs", "sub", "f2.md")}),   # nested -> removed
+        ("c", {"source": _p("a", "docs2", "f3.md")}),          # sibling -> survives
+        ("d", {"source": _p("a", "docs_personal", "f4.md")}),  # sibling -> survives
+        ("e", {"filename": "no-source.md"}),   # sourceless dict -> must not crash
     ]
     rag = _make_vectorrag(rows)
-    res = rag.remove_directory("/a/docs")
+    res = rag.remove_directory(_p("a", "docs"))
     assert res["success"] is True
     assert res["removed_count"] == 2
     remaining = set(rag._collection.get()["ids"])
@@ -69,11 +77,28 @@ def test_vectorrag_remove_is_path_bounded():
 
 
 def test_vectorrag_remove_no_match_is_noop():
-    rag = _make_vectorrag([("a", {"source": "/a/docs/f1.md"})])
-    res = rag.remove_directory("/nowhere")
+    rag = _make_vectorrag([("a", {"source": _p("a", "docs", "f1.md")})])
+    res = rag.remove_directory(_p("nowhere"))
     assert res["success"] is True
     assert res["removed_count"] == 0
     assert set(rag._collection.get()["ids"]) == {"a"}
+
+
+def test_vectorrag_remove_normalises_a_relative_argument():
+    """remove_directory abspaths its argument; a relative path must still hit.
+
+    Pins the asymmetry worth knowing about: remove_directory normalises, while
+    index_personal_documents stores `source` exactly as the walk produced it.
+    They agree because callers pass absolute directories.
+    """
+    target = os.path.abspath("some_docs")
+    rag = _make_vectorrag([
+        ("a", {"source": os.path.join(target, "f1.md")}),
+        ("b", {"source": os.path.abspath(os.path.join("other_docs", "f2.md"))}),
+    ])
+    res = rag.remove_directory("some_docs")
+    assert res["removed_count"] == 1
+    assert set(rag._collection.get()["ids"]) == {"b"}
 
 
 # --------------------------------------------------------------------------- #

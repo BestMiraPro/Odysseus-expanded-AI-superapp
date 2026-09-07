@@ -928,7 +928,13 @@ class UploadHandler:
             if not owner and current_info.get("owner") is not None:
                 return None
 
-            existing_paths: set[str] = set()
+            # Keyed on the normcased real path so two rows naming the same file
+            # different ways collapse to one, but the *value* is the path as
+            # stored. normcase lowercases on Windows, and returning that key
+            # replaced the upload's recorded path with a lowercased copy —
+            # corrupting the metadata and making path_changed true on every
+            # reservation, so the index was rewritten each time.
+            existing_paths: dict[str, str] = {}
             for row in matching_rows:
                 stored_path = row.get("path")
                 if not stored_path:
@@ -942,11 +948,12 @@ class UploadHandler:
                 if os.path.isfile(stored_path):
                     if os.path.basename(stored_path) != upload_id:
                         return None
-                    existing_paths.add(os.path.normcase(os.path.realpath(stored_path)))
+                    key = os.path.normcase(os.path.realpath(stored_path))
+                    existing_paths.setdefault(key, stored_path)
             if len(existing_paths) > 1:
                 logger.warning("Cannot reserve upload %s with multiple indexed paths", upload_id)
                 return None
-            path = next(iter(existing_paths), None) or self._find_upload_path(upload_id)
+            path = next(iter(existing_paths.values()), None) or self._find_upload_path(upload_id)
             if not path or not os.path.isfile(path) or not self._inside_upload_dir(path):
                 return None
 

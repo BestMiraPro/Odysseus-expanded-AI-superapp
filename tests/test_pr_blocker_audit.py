@@ -721,9 +721,17 @@ def test_cli_terminal_no_color_outputs_no_ansi(tmp_path, capsys):
 
 
 def test_color_auto_requires_terminal_and_support(monkeypatch):
+    """The POSIX branch: a tty plus a TERM means colour, NO_COLOR overrides.
+
+    os.name is pinned because the Windows branch returns
+    enable_windows_vt_mode(), which legitimately fails under pytest's
+    non-console stdout — that path is asserted separately below rather than
+    letting the host decide which branch this test measures.
+    """
     audit = load_module()
     args = audit.argparse.Namespace(format="terminal", color="auto", output=None)
 
+    monkeypatch.setattr(audit.os, "name", "posix")
     monkeypatch.setattr(audit.sys.stdout, "isatty", lambda: True)
     monkeypatch.delenv("NO_COLOR", raising=False)
     monkeypatch.setitem(audit.os.environ, "TERM", "xterm-256color")
@@ -731,6 +739,21 @@ def test_color_auto_requires_terminal_and_support(monkeypatch):
 
     monkeypatch.setitem(audit.os.environ, "NO_COLOR", "1")
     assert not audit.should_use_color(args)
+
+
+@pytest.mark.parametrize("vt_enabled", [True, False])
+def test_color_auto_on_windows_follows_vt_mode(monkeypatch, vt_enabled):
+    """The Windows branch: colour is exactly whether VT mode could be enabled."""
+    audit = load_module()
+    args = audit.argparse.Namespace(format="terminal", color="auto", output=None)
+
+    monkeypatch.setattr(audit.os, "name", "nt")
+    monkeypatch.setattr(audit.sys.stdout, "isatty", lambda: True)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setitem(audit.os.environ, "TERM", "xterm-256color")
+    monkeypatch.setattr(audit, "enable_windows_vt_mode", lambda: vt_enabled)
+
+    assert audit.should_use_color(args) is vt_enabled
 
 
 def test_color_output_file_and_markdown_disable_ansi(monkeypatch):

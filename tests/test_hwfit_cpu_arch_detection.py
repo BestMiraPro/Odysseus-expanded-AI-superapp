@@ -16,6 +16,13 @@ def _clear_hwfit_cache(monkeypatch):
 
 
 def _stub_common_probe(monkeypatch, machine):
+    # detect_system() short-circuits to the PowerShell/WMI probe when
+    # os.name == "nt", before any of the stubs below are consulted. On a
+    # Windows host that returned the real machine's hardware, so these
+    # assertions were comparing mocked expectations against this laptop.
+    # These cases exercise the generic POSIX path, so pin the platform to
+    # match the rest of the fixture.
+    monkeypatch.setattr(hardware.os, "name", "posix")
     monkeypatch.setattr(hardware.platform, "machine", lambda: machine)
     monkeypatch.setattr(hardware, "_get_ram_gb", lambda: 64.0)
     monkeypatch.setattr(hardware, "_get_available_ram_gb", lambda: 48.0)

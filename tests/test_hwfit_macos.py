@@ -104,6 +104,7 @@ def test_apple_silicon_detected_as_metal(monkeypatch):
     """On local Apple Silicon, detection reports a Metal GPU with a RAM-scaled
     unified-memory budget."""
     monkeypatch.setattr(hardware, "_remote_host", None)
+    monkeypatch.setattr(hardware.os, "name", "posix")  # not the Windows probe
     monkeypatch.setattr(hardware.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(hardware.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(hardware, "_run", _fake_sysctl(
@@ -122,6 +123,7 @@ def test_apple_silicon_detected_as_metal(monkeypatch):
 
 def test_apple_silicon_gpu_cores_fall_back_to_plain_text(monkeypatch):
     monkeypatch.setattr(hardware, "_remote_host", None)
+    monkeypatch.setattr(hardware.os, "name", "posix")  # not the Windows probe
     monkeypatch.setattr(hardware.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(hardware.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(hardware, "_run", _fake_sysctl(
@@ -138,6 +140,7 @@ def test_apple_silicon_gpu_cores_fall_back_to_plain_text(monkeypatch):
 
 def test_apple_silicon_gpu_cores_are_optional(monkeypatch):
     monkeypatch.setattr(hardware, "_remote_host", None)
+    monkeypatch.setattr(hardware.os, "name", "posix")  # not the Windows probe
     monkeypatch.setattr(hardware.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(hardware.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(hardware, "_run", _fake_sysctl(memsize_gb=32))
@@ -159,6 +162,7 @@ def test_apple_silicon_skipped_on_linux(monkeypatch):
 def test_intel_mac_skipped(monkeypatch):
     """Intel Macs have no Metal GPU worth serving LLMs on — fall through to CPU."""
     monkeypatch.setattr(hardware, "_remote_host", None)
+    monkeypatch.setattr(hardware.os, "name", "posix")  # not the Windows probe
     monkeypatch.setattr(hardware.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(hardware.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(hardware, "_run", _fake_sysctl())
@@ -168,6 +172,7 @@ def test_intel_mac_skipped(monkeypatch):
 def test_plain_arm_mac_skipped(monkeypatch):
     """Only ARM64-class Macs should enter the Apple Silicon Metal path."""
     monkeypatch.setattr(hardware, "_remote_host", None)
+    monkeypatch.setattr(hardware.os, "name", "posix")  # not the Windows probe
     monkeypatch.setattr(hardware.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(hardware.platform, "machine", lambda: "armv7l")
     monkeypatch.setattr(hardware, "_run", _fake_sysctl())
@@ -177,6 +182,12 @@ def test_plain_arm_mac_skipped(monkeypatch):
 def test_detect_system_propagates_unified_memory(monkeypatch):
     """The unified_memory flag set by GPU detection must survive into the
     system dict so the API and UI can report it (it was being dropped)."""
+    # detect_system() returns the PowerShell/WMI result before reaching any of
+    # these stubs when os.name == "nt", so on a Windows host this asserted
+    # against the real machine. Pin the platform to match the fixture.
+    monkeypatch.setattr(hardware, "_remote_host", None)
+    monkeypatch.setattr(hardware, "_remote_platform", None)
+    monkeypatch.setattr(hardware.os, "name", "posix")
     monkeypatch.setattr(hardware, "_detect_apple_silicon", lambda: {
         "gpu_name": "Apple M4", "gpu_vram_gb": 10.7, "gpu_count": 1,
         "gpus": [], "gpu_groups": [], "homogeneous": True,
