@@ -33,6 +33,11 @@ from routes.cookbook_helpers import (
     run_ssh_command_async,
 )
 
+# Resolve bash explicitly: bare "bash" can hit the Windows WSL stub.
+from tests._shell_helpers import BASH, requires_bash
+
+pytestmark = requires_bash
+
 
 def test_safe_env_prefix_accepts_quoted_venv_path():
     assert (
@@ -349,7 +354,7 @@ def test_pip_install_fallback_chain_propagates_failure_in_venv():
         "&& echo user_attempt; }"
     )
     result = subprocess.run(
-        ["bash", "-c", script],
+        [BASH, "-c", script],
         capture_output=True, text=True, encoding="utf-8", timeout=10,
     )
     assert "user_attempt" not in result.stdout
@@ -367,7 +372,7 @@ def test_pip_install_fallback_chain_tries_user_outside_venv():
         "'"
     )
     result = subprocess.run(
-        ["bash", "-c", script],
+        [BASH, "-c", script],
         capture_output=True, text=True, encoding="utf-8", timeout=10,
     )
     assert "user_attempt" in result.stdout, "Chain should try --user when not in venv and base fails"
@@ -485,7 +490,7 @@ def test_pip_install_attempt_failure_propagates_real_exit_code():
     to confirm the subshell exits with pip's non-zero status."""
     snippet = _pip_install_attempt("python3 -m pip install __nonexistent_package_12345__")
     result = subprocess.run(
-        ["bash", "-c", snippet],
+        [BASH, "-c", snippet],
         capture_output=True,
         text=True, encoding="utf-8",
         timeout=60,
@@ -497,7 +502,7 @@ def test_pip_install_attempt_success_exits_zero():
     """When pip succeeds, the subshell should exit 0."""
     snippet = _pip_install_attempt("python3 -c 'pass'")
     result = subprocess.run(
-        ["bash", "-c", snippet],
+        [BASH, "-c", snippet],
         capture_output=True,
         text=True, encoding="utf-8",
         timeout=15,
@@ -509,7 +514,7 @@ def test_pip_install_attempt_surfaces_stderr_on_failure():
     """On failure, the last 5 lines of pip output should appear in stdout."""
     snippet = _pip_install_attempt("python3 -m pip install __nonexistent_package_12345__")
     result = subprocess.run(
-        ["bash", "-c", snippet],
+        [BASH, "-c", snippet],
         capture_output=True,
         text=True, encoding="utf-8",
         timeout=60,

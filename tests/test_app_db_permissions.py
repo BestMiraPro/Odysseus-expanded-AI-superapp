@@ -32,6 +32,7 @@ def test_app_db_created_with_0600(tmp_path):
         [sys.executable, "-c", "import core.database"],
         env=env,
         cwd=repo_root,
+        capture_output=True,
         check=True,
     )
     assert db_file.exists()
@@ -46,6 +47,7 @@ def test_app_db_created_with_0600(tmp_path):
         [sys.executable, "-c", "import core.database"],
         env=env,
         cwd=repo_root,
+        capture_output=True,
         check=True,
     )
     assert db_file.stat().st_mode & 0o777 == 0o600, "existing 0644 DB not re-locked on startup"
@@ -111,6 +113,7 @@ def test_app_db_sidecars_relocked(tmp_path):
         [sys.executable, "-c", "import core.database"],
         env=env,
         cwd=repo_root,
+        capture_output=True,
         check=True,
     )
 
@@ -186,6 +189,7 @@ def test_app_db_file_uri_created_with_0600(tmp_path):
         [sys.executable, "-c", "import core.database"],
         env=env,
         cwd=repo_root,
+        capture_output=True,
         check=True,
     )
 
@@ -213,6 +217,7 @@ def test_app_db_localhost_file_uri_created_with_0600(tmp_path):
         [sys.executable, "-c", "import core.database"],
         env=env,
         cwd=repo_root,
+        capture_output=True,
         check=True,
     )
 
@@ -238,6 +243,7 @@ def test_app_db_non_uri_mode_query_created_with_0600(tmp_path):
         [sys.executable, "-c", "import core.database"],
         env=env,
         cwd=repo_root,
+        capture_output=True,
         check=True,
     )
 
@@ -262,6 +268,7 @@ def test_app_db_plain_file_uri_created_with_0600(tmp_path):
         [sys.executable, "-c", "import core.database"],
         env=env,
         cwd=repo_root,
+        capture_output=True,
         check=True,
     )
 

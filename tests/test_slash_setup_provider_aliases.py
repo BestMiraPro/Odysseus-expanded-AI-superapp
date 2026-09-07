@@ -26,4 +26,11 @@ const goCredential = _extractSetupProviderCredential('opencode go sk-test');
 assert(goCredential && goCredential.provider.name === 'OpenCode Go', 'opencode go credential provider failed');
 assert(goCredential.credential === 'sk-test', 'opencode go credential extraction failed');
 """
-    subprocess.run(["node", "-e", script], check=True)
+    # Capture both streams: inheriting pytest's captured handles fails
+    # nondeterministically on Windows (WinError 50), and capturing also lets a
+    # node assertion failure be reported instead of vanishing into the capture.
+    proc = subprocess.run(
+        ["node", "-e", script],
+        capture_output=True, text=True, encoding="utf-8",
+    )
+    assert proc.returncode == 0, proc.stderr or proc.stdout

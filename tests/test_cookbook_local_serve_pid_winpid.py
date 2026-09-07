@@ -7,6 +7,11 @@ from pathlib import Path
 
 from routes.cookbook_routes import _windows_local_pid_record_line
 
+# Resolve bash explicitly: bare "bash" can hit the Windows WSL stub.
+from tests._shell_helpers import BASH, requires_bash
+
+pytestmark = requires_bash
+
 
 ROOT = Path(__file__).resolve().parents[1]
 COOKBOOK_ROUTES = ROOT / "routes" / "cookbook_routes.py"
@@ -35,7 +40,7 @@ def _run_pid_line(
     **extra_env: str,
 ) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["bash", "-c", _windows_local_pid_record_line(pid_path, ready_path)],
+        [BASH, "-c", _windows_local_pid_record_line(pid_path, ready_path)],
         capture_output=True,
         text=True, encoding="utf-8",
         env=_env_for(fake_bin, **extra_env),
@@ -88,13 +93,16 @@ def test_windows_local_pid_line_waits_for_python_fallback_before_replacing(tmp_p
 
     proc = subprocess.Popen(
         [
-            "bash",
+            BASH,
             "-c",
             _windows_local_pid_record_line(pid_path, ready_path),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True, encoding="utf-8",
+        # errors="replace": a failing child can emit locale-encoded text
+        # (cp1252 on this host), which would otherwise raise
+        # UnicodeDecodeError and hide the real assertion.
+        text=True, encoding="utf-8", errors="replace",
         env=_env_for(fake_bin, FAKE_WINPID="42324"),
     )
 
