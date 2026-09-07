@@ -42,7 +42,7 @@ def extract_function(name: str, source: str | None = None) -> str:
         re.DOTALL | re.MULTILINE,
     )
     if not match:
-        raise AssertionError(f"{name} not found as a top-level function in study.js")
+        raise AssertionError(f"{name} not found as a top-level function")
     return match.group(0).replace("export function", "function", 1)
 
 
@@ -70,13 +70,15 @@ def extract_const(name: str, source: str | None = None) -> str:
     return match.group(0)
 
 
-def run_js(prelude: str, *function_names: str, epilogue: str = "") -> dict:
-    """Execute the named study.js functions under Node and return parsed JSON.
+def run_js(prelude: str, *function_names: str, epilogue: str = "",
+           source_path: Path | None = None) -> dict:
+    """Execute the named functions under Node and return parsed JSON.
 
     ``prelude`` defines the stubs the functions close over; ``epilogue`` drives
     them and must ``console.log(JSON.stringify(...))`` exactly one result.
+    ``source_path`` defaults to study.js but any ES module in static/js works.
     """
-    src = STUDY_JS.read_text(encoding="utf-8")
+    src = (source_path or STUDY_JS).read_text(encoding="utf-8")
     body = "\n\n".join(extract_function(n, src) for n in function_names)
     script = f"{prelude}\n\n{body}\n\n{epilogue}\n"
     proc = subprocess.run(

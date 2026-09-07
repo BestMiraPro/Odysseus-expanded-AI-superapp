@@ -59,6 +59,85 @@ async function _postSettings(body) {
 
 const el = byId;
 function esc(s) { return uiModule.esc(s); }
+
+// ---------------------------------------------------------------------------
+// MCP PERMISSION UPDATES
+// ---------------------------------------------------------------------------
+// Tool toggles and the enable/disable switch both PATCH the server. fetch()
+// resolves for 4xx/5xx, so an unchecked response let the UI show permissions
+// the server never saved. Each checkbox change also sent the whole disabled
+// list independently, so two rapid toggles could land out of order and leave
+// the server holding the earlier choice.
+//
+// Keyed per server: one slow server must not stall another.
+const _mcpToolSaves = new Map();
+
+async function sendMcpToolUpdate(serverId, disabled, fetchImpl = fetch) {
+  try {
+    const res = await fetchImpl(`/api/mcp/servers/${serverId}/tools`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ disabled }),
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = await res.json();
+        if (body && body.detail) detail = String(body.detail);
+      } catch { /* error body was not JSON */ }
+      return { ok: false, status: res.status, detail };
+    }
+    return { ok: true, status: res.status, disabled };
+  } catch (e) {
+    return { ok: false, status: 0, detail: (e && e.message) || String(e) };
+  }
+}
+
+// Single-flight per server, coalescing to the latest desired list. Aborting a
+// fetch would not undo a write the server had already applied, so the fix is to
+// never have two in flight.
+async function queueMcpToolUpdate(serverId, disabled, fetchImpl = fetch) {
+  const state = _mcpToolSaves.get(serverId) || { pending: null, running: false };
+  _mcpToolSaves.set(serverId, state);
+  state.pending = disabled;
+  if (state.running) return { ok: true, coalesced: true };
+  state.running = true;
+  let last = { ok: true, coalesced: true };
+  try {
+    while (state.pending) {
+      const next = state.pending;
+      state.pending = null;
+      last = await sendMcpToolUpdate(serverId, next, fetchImpl);
+      if (!last.ok) { state.pending = null; return last; }
+      state.confirmed = next;
+    }
+  } finally {
+    state.running = false;
+  }
+  return last;
+}
+
+async function sendMcpServerEnabled(serverId, enabled, fetchImpl = fetch) {
+  try {
+    const fd = new FormData();
+    fd.append('is_enabled', String(enabled));
+    const res = await fetchImpl(`/api/mcp/servers/${serverId}`, {
+      method: 'PATCH', body: fd, credentials: 'same-origin',
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const body = await res.json();
+        if (body && body.detail) detail = String(body.detail);
+      } catch { /* error body was not JSON */ }
+      return { ok: false, status: res.status, detail };
+    }
+    return { ok: true, status: res.status };
+  } catch (e) {
+    return { ok: false, status: 0, detail: (e && e.message) || String(e) };
+  }
+}
 function safeRasterDataUrl(raw) {
   const value = String(raw || '').trim();
   return /^data:image\/(?:png|jpe?g|gif|webp);base64,[a-z0-9+/=\s]+$/i.test(value) ? value : '';
@@ -5004,8 +5083,13 @@ async function initUnifiedIntegrations() {
         });
         // Toggle enable/disable
         el('uf-mcp-toggle').addEventListener('click', async () => {
-          const fd = new FormData(); fd.append('is_enabled', String(!srv.is_enabled));
-          await fetch(`/api/mcp/servers/${srv.id}`, { method: 'PATCH', body: fd, credentials: 'same-origin' });
+          const msg = el('uf-mcp-msg');
+          const r = await sendMcpServerEnabled(srv.id, !srv.is_enabled);
+          if (!r.ok) {
+            // Do not re-render as though it applied: the server refused.
+            if (msg) msg.textContent = `Could not change state: ${r.detail}`;
+            return;
+          }
           await renderList();
           showMcpForm(editId);
         });
@@ -5019,12 +5103,31 @@ async function initUnifiedIntegrations() {
             if (tools.length) {
               const disabled = new Set(tools.filter(t => t.is_disabled).map(t => t.name));
               panel.innerHTML = `<div class="mcp-tools-header"><span>Tools</span><span style="display:flex;gap:8px;align-items:center"><span class="mcp-tools-count">${tools.length - disabled.size}/${tools.length} enabled</span><a href="#" id="uf-mcp-all">All</a> <a href="#" id="uf-mcp-none">None</a></span></div><div class="mcp-tools-list">${tools.map(t => `<label title="${esc(t.description)}"><input type="checkbox" data-mcp-tool-name="${esc(t.name)}" ${!t.is_disabled ? 'checked' : ''}><span><strong>${esc(t.name)}</strong> <span style="opacity:0.5">— ${esc((t.description||'').slice(0,80))}</span></span></label>`).join('')}</div>`;
+              // The last list the server confirmed. Restoring from it is how a
+              // failed toggle stops showing a permission that was never saved.
+              let confirmedDisabled = [...disabled];
+              const paintCount = (dis, note = '') => {
+                const cnt = panel.querySelector('.mcp-tools-count');
+                if (cnt) cnt.textContent = `${tools.length - dis.length}/${tools.length} enabled${note}`;
+              };
+              const restoreConfirmed = () => {
+                const set = new Set(confirmedDisabled);
+                panel.querySelectorAll('input[type=checkbox]').forEach(cb => {
+                  cb.checked = !set.has(cb.dataset.mcpToolName);
+                });
+                paintCount(confirmedDisabled);
+              };
               const saveFn = async () => {
                 const dis = [];
                 panel.querySelectorAll('input[type=checkbox]').forEach(cb => { if (!cb.checked) dis.push(cb.dataset.mcpToolName); });
-                await fetch(`/api/mcp/servers/${srv.id}/tools`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', body: JSON.stringify({ disabled: dis }) });
-                const cnt = panel.querySelector('.mcp-tools-count');
-                if (cnt) cnt.textContent = `${tools.length - dis.length}/${tools.length} enabled`;
+                paintCount(dis, ' — saving…');
+                const r = await queueMcpToolUpdate(srv.id, dis);
+                if (r.coalesced) return;      // a later change owns the outcome
+                if (r.ok) { confirmedDisabled = r.disabled || dis; paintCount(confirmedDisabled); return; }
+                // Show what the server actually has, not what was clicked.
+                restoreConfirmed();
+                const msg = el('uf-mcp-msg');
+                if (msg) msg.textContent = `Tool permissions not saved: ${r.detail}`;
               };
               panel.querySelectorAll('input[type=checkbox]').forEach(cb => cb.addEventListener('change', saveFn));
               el('uf-mcp-all')?.addEventListener('click', (e) => { e.preventDefault(); panel.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = true); saveFn(); });
