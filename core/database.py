@@ -1186,13 +1186,36 @@ def _migrate_add_study_composite_indexes():
             pass
 
 
+def _scalar_default_sql(column, dialect):
+    """Render a model column's scalar Python-side default as SQL, or None."""
+    if column.default is None or column.default.is_callable:
+        return None
+    value = column.default.arg
+    if isinstance(value, bool):
+        return ("true" if value else "false") if dialect.name == "postgresql" \
+            else ("1" if value else "0")
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    return None
+
+
 def _column_ddl(column, dialect) -> str:
     """Render one model column as ALTER TABLE ADD COLUMN body text.
 
-    NOT NULL is only emitted alongside a usable default: adding a mandatory
-    column to a table that already has rows fails otherwise, and refusing the
-    whole reconciliation over one column would be worse than adding it
-    nullable and leaving the model's own validation to catch bad rows.
+    Only ``server_default`` becomes a DDL DEFAULT. SQLAlchemy's ``default=`` is
+    a *Python-side* default applied by the ORM on insert — ``create_all`` emits
+    no DDL default for it — so turning it into one here would both diverge from
+    a freshly created schema and, worse, silently backfill every existing row
+    with a value it never had. That is not cosmetic: migrations that derive a
+    value from other columns look for NULLs, and a DDL default erases the very
+    rows they were meant to find (see _migrate_add_email_smtp_security).
+
+    NOT NULL is only emitted alongside a usable default, because adding a
+    mandatory column to a populated table fails otherwise; refusing the whole
+    reconciliation over one column would be worse than adding it nullable and
+    leaving the model's own validation to catch bad rows.
     """
     type_sql = column.type.compile(dialect)
     parts = [f"{column.name} {type_sql}"]
@@ -1202,21 +1225,17 @@ def _column_ddl(column, dialect) -> str:
         arg = getattr(column.server_default, "arg", None)
         if arg is not None:
             default = str(getattr(arg, "text", arg))
-    elif column.default is not None and not column.default.is_callable:
-        value = column.default.arg
-        if isinstance(value, bool):
-            default = "1" if value else "0"
-            if dialect.name == "postgresql":
-                default = "true" if value else "false"
-        elif isinstance(value, (int, float)):
-            default = str(value)
-        elif isinstance(value, str):
-            default = "'" + value.replace("'", "''") + "'"
-
     if default is not None:
         parts.append(f"DEFAULT {default}")
-        if not column.nullable:
-            parts.append("NOT NULL")
+    elif not column.nullable:
+        # Mandatory and no server default: fall back to the Python-side scalar
+        # purely so the ALTER can succeed on a populated table.
+        fallback = _scalar_default_sql(column, dialect)
+        if fallback is not None:
+            parts.append(f"DEFAULT {fallback}")
+
+    if not column.nullable and len(parts) > 1:
+        parts.append("NOT NULL")
     return " ".join(parts)
 
 
@@ -1233,8 +1252,15 @@ def reconcile_schema_with_models(engine) -> list:
     ``Base.metadata`` already describes the current schema authoritatively, so
     reconciling against it is dialect-agnostic by construction and covers every
     table at once instead of needing one bespoke migration per column. It runs
-    after the legacy migrations, which keep their data backfills; on SQLite
-    they have normally already added the columns, so this is a no-op there.
+    in init_db *before* the legacy migrations, so their data backfills find the
+    columns present on every dialect; on SQLite those migrations have normally
+    already added the columns, so this is a no-op there.
+
+    Limits, deliberately: it compares column and index *names*. Existing column
+    types, constraints, and index definitions are not verified, and an index is
+    rebuilt from ``index.columns``, which cannot express a partial predicate,
+    an expression, or an ordering. It will not repair a column of the wrong
+    type or weaken an existing index — it only adds what is absent.
 
     Returns the list of applied changes ("table.column", "index:name"), which
     is empty on an up-to-date schema.
@@ -2842,17 +2868,30 @@ def _migrate_add_email_smtp_security():
         conn = sqlite3.connect(db_path)
         cursor = conn.execute("PRAGMA table_info(email_accounts)")
         columns = [row[1] for row in cursor.fetchall()]
-        if columns and "smtp_security" not in columns:
-            conn.execute("ALTER TABLE email_accounts ADD COLUMN smtp_security TEXT DEFAULT 'ssl'")
-            conn.execute(
-                "UPDATE email_accounts SET smtp_security = CASE "
-                "WHEN COALESCE(smtp_port, 465) = 587 THEN 'starttls' "
-                "WHEN COALESCE(smtp_port, 465) = 465 THEN 'ssl' "
-                "ELSE 'ssl' END "
-                "WHERE smtp_security IS NULL OR smtp_security = ''"
-            )
-            conn.commit()
-            logging.getLogger(__name__).info("Migrated: added smtp_security column to email_accounts")
+        if not columns:
+            return
+        # Adding the column and deriving its value are separate steps. The
+        # column used to be added with DEFAULT 'ssl', which filled every
+        # existing row, so the port-based UPDATE below (WHERE ... IS NULL)
+        # matched nothing and never ran — port 587 accounts silently kept
+        # 'ssl'. The column is added without a default so the rows that need
+        # deriving are still identifiable.
+        if "smtp_security" not in columns:
+            conn.execute("ALTER TABLE email_accounts ADD COLUMN smtp_security TEXT")
+        # Runs on every startup, not only when this call added the column:
+        # schema reconciliation may have added it first, and an operator's
+        # explicit choice is preserved because only NULL/'' rows are touched.
+        conn.execute(
+            "UPDATE email_accounts SET smtp_security = CASE "
+            "WHEN COALESCE(smtp_port, 465) = 587 THEN 'starttls' "
+            "WHEN COALESCE(smtp_port, 465) = 465 THEN 'ssl' "
+            "ELSE 'ssl' END "
+            "WHERE smtp_security IS NULL OR smtp_security = ''"
+        )
+        conn.commit()
+        logging.getLogger(__name__).info(
+            "Migrated: smtp_security present and backfilled on email_accounts"
+        )
     except Exception as e:
         logging.getLogger(__name__).warning(f"smtp_security migration skipped: {e}")
     finally:
