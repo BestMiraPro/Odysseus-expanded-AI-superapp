@@ -70,6 +70,7 @@ async function jpost(path, body) {
   throw err;
 }
 function scheduleRetryFlush() { /* timers are driven explicitly in tests */ }
+function renderSubmissionStatus() { /* U05 status line; no DOM here */ }
 """
 
 

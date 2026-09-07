@@ -259,10 +259,12 @@ async function postDurably(kind, path, payload, keyPrefix, entityId, logicalId) 
   try {
     const result = await jpost(item.path, item.payload);
     removeRetryItem(item.id);
+    renderSubmissionStatus();
     scheduleRetryFlush();
     return result;
   } catch (err) {
     recordQueueFailure(item, err);
+    renderSubmissionStatus();
     scheduleRetryFlush();
     throw err;
   }
@@ -301,7 +303,62 @@ async function flushRetryQueue() {
   } finally {
     _retryFlushing = false;
   }
+  renderSubmissionStatus();
   if (loadRetryQueue().some(i => !i.permanent && !i.needs_auth)) scheduleRetryFlush(5000);
+}
+
+// ---------------------------------------------------------------------------
+// SUBMISSION STATUS
+// ---------------------------------------------------------------------------
+// Rating a card advances the session before the save completes, and retries
+// happen in the background, so without a persistent status a learner can
+// finish a session not knowing which answers reached the server. The queue
+// already holds the facts; this reports them in one line.
+function summariseSubmissionQueue() {
+  const q = loadRetryQueue();
+  return {
+    pending: q.filter(i => !i.permanent && !i.needs_auth).length,
+    attention: q.filter(i => i.permanent).length,
+    needsAuth: q.filter(i => i.needs_auth).length,
+    storageFailed: !queueStorageHealthy(),
+    paused: queueIsPaused(),
+  };
+}
+
+function submissionStatusText(s) {
+  // Ordered by what the learner can act on. A failed local write comes first
+  // because it is the one state where reloading can lose the answer.
+  if (s.storageFailed) {
+    return 'Answers could not be saved on this device — do not reload until they sync';
+  }
+  if (s.paused || s.needsAuth) return 'Sign in again to sync your answers';
+  if (s.attention) {
+    return s.attention === 1
+      ? '1 answer needs attention'
+      : `${s.attention} answers need attention`;
+  }
+  if (s.pending) {
+    return s.pending === 1
+      ? '1 answer waiting to sync'
+      : `${s.pending} answers waiting to sync`;
+  }
+  return 'All answers saved';
+}
+
+// Only touch the DOM when the message actually changes: a polite live region
+// that rewrites itself on every tick is announced on every tick.
+let _lastSubmissionStatus = null;
+
+function renderSubmissionStatus() {
+  const elStatus = _pane?.querySelector('#study-sync-status');
+  if (!elStatus) return;
+  const summary = summariseSubmissionQueue();
+  const text = submissionStatusText(summary);
+  if (text === _lastSubmissionStatus) return;
+  _lastSubmissionStatus = text;
+  const bad = summary.storageFailed || summary.attention || summary.paused;
+  elStatus.textContent = text;
+  elStatus.className = `study-sync-status${bad ? ' warn' : ''}`;
 }
 
 window.addEventListener('online', () => scheduleRetryFlush(250));
@@ -383,6 +440,8 @@ function injectStyles() {
 .study-title { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
 /* Scroll rather than wrap: nine tabs wrapping grows the header until the
    close control is pushed off a narrow screen. */
+.study-sync-status { font-size: 10.5px; opacity: 0.7; white-space: nowrap; }
+.study-sync-status.warn { color: var(--danger, #c0392b); opacity: 1; }
 /* Search hits are buttons so they are focusable and operable, but they should
    read as the rows they replaced. */
 .study-search-hit { display: flex; align-items: center; gap: 8px; width: 100%;
@@ -646,6 +705,7 @@ export function openPanel() {
         ${TABS.map(([k, label]) => `<button class="study-tab" data-tab="${k}" role="tab" id="study-tab-${k}" aria-controls="study-body" aria-selected="${_tab === k}" tabindex="${_tab === k ? 0 : -1}">${label}</button>`).join('')}
       </div>
       <span class="study-header-spacer"></span>
+      <span class="study-sync-status" id="study-sync-status" role="status" aria-live="polite"></span>
       <details id="study-options">
         <summary aria-label="Study options">Study options</summary>
         <span class="study-model-wrap study-options-body" id="study-model-wrap" title="Model used for extraction, grading and hints. 'Same as chat' falls back to the utility/default model.">
