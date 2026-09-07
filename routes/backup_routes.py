@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -21,7 +22,27 @@ _IMPORT_SECTIONS = (
 # Row fields the importer calls string methods on. A non-string here used to
 # raise AttributeError partway through the import.
 _MEMORY_STR_FIELDS = ("text", "owner")
-_SKILL_STR_FIELDS = ("title", "description", "name", "owner", "category")
+
+# The complete accepted shape for a skill row, grouped by what the store can
+# actually consume (services/memory/skills.py, add_skill).
+#
+# Scalar strings. 'id' is included because the importer tests it for set
+# membership (`sid in existing_ids`), which raises on an unhashable value.
+_SKILL_STR_FIELDS = (
+    "id", "title", "name", "description", "problem", "solution", "owner",
+    "category", "when_to_use", "teacher_model", "status", "version", "source",
+)
+# add_skill wraps each of these in list(). list(42) raises; list("biology")
+# does something worse — it silently yields seven single-character tags — so a
+# bare string is rejected rather than accepted as a one-element list.
+_SKILL_LIST_FIELDS = (
+    "tags", "steps", "procedure", "pitfalls", "verification",
+    "platforms", "requires_toolsets", "fallback_for_toolsets",
+)
+# add_skill calls float(confidence). Skills treat confidence as a 0..1 score
+# (the store's own defaults are 0.8 and 0.5), so anything outside that is a
+# corrupt export rather than a usable value.
+_CONFIDENCE_MIN, _CONFIDENCE_MAX = 0.0, 1.0
 
 
 def _reject(section: str, detail: str, index=None):
@@ -40,14 +61,56 @@ def _check_str_fields(row, fields, section, index):
         _reject(section, f"{field!r} must be a string, got {type(value).__name__}", index)
 
 
-def _check_rows(body, section, str_fields):
+def _check_list_of_str(row, fields, section, index):
+    for field in fields:
+        value = row.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            _reject(section, f"{field!r} must be a list of strings, not a string "
+                             f"(it would be split into characters)", index)
+        if not isinstance(value, list):
+            _reject(section, f"{field!r} must be a list of strings, "
+                             f"got {type(value).__name__}", index)
+        for position, item in enumerate(value):
+            if not isinstance(item, str):
+                _reject(section, f"{field!r}[{position}] must be a string, "
+                                 f"got {type(item).__name__}", index)
+
+
+def _check_confidence(row, section, index):
+    value = row.get("confidence")
+    if value is None:
+        return
+    # bool is an int subclass; True would silently become 1.0.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _reject(section, f"'confidence' must be a number, "
+                         f"got {type(value).__name__}", index)
+    if not math.isfinite(value):
+        _reject(section, "'confidence' must be a finite number", index)
+    if not (_CONFIDENCE_MIN <= value <= _CONFIDENCE_MAX):
+        _reject(section, f"'confidence' must be between {_CONFIDENCE_MIN} and "
+                         f"{_CONFIDENCE_MAX}, got {value}", index)
+
+
+def _check_memory_row(row, section, index):
+    _check_str_fields(row, _MEMORY_STR_FIELDS, section, index)
+
+
+def _check_skill_row(row, section, index):
+    _check_str_fields(row, _SKILL_STR_FIELDS, section, index)
+    _check_list_of_str(row, _SKILL_LIST_FIELDS, section, index)
+    _check_confidence(row, section, index)
+
+
+def _check_rows(body, section, check_row):
     rows = body[section]
     if not isinstance(rows, list):
         _reject(section, f"expected a list, got {type(rows).__name__}")
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             _reject(section, f"expected an object, got {type(row).__name__}", index)
-        _check_str_fields(row, str_fields, section, index)
+        check_row(row, section, index)
 
 
 def _check_str_keyed_object(body, section):
@@ -67,15 +130,16 @@ def _validate_import_payload(body: dict) -> None:
     a malformed file a no-op instead of a half-applied restore.
 
     Partial-import policy: once validation passes, sections are written in
-    ``_IMPORT_SECTIONS`` order. A failure after that point is an infrastructure
-    failure (unwritable store, full disk), not a payload problem; it is
-    reported with the sections that had already been applied so the operator
-    knows the restore is incomplete.
+    ``_IMPORT_SECTIONS`` order. A failure after that point is *usually*
+    infrastructure (unwritable store, full disk), but it can also mean this
+    validator missed a shape the store rejects — so the handler reports what
+    it observed rather than asserting a cause, and names the sections already
+    applied so the operator knows the restore is incomplete.
     """
     if "memories" in body:
-        _check_rows(body, "memories", _MEMORY_STR_FIELDS)
+        _check_rows(body, "memories", _check_memory_row)
     if "skills" in body:
-        _check_rows(body, "skills", _SKILL_STR_FIELDS)
+        _check_rows(body, "skills", _check_skill_row)
     if "presets" in body:
         _check_str_keyed_object(body, "presets")
         for key, value in body["presets"].items():
@@ -297,11 +361,13 @@ def setup_backup_routes(memory_manager, preset_manager, skills_manager) -> APIRo
         except HTTPException:
             raise
         except Exception as e:
-            # Validation already passed, so this is an infrastructure
-            # failure (unwritable store, full disk) rather than a bad
-            # payload. Sections apply to independent stores with no shared
-            # transaction, so name what landed: the restore is incomplete
-            # and the operator needs to know where it stopped.
+            # Validation passed, so this is most likely infrastructure (an
+            # unwritable store, a full disk) — but it can equally mean the
+            # validator missed a shape the store rejects, which is how the
+            # skill-field gaps went unnoticed. Don't assert a cause. Sections
+            # apply to independent stores with no shared transaction, so name
+            # what landed: the restore is incomplete and the operator needs to
+            # know where it stopped.
             logger.exception("Import failed after applying: %s", imported)
             done = ", ".join(imported) if imported else "nothing"
             raise HTTPException(
