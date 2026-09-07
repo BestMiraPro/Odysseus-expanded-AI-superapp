@@ -53,14 +53,17 @@ def extract_const(name: str, source: str | None = None) -> str:
     ``];`` or ``};`` sits in column 0.
     """
     src = source if source is not None else STUDY_JS.read_text(encoding="utf-8")
+    # Single-line form first: the multi-line pattern is non-greedy but would
+    # still run past a one-line declaration to the next `]`/`}` in column 0,
+    # swallowing everything between.
     match = re.search(
-        r"^const\s+" + re.escape(name) + r"\s*=\s*.*?^(?:\]|\})\s*;",
-        src,
-        re.DOTALL | re.MULTILINE,
+        r"^const\s+" + re.escape(name) + r"\s*=\s*[^\n]*;", src, re.MULTILINE
     )
     if not match:
         match = re.search(
-            r"^const\s+" + re.escape(name) + r"\s*=\s*[^\n]*;", src, re.MULTILINE
+            r"^const\s+" + re.escape(name) + r"\s*=\s*.*?^(?:\]|\})\s*;",
+            src,
+            re.DOTALL | re.MULTILINE,
         )
     if not match:
         raise AssertionError(f"{name} not found as a top-level const in study.js")

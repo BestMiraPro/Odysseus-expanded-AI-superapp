@@ -80,7 +80,13 @@ async function jfetch(path, opts = {}) {
   try { data = await res.json(); } catch { /* empty body */ }
   if (!res.ok) {
     const msg = (data && (data.detail || data.error)) || `Request failed (${res.status})`;
-    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    const err = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    // The durable queue needs the status to tell a permanent rejection from a
+    // transient one; without it every failure retried forever.
+    err.status = res.status;
+    const retryAfter = res.headers?.get?.('Retry-After');
+    if (retryAfter) err.retryAfter = retryAfter;
+    throw err;
   }
   return data;
 }
@@ -90,13 +96,54 @@ const jpost = (p, body) => jfetch(p, { method: 'POST', body: JSON.stringify(body
 const jput = (p, body) => jfetch(p, { method: 'PUT', body: JSON.stringify(body || {}) });
 const jdel = (p) => jfetch(p, { method: 'DELETE' });
 
-const RETRY_QUEUE_KEY = 'study:durable-posts:v1';
+// ---------------------------------------------------------------------------
+// DURABLE SUBMISSION QUEUE
+// ---------------------------------------------------------------------------
+// A Study answer is a logical submission: it has one identity and one
+// immutable payload, and every send of it — automatic or manual — carries the
+// same idempotency key so the server can deduplicate it. The queue that
+// carries submissions is scoped to an account and classifies failures, so a
+// permanent rejection stops instead of retrying forever and a queued item
+// never travels under another account's credentials.
+//
+// v1 was origin-wide and unscoped; those entries are deliberately not claimed
+// by whichever account signs in next.
+const RETRY_QUEUE_PREFIX = 'study:durable-posts:v2';
+// Auth-disabled deployments have no username. Use an explicit identity rather
+// than an empty string, so "single user" stays distinguishable from "unknown".
+const SINGLE_USER_QUEUE_OWNER = '__single_user__';
+
+// Server-provided account identity (the same value the backend uses as
+// `owner`). Never inferred from a display name.
+let _queueOwner = null;
+let _queueOwnerResolved = false;
+// Set when the server rejects with 401: dispatch stops until auth is restored,
+// so pending answers are not replayed as somebody else.
+let _queuePaused = false;
 let _retryTimer = null;
 let _retryFlushing = false;
+// Surfaced to the UI when localStorage refuses a write.
+let _queueStorageFailed = false;
+
+function queueStorageKey(owner) {
+  return `${RETRY_QUEUE_PREFIX}:${owner || SINGLE_USER_QUEUE_OWNER}`;
+}
+
+async function resolveQueueOwner(force = false) {
+  if (_queueOwnerResolved && !force) return _queueOwner;
+  try {
+    const status = await jget('/api/auth/status');
+    _queueOwner = (status && status.username) || SINGLE_USER_QUEUE_OWNER;
+  } catch {
+    _queueOwner = _queueOwner || SINGLE_USER_QUEUE_OWNER;
+  }
+  _queueOwnerResolved = true;
+  return _queueOwner;
+}
 
 function loadRetryQueue() {
   try {
-    const raw = localStorage.getItem(RETRY_QUEUE_KEY);
+    const raw = localStorage.getItem(queueStorageKey(_queueOwner));
     const parsed = raw ? JSON.parse(raw) : [];
     return Array.isArray(parsed) ? parsed : [];
   } catch {
@@ -104,14 +151,23 @@ function loadRetryQueue() {
   }
 }
 
+// Returns false when the write failed. Swallowing that means an answer the UI
+// called "saved for later" is gone on reload, so callers must surface it.
 function saveRetryQueue(queue) {
+  const key = queueStorageKey(_queueOwner);
   try {
-    if (queue.length) localStorage.setItem(RETRY_QUEUE_KEY, JSON.stringify(queue));
-    else localStorage.removeItem(RETRY_QUEUE_KEY);
+    if (queue.length) localStorage.setItem(key, JSON.stringify(queue));
+    else localStorage.removeItem(key);
+    _queueStorageFailed = false;
+    return true;
   } catch {
-    /* best effort */
+    _queueStorageFailed = true;
+    return false;
   }
 }
+
+function queueStorageHealthy() { return !_queueStorageFailed; }
+function queueIsPaused() { return _queuePaused; }
 
 function makeIdempotencyKey(prefix, entityId) {
   const nonce = crypto?.randomUUID ? crypto.randomUUID()
@@ -123,49 +179,90 @@ function retryDelayMs(attempts) {
   return Math.min(60000, 1000 * (2 ** Math.min(attempts, 6)));
 }
 
-function enqueueDurablePost(kind, path, payload, keyPrefix, entityId) {
+// Statuses that will never succeed on replay. Retrying them forever hides a
+// real problem behind an endless spinner.
+const PERMANENT_QUEUE_STATUSES = new Set([400, 403, 404, 405, 409, 410, 413, 422]);
+
+function classifyQueueError(err) {
+  const status = (err && err.status) || 0;
+  if (status === 401) return 'auth';
+  if (PERMANENT_QUEUE_STATUSES.has(status)) return 'permanent';
+  return 'retryable';   // 0 (network/offline), 408, 429, 5xx
+}
+
+// Start — or recover — the queue entry for one logical submission.
+// Reusing the existing entry is what makes a manual retry idempotent: same
+// key, same payload snapshot. logicalId identifies the user's attempt, not the
+// request, so a genuine later attempt must pass a new one.
+function beginDurablePost(kind, path, payload, keyPrefix, entityId, logicalId) {
+  const queue = loadRetryQueue();
+  if (logicalId) {
+    const existing = queue.find(item => item.logical_id === logicalId);
+    if (existing) return existing;
+  }
   const idempotencyKey = makeIdempotencyKey(keyPrefix, entityId);
   const item = {
     id: idempotencyKey,
+    logical_id: logicalId || idempotencyKey,
+    entity_id: String(entityId),
     kind,
     path,
+    // Frozen at first send: a retry replays the attempt that was made.
     payload: { ...(payload || {}), idempotency_key: idempotencyKey },
     attempts: 0,
     next_try: 0,
     created_at: Date.now(),
   };
-  const queue = loadRetryQueue();
   queue.push(item);
   saveRetryQueue(queue);
   return item;
 }
 
 function removeRetryItem(id) {
-  saveRetryQueue(loadRetryQueue().filter(item => item.id !== id));
+  return saveRetryQueue(loadRetryQueue().filter(item => item.id !== id));
 }
 
 function updateRetryItem(id, patch) {
   const queue = loadRetryQueue();
   const item = queue.find(x => x.id === id);
-  if (!item) return;
+  if (!item) return false;
   Object.assign(item, patch);
-  saveRetryQueue(queue);
+  return saveRetryQueue(queue);
 }
 
-async function postDurably(kind, path, payload, keyPrefix, entityId) {
-  const item = enqueueDurablePost(kind, path, payload, keyPrefix, entityId);
+function recordQueueFailure(item, err) {
+  const kind = classifyQueueError(err);
+  if (kind === 'auth') {
+    _queuePaused = true;
+    updateRetryItem(item.id, { last_error: err.message, needs_auth: true });
+    return kind;
+  }
+  if (kind === 'permanent') {
+    // Keep it visible and stop: replaying will not change the answer.
+    updateRetryItem(item.id, {
+      permanent: true, last_error: err.message, last_status: err.status || 0,
+    });
+    return kind;
+  }
+  const attempts = (item.attempts || 0) + 1;
+  const after = err && err.retryAfter
+    ? Number(err.retryAfter) * 1000
+    : retryDelayMs(attempts);
+  updateRetryItem(item.id, {
+    attempts, next_try: Date.now() + after, last_error: err.message,
+  });
+  return kind;
+}
+
+async function postDurably(kind, path, payload, keyPrefix, entityId, logicalId) {
+  const item = beginDurablePost(kind, path, payload, keyPrefix, entityId, logicalId);
   try {
     const result = await jpost(item.path, item.payload);
     removeRetryItem(item.id);
     scheduleRetryFlush();
     return result;
   } catch (err) {
-    const attempts = item.attempts + 1;
-    updateRetryItem(item.id, {
-      attempts,
-      next_try: Date.now() + retryDelayMs(attempts),
-      last_error: err.message,
-    });
+    recordQueueFailure(item, err);
     scheduleRetryFlush();
     throw err;
   }
@@ -180,32 +277,41 @@ function scheduleRetryFlush(delay = 1500) {
 }
 
 async function flushRetryQueue() {
-  if (_retryFlushing || navigator.onLine === false) return;
+  if (_retryFlushing || _queuePaused || navigator.onLine === false) return;
   _retryFlushing = true;
   try {
     const now = Date.now();
-    const due = loadRetryQueue().filter(item => !item.next_try || item.next_try <= now);
-    for (const item of due) {
+    const queue = loadRetryQueue();
+    // Ordering matters per entity: an older rating for a card must not be
+    // applied after a newer one, so once an entity fails or is waiting, later
+    // items for that entity wait for the next pass too.
+    const blocked = new Set();
+    for (const item of queue) {
+      if (item.permanent || item.needs_auth) { blocked.add(item.entity_id); continue; }
+      if (item.next_try && item.next_try > now) { blocked.add(item.entity_id); continue; }
+      if (blocked.has(item.entity_id)) continue;
       try {
         await jpost(item.path, item.payload);
         removeRetryItem(item.id);
       } catch (err) {
-        const attempts = (item.attempts || 0) + 1;
-        updateRetryItem(item.id, {
-          attempts,
-          next_try: Date.now() + retryDelayMs(attempts),
-          last_error: err.message,
-        });
+        if (recordQueueFailure(item, err) === 'auth') break;
+        blocked.add(item.entity_id);
       }
     }
   } finally {
     _retryFlushing = false;
   }
-  if (loadRetryQueue().length) scheduleRetryFlush(5000);
+  if (loadRetryQueue().some(i => !i.permanent && !i.needs_auth)) scheduleRetryFlush(5000);
 }
 
 window.addEventListener('online', () => scheduleRetryFlush(250));
-scheduleRetryFlush(1000);
+
+// Resolve the account before any dispatch. The previous code scheduled a flush
+// at import time, so pending items could be posted under whichever session
+// happened to be signed in.
+resolveQueueOwner()
+  .then(() => scheduleRetryFlush(1000))
+  .catch(() => { /* dispatch stays idle until an owner is known */ });
 
 function toast(msg, isError = false) {
   const t = document.createElement('div');
@@ -2129,6 +2235,9 @@ async function rateCard(rating) {
       { rating, duration_ms: duration },
       'rv',
       card.id,
+      // Each rating is its own logical submission; the counter separates
+      // successive ratings of a card that returns via the relearning queue.
+      `sub-rv:${card.id}:${r.submissions = (r.submissions || 0) + 1}`,
     );
   } catch (e) { toast(`Review not saved: ${e.message}`, true); }
 }
@@ -2645,6 +2754,8 @@ async function renderPractice() {
     }
     const btn = el.querySelector('#study-prac-submit');
     btn.disabled = true; btn.textContent = isMcq ? 'Checking…' : 'Grading…';
+    // One identity for this attempt, minted once and reused by every retry.
+    if (!p.submissionId) p.submissionId = makeIdempotencyKey('sub-att', q.id);
     try {
       p.result = await postDurably(
         'attempt',
@@ -2659,6 +2770,7 @@ async function renderPractice() {
         },
         'att',
         q.id,
+        p.submissionId,
       );
       p.log.push({ q, result: p.result, confidence: p.confidence, hints: p.hints.length });
       // Closed book: the marking is graded server-side but stays hidden until
@@ -2699,6 +2811,10 @@ function advancePractice() {
   const p = S.practice;
   p.idx += 1;
   p.result = null; p.choice = null; p.confidence = null; p.emptyArmed = false;
+  // Moving to the next question is the deliberate transition that starts a new
+  // logical attempt; until then every send — automatic retry or a second click
+  // on Check answer — reuses one identity and one idempotency key.
+  p.submissionId = null;
   p.hints = []; p.answerDraft = ''; p.explainText = null;
   p.consulted = false; p.consult = null; p.consultBusy = false;
   p.prereqs = null; p.prereqsFor = null; p.prereqsBusy = false;
@@ -3238,6 +3354,7 @@ async function finishFocus(completed) {
       { actual_min: actual, completed },
       'ff',
       f.id,
+      `sub-ff:${f.id}`,   // a session is finished once
     );
     if (completed) toast(`Focus session logged: ${actual} min`);
   } catch (e) { toast(e.message, true); }
