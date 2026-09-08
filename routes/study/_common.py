@@ -435,6 +435,33 @@ def _study_text_model(owner: Optional[str]) -> str:
         return ""
 
 
+def study_model_info(owner: Optional[str]) -> dict:
+    """Describe which model Study's AI passes will actually use.
+
+    The model is not fixed: _resolve_study_model tries the Study endpoint, then
+    utility, then default. Nothing surfaced which tier answered, so a pass that
+    quietly fell back to utility looked like a hardcoded model the user could
+    not choose. This reports the resolution, including its source, so the UI
+    can say what will run.
+
+    Deliberately returns no URL and no headers — headers carry API keys.
+    """
+    from src.endpoint_resolver import resolve_endpoint
+
+    for source in ("study", "utility", "default"):
+        try:
+            url, model, _headers = resolve_endpoint(source, owner=owner or None)
+        except Exception:
+            continue
+        if url and model:
+            info = {"configured": True, "source": source, "model": model,
+                    "text_model": None}
+            if source == "study":
+                info["text_model"] = _study_text_model(owner) or None
+            return info
+    return {"configured": False, "source": None, "model": None, "text_model": None}
+
+
 def _resolve_study_model(owner: Optional[str], *, prefer_text: bool = False):
     """Resolve (url, model, headers) for a Study LLM call.
 

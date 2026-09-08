@@ -437,6 +437,15 @@ function injectStyles() {
      anything shrinkable collapses onto row 1 and shows two characters. */
   .study-tabs { order: 4; flex: 0 0 100%; min-width: 0; margin-left: 0; }
 }
+.study-tidy-flash { border-radius: 8px; animation: study-tidy-flash 1.6s ease-out 1; }
+@keyframes study-tidy-flash {
+  0%, 100% { box-shadow: 0 0 0 0 transparent; }
+  15%, 60% { box-shadow: 0 0 0 3px rgba(128, 128, 128, 0.35); }
+}
+@media (prefers-reduced-motion: reduce) {
+  /* Still mark it, just without the pulse. */
+  .study-tidy-flash { animation: none; box-shadow: 0 0 0 3px rgba(128, 128, 128, 0.35); }
+}
 #study-options { position: relative; flex-shrink: 0; }
 /* The header is a flex row and the tab strip is the flexible part, so
    the disclosure must keep its intrinsic width. Without this it was
@@ -2257,6 +2266,35 @@ const TIDY_ACTIONS = [
     path: 'reformat', report: r => `${r.questions_reformatted} question(s), ${r.cards_reformatted} card(s)` },
 ];
 
+// Take the user from the practice picker to the grouping controls.
+//
+// The picker's empty state used to name "Detect chapters"/"Group themes" and
+// leave you to find them: Tidy bank is a small button among the question-bank
+// filters on another screen. Naming a control you cannot reach is not an
+// instruction, so the sentence now carries the button, and the button lands
+// you on an expanded, visible panel.
+function openTidyBankForGrouping() {
+  const s = S.subject;
+  if (!s) return;
+  S.practice = null;          // leave the picker
+  s.tidyOpen = true;
+  renderSubjectDetail();
+  renderTidyBank();
+  // Render first, then reveal: the panel does not exist until the subject view
+  // has drawn.
+  setTimeout(() => {
+    const panel = body()?.querySelector('#study-tidy');
+    if (!panel) return;
+    panel.hidden = false;
+    try { panel.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+    catch { panel.scrollIntoView(); }
+    // A brief flash: on a short window the panel opens below the fold, and an
+    // expanded-but-unnoticed panel is the same dead end in a new place.
+    panel.classList.add('study-tidy-flash');
+    setTimeout(() => panel.classList.remove('study-tidy-flash'), 1600);
+  }, 0);
+}
+
 function renderTidyBank() {
   const box = body()?.querySelector('#study-tidy');
   const s = S.subject;
@@ -2786,11 +2824,34 @@ async function renderPracticePicker(deckId) {
         <div class="study-subtle" style="margin-bottom:8px;">One document, in its own order.</div>${chapterRows}` : ''}
       ${themeRows ? `<div class="study-section-title" style="margin-top:22px;">By theme</div>
         <div class="study-subtle" style="margin-bottom:8px;">One idea, across every document in this subject.</div>${themeRows}` : ''}
-      ${!chapterRows && !themeRows ? `<div class="study-subtle" style="margin-top:18px;">
-        Nothing grouped yet \u2014 run \u201cDetect chapters\u201d or \u201cGroup themes\u201d from Tidy bank in the subject view.</div>` : ''}
+      ${!chapterRows && !themeRows ? `<div style="margin-top:18px;">
+        <div class="study-subtle" style="margin-bottom:8px;">
+          Nothing grouped yet. Grouping splits this bank into chapters and
+          themes so you can practise one at a time — an AI pass over the
+          questions you have already extracted.</div>
+        <button class="study-btn primary" id="study-pick-group">Group this bank…</button>
+        <span class="study-subtle" id="study-pick-model" style="margin-left:8px;"></span>
+      </div>` : ''}
     </div>`;
 
   el.querySelector('#study-pick-back').addEventListener('click', () => { S.practice = null; renderPractice(); });
+  el.querySelector('#study-pick-group')?.addEventListener('click', openTidyBankForGrouping);
+  // Say which model the pass will run on. The model is not fixed — Study
+  // falls back to the utility then the default endpoint — and never
+  // showing the resolution is what made it look hardcoded.
+  const modelOut = el.querySelector('#study-pick-model');
+  if (modelOut) {
+    jget('/api/study/model').then(info => {
+      if (!info) return;
+      if (!info.configured) {
+        modelOut.textContent = 'no AI model configured — add one in Settings → Services';
+        return;
+      }
+      modelOut.textContent = info.source === 'study'
+        ? `using ${info.model}`
+        : `using ${info.model} (${info.source} model — pick a Study model in the header)`;
+    }).catch(() => {});
+  }
   el.querySelector('#study-pick-all').addEventListener('click', () => startPractice(deckId));
   el.querySelectorAll('[data-chapter]').forEach(b => b.addEventListener('click', () =>
     startPractice(deckId, 12, { chapter: b.dataset.chapter, label: b.dataset.chapter })));

@@ -394,6 +394,11 @@ def groupings_payload(user, deck_id: str) -> Dict:
 def register(router: APIRouter) -> None:
     # ------------------------------------------------------------------ overview + stats
 
+    @router.get("/model")
+    def study_model(request: Request):
+        """Which model the Study AI passes will use, and where it came from."""
+        return _common.study_model_info(_owner(request))
+
     @router.get("/overview")
     def overview(request: Request):
         """Dashboard payload: per-subject due/new counts, today's retrievals, streak,"""
