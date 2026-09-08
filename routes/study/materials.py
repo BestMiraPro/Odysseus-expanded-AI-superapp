@@ -73,6 +73,9 @@ def create_material_record(user, deck_id: str, *, name=None, text=None,
         db.close()
 
 
+from routes.study.maintenance import run_cluster_themes, run_detect_chapters
+
+
 async def run_extraction(user, material_id: str, *, mode: str = "extract",
                          types=None, count: int = 15, vision=None) -> Dict:
     """AI question extraction: material -> saved question bank items.
@@ -354,15 +357,62 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
     finally:
         db.close()
 
-    # Auto-link multi-part problems for this material so practice immediately
-    # shows earlier parts + answers as context. Best-effort — an extraction
-    # must never fail because grouping did.
-    if created_n:
-        try:
-            await _common._link_deck_parts(user, deck_id, only_material=material_id)
-        except Exception as e:
-            logger.warning("study: auto link-parts after extraction failed: %s", e)
+    resp["grouping"] = await _post_extraction_passes(
+        user, deck_id, material_id, created_n)
     return resp
+
+
+def _auto_group_enabled(user) -> bool:
+    """Whether extraction should group the bank as well as fill it.
+
+    On by default: a bank you cannot practise by chapter or theme is the
+    reason the practice picker used to sit on "Nothing grouped yet". The
+    passes cost model calls and time, so ``study_auto_group`` turns them off
+    for anyone who wants extraction to stay fast.
+    """
+    raw = (_common._read_pref(user, "study_auto_group") or "").strip().lower()
+    return raw not in ("0", "false", "off", "no")
+
+
+async def _post_extraction_passes(user, deck_id, material_id, created_n) -> Dict:
+    """Best-effort passes that run after questions are saved.
+
+    Every pass here is optional: an extraction that produced questions must
+    never be reported as a failure because a follow-up pass could not run.
+    Each outcome is returned so the caller can say what happened instead of
+    silently swallowing it.
+    """
+    report: Dict = {}
+    if not created_n:
+        report["skipped"] = "nothing extracted"
+        return report
+
+    # Multi-part problems first, so practice shows earlier parts as context.
+    try:
+        await _common._link_deck_parts(user, deck_id, only_material=material_id)
+        report["link_parts"] = "ok"
+    except Exception as e:
+        logger.warning("study: auto link-parts after extraction failed: %s", e)
+        report["link_parts"] = f"failed: {e}"
+
+    if not _auto_group_enabled(user):
+        report["skipped"] = "study_auto_group is off"
+        return report
+
+    # Chapters belong to the document just extracted; themes span the subject,
+    # so new questions have to be clustered against the whole deck. Each is
+    # guarded separately — one failing must not cancel the other.
+    try:
+        report["chapters"] = await run_detect_chapters(user, material_id)
+    except Exception as e:
+        logger.warning("study: auto detect-chapters after extraction failed: %s", e)
+        report["chapters"] = f"failed: {e}"
+    try:
+        report["themes"] = await run_cluster_themes(user, deck_id)
+    except Exception as e:
+        logger.warning("study: auto group-themes after extraction failed: %s", e)
+        report["themes"] = f"failed: {e}"
+    return report
 
 
 async def run_transcribe_material(user, material_id: str) -> Dict:
