@@ -568,6 +568,69 @@ async function initUtilityModel() {
   });
 }
 
+/* ── Study Model ── */
+// The Study panel resolves study -> utility -> default, so leaving this unset
+// is a valid choice, not a broken one. It has its own picker in the Study
+// header; this card is the same three settings in the place users look for
+// model configuration, and both write the same keys.
+async function initStudyModel() {
+  var epSel = el('set-studyEpSelect');
+  var modelSel = el('set-studyModelSelect');
+  var textSel = el('set-studyTextModelSelect');
+  var msg = el('set-studyModelMsg');
+  if (!epSel || !modelSel) return;
+  var _endpoints = [];
+  if (epSel.options[0]) epSel.options[0].textContent = 'Same as utility';
+  if (modelSel.options[0]) modelSel.options[0].textContent = 'Same as utility';
+
+  try {
+    _endpoints = await _fetchModelEndpoints();
+    _fillEndpointSelect(epSel, _endpoints, epSel.value, true);
+  } catch (e) { console.warn('Failed to load endpoints for study model', e); }
+
+  // Both model lists come off the *same* endpoint: study_text_model overrides
+  // only the model id, never the endpoint or its credentials.
+  function refreshModels(selectedModel, selectedText) {
+    var ep = _endpoints.find(function(e) { return e.id === epSel.value; });
+    var models = ep ? ep.models : [];
+    _fillModelSelect(modelSel, models, selectedModel, true);
+    _fillModelSelect(textSel, models, selectedText, true);
+    modelSel.disabled = false;
+    textSel.disabled = !epSel.value;
+  }
+
+  try {
+    var res = await fetch('/api/auth/settings', { credentials: 'same-origin' });
+    var settings = await res.json();
+    if (settings.study_endpoint_id) epSel.value = settings.study_endpoint_id;
+    refreshModels(settings.study_model || '', settings.study_text_model || '');
+  } catch (e) { console.warn('Failed to load study model settings', e); }
+
+  async function saveStudy() {
+    try {
+      await _postSettings({
+        study_endpoint_id: epSel.value || '',
+        study_model: modelSel.value || '',
+        study_text_model: textSel ? (textSel.value || '') : '',
+      });
+      msg.textContent = 'Saved'; msg.style.color = 'var(--fg)';
+      setTimeout(function() { msg.textContent = ''; }, 1500);
+    } catch (e) { msg.textContent = 'Failed to save'; msg.style.color = 'var(--red)'; }
+  }
+
+  // Changing the endpoint invalidates both model ids: they name models on the
+  // endpoint that is going away.
+  epSel.addEventListener('change', function() { refreshModels('', ''); saveStudy(); });
+  modelSel.addEventListener('change', saveStudy);
+  textSel?.addEventListener('change', saveStudy);
+
+  _registerAiEndpointRefresh(function(endpoints) {
+    _endpoints = endpoints;
+    _fillEndpointSelect(epSel, _endpoints, epSel.value, true);
+    refreshModels(modelSel.value, textSel ? textSel.value : '');
+  });
+}
+
 /* ── Teacher Model ── */
 // SOTA model called automatically when a self-hosted student model
 // fails an agent-mode task. Stored as a single `teacher_model` string
@@ -2277,6 +2340,7 @@ function initAll() {
   initDefaultChat();
   initTeacherModel();
   initUtilityModel();
+  initStudyModel();
   initImageSettings();
   initVisionSettings();
   initTtsSettings();

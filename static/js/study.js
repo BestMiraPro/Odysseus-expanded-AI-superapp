@@ -412,7 +412,7 @@ function injectStyles() {
 .study-model-status.ok { color: var(--ok, #2e7d32); }
 .study-model-retry { margin-left: 4px; font-size: 10.5px; padding: 1px 6px; cursor: pointer;
   background: none; color: inherit; border: 1px solid currentColor; border-radius: 5px; }
-.study-model-wrap select { max-width: 150px; font-size: 10.5px; padding: 3px 5px;
+.study-model-wrap select { width: 100%; max-width: 100%; font-size: 10.5px; padding: 3px 5px;
   background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; }
 /* The model control is never hidden: hiding it removes the capability rather
    than relocating it. On narrow screens it lives inside the Study options
@@ -446,27 +446,45 @@ function injectStyles() {
   /* Still mark it, just without the pulse. */
   .study-tidy-flash { animation: none; box-shadow: 0 0 0 3px rgba(128, 128, 128, 0.35); }
 }
-#study-options { position: relative; flex-shrink: 0; }
+/* style.css styles EVERY <details> in the app for the inline research and
+   agent-tool disclosures: a background, a border, margin: 12px 0, an
+   overflow: hidden, and a detail-reveal animation on the open content.
+   All of that is wrong for a header popover, and overflow:hidden is fatal —
+   it clips the absolutely-positioned body to the summary's own ~107x25 box,
+   so the disclosure opened onto nothing at every width. Opt out explicitly;
+   this sheet is appended after style.css, so these win. */
+#study-options { position: relative; flex-shrink: 0; overflow: visible;
+  background: none; border: none; border-radius: 0; margin: 0; padding: 0;
+  transition: none; }
+#study-options[open] { background: none; }
+#study-options[open] > :not(summary) { animation: none; }
 /* The header is a flex row and the tab strip is the flexible part, so
    the disclosure must keep its intrinsic width. Without this it was
    squeezed from 109px to 24px at 360px and the label vanished,
    leaving an unlabelled marker. */
+/* The summary is the ONLY way into the disclosure, so it is never hidden.
+   It used to be display:none above 900px, on the theory that the controls
+   would sit inline there — but a closed <details> hides everything that is not
+   its summary, so hiding the summary on a wide screen hid the model picker
+   entirely and left an unlabelled stub in the header. That is what made the
+   model look hardcoded: it was choosable, just not reachable. One behaviour at
+   every width now, and the label names the model that will actually run. */
 #study-options > summary { list-style: none; cursor: pointer; font-size: 11px;
   opacity: 0.72; padding: 4px 8px; border: 1px solid var(--border);
-  border-radius: 6px; white-space: nowrap; }
+  border-bottom: 1px solid var(--border); background: none;
+  border-radius: 6px; white-space: nowrap; max-width: 210px; overflow: hidden;
+  text-overflow: ellipsis; }
 #study-options > summary::-webkit-details-marker { display: none; }
-#study-options[open] > summary { opacity: 1; }
+#study-options > summary:hover, #study-options[open] > summary { opacity: 1; }
 #study-options > .study-options-body { position: absolute; right: 0; top: 100%;
-  z-index: 5; margin-top: 4px; padding: 8px; display: flex; flex-direction: column;
-  gap: 6px; background: var(--bg); border: 1px solid var(--border);
+  z-index: 5; margin-top: 4px; padding: 10px; min-width: 230px; display: flex;
+  flex-direction: column; align-items: stretch;
+  gap: 4px; background: var(--bg); border: 1px solid var(--border);
   border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.18); }
-@media (min-width: 901px) {
-  /* Wide: no disclosure, the controls sit inline in the header as before. */
-  #study-options > summary { display: none; }
-  #study-options > .study-options-body { position: static; margin: 0; padding: 0;
-    flex-direction: row; align-items: center; background: none; border: none;
-    box-shadow: none; }
-}
+.study-model-label { font-size: 10.5px; opacity: 0.6; }
+.study-model-label + select { margin-bottom: 4px; }
+.study-model-note { font-size: 10.5px; opacity: 0.6; line-height: 1.45;
+  white-space: normal; }
 @media (max-width: 768px) { .study-pane { inset: 0; border-radius: 0; } }
 .study-header { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
   border-bottom: 1px solid var(--border); flex-shrink: 0; }
@@ -740,12 +758,15 @@ export function openPanel() {
       <span class="study-header-spacer"></span>
       <span class="study-sync-status" id="study-sync-status" role="status" aria-live="polite"></span>
       <details id="study-options">
-        <summary aria-label="Study options">Study options</summary>
-        <span class="study-model-wrap study-options-body" id="study-model-wrap" title="Model used for extraction, grading and hints. 'Same as chat' falls back to the utility/default model.">
-          <select id="study-ep-select" aria-label="Study model endpoint"><option value="">Same as chat</option></select>
+        <summary id="study-options-summary" aria-label="Study options — choose the model">Study options</summary>
+        <div class="study-model-wrap study-options-body" id="study-model-wrap" title="Model used for extraction, grouping, grading and hints. 'Same as utility' falls back to the utility/default model.">
+          <label class="study-model-label" for="study-ep-select">Endpoint</label>
+          <select id="study-ep-select" aria-label="Study model endpoint"><option value="">Same as utility</option></select>
+          <label class="study-model-label" for="study-model-select">Model</label>
           <select id="study-model-select" aria-label="Study model"><option value="">model…</option></select>
           <span class="study-model-status" id="study-model-status" role="status"></span>
-        </span>
+          <span class="study-model-note" id="study-model-note"></span>
+        </div>
       </details>
       <button class="study-x" id="study-min-btn" title="Minimize" aria-label="Minimize Study">–</button>
       <button class="study-x" id="study-close-btn" title="Close (Esc)" aria-label="Close Study">✕</button>
@@ -935,10 +956,47 @@ function setModelStatus(kind, text, onRetry) {
   el.setAttribute('role', kind === 'error' ? 'alert' : 'status');
 }
 
+// Put the answer to "which model is this running on?" on the closed
+// disclosure, so it is readable without opening anything.
+//
+// Study resolves study -> utility -> default, and a pass that quietly landed
+// on the utility tier looked identical to a hardcoded model. The label names
+// the model; the note inside names the tier it came from.
+async function refreshStudyModelSummary(fetchImpl = fetch) {
+  const label = _pane?.querySelector('#study-options-summary');
+  const note = _pane?.querySelector('#study-model-note');
+  if (!label) return null;
+  let info = null;
+  try { info = await fetchStudyJson('/api/study/model', fetchImpl); }
+  catch { /* offline or unauthenticated — keep the generic label */ }
+  if (!info) {
+    label.textContent = 'Study options';
+    label.title = 'Choose the model Study uses.';
+    return null;
+  }
+  if (!info.configured) {
+    label.textContent = 'Model: none';
+    label.title = 'No AI model is configured, so extraction, grouping and grading cannot run.';
+    if (note) note.textContent = 'No model configured — add one in Settings → Services.';
+    return info;
+  }
+  label.textContent = `Model: ${info.model}`;
+  label.title = info.source === 'study'
+    ? `Study runs on ${info.model}.`
+    : `Study has no model of its own, so it runs on your ${info.source} model (${info.model}). Choose one here to change that.`;
+  if (note) {
+    note.textContent = info.source === 'study'
+      ? 'Used for extraction, grouping, grading and hints.'
+      : `Unset — currently borrowing your ${info.source} model.`;
+  }
+  return info;
+}
+
 async function initModelSelector() {
   const epSel = _pane?.querySelector('#study-ep-select');
   const mSel = _pane?.querySelector('#study-model-select');
   if (!epSel || !mSel) return;
+  refreshStudyModelSummary();
   try {
     const [eps, settings] = await Promise.all([
       fetchStudyJson('/api/model-endpoints'),
@@ -949,7 +1007,7 @@ async function initModelSelector() {
       endpointId: settings.study_endpoint_id || '',
       model: settings.study_model || '',
     };
-    epSel.innerHTML = '<option value="">Same as chat</option>' + _endpoints.map(ep =>
+    epSel.innerHTML = '<option value="">Same as utility</option>' + _endpoints.map(ep =>
       `<option value="${esc(ep.id)}">${esc(ep.name)}${ep.online === false ? ' (offline)' : ''}</option>`).join('');
     epSel.value = settings.study_endpoint_id || '';
     fillStudyModels(settings.study_model || '');
@@ -964,7 +1022,8 @@ async function initModelSelector() {
     const result = await queueStudyModelSave(desired);
     if (result.coalesced) return;      // a later change owns the outcome
     if (result.ok) {
-      setModelStatus('ok', desired.endpointId ? 'Saved' : 'Same as chat');
+      setModelStatus('ok', desired.endpointId ? 'Saved' : 'Same as utility');
+      refreshStudyModelSummary();   // the header label must not lag the choice
       return;
     }
     // Announce nothing as saved: the server refused, and the last confirmed
@@ -2848,8 +2907,8 @@ async function renderPracticePicker(deckId) {
         return;
       }
       modelOut.textContent = info.source === 'study'
-        ? `using ${info.model}`
-        : `using ${info.model} (${info.source} model — pick a Study model in the header)`;
+        ? `using ${info.model} — change it under Study options, top right`
+        : `using ${info.model}, borrowed from your ${info.source} model — pick a Study model under Study options, top right`;
     }).catch(() => {});
   }
   el.querySelector('#study-pick-all').addEventListener('click', () => startPractice(deckId));
@@ -2935,6 +2994,8 @@ async function renderPractice() {
         <span style="flex:1;"></span>
         ${p.mock ? `<span class="study-qchip" id="study-mock-clock" title="Time left in this mock">${fmtClock(mockRemainingSec())}</span>` : ''}
         <span class="study-subtle">${p.idx + 1}/${p.queue.length}</span>
+        <button class="study-btn small" id="study-prac-exit"
+          title="Leave this session. Questions you have already checked are saved.">Exit</button>
       </div>
       ${prereqs.length ? `<div class="study-prereq">
         <div class="study-prereq-title">Earlier in this problem</div>
@@ -3103,6 +3164,16 @@ async function renderPractice() {
     renderPractice();
   });
 
+  // Leaving mid-question. Only an unsubmitted draft can be lost, so only that
+  // asks twice — arming the button rather than window.confirm(), which
+  // browsers can suppress after a few dialogs.
+  el.querySelector('#study-prac-exit')?.addEventListener('click', (ev) => {
+    const btn = ev.currentTarget;
+    const unsaved = !p.result && !isMcq && (p.answerDraft || '').trim();
+    if (unsaved) { armThen(btn, exitPractice, 'Discard answer?'); return; }
+    exitPractice();
+  });
+
   el.querySelector('#study-prac-consult')?.addEventListener('click', () => {
     consultAction(q, !p.result);  // penalize only before the answer is submitted
   });
@@ -3180,6 +3251,25 @@ async function renderPractice() {
     }
     advancePractice();
   });
+}
+
+// Leave a practice session from inside a question.
+//
+// There was no way out short of answering or skipping to the end of the queue,
+// or closing the whole Study panel — which loses the recap and looks like
+// losing the work. Nothing is actually at risk: each answer is written server
+// side as it is checked. What only exists in the client is the session recap,
+// so if anything was answered we land on it instead of dropping it.
+function exitPractice() {
+  const p = S.practice;
+  if (!p) return;
+  stopMockTimer();
+  // A mock is unmarked until you commit to a prediction; ending one early is
+  // already a defined path, so exiting takes it rather than binning the paper.
+  if (p.mock) { p.mock.phase = 'predict'; renderPractice(); return; }
+  if ((p.log || []).some(l => l.result)) { renderPracticeSummary(); return; }
+  S.practice = null;            // nothing answered — straight back to the list
+  renderPractice();
 }
 
 function advancePractice() {
