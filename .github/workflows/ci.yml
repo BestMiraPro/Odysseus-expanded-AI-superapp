@@ -177,12 +177,23 @@ jobs:
           fi
       - run: mkdir -p data  # sqlite DB lives at ./data/app.db
         if: steps.docs-check.outputs.docs_only != 'true'
-      - run: python -m pytest -q
+      - name: Run tests
         if: steps.docs-check.outputs.docs_only != 'true'
+        run: |
+          set -o pipefail
+          python -m pytest -q -rf | tee pytest-output.txt
         env:
           # Exercises the dialect-aware schema reconciliation against a real
           # server; without this the PostgreSQL parity cases skip.
           TEST_POSTGRES_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/postgres
+      # See the windows-tests lane: annotations are readable without repository
+      # access, so the failing test ids belong there and not only in the log.
+      - name: Surface failing tests as annotations
+        if: failure() && steps.docs-check.outputs.docs_only != 'true'
+        run: |
+          grep -E '^(FAILED|ERROR) ' pytest-output.txt | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
 
   windows-tests:
     name: Python tests (Windows, py3.14)
@@ -208,7 +219,22 @@ jobs:
         run: choco install ripgrep -y --no-progress
       - run: mkdir data
       - name: Run tests
-        run: python -m pytest -q
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q -rf | tee pytest-output.txt
+      # Reading a job's log needs access to the repository; check annotations
+      # are public. Without this a failure on this lane reports only "Process
+      # completed with exit code 1" — enough to know it is red, not enough to
+      # know why, which is exactly the position a contributor looking at a
+      # failed run on their own fork is in.
+      - name: Surface failing tests as annotations
+        if: failure()
+        shell: bash
+        run: |
+          grep -E '^(FAILED|ERROR) ' pytest-output.txt | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
 
   lock-installs-on-runtime:
     name: Lock installs on the shipped runtime
@@ -255,5 +281,11 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.14"
+      # The checker parses PEP 508 requirements and evaluates their environment
+      # markers, so it needs `packaging`. A setup-python runner ships neither it
+      # nor anything that re-exports it, so without this the job died on the
+      # import — never once reaching the check it exists to run.
+      - name: Install the checker's own dependency
+        run: python -m pip install --disable-pip-version-check "packaging>=24"
       - name: Every runtime requirement appears in the lock
         run: python .github/scripts/check_lock_covers_requirements.py

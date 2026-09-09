@@ -50,6 +50,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: Normalise the image name
+        # OCI reference names must be lowercase, but `github.repository` keeps
+        # the owner/repo casing exactly as typed on GitHub. Any fork with a
+        # capital letter in either half — this one is
+        # BestMiraPro/Odysseus-expanded-AI-superapp — failed on the very first
+        # push with "repository name must be lowercase". Fold the case here so
+        # the workflow works in any fork rather than only in a lowercase one.
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4.3.0
       - name: Log in to GHCR
@@ -91,6 +99,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+      - name: Normalise the image name
+        # Same reason as in `build`: $GITHUB_ENV does not cross job boundaries,
+        # so the manifest job has to fold the case for itself or it would tag
+        # a differently-named image than the one the digests were pushed to.
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: Read APP_VERSION + short sha
         id: ver
         run: |

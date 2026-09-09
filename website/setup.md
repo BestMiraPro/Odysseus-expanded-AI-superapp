@@ -8,7 +8,7 @@ This page keeps the detailed install, deployment, troubleshooting, and configura
 
 ## Quick Start
 
-> **Branch note:** `dev` is the default branch and contains the latest development changes, but it may be unstable. For the more stable curated branch, use [`main`](https://github.com/odysseus-dev/odysseus/tree/main).
+> **Branch note:** `dev` is the default branch and contains the latest development changes, but it may be unstable. For the more stable curated branch, use [`main`](https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp/tree/main).
 
 Defaults work out of the box: clone, run, then configure models/search/email
 inside **Settings**. Only edit `.env` for deployment-level overrides like
@@ -19,12 +19,12 @@ On first setup, Odysseus creates an admin account (`admin` unless
 For Docker installs, the same line is in `docker compose logs odysseus`.
 Use that for the first login, then change it in **Settings**.
 
-Contributing? See [CONTRIBUTING.md](https://github.com/odysseus-dev/odysseus/blob/dev/CONTRIBUTING.md) for setup, testing, and pull request guidelines.
+Contributing? See [CONTRIBUTING.md](https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp/blob/dev/CONTRIBUTING.md) for setup, testing, and pull request guidelines.
 
 ### Docker (recommended)
 ```bash
-git clone https://github.com/odysseus-dev/odysseus.git
-cd odysseus
+git clone https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp.git
+cd Odysseus-expanded-AI-superapp
 cp .env.example .env       # optional, but recommended for explicit defaults
 docker compose up -d --build
 ```
@@ -41,8 +41,8 @@ only when you intentionally want LAN/reverse-proxy access.
 
 ### Native Linux / macOS
 ```bash
-git clone https://github.com/odysseus-dev/odysseus.git
-cd odysseus
+git clone https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp.git
+cd Odysseus-expanded-AI-superapp
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -59,8 +59,8 @@ Docker on macOS cannot use the Metal GPU. For GPU-accelerated Cookbook on an
 M-series Mac, run Odysseus natively:
 
 ```bash
-git clone https://github.com/odysseus-dev/odysseus.git
-cd odysseus
+git clone https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp.git
+cd Odysseus-expanded-AI-superapp
 ./start-macos.sh
 ```
 
@@ -361,16 +361,16 @@ do not run on macOS. MLX-only models are not served by Odysseus.
 server; safe to re-run):
 
 ```powershell
-git clone https://github.com/odysseus-dev/odysseus.git
-cd odysseus
+git clone https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp.git
+cd Odysseus-expanded-AI-superapp
 powershell -ExecutionPolicy Bypass -File .\launch-windows.ps1
 ```
 
 Or do it by hand:
 
 ```powershell
-git clone https://github.com/odysseus-dev/odysseus.git
-cd odysseus
+git clone https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp.git
+cd Odysseus-expanded-AI-superapp
 py -3.11 -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -715,8 +715,75 @@ Key settings:
 | `ODYSSEUS_EMAIL_COMPOSE_UPLOAD_MAX_BYTES` | `26214400` | Email compose attachment cap in bytes (25 MB). |
 | `ODYSSEUS_STT_MAX_AUDIO_BYTES` | `26214400` | Speech-to-text audio cap in bytes (25 MB). |
 | `ODYSSEUS_ICS_MAX_BYTES` | `10485760` | Calendar `.ics` import cap in bytes (10 MB). |
+| `OMNIGENT_UI_PORT` | `6868` | Docker Compose host port for Omnigent's own web UI. Bound to `APP_BIND`, so loopback-only by default. |
 
 All upload-limit vars are validated (must be a positive integer) and optional; an invalid value fails fast at startup.
+
+## Study
+
+This fork's spaced-repetition study system. Open it from **Tools → Study** in the left
+sidebar — it has no rail shortcut of its own.
+
+Study needs a model before anything works. It resolves in order:
+
+```
+Study Model  ->  Utility Model  ->  Default Chat Model
+```
+
+so it runs on your chat model out of the box, and you only set a Study Model to give it
+its own. Two places do that, and both write the same setting:
+
+- **Settings → Services → Study Model** — endpoint, model, and an optional *text model*.
+- **The Study panel header** — the `Model: …` button, which also names whichever model is
+  currently resolved and says when it is borrowed from another tier.
+
+The **text model** is worth knowing about. Extraction from a scanned PDF needs vision, but
+extraction from text, question discovery, grading and hints do not. Setting a text model
+keeps a vision model selected for pages while everything textual runs on a cheaper or
+faster one, on the same endpoint and key.
+
+### Getting a bank you can practise
+
+1. **Subjects → new subject**, then attach material (lecture notes, textbook chapters, past
+   papers). PDFs, text and images all work.
+2. A PDF whose text layer is thin — a scan, or formula images — needs **Transcribe** first.
+   Study offers it on exactly those materials; it is vision OCR, page by page.
+3. **Extract questions.** This also detects chapters and clusters themes, so the practice
+   picker is ready to use immediately. Turn that off with the `study_auto_group`
+   preference if you want extraction to stay fast, then group by hand from **Tidy bank**.
+4. **Practice** everything, one chapter, or one theme. Scheduling is FSRS; the confidence
+   you state before checking is what produces the "sure but wrong" calibration count.
+
+Grading of written answers, hints, and the **Tutor** tab all run on the Study model and are
+grounded in the material you uploaded.
+
+## Omnigent
+
+The multi-agent orchestrator, baked into the image and bridged into the UI. Reach it from
+the **Omnigent** rail item, **Tools → Omnigent**, or directly at `http://localhost:6868`.
+
+Inside the container it listens on loopback only; Compose bridges that to the host port in
+`OMNIGENT_UI_PORT`, bound to `APP_BIND`. Because Omnigent runs agent crews with shell
+access, keep that on loopback and reach it over Tailscale or an authenticated proxy rather
+than publishing the port.
+
+Its workers come in two kinds:
+
+- **API models** — any endpoint you configured in Settings → Services. No extra login.
+- **Claude Code and Codex** — both CLIs ship in the image so they can run as native
+  sub-agents. Each needs a one-time interactive subscription login *inside the container*:
+
+  ```bash
+  docker compose exec odysseus claude    # then follow the login prompt
+  docker compose exec odysseus codex
+  ```
+
+  That login persists in the data volume. The API-model workers need none of this.
+
+Versions are pinned as build args in the `Dockerfile` (`OMNIGENT_VERSION`,
+`CLAUDE_CODE_VERSION`, `CODEX_VERSION`). Omnigent refuses to start against a chat database
+newer than the binary and Alembic cannot walk revisions backwards, so only ever move
+`OMNIGENT_VERSION` forward.
 
 ### Built-in MCP servers (optional setup)
 

@@ -101,7 +101,12 @@ ENV UV_TOOL_DIR=/opt/uv/tools \
 # (data/omnigent-home/.omnigent/chat.db): Omnigent refuses to start against a
 # database newer than the binary, and alembic cannot walk revisions backwards.
 ARG OMNIGENT_VERSION=0.12.0
-RUN pip install --no-cache-dir uv \
+# uv is pinned like every other tool baked into the image: an unpinned installer
+# is the one dependency that can change the resolution of everything it then
+# installs, so "reproducible build" would stop being true the day uv shipped a
+# resolver change. Dependabot's pip ecosystem tracks this ARG.
+ARG UV_VERSION=0.12.11
+RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
     && uv tool install "omnigent==${OMNIGENT_VERSION}" \
     && chmod -R a+rX /opt/uv \
     && rm -rf /root/.cache
@@ -114,18 +119,19 @@ ARG CODEX_VERSION=0.150.0
 RUN npm install -g \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     "@openai/codex@${CODEX_VERSION}"
-# python-magic powers content-based MIME sniffing in src/upload_handler.py.
-# Image-only (not in requirements.txt) because it needs the libmagic1 system
-# lib installed above; see the apt note near the top of this stage.
-RUN pip install --no-cache-dir python-magic==0.4.27
-
 # Pre-install the patched basicsr/gfpgan/facexlib wheels built in the
 # realesrgan-wheels stage (--no-deps keeps the image lean — torch & friends are
 # pulled only when realesrgan is actually installed). With these dists already
 # satisfied, the Cookbook's plain `pip install realesrgan` resolves them from
 # wheels instead of rebuilding the sdists that fail on Python 3.14.
 COPY --from=realesrgan-wheels /wheels/ /tmp/odysseus-wheels/
-RUN pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
+# One layer for both image-only Python installs — the packages that cannot live
+# in requirements.txt. python-magic powers content-based MIME sniffing in
+# src/upload_handler.py and is here rather than in requirements.txt because it
+# needs the libmagic1 system lib installed above; see the apt note near the top
+# of this stage.
+RUN pip install --no-cache-dir python-magic==0.4.27 \
+    && pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
     && rm -rf /tmp/odysseus-wheels
 
 # Copy app code

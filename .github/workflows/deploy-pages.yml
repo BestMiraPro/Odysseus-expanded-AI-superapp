@@ -15,9 +15,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Publishing is opt-in. `configure-pages` hard-fails when Pages has never been
+  # turned on for the repository, so on a fork this workflow's first run would
+  # be a red X for a site the owner never asked to publish. Check first and skip
+  # quietly instead — and do not auto-enable, because that would put a public
+  # website up as a side effect of editing a Markdown file.
+  preflight:
+    name: Is Pages enabled?
+    runs-on: ubuntu-latest
+    permissions:
+      pages: read
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh api "repos/${REPO}/pages" >/dev/null 2>&1; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GitHub Pages is not enabled for ${REPO}, so website/ was not published. Enable it under Settings -> Pages with source 'GitHub Actions' to turn this on."
+          fi
+
   build:
     name: Package static site
     runs-on: ubuntu-latest
+    needs: preflight
+    if: needs.preflight.outputs.enabled == 'true'
     permissions:
       contents: read
       pages: read
@@ -36,7 +63,8 @@ jobs:
 
   deploy:
     name: Deploy static site
-    needs: build
+    needs: [preflight, build]
+    if: needs.preflight.outputs.enabled == 'true'
     runs-on: ubuntu-latest
     permissions:
       pages: write
