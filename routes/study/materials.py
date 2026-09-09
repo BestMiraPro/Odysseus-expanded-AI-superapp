@@ -445,7 +445,7 @@ async def run_transcribe_material(user, material_id: str) -> Dict:
                        f"{start + len(batch)} of the document). Start each page with "
                        f"a line '[Page N text]:' using the document page number.")
         try:
-            text = await _llm_text_vision(user, TRANSCRIBE_SYSTEM, instruction, batch)
+            text = await _common._llm_text_vision(user, TRANSCRIBE_SYSTEM, instruction, batch)
         except HTTPException as e:
             if e.status_code == 503:
                 raise
@@ -474,8 +474,6 @@ async def run_transcribe_material(user, material_id: str) -> Dict:
 async def run_generate_notes(user, material_id: str) -> Dict:
     """Generate (or regenerate) consultable study notes for one material.
     Shared by the route and the Study agent."""
-    if not _ai_limiter.check(request.client.host):
-        raise HTTPException(429, "Too many requests — try again later")
     db = _common.SessionLocal()
     try:
         m = study_service.get_material(db, material_id, user)
@@ -516,8 +514,6 @@ async def run_generate_notes(user, material_id: str) -> Dict:
 async def run_generate_overview(user, deck_id: str) -> Dict:
     """Generate a short subject overview from the chapter notes (preferred) or
     the raw materials. Shared by the route and the Study agent."""
-    if not _ai_limiter.check(request.client.host):
-        raise HTTPException(429, "Too many requests — try again later")
     db = _common.SessionLocal()
     try:
         deck = study_service.get_deck(db, deck_id, user)
@@ -693,6 +689,8 @@ def register(router: APIRouter) -> None:
     @router.post("/materials/{material_id}/notes")
     async def generate_material_notes(request: Request, material_id: str):
         """Generate (or regenerate) consultable study notes for one material."""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         return await run_generate_notes(_owner(request), material_id)
 
     @router.get("/decks/{deck_id}/overview")
@@ -708,6 +706,8 @@ def register(router: APIRouter) -> None:
     @router.post("/decks/{deck_id}/overview")
     async def generate_deck_overview(request: Request, deck_id: str):
         """Generate a short subject overview from the chapter notes (preferred) or"""
+        if not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
         return await run_generate_overview(_owner(request), deck_id)
 
     @router.post("/materials/{material_id}/extract")

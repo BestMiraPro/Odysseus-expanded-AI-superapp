@@ -70,6 +70,7 @@ from src.study_ai import (
     SOLUTION_AUDIT_SYSTEM,
     STUDY_NOTES_SYSTEM,
     SUBJECT_OVERVIEW_SYSTEM,
+    TRANSCRIBE_SYSTEM,
     chunk_material,
     classify_material,
     canonical_qnum,
@@ -422,6 +423,11 @@ THINKING_OFF_BODY = {
 # comes back empty if the budget runs out mid-think. An upper bound, so it
 # costs nothing for models that answer directly.
 EXTRACTION_MAX_TOKENS = 16000
+
+# Vision-transcription batch size: pages of rendered PDFs per model call.
+# Kept small because each page comes back as full transcribed Markdown.
+# (Lost in the routes/study split; restored from the pre-split monolith.)
+TRANSCRIBE_PAGES_PER_CALL = 3
 
 
 def _study_text_model(owner: Optional[str]) -> str:
