@@ -707,8 +707,13 @@ _MATH_TEXT_NOTE = (
 # markup on the page.
 _VISUALS_NOTE = (
     "\n\nVisuals: the panel draws real figures, so use one where a picture does "
-    "work a sentence cannot. NEVER draw a graph as ASCII art -- you have two "
-    "renderers that produce actual images.\n"
+    "work a sentence cannot. There are exactly TWO renderers, listed below, and "
+    "nothing else in this panel draws anything. A picture in any other form is "
+    "shown to the student as unrenderable source code, which is worse than no "
+    "picture at all -- so no ASCII art, no TikZ or PGFPlots, no \\\\documentclass "
+    "or LaTeX picture environments, and no raw SVG. LaTeX here is for "
+    "MATHEMATICS ONLY: $...$ and $$...$$ are rendered by KaTeX, which knows "
+    "formulas and knows nothing about graphics.\n"
     "- To PLOT anything quantitative -- a function, a curve, a distribution, a "
     "supply/demand pair, data -- write a ```python block using matplotlib. It "
     "runs in the student's browser and its figure is displayed in place of the "

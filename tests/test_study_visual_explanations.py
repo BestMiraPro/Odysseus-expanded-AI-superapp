@@ -69,6 +69,25 @@ def test_the_prompt_names_structural_diagram_types(name):
 
 
 @pytest.mark.parametrize("name", POST_ANSWER)
+def test_the_prompt_rules_out_formats_nothing_renders(name):
+    """Told only what it MAY use, a model reaches for whatever it knows. Given
+    matplotlib and mermaid it still produced a \\begin{tikzpicture} supply and
+    demand graph, because KaTeX renders $...$ and TikZ looks like LaTeX. It is
+    not: TikZ needs a full LaTeX toolchain, so it reaches the student as twenty
+    lines of source. The list of renderers has to be closed, not open."""
+    prompt = getattr(study_ai, name)
+    for banned in ("TikZ", "PGFPlots", "documentclass", "SVG", "ASCII art"):
+        assert banned in prompt, f"{name} does not rule out {banned}"
+
+
+@pytest.mark.parametrize("name", POST_ANSWER)
+def test_the_prompt_says_what_latex_is_actually_for(name):
+    """The ban has to explain itself or it reads as arbitrary: maths yes,
+    graphics no."""
+    assert "MATHEMATICS ONLY" in getattr(study_ai, name)
+
+
+@pytest.mark.parametrize("name", POST_ANSWER)
 def test_the_prompt_does_not_ask_for_plt_show(name):
     """Figures are captured after the snippet returns; plt.show() is a no-op
     under the Agg backend and models add it out of habit."""
