@@ -210,6 +210,92 @@ def _resolve_mcq_answer(item: Dict, options: List[str]) -> Optional[int]:
     return None
 
 
+_TABLE_DIVIDER_RE = re.compile(r"^\s*\|?[\s:\-|]+\|[\s:\-|]*$")
+
+
+def _split_row(line: str) -> List[str]:
+    """Cells of a markdown table row, without the outer pipes."""
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def repair_markdown_tables(text: str) -> str:
+    """Realign markdown tables whose header has more columns than their body.
+
+    A cross-tab printed in a PDF carries two dimension names -- one for the
+    rows, one for the columns:
+
+        Program
+        Opinion   Undergraduate  Master
+        Agree     20%            30%
+
+    Transposing that to markdown, models routinely keep BOTH names as header
+    cells and then write only one label per body row:
+
+        | Program | Opinion | Agree | Disagree | Indifferent |
+        | Undergraduate | 20% | 10% | 10% |
+
+    Five headers over four-cell rows. Markdown pads the short row, so every
+    value slides one column left and renders under the wrong heading -- 20% of
+    undergraduates appear to have answered "Opinion". The numbers are right;
+    only the header is wrong.
+
+    The repair is deliberately narrow, because a header/body mismatch is
+    ambiguous in general and a wrong guess corrupts data that merely looked
+    wrong. It applies only when:
+
+      * every body row has the same cell count m, and
+      * the header has exactly m + 1 cells, and
+      * no header cell is blank (blank trailing cells are a different artifact,
+        handled by padding rather than dropping).
+
+    In that shape the first header is the row-dimension name that genuinely
+    labels column 0 ("Program" labels Undergraduate/Master) and the second is
+    the column-dimension name whose values are already the remaining headers.
+    So the second cell is the redundant one, and dropping it restores the
+    alignment. Any other mismatch is left alone: short rows are padded to the
+    header so nothing shifts, and nothing is ever discarded.
+    """
+    if not text or "|" not in text:
+        return text or ""
+
+    lines = text.split("\n")
+    out: List[str] = []
+    i = 0
+    while i < len(lines):
+        # A table is a header line, a divider, then one or more body rows.
+        if (i + 1 < len(lines) and "|" in lines[i]
+                and _TABLE_DIVIDER_RE.match(lines[i + 1] or "")):
+            header = _split_row(lines[i])
+            divider = lines[i + 1]
+            body_start = i + 2
+            j = body_start
+            while j < len(lines) and "|" in lines[j] and lines[j].strip():
+                j += 1
+            body = [_split_row(lines[k]) for k in range(body_start, j)]
+
+            if body:
+                widths = {len(r) for r in body}
+                if (len(widths) == 1 and len(header) == next(iter(widths)) + 1
+                        and all(c for c in header)):
+                    # The flattened cross-tab: drop the column-dimension name.
+                    header = [header[0]] + header[2:]
+                    divider = "|" + "|".join(["---"] * len(header)) + "|"
+                width = len(header)
+                out.append("| " + " | ".join(header) + " |")
+                out.append(divider if divider.strip().startswith("|")
+                           else "|" + "|".join(["---"] * width) + "|")
+                for row in body:
+                    # Pad rather than truncate: never lose a value.
+                    padded = row + [""] * (width - len(row)) if len(row) < width else row
+                    out.append("| " + " | ".join(padded) + " |")
+                i = j
+                continue
+
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def context_is_redundant(question: str, context: str) -> bool:
     """True when a question's `context` adds nothing because the setup already
     sits verbatim inside the question text — showing it would just repeat the
@@ -607,6 +693,55 @@ _MATH_TEXT_NOTE = (
     "$...$ inline, $$...$$ display."
 )
 
+# Appended to the two post-answer explanation prompts (tutor + explain-further).
+# The Study panel renders ```mermaid fences through Mermaid 11 and $...$ through
+# KaTeX, so a diagram costs the model nothing but a fenced block. Given only to
+# the prompts that EXPLAIN something the student already answered: a diagram
+# during a hint or a grade would either leak the answer or slow the loop down.
+#
+# The plain-text-labels rule is not cosmetic. Mermaid is initialised with
+# securityLevel 'loose' (static/js/markdown.js), which permits HTML inside node
+# labels, and this model reads the student's uploaded PDFs -- untrusted input
+# that can carry prompt injection. Asking for plain labels keeps generated
+# diagrams clear of the one construct that could turn a poisoned material into
+# markup on the page.
+_VISUALS_NOTE = (
+    "\n\nVisuals: the panel draws real figures, so use one where a picture does "
+    "work a sentence cannot. NEVER draw a graph as ASCII art -- you have two "
+    "renderers that produce actual images.\n"
+    "- To PLOT anything quantitative -- a function, a curve, a distribution, a "
+    "supply/demand pair, data -- write a ```python block using matplotlib. It "
+    "runs in the student's browser and its figure is displayed in place of the "
+    "code. numpy is available. Plot the real function rather than sketching "
+    "it: compute the points, label both axes with their meaning and units, add "
+    "a title, and mark whatever the explanation refers to (an optimum, an "
+    "intersection, an asymptote). Do not call plt.show(); every figure you "
+    "create is captured. Keep it to one figure unless a comparison needs two.\n"
+    "- To show STRUCTURE rather than numbers, write a ```mermaid block: "
+    "`flowchart` for a process, derivation or decision; `mindmap` for how a "
+    "concept branches; `sequenceDiagram` for an exchange over time; "
+    "`stateDiagram-v2` for states and transitions; `quadrantChart` for two axes "
+    "splitting cases into four regions; `pie` when the split itself is the "
+    "point.\n"
+    "- Draw only when it genuinely helps. A diagram restating the text is "
+    "noise, and a wrong diagram is worse than none.\n"
+    "- Keep every label plain text: no HTML tags, no <br>, no click directives, "
+    "no styling. Wrap long labels in double quotes.\n"
+    "- The syntax must be valid -- a diagram that fails to parse is shown to "
+    "the student as its own source code, so prefer a simple one you are sure "
+    "of.\n"
+    "- Always say in prose what the diagram shows. It supplements the "
+    "explanation rather than replacing it, and a student using a screen reader "
+    "gets only the prose."
+)
+
+# Same guidance for the prompt whose markdown lives inside a JSON string field.
+_VISUALS_JSON_NOTE = _VISUALS_NOTE + (
+    "\n- The fenced block goes INSIDE the \"explanation\" string as part of its "
+    "markdown, never outside the JSON object. Newlines in the diagram are \\n, "
+    "and backslashes stay doubled as they are for the maths."
+)
+
 EXTRACT_QUESTIONS_SYSTEM = """You extract practice questions from course material (past exams, problem sets, worked examples, lecture notes containing exercises).
 
 Rules:
@@ -862,6 +997,7 @@ For EACH question that cannot be fully understood on its own, write a concise "c
 Rules:
 - Include ONLY the setup needed to understand and attempt the question. NEVER include the solution, the final answer, or steps toward it.
 - Do not repeat the question itself inside "context".
+- Tables: every row must have exactly as many cells as the header, or the values render under the wrong headings. A printed cross-tab names both dimensions ("Program" down the side, "Opinion" across the top); in Markdown only one of them can be the corner cell, so keep the one that labels the row headings and let the other's categories BE the column headings. For the example above that is "| Program | Agree | Disagree | Indifferent |" with one row per program — not a header that keeps both names.
 - If a question already stands alone, OMIT it from the output — do not invent context.
 - Use the material's language.
 
@@ -896,3 +1032,7 @@ STUDY_NOTES_SYSTEM += _MATH_TEXT_NOTE
 SUBJECT_OVERVIEW_SYSTEM += _MATH_TEXT_NOTE
 GRADE_OPEN_SYSTEM += _MATH_JSON_NOTE
 EXPLAIN_FURTHER_SYSTEM += _MATH_JSON_NOTE
+
+# Only the two post-answer explanation surfaces get the visuals guidance.
+ASK_TUTOR_SYSTEM += _VISUALS_NOTE
+EXPLAIN_FURTHER_SYSTEM += _VISUALS_JSON_NOTE

@@ -18,7 +18,8 @@
  */
 
 import * as Modals from './modalManager.js';
-import { mdToHtml } from './markdown.js';
+import { mdToHtml, renderMermaid, renderMath } from './markdown.js';
+import { runPython, codeUsesMatplotlib } from './codeRunner.js';
 import { renderAgentTab, setAgentPrefill, setAgentScope } from './studyAgent.js';
 
 const API = window.location.origin;
@@ -481,6 +482,10 @@ function injectStyles() {
   flex-direction: column; align-items: stretch;
   gap: 4px; background: var(--bg); border: 1px solid var(--border);
   border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.18); }
+.study-plot-output img.code-runner-plot { max-width: 100%; height: auto;
+  display: block; margin: 8px 0; border-radius: 8px; background: #fff; }
+.study-plot-toggle { margin: 2px 0 10px; opacity: 0.65; }
+.study-plot-toggle:hover { opacity: 1; }
 .study-model-label { font-size: 10.5px; opacity: 0.6; }
 .study-model-label + select { margin-bottom: 4px; }
 .study-model-note { font-size: 10.5px; opacity: 0.6; line-height: 1.45;
@@ -1882,10 +1887,74 @@ function _viewerShell(title, actionsHtml, inner) {
   return v;
 }
 
+// mdToHtml only emits placeholders for the two things that need a library:
+// ```mermaid fences become <pre class="mermaid">, and math becomes pending
+// spans when KaTeX had not loaded yet. Both stay inert until something calls
+// the matching renderer. Chat, documents and group all do; Study never did, so
+// a diagram arrived as its own source code and deferred formulas as raw TeX.
+//
+// Both are best-effort and asynchronous: they lazy-load their library on first
+// use, and swallow their own failures, so an unavailable library degrades to
+// the readable source rather than an empty panel.
+function _enrichRendered(el) {
+  if (!el) return;
+  try { renderMermaid(el); } catch { /* diagram stays as its source */ }
+  try { renderMath(el); } catch { /* formula stays as its source */ }
+  try { _runPlotBlocks(el); } catch { /* plot stays as its source */ }
+}
+
+// Draw the plots the tutor wrote, instead of showing their source.
+//
+// Mermaid is right for structure — a process, a hierarchy, states — but it
+// cannot plot y = 2*sqrt(x). Asked for a production function, a model either
+// draws ASCII art or writes matplotlib, and matplotlib is the real answer: the
+// runtime is already here (Pyodide, via codeRunner) and it draws the actual
+// curve rather than an impression of one.
+//
+// Execution is in-browser and sandboxed. It deliberately does NOT go through
+// codeRunner's server path, which shells out to /api/shell/exec: this code is
+// written by a model reading the student's uploaded PDFs, so treating it as
+// trusted input to a shell would turn a poisoned material into remote
+// execution. Pyodide has no filesystem and no network into the host.
+//
+// Only plotting snippets run unattended. Anything else stays inert with its
+// source visible, because auto-running arbitrary model code is a different
+// decision from rendering a figure it asked for.
+function _runPlotBlocks(root) {
+  const blocks = root.querySelectorAll('pre > code.language-python, pre > code.language-py');
+  blocks.forEach((codeEl) => {
+    const pre = codeEl.parentElement;
+    if (!pre || pre.dataset.studyPlotDone) return;
+    const src = codeEl.textContent || '';
+    if (!codeUsesMatplotlib(src)) return;
+    pre.dataset.studyPlotDone = '1';
+
+    const panel = document.createElement('div');
+    panel.className = 'code-runner-output study-plot-output';
+    pre.parentNode.insertBefore(panel, pre.nextSibling);
+
+    // The figure is the explanation; the code is the footnote. Keep it
+    // reachable — a student checking the maths should be able to read it.
+    pre.hidden = true;
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'study-btn small study-plot-toggle';
+    toggle.textContent = 'Show plot code';
+    toggle.addEventListener('click', () => {
+      pre.hidden = !pre.hidden;
+      toggle.textContent = pre.hidden ? 'Show plot code' : 'Hide plot code';
+    });
+    panel.parentNode.insertBefore(toggle, panel.nextSibling);
+
+    runPython(src, panel).catch(() => { pre.hidden = false; });
+  });
+}
+
 function _renderMarkdownInto(el, md) {
   if (!el) return;
   try { el.innerHTML = mdToHtml(md || '', {}); }
   catch { el.textContent = md || ''; }
+  _enrichRendered(el);
   // Source-material links (page citations in notes / explain-further) open in a
   // new browser tab at the file + #page anchor.
   el.querySelectorAll('a[href*="/api/upload/"]').forEach(a => {
@@ -2973,7 +3042,8 @@ async function renderPractice() {
       if (cur && cur.id === q.id) renderPractice();
     }).catch(() => { p.prereqsBusy = false; p.prereqsFor = q.id; });
   }
-  const prereqs = (p.prereqsFor === q.id && p.prereqs) ? p.prereqs : [];
+  const prereqs = _prereqsToShow(
+    (p.prereqsFor === q.id && p.prereqs) ? p.prereqs : [], q);
 
   const progress = Math.round((p.idx / p.queue.length) * 100);
   const isMcq = q.qtype === 'mcq';
@@ -3096,6 +3166,11 @@ async function renderPractice() {
       </div>
         `}
     </div>`;
+
+  // The graded feedback, the Explain-options text and the Ask-AI thread are all
+  // model-written markdown in this subtree, so any diagram or deferred formula
+  // in them belongs to this render pass.
+  _enrichRendered(el);
 
   // handlers
   el.querySelectorAll('[data-opt]').forEach(b => b.addEventListener('click', () => {
@@ -3251,6 +3326,47 @@ async function renderPractice() {
     }
     advancePractice();
   });
+}
+
+// Compare question bodies ignoring formatting: the same exercise can be stored
+// once as raw PDF text and once as markdown, so only the letters and digits are
+// reliable.
+function _normQ(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+// Decide which "Earlier in this problem" entries are worth showing.
+//
+// Extraction can produce the same exercise twice: once whole (setup, table and
+// every sub-part in one question) and once split (setup moved to `context`,
+// sub-parts as the question). The part linker then sees a shared setup and
+// links them, so the whole version is offered as a prerequisite of the split
+// one -- and because it is the same exercise, its stored answer is the answer
+// to the question on screen. That is how a practice question came to display
+// its own solution above itself, with the setup printed twice for good measure.
+//
+// A genuine earlier part restates the setup but asks something different. One
+// that contains the current question outright is not an earlier part at all.
+// The length floor keeps a terse question ("Compute the variance.") from
+// matching by coincidence inside a long one.
+const _PREREQ_MIN_OVERLAP = 40;
+
+function _prereqsToShow(prereqs, q) {
+  const cur = _normQ(q && q.question);
+  const ctx = String((q && q.context) || '');
+  const out = [];
+  for (const pr of prereqs || []) {
+    let text = String(pr.question || '');
+    // Best effort: if the shared setup sits verbatim in the earlier part, drop
+    // it -- "Problem setup" below already shows it. When the two were stored in
+    // different formats this will not match, and the duplicate check usually
+    // removes the entry anyway.
+    if (ctx && text.includes(ctx)) text = text.replace(ctx, '').trim();
+    const norm = _normQ(text);
+    if (!norm) continue;
+    if (cur.length >= _PREREQ_MIN_OVERLAP
+        && (norm.includes(cur) || cur.includes(norm))) continue;
+    out.push(Object.assign({}, pr, { question: text }));
+  }
+  return out;
 }
 
 // Leave a practice session from inside a question.

@@ -8,7 +8,7 @@
  * doesn't lose the conversation.
  */
 
-import { mdToHtml } from './markdown.js';
+import { mdToHtml, renderMermaid, renderMath } from './markdown.js';
 
 const API = window.location.origin;
 
@@ -222,6 +222,13 @@ function renderLog() {
   }
   log.innerHTML = A.messages.map(renderMessage).join('');
   log.querySelectorAll('a[href*="/api/upload/"]').forEach(a => { a.target = '_blank'; a.rel = 'noopener'; });
+  // Turn the tutor's ```mermaid fences into diagrams and typeset any formula
+  // KaTeX had to defer. Both lazy-load on first use and swallow their own
+  // errors, so a missing library leaves readable source rather than a blank.
+  // This runs on every renderLog because streaming replaces the whole log, and
+  // renderMermaid skips nodes it has already processed.
+  try { renderMermaid(log); } catch { /* diagram stays as its source */ }
+  try { renderMath(log); } catch { /* formula stays as its source */ }
   log.scrollTop = log.scrollHeight;
 }
 

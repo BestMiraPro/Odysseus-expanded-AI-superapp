@@ -57,6 +57,7 @@ from src.study_ai import (
     DISCOVER_QUESTIONS_SYSTEM,
     EXPLAIN_FURTHER_SYSTEM,
     context_is_redundant,
+    repair_markdown_tables,
     EXPLAIN_SYSTEM,
     EXTRACT_QUESTIONS_SYSTEM,
     FIGURE_CAPTION_SYSTEM,
@@ -926,6 +927,11 @@ async def _backfill_context_items(owner, material_text: str,
         for it in (arr or []):
             if isinstance(it, dict) and it.get("id"):
                 ctx = str(it.get("context") or "").strip()
+                # Transposing a cross-tab out of a PDF, models keep both
+                # dimension names in the header and write one label per row,
+                # which slides every value a column left when rendered. Repair
+                # before storing so the bad shape never reaches a student.
+                ctx = repair_markdown_tables(ctx)
                 # Drop context that just repeats the question (the model
                 # sometimes adds setup to already self-contained questions).
                 if ctx and not context_is_redundant(qtext.get(str(it["id"]), ""), ctx):
