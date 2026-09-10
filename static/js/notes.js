@@ -491,7 +491,20 @@ async function _patchNote(id, patch) {
 
 // ---- Helpers ----
 
-function _esc(s) { return uiModule.esc ? uiModule.esc(s || '') : (s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+// The fallback must escape exactly what uiModule.esc does. It used to handle
+// only < and >, which is fine for text but not for the attribute contexts this
+// feeds: _buildChecklistHtml interpolates into value="...", so a quote in a
+// note's text closed the attribute and the rest was parsed as markup. & has to
+// go first or the entities it writes get re-escaped.
+function _esc(s) {
+  if (uiModule.esc) return uiModule.esc(s || '');
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 function _attrEsc(s) {
   return String(s || '')
     .replace(/"/g, '&quot;')

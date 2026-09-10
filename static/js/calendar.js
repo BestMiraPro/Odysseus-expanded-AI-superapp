@@ -3431,7 +3431,18 @@ function _addMinutesToLocalIso(baseIso, addMinutes) {
   return `${y}-${mo}-${da}T${h}:${m}:00${_tzOffsetForDate(d)}`;
 }
 
-function _e(s) { return uiModule.esc ? uiModule.esc(s || '') : (s || '').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+// Mirror uiModule.esc exactly. The fallback previously skipped & (so an event
+// title containing &lt; came back through as a literal <) and ' (which matters
+// wherever this lands in a single-quoted attribute). & must be replaced first.
+function _e(s) {
+  if (uiModule.esc) return uiModule.esc(s || '');
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // Linkify a location string: URLs become clickable, plain addresses get a Maps link.
 function _locHTML(loc) {

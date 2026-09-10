@@ -1005,10 +1005,18 @@ export function recordSessionMetricsCost(metrics, sessionId, selectedEndpointUrl
   const writeCost = () => {
     if (runId) {
       try {
-        const runCosts = JSON.parse(localStorage.getItem(_COST_RUNS_KEY) || '{}');
+        // Null-prototype maps: sid and runId are used as keys, and assigning
+        // to the key "__proto__" on a normal object walks into Object.prototype
+        // instead of creating an own property, poisoning every object on the
+        // page. These come back from localStorage, so they are only as
+        // trustworthy as that store. With no prototype there is nothing to
+        // pollute, and JSON.stringify still serialises them unchanged.
+        const runCosts = Object.assign(
+          Object.create(null),
+          JSON.parse(localStorage.getItem(_COST_RUNS_KEY) || '{}'));
         const sessionRuns = runCosts[sid] && typeof runCosts[sid] === 'object'
-          ? runCosts[sid]
-          : {};
+          ? Object.assign(Object.create(null), runCosts[sid])
+          : Object.create(null);
         // Assigning by detached-run identity is replay-idempotent even when a
         // refresh produces a fresh metrics object. The Web Lock around this
         // read/modify/write also keeps distinct runs from two tabs from
@@ -1017,7 +1025,9 @@ export function recordSessionMetricsCost(metrics, sessionId, selectedEndpointUrl
         const entries = Object.entries(sessionRuns);
         if (entries.length > _MAX_COST_RUNS_PER_SESSION) {
           const overflow = entries.slice(0, entries.length - _MAX_COST_RUNS_PER_SESSION);
-          const costs = JSON.parse(localStorage.getItem(_COST_KEY) || '{}');
+          const costs = Object.assign(
+            Object.create(null),
+            JSON.parse(localStorage.getItem(_COST_KEY) || '{}'));
           costs[sid] = (costs[sid] || 0) + overflow.reduce(
             (total, entry) => total + (Number(entry[1]) || 0),
             0,

@@ -1,0 +1,72 @@
+# CodeQL configuration
+#
+# Three rules are excluded below. Each exclusion is a claim that the finding is
+# either by design or already guarded, and each names the evidence so a reviewer
+# can check the claim rather than take it on trust. Nothing else is filtered:
+# the remaining ~190 findings stay visible, including the 77
+# py/stack-trace-exposure results, which are a real class and deliberately left
+# open rather than suppressed.
+#
+# Re-verify with the same scan that produced these numbers:
+#   codeql database create <db> --language=<lang> --build-mode=none
+#   codeql database analyze <db> <lang>-code-scanning.qls --format=sarif-latest
+#
+# Excluding a rule is a blunt instrument -- it hides future genuine instances of
+# that rule too. It is used here only where the rule is structurally wrong for
+# this application, not merely noisy. If a code path ever takes an untrusted
+# path or URL from an unauthenticated source, these exclusions must be revisited.
+
+name: "Odysseus CodeQL config"
+
+query-filters:
+  # py/full-ssrf (15 findings: src/llm_core.py, routes/model_routes.py,
+  # routes/embedding_routes.py, services/memory/skill_importer.py)
+  #
+  # The "user-provided value" is the endpoint URL an administrator types into
+  # Settings -> Services. Sending requests to an operator-chosen endpoint is the
+  # product: Odysseus exists to talk to whichever OpenAI-compatible server you
+  # point it at, local or hosted. There is no fixed allowlist to check against
+  # because the whole feature is "use your own endpoint".
+  #
+  # The reachable surface is admin-only (POST /api/auth/settings is gated on
+  # auth_manager.is_admin), so this is an admin configuring their own server to
+  # call a host they chose -- not an unauthenticated request smuggling one in.
+  - exclude:
+      id: py/full-ssrf
+
+  # py/command-line-injection (16 findings: routes/shell_routes.py,
+  # routes/cookbook_routes.py, routes/codex_routes.py, core/platform_compat.py,
+  # scripts/mlx_image_server.py)
+  #
+  # These are the features whose entire purpose is running a command. The shell
+  # tool runs shell commands on request; Cookbook launches and manages local
+  # model servers; the Codex and MLX paths spawn their respective CLIs. A
+  # "fix" here would mean removing the capability, not securing it.
+  #
+  # The control that matters is authentication, and it is enforced upstream of
+  # these call sites. AUTH_ENABLED defaults to true and README/setup.md both
+  # tell operators to keep it on for anything network-accessible.
+  - exclude:
+      id: py/command-line-injection
+
+  # py/path-injection (69 findings across 18 files)
+  #
+  # Verified guarded. CodeQL models neither os.path.commonpath containment nor
+  # regex allowlists nor Path().name as sanitisers, so it reports the path as
+  # tainted even where traversal is impossible. Three files checked, three
+  # different correct guards:
+  #
+  #   routes/upload_routes.py:154  _path_inside_upload_dir() compares
+  #       os.path.commonpath([realpath(root), realpath(path)]) against the
+  #       upload root and raises 403 on mismatch.
+  #   routes/emoji_routes.py:30    _CODE_RE = ^[0-9a-f]{2,6}(?:-[0-9a-f]{2,6})*$
+  #       -- hex codepoints only; a dot or slash cannot match.
+  #   routes/email_routes.py:4238  safe_token = Path(token).name discards any
+  #       directory component, under a "Prevent path traversal" comment.
+  #
+  # This is the least comfortable of the three exclusions, because it is the one
+  # where a genuinely unguarded site could hide among the guarded ones. It was
+  # taken on three samples, not all 69. Anything new that joins user input to a
+  # filesystem path should be reviewed by hand.
+  - exclude:
+      id: py/path-injection

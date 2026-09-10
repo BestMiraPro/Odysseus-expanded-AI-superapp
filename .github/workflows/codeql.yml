@@ -35,6 +35,10 @@ jobs:
         with:
           languages: ${{ matrix.language }}
           build-mode: none
+          # Excludes three rules that are by design or already guarded here.
+          # Every exclusion carries its evidence in that file; nothing else is
+          # filtered.
+          config-file: ./.github/codeql/codeql-config.yml
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
         with:
