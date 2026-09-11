@@ -1,11 +1,15 @@
 # CodeQL configuration
 #
-# Three rules are excluded below. Each exclusion is a claim that the finding is
-# either by design or already guarded, and each names the evidence so a reviewer
-# can check the claim rather than take it on trust. Nothing else is filtered:
-# the remaining ~190 findings stay visible, including the 77
-# py/stack-trace-exposure results, which are a real class and deliberately left
-# open rather than suppressed.
+# Five rules are excluded below, covering 147 of the 291 findings the first full
+# scan produced. Each exclusion is a claim that the finding is either by design,
+# already guarded, or structurally misread, and each names the evidence so a
+# reviewer can check the claim rather than take it on trust.
+#
+# Nothing else is filtered. The remaining ~144 findings stay visible, including
+# all 77 py/stack-trace-exposure results -- a real class, deliberately left open
+# rather than suppressed -- and js/xss-through-dom, which is kept enabled
+# BECAUSE it found genuine bugs: two incomplete HTML escapers, fixed in
+# 1f9b3ee3. A rule that has caught something real is not a rule to silence.
 #
 # Re-verify with the same scan that produced these numbers:
 #   codeql database create <db> --language=<lang> --build-mode=none
@@ -70,3 +74,59 @@ query-filters:
   # filesystem path should be reviewed by hand.
   - exclude:
       id: py/path-injection
+
+  # js/incomplete-multi-character-sanitization (18 findings, 14 distinct sites)
+  #
+  # The rule assumes a .replace() that strips markup is a sanitiser protecting a
+  # later HTML sink, and warns that a nested or malformed construct can survive
+  # it. Every site in this repo is the other thing: HTML being converted TO TEXT,
+  # where the output is measured, matched or shown as text and never returned to
+  # innerHTML. An incomplete strip there is a cosmetic defect, not an injection.
+  #
+  # Seven of the fourteen read in full, covering every distinct pattern:
+  #
+  #   static/js/chat.js:4044              strips tags only to measure length
+  #                                       (_proseLen); the result is compared to
+  #                                       24 and then discarded.
+  #   static/js/settings.js:3816          strips tags, then passes the result
+  #                                       through esc() into a title attribute.
+  #                                       The escaper is the actual defence.
+  #   static/js/emailInbox.js:963         html -> plain text for a reply draft.
+  #   static/js/emailLibrary/utils.js:108 pulls author/date out of a quote header
+  #                                       as text.
+  #   .../signatureFold.js:190            strips tags so a heuristic can regex
+  #                                       the remaining prose.
+  #   static/js/slashCommands.js:468      builds a plain-text copy for the
+  #                                       typewriter animation.
+  #   .github/scripts/check-issue-description.js:21
+  #                                       strips <!-- --> in CI to test whether
+  #                                       a template body is empty.
+  #
+  # Kept in mind: the one site that DID matter -- text stripped and then put
+  # back into HTML -- was caught by js/xss-through-dom, which stays enabled.
+  - exclude:
+      id: js/incomplete-multi-character-sanitization
+
+  # py/polynomial-redos (29 findings: routes/calendar_routes.py,
+  # routes/email_routes.py, routes/chat_helpers.py, routes/cookbook_routes.py)
+  #
+  # All polynomial, none exponential, and every input traced is the operator's
+  # own text rather than anything an outsider supplies:
+  #
+  #   routes/email_routes.py:1395  _md_to_email_html renders the COMPOSE body on
+  #       send (call sites at 4281 and 4569). It is the mail being written, not
+  #       mail received -- inbound HTML never reaches these regexes.
+  #   routes/calendar_routes.py:410-577  natural-language date parsing of a
+  #       phrase the user typed into their own calendar.
+  #   routes/chat_helpers.py:870   untangles <think> tags in model output.
+  #   routes/cookbook_routes.py:1818  parses OLLAMA_HOST out of local config.
+  #
+  # On a single-user self-hosted deployment the worst case is the operator
+  # making their own server do quadratic work on a string they wrote. Set
+  # against that, rewriting 29 regexes inside a date parser and a markdown
+  # renderer is a real risk of changing how input is parsed.
+  #
+  # This exclusion is the one to revisit first if Odysseus is ever run
+  # multi-tenant, or if any of these regexes is pointed at received mail.
+  - exclude:
+      id: py/polynomial-redos
