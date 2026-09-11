@@ -9,6 +9,7 @@
  */
 
 import { mdToHtml, renderMermaid, renderMath } from './markdown.js';
+import { renderPythonPlots } from './codeRunner.js';
 
 const API = window.location.origin;
 
@@ -229,6 +230,7 @@ function renderLog() {
   // renderMermaid skips nodes it has already processed.
   try { renderMermaid(log); } catch { /* diagram stays as its source */ }
   try { renderMath(log); } catch { /* formula stays as its source */ }
+  try { renderPythonPlots(log); } catch { /* plot stays as its source */ }
   log.scrollTop = log.scrollHeight;
 }
 

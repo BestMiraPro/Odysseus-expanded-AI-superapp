@@ -991,6 +991,14 @@ def build_system_prompt(owner, deck_id: Optional[str], allow_code: bool, model: 
                      + "\nApp map:\n" + APP_MAP)
     else:
         parts.append("Code tools are disabled for this chat (the user can enable 'Allow code changes').")
+    # The Tutor tab renders the same way the practice panel does, but it is a
+    # different prompt and was missing this: asked for a supply-and-demand graph
+    # it answered "I can't generate visual charts -- I'm a text-based agent" and
+    # offered TikZ to paste into Overleaf. It can draw; it just had not been told.
+    # Imported here rather than at module scope to match how this module already
+    # pulls from study_ai, and to keep the import cost off the hot path.
+    from src.study_ai import _VISUALS_NOTE
+    parts.append(_VISUALS_NOTE.strip())
     return "\n\n".join(parts)
 
 

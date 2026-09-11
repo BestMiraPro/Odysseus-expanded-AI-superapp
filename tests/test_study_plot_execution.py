@@ -119,33 +119,53 @@ def test_study_runs_plots_in_the_browser_not_on_the_server():
 def test_study_imports_the_sandboxed_runner():
     match = re.search(r"import \{([^}]*)\} from '\./codeRunner\.js'", STUDY_JS)
     assert match, "Study does not import the code runner"
-    assert "runPython" in match.group(1)
+    assert "renderPythonPlots" in match.group(1)
+
+
+def _plot_runner() -> str:
+    body = re.search(r"export function renderPythonPlots\(.*?\n\}", RUNNER_JS, re.DOTALL)
+    assert body, "renderPythonPlots is gone"
+    return body.group(0)
 
 
 def test_only_plotting_blocks_run_unattended():
     """Auto-running arbitrary model code is a different decision from drawing
     a figure it asked for."""
-    body = re.search(r"function _runPlotBlocks\(.*?\n\}", STUDY_JS, re.DOTALL)
-    assert body, "_runPlotBlocks is gone"
-    assert "codeUsesMatplotlib" in body.group(0), (
+    assert "codeUsesMatplotlib" in _plot_runner(), (
         "every python block would run, not just the plots"
     )
 
 
 def test_a_block_is_not_run_twice():
-    """Practice re-renders on every interaction."""
-    body = re.search(r"function _runPlotBlocks\(.*?\n\}", STUDY_JS, re.DOTALL)
-    assert "studyPlotDone" in body.group(0)
+    """Practice re-renders on every interaction, and the tutor log re-renders
+    on every streamed chunk."""
+    assert "plotRunDone" in _plot_runner()
 
 
 def test_the_code_stays_reachable_behind_a_toggle():
     """A student checking the maths must be able to read the snippet."""
-    body = re.search(r"function _runPlotBlocks\(.*?\n\}", STUDY_JS, re.DOTALL)
-    assert "Show plot code" in body.group(0)
+    assert "Show plot code" in _plot_runner()
 
 
 def test_a_failed_run_reveals_the_source_again():
     """Better a visible snippet than a blank space where a graph should be."""
-    body = re.search(r"function _runPlotBlocks\(.*?\n\}", STUDY_JS, re.DOTALL)
-    assert re.search(r"catch\(\s*\)\s*=>\s*\{\s*pre\.hidden\s*=\s*false", body.group(0)) \
-        or "pre.hidden = false" in body.group(0)
+    assert "pre.hidden = false" in _plot_runner()
+
+
+# Both tutors must draw. They render the same markdown through different
+# modules, and the Tutor tab was missed the first time: it rendered mermaid but
+# never ran a plot, and its prompt never mentioned either. Asked for a graph it
+# replied "I can't generate visual charts -- I'm a text-based agent".
+@pytest.mark.parametrize("mod", ["study.js", "studyAgent.js"])
+def test_both_render_surfaces_run_plots(mod):
+    src = {"study.js": STUDY_JS,
+           "studyAgent.js": (REPO / "static" / "js" / "studyAgent.js")
+           .read_text(encoding="utf-8")}[mod]
+    assert "renderPythonPlots" in src, f"{mod} never runs a plot block"
+
+
+def test_the_runner_is_defined_once():
+    """It lived in study.js, so the Tutor tab could not reach it."""
+    assert "function renderPythonPlots" not in STUDY_JS, (
+        "the plot runner is duplicated instead of shared"
+    )

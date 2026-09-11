@@ -19,7 +19,7 @@
 
 import * as Modals from './modalManager.js';
 import { mdToHtml, renderMermaid, renderMath } from './markdown.js';
-import { runPython, codeUsesMatplotlib } from './codeRunner.js';
+import { renderPythonPlots } from './codeRunner.js';
 import { renderAgentTab, setAgentPrefill, setAgentScope } from './studyAgent.js';
 
 const API = window.location.origin;
@@ -1900,55 +1900,9 @@ function _enrichRendered(el) {
   if (!el) return;
   try { renderMermaid(el); } catch { /* diagram stays as its source */ }
   try { renderMath(el); } catch { /* formula stays as its source */ }
-  try { _runPlotBlocks(el); } catch { /* plot stays as its source */ }
+  try { renderPythonPlots(el); } catch { /* plot stays as its source */ }
 }
 
-// Draw the plots the tutor wrote, instead of showing their source.
-//
-// Mermaid is right for structure — a process, a hierarchy, states — but it
-// cannot plot y = 2*sqrt(x). Asked for a production function, a model either
-// draws ASCII art or writes matplotlib, and matplotlib is the real answer: the
-// runtime is already here (Pyodide, via codeRunner) and it draws the actual
-// curve rather than an impression of one.
-//
-// Execution is in-browser and sandboxed. It deliberately does NOT go through
-// codeRunner's server path, which shells out to /api/shell/exec: this code is
-// written by a model reading the student's uploaded PDFs, so treating it as
-// trusted input to a shell would turn a poisoned material into remote
-// execution. Pyodide has no filesystem and no network into the host.
-//
-// Only plotting snippets run unattended. Anything else stays inert with its
-// source visible, because auto-running arbitrary model code is a different
-// decision from rendering a figure it asked for.
-function _runPlotBlocks(root) {
-  const blocks = root.querySelectorAll('pre > code.language-python, pre > code.language-py');
-  blocks.forEach((codeEl) => {
-    const pre = codeEl.parentElement;
-    if (!pre || pre.dataset.studyPlotDone) return;
-    const src = codeEl.textContent || '';
-    if (!codeUsesMatplotlib(src)) return;
-    pre.dataset.studyPlotDone = '1';
-
-    const panel = document.createElement('div');
-    panel.className = 'code-runner-output study-plot-output';
-    pre.parentNode.insertBefore(panel, pre.nextSibling);
-
-    // The figure is the explanation; the code is the footnote. Keep it
-    // reachable — a student checking the maths should be able to read it.
-    pre.hidden = true;
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = 'study-btn small study-plot-toggle';
-    toggle.textContent = 'Show plot code';
-    toggle.addEventListener('click', () => {
-      pre.hidden = !pre.hidden;
-      toggle.textContent = pre.hidden ? 'Show plot code' : 'Hide plot code';
-    });
-    panel.parentNode.insertBefore(toggle, panel.nextSibling);
-
-    runPython(src, panel).catch(() => { pre.hidden = false; });
-  });
-}
 
 function _renderMarkdownInto(el, md) {
   if (!el) return;

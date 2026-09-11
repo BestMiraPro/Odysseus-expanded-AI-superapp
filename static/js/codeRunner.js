@@ -455,7 +455,60 @@ export function run(btn) {
   }
 }
 
+/**
+ * Draw the plots an AI wrote, instead of showing their source.
+ *
+ * Mermaid is right for structure, but it cannot plot y = 2*sqrt(x). Asked for a
+ * production function with only diagram syntax available, a model draws ASCII
+ * art or hands over TikZ to paste into Overleaf. matplotlib is the real answer:
+ * the runtime is already here, and it draws the actual curve.
+ *
+ * Execution is in-browser and sandboxed. It deliberately does NOT use
+ * runServer, which shells out to /api/shell/exec: this code is written by a
+ * model reading the user's own uploaded documents, so treating it as trusted
+ * input to a shell would turn a poisoned file into remote execution. Pyodide
+ * has no filesystem and no network into the host.
+ *
+ * Only plotting snippets run unattended. Anything else stays inert with its
+ * source visible, because auto-running arbitrary model code is a different
+ * decision from rendering a figure it asked for.
+ *
+ * Shared by the Study panel and the Tutor tab -- they render the same markdown
+ * through different modules, and a plot must work in both.
+ */
+export function renderPythonPlots(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return;
+  const blocks = root.querySelectorAll('pre > code.language-python, pre > code.language-py');
+  blocks.forEach((codeEl) => {
+    const pre = codeEl.parentElement;
+    if (!pre || pre.dataset.plotRunDone) return;
+    const src = codeEl.textContent || '';
+    if (!codeUsesMatplotlib(src)) return;
+    pre.dataset.plotRunDone = '1';
+
+    const panel = document.createElement('div');
+    panel.className = 'code-runner-output study-plot-output';
+    pre.parentNode.insertBefore(panel, pre.nextSibling);
+
+    // The figure is the explanation; the code is the footnote. Keep it
+    // reachable — someone checking the maths should be able to read it.
+    pre.hidden = true;
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'study-btn small study-plot-toggle';
+    toggle.textContent = 'Show plot code';
+    toggle.addEventListener('click', () => {
+      pre.hidden = !pre.hidden;
+      toggle.textContent = pre.hidden ? 'Show plot code' : 'Hide plot code';
+    });
+    panel.parentNode.insertBefore(toggle, panel.nextSibling);
+
+    runPython(src, panel).catch(() => { pre.hidden = false; });
+  });
+}
+
 const codeRunnerModule = {
   run, runPython, runJavaScript, runHTML, runServer, codeUsesMatplotlib,
+  renderPythonPlots,
 };
 export default codeRunnerModule;

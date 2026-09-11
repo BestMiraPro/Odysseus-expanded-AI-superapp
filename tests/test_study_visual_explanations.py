@@ -33,6 +33,20 @@ AGENT_JS = (REPO / "static" / "js" / "studyAgent.js").read_text(encoding="utf-8"
 MARKDOWN_JS = (REPO / "static" / "js" / "markdown.js").read_text(encoding="utf-8")
 
 POST_ANSWER = ["ASK_TUTOR_SYSTEM", "EXPLAIN_FURTHER_SYSTEM"]
+
+
+def test_the_tutor_tab_prompt_also_offers_visuals():
+    """There are two tutors. "Ask the tutor" opens the agent tab, which builds
+    its prompt in study_agent.py -- a different string from ASK_TUTOR_SYSTEM,
+    which backs only the inline Ask-AI box in the practice view. Patching one
+    left the other answering "I can't generate visual charts, I'm a text-based
+    agent" and offering TikZ to paste into Overleaf."""
+    import src.study_agent as study_agent
+
+    prompt = study_agent.build_system_prompt("alice", None, False, "test-model")
+    assert "matplotlib" in prompt, "the Tutor tab is not told it can plot"
+    assert "mermaid" in prompt, "the Tutor tab is not told it can draw diagrams"
+    assert "TikZ" in prompt, "the Tutor tab is not told TikZ does not render"
 # Everything that runs before the student commits, plus the scoring pass.
 PRE_ANSWER = [
     "HINT_SYSTEM", "ASK_COACH_SYSTEM", "GRADE_OPEN_SYSTEM",
