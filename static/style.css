@@ -4441,6 +4441,38 @@ body.bg-pattern-sparkles {
     .code-runner-output,
     .doc-run-output { padding-right: 110px; }
 
+    /* A panel that holds a figure is sized by the figure, not capped and
+       scrolled. The 400px max-height above suits a stream of text output, but a
+       chart clipped at 400px inside its own scrollbars can never be seen whole,
+       which defeats the point of drawing it. The 110px right gutter exists for a
+       Copy pill that a figure panel does not have at its top level, so there it
+       only squeezed the chart. :has() keeps text-only panels on exactly their
+       existing rules, and a browser without :has() falls back to those too. */
+    .code-runner-output:has(> img.code-runner-plot) {
+      max-height:none;
+      overflow:visible;
+      padding-right:12px;
+    }
+    /* The figure scales down to fit the panel's width AND most of the viewport's
+       height, keeping its aspect ratio, so the whole chart is on screen at once
+       rather than needing a scroll to reach its bottom axis. */
+    img.code-runner-plot {
+      display:block;
+      width:auto;
+      height:auto;
+      max-width:100%;
+      max-height:70vh;
+    }
+    /* Printed text beneath a figure carries its own Copy pill. Laid out as a row,
+       so the note is always at least as tall as the pill. Positioned absolutely
+       (as it is in a text panel), a 32px pill in a one-line, 22px note -- which is
+       exactly what matplotlib's font-cache notice produces -- hung 16px out of the
+       note and drew across the panel's bottom border. A reserved gutter or a
+       min-height would only encode today's pill size. */
+    .code-runner-note { display:flex; align-items:flex-start; gap:8px; }
+    .code-runner-note .code-runner-pre { flex:1; min-width:0; }
+    .code-runner-note .code-runner-copy-inline { position:static; flex:none; }
+
     .toast {
       position:fixed;
       top: 16px; right: 16px;

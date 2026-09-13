@@ -631,6 +631,12 @@ a.study-btn { display: inline-flex; align-items: center; text-decoration: none; 
 .study-ask-head { font-size: 11px; opacity: 0.7; margin-bottom: 6px; }
 .study-ask-thread { display: flex; flex-direction: column; gap: 6px; max-height: 260px;
   overflow-y: auto; margin-bottom: 6px; }
+/* A reply that draws a chart would otherwise be cut off at 260px inside this
+   thread's own scroll box, exactly as run panels cut charts off at 400px. Text
+   conversations keep the cap; a thread holding a figure grows to fit it, and
+   the figure itself is held to most of the viewport's height by the global
+   img.code-runner-plot rule, so the whole chart is on screen at once. */
+.study-ask-thread:has(img.code-runner-plot) { max-height: none; overflow-y: visible; }
 .study-ask-msg { font-size: 12.5px; line-height: 1.5; padding: 5px 8px; border-radius: 7px; }
 .study-ask-msg.student { background: rgba(128,128,128,0.10); align-self: flex-end; max-width: 85%; }
 .study-ask-msg.ai { background: rgba(91,138,191,0.10); align-self: flex-start; max-width: 92%; }
