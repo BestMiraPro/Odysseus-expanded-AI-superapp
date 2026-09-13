@@ -143,9 +143,18 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             # Migrating to nonce-only requires templating the HTML files +
             # auditing every JS-set style attribute. Since inline styles
             # don't execute script, the residual risk is visual-only.
+            #
+            # 'wasm-unsafe-eval' lets the in-browser Python runtime (Pyodide,
+            # static/js/codeRunner.js) compile its WebAssembly. Without it the
+            # browser refuses the compile outright -- whatever origin the .wasm
+            # came from -- and Pyodide does not reject, it hangs, so every
+            # "Run" and every Study plot sat on "Loading Python runtime" forever.
+            # It is scoped to WebAssembly compilation only: it does NOT permit
+            # eval(), new Function() or string timers, which remain blocked, so
+            # an injected string still cannot be turned into running script.
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; "
-                f"script-src 'self' 'nonce-{nonce}' https://cdn.jsdelivr.net; "
+                f"script-src 'self' 'nonce-{nonce}' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; "
                 "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
                 "font-src 'self' https://cdn.jsdelivr.net; "
                 "img-src 'self' data: blob: https:; "

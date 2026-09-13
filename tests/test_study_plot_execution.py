@@ -149,7 +149,18 @@ def test_the_code_stays_reachable_behind_a_toggle():
 
 def test_a_failed_run_reveals_the_source_again():
     """Better a visible snippet than a blank space where a graph should be."""
-    assert "pre.hidden = false" in _plot_runner()
+    # A cheap tripwire only. Its previous form -- that the text
+    # `pre.hidden = false` appeared anywhere -- kept passing while that line sat
+    # inside a .catch() that runPython's never-rejecting contract made
+    # unreachable, so a failed plot left its code hidden and this test green.
+    # The behaviour is exercised for real in
+    # test_render_python_plots_reveals_code_js.py. This pins only that the
+    # reveal is driven by the resolved result, not by a rejection that cannot
+    # happen.
+    assert re.search(
+        r"\.then\(\s*\(r\)\s*=>\s*\{\s*if \(!r \|\| !r\.images\) pre\.hidden = false",
+        _plot_runner(),
+    ), "the reveal is not driven by runPython's resolved result"
 
 
 # Both tutors must draw. They render the same markdown through different

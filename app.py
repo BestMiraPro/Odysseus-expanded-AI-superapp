@@ -57,7 +57,6 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -529,21 +528,13 @@ app.add_middleware(_ForwardedProtoMiddleware)
 # ========= STATIC FILES =========
 os.makedirs(STATIC_DIR, exist_ok=True)
 
+# Caching rules, and the MIME types the in-browser Python runtime needs, live in
+# core/static_files.py, where they can be exercised directly -- including the
+# Windows path case that a plain prefix check silently misses.
+from core.static_files import RevalidatingStatic as _RevalidatingStatic
+from core.static_files import register_runtime_mimetypes
 
-class _RevalidatingStatic(StaticFiles):
-    """Serve static assets normally, but force the browser to REVALIDATE
-    source files (.js/.css/.html) on every load instead of serving a stale
-    copy from disk cache. The app ships raw ES modules with no build step or
-    versioned URLs, so browsers were caching modules across deploys — a code
-    change wouldn't appear without a manual hard-refresh. `no-cache` keeps the
-    cached bytes but requires a conditional request; unchanged files still
-    return a cheap 304 (ETag/Last-Modified are preserved)."""
-
-    async def get_response(self, path, scope):
-        resp = await super().get_response(path, scope)
-        if path.endswith((".js", ".css", ".html")):
-            resp.headers["Cache-Control"] = "no-cache"
-        return resp
+register_runtime_mimetypes()
 
 
 app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")

@@ -44,6 +44,10 @@ assets/branding/
 /research_data/
 tasks/
 _scratch/
+# Pyodide is fetched and checksum-verified inside the image build (see the
+# Dockerfile). A copy someone fetched locally must not ride in on COPY . . and
+# overlay the verified one.
+static/lib/pyodide/
 compound.config.json
 search_analytics.json
 **/search_analytics.json

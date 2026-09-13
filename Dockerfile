@@ -134,6 +134,18 @@ RUN pip install --no-cache-dir python-magic==0.4.27 \
     && pip install --no-cache-dir --no-deps /tmp/odysseus-wheels/*.whl \
     && rm -rf /tmp/odysseus-wheels
 
+# In-browser Python runtime (Pyodide) for the chat's Run button and Study's
+# plots, served from this origin rather than cdn.jsdelivr.net: the page's CSP
+# allows only same-origin fetches, and a CDN breaks offline installs and tells a
+# third party each time a session runs Python. At 26.8 MB it is too large to
+# commit, so it is fetched here, and every file is checked against the
+# committed, provenance-anchored manifest before it lands. Copying just the
+# script and manifest first keeps this layer cached across ordinary code
+# changes. static/lib/pyodide/ is in .dockerignore, so COPY . . below can never
+# lay an unverified local copy over the verified one.
+COPY scripts/fetch_pyodide.py scripts/pyodide_manifest.json ./scripts/
+RUN python scripts/fetch_pyodide.py
+
 # Copy app code
 COPY . .
 

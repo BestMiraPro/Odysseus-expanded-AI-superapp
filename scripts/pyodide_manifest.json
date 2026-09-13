@@ -1,0 +1,78 @@
+{
+  "version": "0.27.5",
+  "source": "https://cdn.jsdelivr.net/pyodide/v0.27.5/full/",
+  "files": {
+    "pyodide.js": {
+      "sha256": "7fdbe66e53f68f6a4e93c295a667371759be093d2bd402bb44545514584039b6",
+      "size": 14928
+    },
+    "pyodide.asm.js": {
+      "sha256": "3a889f073e628c2196c705b42fa0e955ba2e25c034b1e3dd589c35be675bc01b",
+      "size": 1253804
+    },
+    "pyodide.asm.wasm": {
+      "sha256": "f7fefe563134714a17abd65516d94960e8dbd96fe6778a7a842947fc9686b3a1",
+      "size": 10103326
+    },
+    "python_stdlib.zip": {
+      "sha256": "6030964967e447c887abc46c5f0967c55688644d759496de82a3ef09f49f5cba",
+      "size": 2358894
+    },
+    "pyodide-lock.json": {
+      "sha256": "be1807745da93daa09d360b109c17a0e526e74d664d1f1b9870aafcce98ce426",
+      "size": 112205
+    },
+    "contourpy-1.3.0-cp312-cp312-pyodide_2024_0_wasm32.whl": {
+      "sha256": "d640f7cba60c14cf381c04a7a781e1454ca55f0ae5e015facfb2291d8c869875",
+      "size": 112206
+    },
+    "cycler-0.12.1-py3-none-any.whl": {
+      "sha256": "d9b2fa15e8dfa23230d5e4e182ab4b160a00a84b714cad1a258e5bf6ac36b930",
+      "size": 8321
+    },
+    "fonttools-4.51.0-py3-none-any.whl": {
+      "sha256": "34cbc5d0d263cab22e6a917d6adb018a3d0512b19b96ef1cd35e2cfd03d0bd24",
+      "size": 1073094
+    },
+    "kiwisolver-1.4.5-cp312-cp312-pyodide_2024_0_wasm32.whl": {
+      "sha256": "f006a1adb6d567f292eb5facec3d5f0b4e4e055ee506c7dfbcd10e6b05e3d46d",
+      "size": 35233
+    },
+    "matplotlib-3.8.4-cp312-cp312-pyodide_2024_0_wasm32.whl": {
+      "sha256": "726a069e0407cf14ba9d921747c9c4c81687621a4cdf0a27ad4af2b403025f4d",
+      "size": 6714843
+    },
+    "matplotlib_pyodide-0.2.3-py3-none-any.whl": {
+      "sha256": "fdecad0b458cd658bffa8cd014bed38d008f1f441aaa10ee6081fcf3e74318ff",
+      "size": 26183
+    },
+    "numpy-2.0.2-cp312-cp312-pyodide_2024_0_wasm32.whl": {
+      "sha256": "d9cc75a959bbfb14efe05e26ca04cb2c85acbdad8b0a07a1c0140c4b820b4eec",
+      "size": 3106119
+    },
+    "packaging-24.2-py3-none-any.whl": {
+      "sha256": "8702ed5471ec290c11d7b7792d70159ecb47b0dc476a5606acd891609a9ff7d0",
+      "size": 71930
+    },
+    "pillow-10.2.0-cp312-cp312-pyodide_2024_0_wasm32.whl": {
+      "sha256": "cf56845b516fe5410e62df531ca3efac7d865e52d43ff0763238db3ad454d2f7",
+      "size": 987254
+    },
+    "pyparsing-3.1.2-py3-none-any.whl": {
+      "sha256": "891387669ff1255b12e7ca1a35ff2691a4e635b016ea9dc32f48b306e2e79c0c",
+      "size": 103246
+    },
+    "python_dateutil-2.9.0.post0-py2.py3-none-any.whl": {
+      "sha256": "ae746faed61551f3cc0d663f52f732551c3e3f8c6c61c6b36862440819acd470",
+      "size": 229892
+    },
+    "pytz-2024.1-py2.py3-none-any.whl": {
+      "sha256": "dc3559afd49896fa97d16d17cc802d2ee8e5247d26a15cb4338656b5b079dc00",
+      "size": 505474
+    },
+    "six-1.16.0-py2.py3-none-any.whl": {
+      "sha256": "894f203bc82a942d3a405dbd15ac331a6bd3f63fedadfbb5a557a8ed7f13a9b3",
+      "size": 11053
+    }
+  }
+}

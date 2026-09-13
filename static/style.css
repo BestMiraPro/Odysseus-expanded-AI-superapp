@@ -4407,6 +4407,12 @@ body.bg-pattern-sparkles {
       border:none !important;
     }
     .code-runner-error { color:var(--red); }
+    /* Text a plotting snippet printed, shown beneath its figure rather than in
+       its place. A warning here is not a failure -- matplotlib announces
+       "building the font cache" on its first import of every session -- so it
+       is muted: a student should not read it as the plot having gone wrong. */
+    .code-runner-note { margin-top:6px; }
+    .code-runner-warning .code-runner-pre { opacity:.6; font-size:.92em; }
     .code-runner-loading { font-style:italic; color:var(--red); padding:4px 0; }
     .code-runner-close {
       position:absolute; top:4px; right:4px;

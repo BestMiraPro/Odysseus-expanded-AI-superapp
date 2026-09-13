@@ -139,8 +139,36 @@ function addCopyBtn_unused(panel, text) {
  */
 function addCloseBtn(_panel) { /* no-op */ }
 
+// Where the runtime is served from: this origin, never a CDN.
+//
+// pyodide.js resolves the .wasm, the stdlib and every package wheel relative to
+// this URL, so all of those fetches fall under the page's connect-src 'self'.
+// Loading from cdn.jsdelivr.net is what broke it -- the CSP blocked Pyodide's
+// own downloads, and the load hung -- and this project had already moved KaTeX
+// and Mermaid off that CDN for breaking offline installs and announcing every
+// session to a third party.
+//
+// The files are too large to commit (26.8 MB), so scripts/fetch_pyodide.py
+// downloads and checksum-verifies them into static/lib/pyodide/<version>/: at
+// Docker build time, or once by hand for a native install. The version is in
+// the path so an upgrade changes the URL instead of mixing old and new files,
+// and it must match scripts/pyodide_manifest.json (a test pins the two).
+const PYODIDE_INDEX_URL = '/static/lib/pyodide/0.27.5/';
+
+// How long the runtime may take to come up before it is reported as failed.
+// The first load pulls ~14 MB, so this is generous: its job is to turn a hang
+// into an error, not to race a slow connection.
+const PYODIDE_LOAD_TIMEOUT_MS = 90000;
+
 /**
- * Lazy-load Pyodide from CDN
+ * Lazy-load Pyodide.
+ *
+ * Every outcome settles exactly once and resets the loading flag. Neither was
+ * true before. When the page's CSP blocked Pyodide's own fetches of its .wasm
+ * and stdlib, window.loadPyodide() did not reject -- it never settled -- so the
+ * panel sat on "Loading Python runtime" indefinitely with nothing in it to say
+ * why. And because pyodideLoading stayed true, every later attempt joined the
+ * queue behind that same dead promise, so retrying could not help either.
  */
 function loadPyodide() {
   if (pyodideInstance) return Promise.resolve(pyodideInstance);
@@ -152,31 +180,52 @@ function loadPyodide() {
   pyodideLoading = true;
 
   return new Promise((resolve, reject) => {
-    const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/pyodide.js';
-    script.onload = () => {
-      window.loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/' })
-        .then(py => {
-          pyodideInstance = py;
-          pyodideLoading = false;
-          pyodideQueue.forEach(q => q.resolve(py));
-          pyodideQueue.length = 0;
-          resolve(py);
-        })
-        .catch(err => {
-          pyodideLoading = false;
-          pyodideQueue.forEach(q => q.reject(err));
-          pyodideQueue.length = 0;
-          reject(err);
-        });
-    };
-    script.onerror = () => {
+    let settled = false;
+    let timer = null;
+    const succeed = (py) => {
+      if (settled) return;          // a late load after a timeout must not revive state
+      settled = true;
+      clearTimeout(timer);
+      pyodideInstance = py;
       pyodideLoading = false;
-      const err = new Error('Failed to load Pyodide');
-      pyodideQueue.forEach(q => q.reject(err));
-      pyodideQueue.length = 0;
+      pyodideQueue.splice(0).forEach(q => q.resolve(py));
+      resolve(py);
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      pyodideLoading = false;       // let the next attempt start fresh
+      pyodideQueue.splice(0).forEach(q => q.reject(err));
       reject(err);
     };
+
+    timer = setTimeout(() => fail(new Error(
+      'The Python runtime did not finish loading. Its files may be missing or ' +
+      'incomplete (run `python scripts/fetch_pyodide.py --check`), or a request ' +
+      'may be blocked by the page\'s Content-Security-Policy -- the browser ' +
+      'console names any blocked request.')), PYODIDE_LOAD_TIMEOUT_MS);
+
+    const script = document.createElement('script');
+    script.src = PYODIDE_INDEX_URL + 'pyodide.js';
+    script.onload = () => {
+      if (typeof window.loadPyodide !== 'function') {
+        fail(new Error('pyodide.js loaded but did not define loadPyodide'));
+        return;
+      }
+      // Promise.resolve().then: a synchronous throw inside the loader becomes a
+      // rejection routed to fail(), instead of escaping the onload handler.
+      Promise.resolve()
+        .then(() => window.loadPyodide({ indexURL: PYODIDE_INDEX_URL }))
+        .then(succeed, fail);
+    };
+    // A 404 here almost always means the runtime was never fetched. It is not
+    // in git (26.8 MB): Docker images fetch it at build time, but a native
+    // install has to run the fetch script once.
+    script.onerror = () => fail(new Error(
+      'Could not fetch the Python runtime script from ' + PYODIDE_INDEX_URL +
+      ' -- it is probably not installed. Run `python scripts/fetch_pyodide.py` ' +
+      'once from the Odysseus folder, then reload. (Docker images include it.)'));
     document.head.appendChild(script);
   });
 }
@@ -193,9 +242,17 @@ export function codeUsesMatplotlib(code) {
   return /\b(?:matplotlib|pyplot|\bplt\.)/.test(String(code || ''));
 }
 
+/**
+ * Run Python in the browser, rendering its figures and output into panel.
+ *
+ * Resolves to { ok, images, error } and never rejects: the panel is where
+ * errors are shown, but callers still need to know whether anything was drawn.
+ * renderPythonPlots used to wait on a .catch() that could never fire, so a
+ * failed Study plot left its code hidden with nothing in its place.
+ */
 export async function runPython(code, panel) {
   const wantsPlot = codeUsesMatplotlib(code);
-  showLoading(panel, 'Loading Python runtime (first time ~10 MB)...');
+  showLoading(panel, 'Loading Python runtime (first time ~14 MB)...');
 
   let py;
   try {
@@ -203,21 +260,36 @@ export async function runPython(code, panel) {
   } catch (e) {
     showOutput(panel, 'Failed to load Python runtime: ' + e.message, true);
     addCloseBtn(panel);
-    return;
+    return { ok: false, images: 0, error: e.message };
   }
 
   if (wantsPlot) {
-    showLoading(panel, 'Loading plotting library (first time ~15 MB)...');
+    showLoading(panel, 'Loading plotting library (first time ~13 MB)...');
+    let packageTimer = null;
     try {
       // MPLBACKEND must be set before the first matplotlib import: Pyodide's
       // default backend draws to a canvas it owns, and savefig on it produces
       // nothing. Agg renders to a buffer, which is what we want to capture.
       await py.runPythonAsync("import os; os.environ['MPLBACKEND'] = 'AGG'");
-      await py.loadPackage(['matplotlib', 'numpy']);
+      // Bounded like the runtime load, and for the same reason: a package fetch
+      // the page cannot complete does not reliably reject, and an unbounded
+      // await would leave the panel on "Loading plotting library" with no way
+      // out. The wheels are about the size of the runtime, so the same limit fits.
+      await Promise.race([
+        py.loadPackage(['matplotlib', 'numpy']),
+        new Promise((_, reject) => {
+          packageTimer = setTimeout(() => reject(new Error(
+            'the plotting packages did not finish loading. The wheels under ' +
+            PYODIDE_INDEX_URL + ' may be missing -- run ' +
+            '`python scripts/fetch_pyodide.py --check`.')), PYODIDE_LOAD_TIMEOUT_MS);
+        }),
+      ]);
     } catch (e) {
       showOutput(panel, 'Could not load the plotting library: ' + e.message, true);
       addCloseBtn(panel);
-      return;
+      return { ok: false, images: 0, error: e.message };
+    } finally {
+      clearTimeout(packageTimer);
     }
   }
 
@@ -281,17 +353,46 @@ finally:
       img.src = 'data:image/png;base64,' + b64;
       panel.appendChild(img);
     });
+
+    if (images.length) {
+      // A figure means the snippet worked, so anything it printed belongs BELOW
+      // the figure, never in its place. showOutput clears whatever it writes
+      // into, so each piece of text gets a container of its own.
+      //
+      // This is not cosmetic. matplotlib writes "Matplotlib is building the font
+      // cache; this may take a moment." to stderr on its first import in every
+      // session. Routed straight to showOutput, that notice erased the first
+      // plot of every session -- and, treated as an error, hid the entire panel
+      // 7 s later, which looked exactly like matplotlib failing to load. A stray
+      // print() erased a plot the same way. With a figure present, stderr is a
+      // warning: not styled as an error, and never scheduling that auto-hide.
+      for (const [text, kind] of [[stdout, 'output'], [stderr, 'warning']]) {
+        if (!text) continue;
+        const note = document.createElement('div');
+        note.className = 'code-runner-note code-runner-' + kind;
+        note.style.position = 'relative';
+        panel.appendChild(note);
+        showOutput(note, text, false);
+      }
+      addCloseBtn(panel);
+      return { ok: true, images: images.length, error: null };
+    }
+
+    // No figure: the text IS the result, shown exactly as it always was.
     if (stderr) {
       showOutput(panel, stderr, true);
     } else if (stdout) {
       showOutput(panel, stdout, false);
-    } else if (!images.length) {
+    } else {
       showOutput(panel, '(no output)', false);
     }
+    addCloseBtn(panel);
+    return { ok: !stderr, images: 0, error: stderr || null };
   } catch (e) {
     showOutput(panel, e.message, true);
+    addCloseBtn(panel);
+    return { ok: false, images: 0, error: e.message };
   }
-  addCloseBtn(panel);
 }
 
 /**
@@ -503,7 +604,14 @@ export function renderPythonPlots(root) {
     });
     panel.parentNode.insertBefore(toggle, panel.nextSibling);
 
-    runPython(src, panel).catch(() => { pre.hidden = false; });
+    // runPython resolves to { ok, images, error } and never rejects, so a
+    // .catch() on its own could never fire: a failed plot used to leave its
+    // code hidden with nothing in its place. Reveal the code whenever nothing
+    // was drawn -- including a run that succeeded without producing a figure --
+    // and keep the .catch() only for anything unexpected.
+    runPython(src, panel)
+      .then((r) => { if (!r || !r.images) pre.hidden = false; })
+      .catch(() => { pre.hidden = false; });
   });
 }
 

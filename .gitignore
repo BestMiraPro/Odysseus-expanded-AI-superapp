@@ -68,6 +68,9 @@ Thumbs.db
 *.cache
 cache/
 output.txt.txt
+# Pyodide runtime, 26.8 MB -- fetched and verified by scripts/fetch_pyodide.py,
+# never committed. The pinned hashes live in scripts/pyodide_manifest.json.
+static/lib/pyodide/
 
 # Media (uploaded/generated)
 *.jpg
