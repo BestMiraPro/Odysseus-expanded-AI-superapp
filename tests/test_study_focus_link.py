@@ -10,7 +10,7 @@ Verifies:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 import json
 from contextlib import contextmanager
 
@@ -24,6 +24,7 @@ from core.database import (
     StudyFocusSession,
 )
 from routes import study_routes
+import routes.study._common as study_common
 
 
 OWNER = "alice"
@@ -90,6 +91,14 @@ def _session_scope(session):
     yield session
 
 
+# The endpoint reads the clock per request, so the tests pin it. A "today"
+# taken from the real clock at import raced the endpoint's: a CI run collected
+# this file at 23:46 UTC, reached the test after midnight, and the plan's
+# blocks were for yesterday (assert 0 == 2).
+FIXED_NOW = datetime(2026, 3, 14, 12, 0, 0)
+TODAY_ISO = FIXED_NOW.date().isoformat()
+
+
 @pytest.fixture
 def study_client(monkeypatch):
     session = _Session()
@@ -99,13 +108,11 @@ def study_client(monkeypatch):
     monkeypatch.setattr(study_routes, "get_current_user", lambda _request: OWNER)
     monkeypatch.setattr(study_routes, "_read_pref", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(study_routes.RateLimiter, "check", lambda *_a, **_k: True)
+    monkeypatch.setattr(study_common, "_utcnow_naive", lambda: FIXED_NOW)
     return TestClient(app), session
 
 
 # --------------------------------------------------------------------------- builders
-
-TODAY_ISO = datetime.now(timezone.utc).date().isoformat()
-
 
 def _deck(**overrides):
     data = {
@@ -202,6 +209,23 @@ def test_today_blocks_returns_shape_for_user_with_plan(study_client):
     assert blocks[1]["block_key"] == f"{TODAY_ISO}:1"
     assert blocks[1]["type"] == "practice"
     assert blocks[1]["minutes"] == 50
+
+
+def test_today_blocks_follows_the_request_clock_across_midnight(study_client, monkeypatch):
+    """"Today" is whatever the clock says when the request arrives: the last
+    second of a plan day still shows its blocks, and the first second of the
+    next day does not. This also proves the pinned clock reaches the endpoint
+    -- if it did not, the first assertion could pass only on FIXED_NOW's date."""
+    client, session = study_client
+    session.rows[StudyExam] = [_exam_with_today_blocks()]
+
+    last_second = FIXED_NOW.replace(hour=23, minute=59, second=59)
+    monkeypatch.setattr(study_common, "_utcnow_naive", lambda: last_second)
+    assert len(client.get("/api/study/focus/today-blocks").json()["blocks"]) == 2
+
+    next_midnight = FIXED_NOW.replace(hour=0, minute=0, second=0) + timedelta(days=1)
+    monkeypatch.setattr(study_common, "_utcnow_naive", lambda: next_midnight)
+    assert client.get("/api/study/focus/today-blocks").json()["blocks"] == []
 
 
 def test_today_blocks_empty_when_no_plan(study_client):
