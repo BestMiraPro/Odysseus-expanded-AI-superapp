@@ -46,7 +46,7 @@ def setup_study_agent_routes() -> APIRouter:
         model = ""
         try:
             from routes.study_routes import _resolve_study_model
-            _url, model, _h = _resolve_study_model(user, prefer_text=True)
+            _url, model, _h = _resolve_study_model(user)
         except HTTPException as e:
             model = f"(none: {e.detail})"
         return {

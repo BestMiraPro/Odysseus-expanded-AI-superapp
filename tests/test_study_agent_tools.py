@@ -322,3 +322,52 @@ def test_run_agent_stream_executes_tool_and_persists(db, monkeypatch):
     ui = sa.thread_messages_for_ui("alice", tid)
     assert [m["role"] for m in ui] == ["user", "assistant", "tool", "assistant"]
     assert ui[-1]["content"] == "No subjects yet."
+
+
+def test_tutor_uses_the_model_selected_in_the_study_menu(db, monkeypatch):
+    from src import study_agent as sa
+    from routes import study_routes as sr
+
+    def resolve(_owner, prefer_text=False):
+        model = "deepseek-ai/DeepSeek-V4-Pro" if prefer_text else "menu-selected"
+        return "http://x", model, {}
+
+    used_models = []
+
+    async def fake_stream(_url, model, _messages, **_kwargs):
+        used_models.append(model)
+        yield 'data: {"delta": "Hello"}\n\n'
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(sr, "_resolve_study_model", resolve)
+    import src.llm_core as lc
+    monkeypatch.setattr(lc, "stream_llm", fake_stream)
+
+    async def collect():
+        thread = sa.create_thread("alice")
+        return [chunk async for chunk in sa.run_study_agent("alice", thread["id"], "hello")]
+
+    chunks = asyncio.run(collect())
+    model_info = next(json.loads(c[6:]) for c in chunks if '"type": "model_info"' in c)
+    assert model_info["model"] == "menu-selected"
+    assert used_models == ["menu-selected"]
+
+
+def test_tutor_capabilities_reports_the_model_selected_in_the_study_menu(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routes import study_agent_routes as sar, study_routes as sr
+    import src.tool_security as tool_security
+
+    def resolve(_owner, prefer_text=False):
+        model = "deepseek-ai/DeepSeek-V4-Pro" if prefer_text else "menu-selected"
+        return "http://x", model, {}
+
+    monkeypatch.setattr(sr, "_resolve_study_model", resolve)
+    monkeypatch.setattr(sar, "get_current_user", lambda _request: "alice")
+    monkeypatch.setattr(tool_security, "owner_is_admin_or_single_user", lambda _owner: False)
+    app = FastAPI()
+    app.include_router(sar.setup_study_agent_routes())
+
+    body = TestClient(app).get("/api/study/agent/capabilities").json()
+    assert body["model"] == "menu-selected"
