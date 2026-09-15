@@ -1266,7 +1266,7 @@ async def run_study_agent(owner, thread_id: str, user_text: str, *, deck_id: Opt
     # when no model is configured yet (the error below is then the reply).
     save_message(owner, thread_id, "user", user_text)
     try:
-        url, model, headers = sr._resolve_study_model(owner, prefer_text=True)
+        url, model, headers = sr._resolve_study_model(owner)
     except HTTPException as e:
         yield _sse({"type": "error", "message": str(e.detail)})
         yield DONE
