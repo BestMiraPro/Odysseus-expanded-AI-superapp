@@ -2378,6 +2378,12 @@ class StudyQuestion(TimestampMixin, Base):
     topic           = Column(String, nullable=True, index=True)
     difficulty      = Column(String, default="medium")  # easy | medium | hard
     origin          = Column(String, default="extracted")  # "extracted" | "authored" | "user"
+    # Where the answer/reference and MCQ key came from, per field:
+    # {"reference": {"origin": "document_transcribed", ...},
+    #  "correct_index": {"origin": "ai_generated"}}. JSON; null for legacy rows.
+    # Origins: document_transcribed | ai_generated | mixed | user_edited | unknown.
+    # Distinct from `origin`, which says where the *question* came from.
+    answer_provenance = Column(Text, nullable=True)
     suspended       = Column(Boolean, default=False)
     # FSRS state (same scheme as StudyCard)
     state           = Column(String, default="new", index=True)
@@ -2435,6 +2441,9 @@ class StudyAgentThread(TimestampMixin, Base):
     owner    = Column(String, nullable=True, index=True)
     title    = Column(String, nullable=True)
     deck_id  = Column(String, nullable=True, index=True)   # subject the thread is scoped to
+    # Non-null marks a PRACTICE thread: a protected Ask AI conversation bound
+    # to one practice question. Ordinary tutor threads stay NULL here.
+    question_id = Column(String, nullable=True, index=True)
 
 
 class StudyAgentMessage(TimestampMixin, Base):

@@ -102,17 +102,17 @@ def test_long_note_text_wraps_instead_of_pushing_the_pill_out():
 
 
 def test_the_practice_ask_thread_does_not_clip_a_chart_either():
-    """Practice's Ask-AI replies render inside .study-ask-thread, capped at
-    260px with its own scroll -- and _enrichRendered runs plot blocks there. A
+    """Practice's Ask-AI replies render inside .study-coach-log, capped at
+    260px with its own scroll -- and the panel enriches plot blocks there. A
     chart in a reply would be cut off exactly like the reported one."""
-    decls = _declarations(STUDY_JS, ".study-ask-thread:has(img.code-runner-plot)")
+    decls = _declarations(STUDY_JS, ".study-coach-log:has(img.code-runner-plot)")
     assert decls, "no override lets the Ask-AI thread fit a figure"
     assert decls.get("max-height") == "none"
     assert decls.get("overflow-y") == "visible"
 
 
 def test_a_text_only_ask_thread_still_scrolls():
-    decls = _declarations(STUDY_JS, ".study-ask-thread")
+    decls = _declarations(STUDY_JS, ".study-coach-log")
     assert decls.get("max-height") == "260px"
     assert decls.get("overflow-y") == "auto"
 

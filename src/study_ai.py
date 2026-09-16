@@ -296,6 +296,224 @@ def repair_markdown_tables(text: str) -> str:
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Answer provenance
+# ---------------------------------------------------------------------------
+# Where a question's reference answer and MCQ key came from, per field.
+# `StudyQuestion.origin` says where the *question* came from (extracted /
+# authored / user); this says where its *answer* came from, because extraction
+# instructions explicitly permit deriving a solution when the document has
+# none — so origin="extracted" alone cannot establish that an answer was
+# transcribed from the source.
+#
+# "Source attribution describes extraction provenance, not independently
+# guaranteed correctness": document_transcribed means "the extractor copied it
+# from the material", not "verified against the answer key".
+
+ANSWER_PROVENANCE_ORIGINS = (
+    "document_transcribed", "ai_generated", "mixed", "user_edited", "unknown",
+)
+
+_EXCERPT_MAX_CHARS = 1000
+_EVIDENCE_MAX_ID_CHARS = 200
+
+
+def _norm_whitespace(s: str) -> str:
+    return " ".join((s or "").split())
+
+
+def _provenance_entry(value) -> Dict:
+    """Normalize one per-field provenance entry ({origin, evidence?})."""
+    if not isinstance(value, dict):
+        return {"origin": "unknown"}
+    origin = str(value.get("origin") or "").strip().lower() or "unknown"
+    if origin not in ANSWER_PROVENANCE_ORIGINS:
+        origin = "unknown"
+    out = {"origin": origin}
+    # user_edited / ai_generated / unknown carry no source evidence; a
+    # transcribed or mixed entry may.
+    if origin in ("document_transcribed", "mixed"):
+        material_id = str(value.get("material_id") or "").strip()
+        if material_id:
+            out["material_id"] = material_id[:_EVIDENCE_MAX_ID_CHARS]
+        try:
+            page = int(value.get("page"))
+            if page > 0:
+                out["page"] = page
+        except (TypeError, ValueError):
+            pass
+        excerpt = str(value.get("excerpt") or "").strip()
+        if excerpt:
+            out["excerpt"] = excerpt[:_EXCERPT_MAX_CHARS]
+    return out
+
+
+def normalize_answer_provenance(value) -> Dict:
+    """Normalize a stored provenance value into a well-formed dict.
+
+    Accepts the parsed dict or its JSON-encoded string. Null, malformed legacy
+    values and missing subfields become ``{"origin": "unknown"}`` without
+    rewriting the database.
+    """
+    data = value
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except ValueError:
+            data = None
+    if not isinstance(data, dict):
+        data = {}
+    return {
+        "reference": _provenance_entry(data.get("reference")),
+        "correct_index": _provenance_entry(data.get("correct_index")),
+    }
+
+
+def provenance_is_blank(prov: Dict) -> bool:
+    """True when every entry is plain ``unknown`` with no evidence — the
+    all-default state a legacy row effectively has without storing it."""
+    prov = normalize_answer_provenance(prov)
+    return all(
+        entry == {"origin": "unknown"} for entry in prov.values()
+    )
+
+
+def updated_answer_provenance(existing, *, changed_fields=(), author="user",
+                              formatting_only=False) -> Dict:
+    """Return the provenance that results from editing a question.
+
+    ``changed_fields`` contains the fields whose *values actually changed*
+    (question, context, options, correct_index, reference), not merely keys
+    present in the request. ``author`` is supplied by the server call site
+    ("user" or "ai"), never trusted from an arbitrary edit payload.
+
+    Rules (plan section 4):
+    - question/context changes invalidate both entries (the answer may no
+      longer match the prompt).
+    - option content/order changes invalidate both entries, unless this is the
+      formatting-only maintenance path which preserves meaning and order.
+    - a reference/key edit marks only that entry (user_edited or
+      ai_generated) and removes stale source evidence.
+    - formatting-only changes preserve origin and evidence.
+    """
+    prov = normalize_answer_provenance(existing)
+    if formatting_only:
+        return prov
+    fields = set(changed_fields or ())
+    if fields & {"question", "context", "options"}:
+        return {"reference": {"origin": "unknown"},
+                "correct_index": {"origin": "unknown"}}
+    new_origin = "user_edited" if author == "user" else "ai_generated"
+    if "reference" in fields:
+        prov["reference"] = {"origin": new_origin}
+    if "correct_index" in fields:
+        prov["correct_index"] = {"origin": new_origin}
+    return prov
+
+
+def extracted_answer_provenance(item: Dict, *, material_id=None,
+                                source_text=None) -> Dict:
+    """Per-field provenance for one extracted item, from the extractor's claim.
+
+    The reference solution and the MCQ key can come from different places, so
+    the extractor may emit ``reference_origin`` / ``reference_page`` /
+    ``reference_excerpt`` and ``key_origin`` / ``key_page`` /
+    ``key_excerpt`` (document_transcribed / ai_generated / mixed, plus short
+    verbatim evidence when transcribed). When a field has no per-field claim
+    the legacy single-origin form (``answer_origin`` +
+    ``answer_source_page``/``answer_source_excerpt``) carries to BOTH entries —
+    a compatibility fallback, never evidence of independently confirmed
+    origins.
+
+    Each claim is validated against the actual source where it can be checked:
+    an excerpt that does not appear in ``source_text`` is dropped rather than
+    kept as false evidence. Pages are only accepted from the extractor — never
+    inferred from the question's own location, because the answer may appear
+    elsewhere in the document.
+    """
+    flat = str(item.get("answer_origin") or "").strip() or None
+
+    def _claim(prefix: str) -> Dict:
+        """(origin, page, excerpt) for one field: per-field keys when present,
+        else the legacy flat triple for BOTH entries."""
+        if item.get(f"{prefix}_origin") is not None:
+            origin_raw = item.get(f"{prefix}_origin")
+            page_raw = item.get(f"{prefix}_page")
+            exc_raw = item.get(f"{prefix}_excerpt")
+        else:
+            origin_raw = flat
+            page_raw = item.get("answer_source_page")
+            exc_raw = item.get("answer_source_excerpt")
+        origin = str(origin_raw or "unknown").strip().lower() or "unknown"
+        if origin not in ANSWER_PROVENANCE_ORIGINS:
+            origin = "unknown"
+        page = None
+        try:
+            p = int(page_raw or 0)
+            if p > 0:
+                page = p
+        except (TypeError, ValueError):
+            page = None
+        excerpt = str(exc_raw or "").strip()
+        if excerpt and source_text:
+            if _norm_whitespace(excerpt) not in _norm_whitespace(source_text):
+                excerpt = ""
+        evidence: Dict = {}
+        if excerpt:
+            evidence["excerpt"] = excerpt[:_EXCERPT_MAX_CHARS]
+        if page:
+            evidence["page"] = page
+        if origin in ("document_transcribed", "mixed") and material_id:
+            evidence["material_id"] = material_id
+        return {"origin": origin, **evidence}
+
+    def _entry(claim: Dict, configured: bool) -> Dict:
+        if not configured or claim["origin"] == "unknown":
+            return {"origin": "unknown"}
+        return claim
+
+    qtype = item.get("qtype")
+    return {
+        "reference": _entry(_claim("reference"),
+                            qtype is None
+                            or bool(str(item.get("reference") or "").strip())),
+        "correct_index": _entry(_claim("key"),
+                                qtype is None
+                                or item.get("correct_index") is not None),
+    }
+
+
+def question_answer_provenance(item: Dict, *, material_id=None, source_text=None,
+                               authored=False) -> Dict:
+    """The provenance to store on a new question row.
+
+    ``authored=True`` covers authoring (extraction mode "author" and the
+    agent's add_questions tool): provided answers are ``ai_generated``,
+    missing ones ``unknown``. Otherwise the extractor's per-field claim is
+    used, with one correction: an MCQ whose reference is just the correct
+    option's own wording (filled from the key) inherits the key's provenance
+    rather than claiming a separate document explanation.
+    """
+    if authored:
+        def _auth(configured: bool) -> Dict:
+            return {"origin": "ai_generated"} if configured \
+                else {"origin": "unknown"}
+        return {
+            "reference": _auth(bool(str(item.get("reference") or "").strip())),
+            "correct_index": _auth(item.get("correct_index") is not None),
+        }
+    prov = extracted_answer_provenance(
+        item, material_id=material_id, source_text=source_text)
+    if item.get("qtype") == "mcq":
+        options = item.get("options") or []
+        ci = item.get("correct_index")
+        reference = str(item.get("reference") or "").strip()
+        if reference and ci is not None and 0 <= ci < len(options) \
+                and _norm_whitespace(reference) == _norm_whitespace(str(options[ci])):
+            prov["reference"] = prov["correct_index"]
+    return prov
+
+
 def context_is_redundant(question: str, context: str) -> bool:
     """True when a question's `context` adds nothing because the setup already
     sits verbatim inside the question text — showing it would just repeat the
@@ -386,6 +604,19 @@ def normalize_questions(value) -> List[Dict]:
             "context": ctx,
             "chapter": chapter,
             "chapter_index": chapter_index,
+            # Raw extractor provenance claim; only question_answer_provenance()
+            # (which validates against the actual source) turns these into the
+            # stored answer_provenance dict. Per-field claims win; the flat
+            # answer_origin triple is the compatibility fallback for both.
+            "reference_origin": str(item.get("reference_origin") or "").strip() or None,
+            "reference_page": item.get("reference_page"),
+            "reference_excerpt": str(item.get("reference_excerpt") or "").strip() or None,
+            "key_origin": str(item.get("key_origin") or "").strip() or None,
+            "key_page": item.get("key_page"),
+            "key_excerpt": str(item.get("key_excerpt") or "").strip() or None,
+            "answer_origin": str(item.get("answer_origin") or "").strip() or None,
+            "answer_source_page": item.get("answer_source_page"),
+            "answer_source_excerpt": str(item.get("answer_source_excerpt") or "").strip() or None,
         })
     return out
 
@@ -760,11 +991,12 @@ Rules:
 - "chapter"/"chapter_index": when the document is divided into chapters or numbered sections, set "chapter" to the heading the question sits under, exactly as it appears and prefixed by its number ("3 - Joint distributions"), and "chapter_index" to that heading's position starting at 1. Use the SAME string for every question under one heading. Omit BOTH fields entirely when the document has no chapter structure (a single exam paper, one problem set) - never invent divisions.
 - Skip pure definitions of administrative text (deadlines, grading policy, etc.).
 - The QUESTION text must ask something the learner has to work out, and must NOT state the answer. "Prove that f is concave", "Show that g is continuous", "Verify that the constraints are differentiable" are fine (they ask for the work). But NEVER emit a question that already gives away its own result: a conclusion ("Conclude that (3,3) is the solution", "Therefore the point is optimal"), or a verify/show/compute instruction that names the specific result ("Verify that the gradient is $(-4(x-6),-4(y-4))$", "Show that the Hessian is $-4I$, hence concave", "Solve the system to get (3,3,2,6,0)"). When the source is a solution walkthrough, recover the underlying QUESTION it answers and move the result + steps into "reference"; never leave the answer in the question text.
+- Say where each question's ANSWER came from, per field. "reference_origin" describes the reference solution; "key_origin" describes the MCQ correct key. Each is "document_transcribed" when copied from the material (options, worked solutions, answer-key pages), "ai_generated" when you derived it, or "mixed" when a document solution was augmented with your own reasoning. When an entry is at least partly transcribed, also give its "reference_page"/"key_page" (the 1-based page you actually saw that answer on) and "reference_excerpt"/"key_excerpt" (a short excerpt taken WORD-FOR-WORD from the material showing that answer). If BOTH entries came from the same place in the same way, you may instead give only "answer_origin" (+ "answer_source_page"/"answer_source_excerpt") — that shorthand means both came from there, not that they were separately confirmed. Never invent pages or excerpts, and never give an excerpt for a part you derived yourself; for an MCQ do not give a separate excerpt for a reference that is just the correct option's own wording.
 - Use the language of the source material.
 
 Output ONLY a JSON array:
-[{"number":"1","type":"mcq","question":"...","options":["...","..."],"correct_index":0,"reference":"...","topic":"...","difficulty":"medium"},
- {"number":"2a","type":"open","question":"...","context":"...","reference":"...","topic":"...","difficulty":"hard","chapter":"3 - Joint distributions","chapter_index":3}]
+[{"number":"1","type":"mcq","question":"...","options":["...","..."],"correct_index":0,"reference":"...","topic":"...","difficulty":"medium","reference_origin":"mixed","reference_page":9,"reference_excerpt":"...","key_origin":"document_transcribed","key_page":9},
+ {"number":"2a","type":"open","question":"...","context":"...","reference":"...","topic":"...","difficulty":"hard","chapter":"3 - Joint distributions","chapter_index":3,"reference_origin":"ai_generated"}]
 No markdown fences or commentary around the JSON (LaTeX inside the field values is expected)."""
 EXTRACT_QUESTIONS_SYSTEM += _MATH_JSON_NOTE
 

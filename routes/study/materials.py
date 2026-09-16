@@ -281,6 +281,18 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
                 if page:
                     q["source_page"] = page
 
+    # Attach per-field answer provenance before the rows are saved. The
+    # extractor's claim is validated against the material's own text when the
+    # extraction read the text layer (vision reads rendered pages, whose text
+    # layer may be thin or absent — nothing to substring-match against).
+    from src.study_ai import question_answer_provenance
+    for q in questions:
+        q["answer_provenance"] = question_answer_provenance(
+            q, material_id=material_id,
+            source_text=(content if mode == "extract" and not used_vision
+                         else None),
+            authored=(mode == "author"))
+
     if not questions:
         if errors >= len(chunks):
             detail = ("Every chunk failed: the model's replies were empty or "

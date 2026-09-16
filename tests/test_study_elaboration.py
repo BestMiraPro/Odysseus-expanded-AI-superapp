@@ -159,55 +159,13 @@ def test_ask_elaborate_system_never_reveals():
 # ---------------------------------------------------------------------------
 # Route-level elaboration gating
 # ---------------------------------------------------------------------------
-
-def test_ask_defaults_to_coach_when_not_answered(study_app):
-    client, session_local = study_app
-    _seed(session_local, _deck(), _question())
-    r = client.post(
-        "/api/study/questions/q-1/ask",
-        json={"message": "Help", "answered": False, "elaborate": False},
-    )
-    assert r.status_code == 200
-    payload = r.json()
-    assert payload["mode"] == "coach"
-    assert "[system_len=" in payload["reply"]
-
-
-def test_ask_defaults_to_tutor_when_answered(study_app):
-    client, session_local = study_app
-    _seed(session_local, _deck(), _question())
-    r = client.post(
-        "/api/study/questions/q-1/ask",
-        json={"message": "Why?", "answered": True, "elaborate": False},
-    )
-    assert r.status_code == 200
-    payload = r.json()
-    assert payload["mode"] == "tutor"
-
-
-def test_ask_switches_to_elaborate_when_answered_and_elaborate_true(study_app):
-    client, session_local = study_app
-    _seed(session_local, _deck(), _question())
-    r = client.post(
-        "/api/study/questions/q-1/ask",
-        json={"message": "Why?", "answered": True, "elaborate": True},
-    )
-    assert r.status_code == 200
-    payload = r.json()
-    assert payload["mode"] == "elaborate"
-
-
-def test_ask_coach_ignores_elaborate_flag(study_app):
-    client, session_local = study_app
-    _seed(session_local, _deck(), _question())
-    r = client.post(
-        "/api/study/questions/q-1/ask",
-        json={"message": "Help", "answered": False, "elaborate": True},
-    )
-    assert r.status_code == 200
-    payload = r.json()
-    # Before answering, elaborate never triggers.
-    assert payload["mode"] == "coach"
+# The old ask route switched to unrestricted TUTOR mode after submission. The
+# Ask AI panel now keeps ONE protected policy before and after submission
+# (dev-docs/ask-ai-mini-tutor-implementation-plan-2026-09-15.md): the elaborate
+# flag is a response STYLE within that policy, never an answer unlock, and it
+# only takes effect after a server-verified submission. Those route behaviours
+# are pinned in tests/test_study_practice_coach_routes.py (elaborate stays
+# coach without a verified submission, turns elaborate with one).
 
 
 # ---------------------------------------------------------------------------

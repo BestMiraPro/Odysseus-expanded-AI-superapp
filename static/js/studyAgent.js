@@ -8,8 +8,8 @@
  * doesn't lose the conversation.
  */
 
-import { mdToHtml, renderMermaid, renderMath } from './markdown.js';
-import { renderPythonPlots } from './codeRunner.js';
+import { mdToHtml } from './markdown.js';
+import { consumeStudyEvents, enrichStudyMessage } from './studyChat.js';
 
 const API = window.location.origin;
 
@@ -224,13 +224,11 @@ function renderLog() {
   log.innerHTML = A.messages.map(renderMessage).join('');
   log.querySelectorAll('a[href*="/api/upload/"]').forEach(a => { a.target = '_blank'; a.rel = 'noopener'; });
   // Turn the tutor's ```mermaid fences into diagrams and typeset any formula
-  // KaTeX had to defer. Both lazy-load on first use and swallow their own
-  // errors, so a missing library leaves readable source rather than a blank.
-  // This runs on every renderLog because streaming replaces the whole log, and
-  // renderMermaid skips nodes it has already processed.
-  try { renderMermaid(log); } catch { /* diagram stays as its source */ }
-  try { renderMath(log); } catch { /* formula stays as its source */ }
-  try { renderPythonPlots(log); } catch { /* plot stays as its source */ }
+  // KaTeX had to defer, plus the python plots. All of these lazy-load on first
+  // use and swallow their own errors, so a missing library leaves readable
+  // source rather than a blank. This runs on every renderLog because streaming
+  // replaces the whole log; the shared enrich skips what it already processed.
+  enrichStudyMessage(log);
   log.scrollTop = log.scrollHeight;
 }
 
@@ -273,9 +271,6 @@ async function send() {
       try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
       throw new Error(detail);
     }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
     const handle = (ev) => {
       if (ev.type === 'thread') {
         if (!A.threadId) { A.threadId = ev.thread_id; refreshThreads(); }
@@ -308,21 +303,7 @@ async function send() {
       }
       scheduleRender();
     };
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) !== -1) {
-        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
-        for (const line of block.split('\n')) {
-          if (!line.startsWith('data:')) continue;
-          const payload = line.slice(5).trim();
-          if (payload === '[DONE]') continue;
-          try { handle(JSON.parse(payload)); } catch { /* ignore malformed */ }
-        }
-      }
-    }
+    await consumeStudyEvents(res, handle);
   } catch (e) {
     if (e.name !== 'AbortError') A.messages.push({ role: 'error', content: e.message });
     else A.messages.push({ role: 'error', content: 'Stopped.' });

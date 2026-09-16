@@ -149,10 +149,21 @@ async def run_backfill_context(user, deck_id=None) -> Dict:
     filled = 0
     db = _common.SessionLocal()
     try:
+        from src.study_ai import normalize_answer_provenance, \
+            provenance_is_blank, updated_answer_provenance
         for r in (db.query(StudyQuestion).filter(StudyQuestion.id.in_(list(results))).all()
                   if results else []):
             if not (r.context or "").strip():
                 r.context = results[r.id]
+                # A recovered setup is a semantic context change: the stored
+                # answer may no longer be presented as sourced from the old
+                # document passage. The shared edit rules apply to this path
+                # too (used by both the HTTP route and the tutor tool).
+                prov = updated_answer_provenance(
+                    normalize_answer_provenance(r.answer_provenance),
+                    changed_fields=("context",), author="ai")
+                r.answer_provenance = json.dumps(prov) \
+                    if not provenance_is_blank(prov) else None
                 filled += 1
         db.commit()
     finally:

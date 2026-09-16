@@ -3,6 +3,7 @@ from routes.study._common import *  # noqa: F401,F403
 import routes.study._common as _common  # noqa: F401
 
 from fastapi import APIRouter  # noqa: F401  (re-exported via _common but explicit)
+from fastapi.responses import StreamingResponse
 
 
 def _split_topics(topics) -> List[str]:
@@ -262,21 +263,34 @@ def register(router: APIRouter) -> None:
         user = _owner(request)
         db = _common.SessionLocal()
         try:
+            from src.study_ai import normalize_answer_provenance, \
+                provenance_is_blank, updated_answer_provenance
             row = study_service.get_question(db, question_id, user)
+            changed: set = set()
             if body.question is not None:
-                row.question = body.question.strip() or row.question
+                new_q = body.question.strip()
+                if new_q and new_q != row.question:
+                    row.question = new_q
+                    changed.add("question")
             if body.options is not None:
                 opts = [o.strip() for o in body.options if o.strip()]
                 if row.qtype == "mcq" and len(opts) < 2:
                     raise HTTPException(400, "MCQ needs at least 2 options")
-                row.options = json.dumps(opts) if opts else None
+                new_options = json.dumps(opts) if opts else None
+                if new_options != row.options:
+                    row.options = new_options
+                    changed.add("options")
             if body.correct_index is not None:
                 opts = json.loads(row.options) if row.options else []
                 if not (0 <= body.correct_index < len(opts)):
                     raise HTTPException(400, "correct_index out of range")
-                row.correct_index = body.correct_index
+                if body.correct_index != row.correct_index:
+                    row.correct_index = body.correct_index
+                    changed.add("correct_index")
             if body.reference is not None:
-                row.reference = body.reference
+                if body.reference != row.reference:
+                    row.reference = body.reference
+                    changed.add("reference")
             if body.topic is not None:
                 row.topic = body.topic.strip() or None
             if body.difficulty in ("easy", "medium", "hard"):
@@ -285,6 +299,15 @@ def register(router: APIRouter) -> None:
                 row.suspended = body.suspended
             row.explanation = None if body.options is not None or body.reference is not None \
                 else row.explanation
+            # The human hand edited value-bearing fields: keep provenance
+            # truthful (user_edited for the touched entry, unknown after a
+            # prompt/options change), never a stale transcription claim.
+            if changed:
+                prov = updated_answer_provenance(
+                    normalize_answer_provenance(row.answer_provenance),
+                    changed_fields=changed, author="user")
+                row.answer_provenance = json.dumps(prov) \
+                    if not provenance_is_blank(prov) else None
             db.commit()
             material = db.query(StudyMaterial).filter(StudyMaterial.id == row.material_id).first() \
                 if row.material_id else None
@@ -348,6 +371,9 @@ def register(router: APIRouter) -> None:
             question_text = row.question
             reference = row.reference or ""
             correct_index = row.correct_index
+            from src.study_practice_coach import grading_basis
+            basis = grading_basis(qtype=qtype, reference=reference,
+                                  correct_index=correct_index, options=options)
             if body.idempotency_key:
                 prior = db.query(StudyAttempt).filter(
                     StudyAttempt.owner == user,
@@ -407,20 +433,17 @@ def register(router: APIRouter) -> None:
         if qtype == "mcq" and body.typed_recall:
             # Phase 2.5 typed-recall: free-typed answer for an MCQ, graded via open path
             answer_text = (body.answer or "").strip()
-            ref_block = reference if reference.strip() else (
-                options[correct_index] if correct_index is not None and options else "")
+            ref_block = basis["typed_recall_reference"]
             score, grading = await _grade_open_answer(answer_text, ref_block)
             correct = (grading["verdict"] == "correct")
         elif qtype == "mcq":
             if body.choice_index is None or not (0 <= body.choice_index < len(options)):
                 raise HTTPException(400, "choice_index required for MCQ")
-            correct = (body.choice_index == correct_index)
+            correct = (body.choice_index == basis["index_basis"]["correct_index"])
             answer_text = options[body.choice_index]
         else:
             answer_text = (body.answer or "").strip()
-            ref_block = reference if reference.strip() else (
-                "(no reference available - first work out the correct answer "
-                "yourself, then grade the learner's answer against it)")
+            ref_block = basis["open_reference"]
             score, grading = await _grade_open_answer(answer_text, ref_block)
             correct = (grading["verdict"] == "correct")
 
@@ -547,65 +570,103 @@ def register(router: APIRouter) -> None:
 
     @router.post("/questions/{question_id}/ask")
     async def question_ask(request: Request, question_id: str, body: AskIn):
-        """Conversational 'Ask AI' for a practice question. Before the student
-        submits (answered=False) it runs in Socratic COACH mode — guidance/hints
-        only, never the answer. After they submit it runs in TUTOR mode — full
-        explanation. Grounded in the question + reference (for-eyes-only while
-        coaching)."""
+        """Protected 'Ask AI' for a practice question.
+
+        One policy before AND after submission: the target solution is never
+        disclosed. The turn runs through the persisted question-bound agent
+        thread with learning-only tools and a server-side spoiler review; the
+        reply is buffered and approved before it reaches the browser. See
+        dev-docs/ask-ai-mini-tutor-implementation-plan-2026-09-15.md.
+
+        Transport:
+        - ``stream=false`` returns the legacy JSON shape ``{reply, mode,
+          thread_id, retryable}``; ``mode`` is ``coach`` or ``elaborate``,
+          never ``tutor``.
+        - ``stream=true`` emits the protected SSE subset: thread, model_info,
+          fixed status messages, and a single atomic reply event.
+        """
         if not _ai_limiter.check(request.client.host):
             raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
-        msg = (body.message or "").strip()
-        if not msg:
+
+        message = (body.message or "").strip()
+        if not message:
             raise HTTPException(400, "Empty message")
-        db = _common.SessionLocal()
-        try:
-            row = study_service.get_question(db, question_id, user)
-            question_text = row.question
-            ctx = (row.context or "").strip()
-            options = json.loads(row.options) if row.options else None
-            reference = row.reference or ""
-            correct_index = row.correct_index
-        finally:
-            db.close()
+        if len(message) > 20000:
+            raise HTTPException(400, "Message too long (20000 characters max)")
+        if len(body.draft or "") > 8000:
+            raise HTTPException(400, "Draft too long (8000 characters max)")
+        if len(body.hints) > 3:
+            raise HTTPException(400, "At most 3 hints")
+        if any(len(str(h) or "") > 4000 for h in body.hints):
+            raise HTTPException(400, "A hint is too long (4000 characters max)")
+        for field in ("thread_id", "submission_id"):
+            value = getattr(body, field)
+            if value is not None and (not str(value).strip() or len(str(value)) > 200):
+                raise HTTPException(400, f"{field} invalid")
 
-        opts_txt = ("\nOPTIONS:\n" + "\n".join(f"{i}. {o}" for i, o in enumerate(options))) if options else ""
-        ctx_txt = f"\nPROBLEM SETUP:\n{ctx}" if ctx else ""
-        draft = (body.draft or "").strip()
-        if body.answered:
-            if body.elaborate:
-                system = ASK_ELABORATE_SYSTEM
-                mode = "elaborate"
-            else:
-                system = ASK_TUTOR_SYSTEM
-                mode = "tutor"
-            ans = ""
-            if options is not None and correct_index is not None:
-                ans += f"\nCORRECT OPTION INDEX: {correct_index}"
-            if reference:
-                ans += f"\nREFERENCE SOLUTION:\n{reference}"
-            if draft:
-                ans += f"\n\nSTUDENT'S SUBMITTED ANSWER:\n{draft}"
-        else:
-            system = ASK_COACH_SYSTEM
-            mode = "coach"
-            ans = f"\nREFERENCE SOLUTION (FOR YOUR EYES ONLY — never reveal):\n{reference}" if reference else ""
-            if draft:
-                ans += f"\n\nStudent's current draft (NOT submitted):\n{draft}"
+        from src import study_agent
+        from src.study_practice_coach import build_practice_context, \
+            resolve_practice_thread
 
-        convo = ""
-        for t in (body.history or [])[-12:]:
-            if not isinstance(t, dict):
+        # Ownership checks run before any streaming starts: an unowned question
+        # or thread is a plain 404, a mismatched thread a 409.
+        thread_id = resolve_practice_thread(user, question_id, body.thread_id)
+        if study_agent.practice_turn_active(thread_id):
+            raise HTTPException(409, "This conversation is already answering. "
+                                     "Wait for it to finish.")
+        body.thread_id = thread_id
+        context = build_practice_context(user, question_id, body)
+
+        async def _events():
+            yield study_agent._sse({"type": "thread", "thread_id": thread_id})
+            try:
+                async for chunk in study_agent.run_study_agent(
+                        user, thread_id, message, practice_context=context):
+                    yield chunk
+            except HTTPException as e:
+                # server-authored detail, safe to surface
+                yield study_agent._sse({"type": "error", "retryable": False,
+                                        "message": str(e.detail)})
+                yield study_agent.DONE
+            except Exception:
+                logger.exception("study practice coach stream failed")
+                yield study_agent._sse({
+                    "type": "error", "retryable": True,
+                    "message": "Something went wrong while preparing your reply. "
+                    "You can retry in a moment."})
+                yield study_agent.DONE
+
+        if body.stream:
+            return StreamingResponse(
+                _events(), media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache",
+                         "X-Accel-Buffering": "no"})
+
+        # JSON adapter: consumes the same protected executor — there is no
+        # second, weaker generation path.
+        reply = None
+        retryable = False
+        error = None
+        async for chunk in _events():
+            data = chunk.removeprefix("data: ").strip()
+            if not data or data in ("[DONE]",):
                 continue
-            who = "Student" if t.get("role") == "student" else "AI"
-            convo += f"{who}: {str(t.get('content', '')).strip()}\n"
-
-        prompt = (f"QUESTION:\n{question_text}{opts_txt}{ctx_txt}{ans}\n\n"
-                  f"CONVERSATION SO FAR:\n{convo}Student: {msg}\n\n"
-                  f"Reply to the student's latest message.")
-        reply = await _common._llm_text(user, system, prompt,
-                                temperature=0.3, max_tokens=4000, timeout=120)
-        return {"reply": reply, "mode": mode}
+            try:
+                event = json.loads(data)
+            except ValueError:
+                continue
+            if event.get("type") == "reply":
+                reply = str(event.get("content") or "")
+                retryable = bool(event.get("retryable"))
+            elif event.get("type") == "error":
+                error = str(event.get("message") or "")
+        if error:
+            raise HTTPException(502, error)
+        if reply is None:
+            raise HTTPException(502, "The reply was not produced. Try again.")
+        return {"reply": reply, "mode": context["mode"],
+                "thread_id": thread_id, "retryable": retryable}
 
     @router.post("/questions/{question_id}/explain")
     async def question_explain(request: Request, question_id: str):

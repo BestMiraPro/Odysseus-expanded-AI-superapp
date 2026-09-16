@@ -58,8 +58,9 @@ def setup_study_agent_routes() -> APIRouter:
         }
 
     @router.get("/threads")
-    def threads(request: Request):
-        return {"threads": study_agent.list_threads(get_current_user(request))}
+    def threads(request: Request, question_id: Optional[str] = None):
+        return {"threads": study_agent.list_threads(
+            get_current_user(request), question_id=question_id)}
 
     @router.post("/threads")
     def create_thread(request: Request, body: ThreadCreate):
@@ -82,7 +83,12 @@ def setup_study_agent_routes() -> APIRouter:
             raise HTTPException(400, "message is required")
         thread_id = body.thread_id
         if thread_id:
-            study_agent.get_thread(user, thread_id)  # ownership check
+            thread = study_agent.get_thread(user, thread_id)  # ownership check
+            if thread.question_id is not None:
+                # Protected Ask AI conversations can only continue through the
+                # practice endpoint: this chat would lift the restrictions.
+                raise HTTPException(409, "This conversation belongs to the Ask AI "
+                                         "panel. Continue it from the practice question.")
         else:
             thread_id = study_agent.create_thread(user, deck_id=body.deck_id)["id"]
 

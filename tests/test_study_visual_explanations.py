@@ -162,6 +162,24 @@ def test_the_module_imports_both_renderers(mod):
     # PYTEST_CURRENT_TEST, which blows the 32767-character limit Windows puts on
     # an environment variable.
     src = {"study.js": STUDY_JS, "studyAgent.js": AGENT_JS}[mod]
+    if mod == "studyAgent.js":
+        # The tutor tab enriches whole-log renders through the shared chat
+        # helper; the renderers themselves must live on that helper.
+        chat_js = (REPO / "static" / "js" / "studyChat.js").read_text(
+            encoding="utf-8")
+        match = re.search(r"import \{([^}]*)\} from '\./studyChat\.js'", src)
+        assert match, f"{mod} does not import from studyChat.js"
+        assert "enrichStudyMessage" in match.group(1), (
+            f"{mod} no longer enriches its rendered log")
+        chat_match = re.search(
+            r"import \{([^}]*)\} from '\./markdown\.js'", chat_js)
+        assert chat_match, "studyChat.js does not import from markdown.js"
+        chat_names = chat_match.group(1)
+        assert "renderMermaid" in chat_names, "the shared helper imports no diagram renderer"
+        assert "renderMath" in chat_names, "the shared helper imports no math renderer"
+        assert "renderPythonPlots" in chat_js, (
+            "the shared helper never runs a plot block")
+        return
     match = re.search(r"import \{([^}]*)\} from '\./markdown\.js'", src)
     assert match, f"{mod} does not import from markdown.js"
     names = match.group(1)
@@ -187,7 +205,7 @@ def test_the_practice_view_renders_the_tutor_thread():
 def test_the_tutor_tab_renders_its_log():
     body = re.search(r"function renderLog\(.*?\n\}", AGENT_JS, re.DOTALL)
     assert body, "renderLog is gone"
-    assert "renderMermaid" in body.group(0), (
+    assert "enrichStudyMessage" in body.group(0), (
         "the tutor tab writes messages but never renders their diagrams"
     )
 

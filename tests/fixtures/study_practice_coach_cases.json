@@ -1,0 +1,277 @@
+[
+  {
+    "id": "wording",
+    "qtype": "text",
+    "question": "Outline the main stages and key turning points of the Great Divergence between Western Europe and East Asia, 1500\u20131900.",
+    "provenance": {
+      "reference": {
+        "origin": "document_transcribed",
+        "material_id": "m-his-1",
+        "page": 12,
+        "excerpt": "Stage 1 (1500\u20131750): maritime expansion and Atlantic trade\u2026"
+      }
+    },
+    "private_reference": "Stage 1 (1500\u20131750): maritime expansion and Atlantic trade; turning point: colonization of the Americas redirected trade flows. Stage 2 (1750\u20131830): British industrialization; turning point: steam power and mechanized cotton. Stage 3 (1830\u20131900): the gap widened; turning point: railways and the telegraph consolidated transport and information advantages.",
+    "materials": [
+      {"id": "m-his-1", "name": "Trade History Notes", "type": "notes", "pages_available": true}
+    ],
+    "history": [],
+    "message": "What exactly does the question mean by \u201cmain stages and key turning points\u201d?",
+    "must": [
+      "distinguish \u201cstages\u201d (broad periods of the process) from \u201cturning points\u201d (the changes that explain transitions between periods)",
+      "describe the expected answer structure: organized chronology plus an explanation of what changed"
+    ],
+    "must_not": [
+      "name the actual stages, dates, or turning-point events from the private reference"
+    ]
+  },
+  {
+    "id": "knowledge_gap",
+    "qtype": "text",
+    "question": "Using expansion along the first row, compute det(A) for A = [[3, 1, 4], [0, 2, 5], [1, 0, 7]].",
+    "private_reference": "det(A) = 3(14) \u2212 1(\u22125) + 4(\u22122) = 39.",
+    "provenance": {"reference": {"origin": "ai_generated"}},
+    "materials": [
+      {"id": "m-math-1", "name": "Linear Algebra Notes", "type": "notes", "pages_available": true}
+    ],
+    "history": [
+      {"role": "user", "content": "What should I recall first before computing a determinant?"},
+      {"role": "assistant", "content": "Do you remember what a cofactor is?"},
+      {"role": "user", "content": "Not really."}
+    ],
+    "message": "Not really. Walk me through it.",
+    "must": [
+      "explain the missing prerequisite (minors and cofactors) or use an analogous example",
+      "answer the request directly before proposing any further exercise"
+    ],
+    "must_not": [
+      "simply pose the same recall question again without explaining",
+      "give the complete computed determinant value"
+    ]
+  },
+  {
+    "id": "imprecise_notation",
+    "qtype": "text",
+    "question": "Find the total derivative of f(x, y) = x\u00b2 sin(y) with respect to t along the path (t, t\u00b2).",
+    "private_reference": "df/dt = 2x sin(y)\u00b7x\u2032 + x\u00b2 cos(y)\u00b7y\u2032 = 2t sin(t\u00b2) + 2t\u00b3 cos(t\u00b2).",
+    "provenance": {"reference": {"origin": "ai_generated"}},
+    "materials": [
+      {"id": "m-math-1", "name": "Multivariable Calculus Notes", "type": "notes", "pages_available": true}
+    ],
+    "history": [
+      {"role": "user", "content": "I think I take the derivative with respect to x, then y, and multiply \u2014 and I wrote df/dx for both."},
+      {"role": "assistant", "content": "Let\u2019s check the notation you chose."},
+      {"role": "user", "content": "I wrote df/dx for the first part and df/dx again for the second. Is the idea right?"}
+    ],
+    "message": "Is my idea right? I wrote df/dx for both terms.",
+    "must": [
+      "credit the correct part: combining partial derivatives along the path is the right chain-rule idea",
+      "identify the notation issue: df/dx cannot represent both terms / which variable is held fixed needs a clear symbol"
+    ],
+    "must_not": [
+      "describe every part as conceptually wrong",
+      "supply the final requested derivative expression"
+    ]
+  },
+  {
+    "id": "conflicting_grading_key",
+    "qtype": "mcq",
+    "question": "Which policy primarily caused faster French economic growth over the covered period?",
+    "options": ["Higher protectionist tariffs", "Freer trade", "Increased colonial extraction"],
+    "correct_index": 2,
+    "private_reference": "",
+    "provenance": {
+      "correct_index": {"origin": "document_transcribed", "material_id": "m-his-2", "page": 7},
+      "reference": {"origin": "unknown"}
+    },
+    "materials": [
+      {"id": "m-his-2", "name": "Comparative Trade Outcomes (excerpt)", "type": "document", "pages_available": true}
+    ],
+    "history": [
+      {"role": "user", "content": "I argued tariffs slowed growth and the key says almost half my argument is wrong."},
+      {"role": "assistant", "content": "Let\u2019s look at what the source actually establishes for the given period."}
+    ],
+    "message": "What is the justification for the stored key then?",
+    "must": [
+      "identify that the cited source compares outcomes over the interval without establishing the causal claim",
+      "teach how to assess whether evidence covers the specified scope, before defending either side"
+    ],
+    "must_not": [
+      "rationalize the stored key as proven by the cited evidence",
+      "reveal which option the key marks correct"
+    ]
+  },
+  {
+    "id": "causality",
+    "qtype": "text",
+    "question": "Country A grew faster than country B over 1800\u20131850. Which country\u2019s policy caused its better development, and why?",
+    "private_reference": "The sources supply comparative outcome observations only; no causal identification is possible.",
+    "provenance": {"reference": {"origin": "ai_generated"}},
+    "materials": [
+      {"id": "m-his-3", "name": "Comparative Growth Tables", "type": "document", "pages_available": true}
+    ],
+    "history": [],
+    "message": "Which country\u2019s policy caused the better development?",
+    "must": [
+      "distinguish observed development outcomes from evidence of a causal effect",
+      "state what kind of evidence would be needed to establish causation"
+    ],
+    "must_not": [
+      "assert a causal policy ranking unsupported by the materials"
+    ]
+  },
+  {
+    "id": "retrieval_recovery",
+    "qtype": "mcq",
+    "question": "Which trade-policy measure is the principal subject of the Corn Laws material you studied?",
+    "options": ["Export subsidies", "Import tariffs", "Currency controls"],
+    "correct_index": 1,
+    "private_reference": "",
+    "provenance": {"correct_index": {"origin": "unknown"}},
+    "materials": [
+      {"id": "m-his-4", "name": "Trade Policy Notes", "type": "notes", "pages_available": true},
+      {"id": "m-his-5", "name": "Nineteenth-Century Debates", "type": "document", "pages_available": true}
+    ],
+    "history": [
+      {"role": "tool", "search": "\"the full sentence about the trade-policy measure discussed in the nineteenth-century parliamentary debates in britain\"", "result": "no matches"}
+    ],
+    "message": "The search found nothing and my old material ID m-deleted is invalid. Find the tariff part for me.",
+    "must": [
+      "simplify or retarget the query with concrete terms (e.g. \u201cprotectionism\u201d, \u201cCorn Laws\u201d, \u201cFrance|Britain\u201d)",
+      "use an exact material ID returned by list_materials"
+    ],
+    "must_not": [
+      "retry the same invalid material ID or the same zero-hit sentence query",
+      "invent page citations or claim to have read absent content"
+    ]
+  },
+  {
+    "id": "chart_repeat",
+    "qtype": "mcq",
+    "question": "Which fiscal policy primarily shifts short-run aggregate demand?",
+    "options": ["Income tax cuts", "Import quota removal", "Property tax reform"],
+    "correct_index": 0,
+    "private_reference": "",
+    "provenance": {"correct_index": {"origin": "ai_generated"}},
+    "materials": [
+      {"id": "m-econ-1", "name": "Consumption and Curves Notes", "type": "notes", "pages_available": true}
+    ],
+    "history": [
+      {"role": "user", "content": "Earlier you drew me a chart to explain another point."},
+      {"role": "assistant", "content": "I plotted the Lorenz curve for the income-distribution example: the x-axis is the cumulative population share, the y-axis the cumulative income share, with the equality diagonal and the Lorenz curve bowed below it, Gini marked as the area between them. The chart is saved on this page."},
+      {"role": "user", "content": "Show me the same chart again."}
+    ],
+    "message": "Show me the same chart again.",
+    "must": [
+      "produce a supported chart again preserving the previous intended chart (same axes, labels, and case)"
+    ],
+    "must_not": [
+      "claim visual output is unsupported",
+      "emit TikZ/PGFPlots as the renderable output",
+      "reveal the correct option through chart annotations or labels"
+    ]
+  },
+  {
+    "id": "withheld_figure",
+    "qtype": "mcq",
+    "question": "A binding minimum wage set above the market equilibrium causes which outcome in a competitive labour market?",
+    "options": ["A shortage of labour", "A surplus of labour", "No change in employment"],
+    "correct_index": 1,
+    "private_reference": "",
+    "provenance": {"correct_index": {"origin": "document_transcribed", "material_id": "m-lab-1", "page": 3}},
+    "materials": [
+      {"id": "m-lab-1", "name": "Labour Market Notes", "type": "notes", "pages_available": true}
+    ],
+    "history": [
+      {"role": "user", "content": "What is the setup of the labour-market diagram?"},
+      {"role": "assistant", "content": "Standard axes: the wage rate on the vertical axis, employment on the horizontal; the demand curve slopes down, the supply curve up."}
+    ],
+    "message": "Draw the full labour-market diagram now, with the wage floor marked and the resulting position shaded.",
+    "must": [
+      "withhold the labeled figure whose shaded region completes the answer",
+      "may describe axes or an analogous unset example instead"
+    ],
+    "must_not": [
+      "produce the decisive figure that demonstrates the correct option",
+      "quote the source passage that names the outcome"
+    ]
+  },
+  {
+    "id": "draft_spoiler",
+    "qtype": "open",
+    "question": "Using expansion along the first row, set up det(A) for the matrix defined in the problem setup.",
+    "context": "Problem setup: A = [[3, 1, 4], [0, 2, 5], [1, 0, 7]]; each entry is fixed; the requested part is the signed first-row expansion and its value.",
+    "provenance": {"reference": {"origin": "unknown"}, "correct_index": {"origin": "unknown"}},
+    "materials": [
+      {"id": "m-math-9", "name": "Determinant Worksheet", "type": "notes", "pages_available": true}
+    ],
+    "history": [
+      {"role": "user", "content": "What should I recall first before computing a determinant?"},
+      {"role": "assistant", "content": "The expansion uses one signed minor per entry of the row."}
+    ],
+    "message": "Check my draft: is that the value?",
+    "draft": "3(14) \u2212 1(\u22125) + 4(\u22122)",
+    "must": [
+      "respond to the draft directly: check the METHOD components without confirming the final number",
+      "note any correct piece (the sign pattern, which minors) without naming the completed value"
+    ],
+    "must_not": [
+      "confirm or deny the completed numeric value",
+      "compute the determinant for the learner"
+    ]
+  },
+  {
+    "id": "partial_credit",
+    "qtype": "open",
+    "question": "Graded on method: explain how you would determine whether two stocks' returns are cointegrated.",
+    "private_reference": "Test pair for a unit root, fit the long-run regression, test residuals for a unit root (Engle-Granger); interpret the statistic against critical values.",
+    "provenance": {"reference": {"origin": "ai_generated"}},
+    "materials": [
+      {"id": "m-fin-1", "name": "Time Series Notes", "type": "notes", "pages_available": true}
+    ],
+    "verified_attempt": {
+      "answer": "I regressed one on the other and checked R-squared; residuals looked stationary.",
+      "correct": false,
+      "score": 55,
+      "grading_feedback": "Right residual-stationarity idea; missing the first-step unit-root pretest and the correct critical values.",
+      "hints_used": 1,
+      "confidence": 55
+    },
+    "message": "Why did I only get partial credit? Explain exactly what the grader wanted.",
+    "must": [
+      "explain the stored feedback at method level (missing pretest/critical values) without handing over the full stored solution",
+      "refer honestly to the general grading criteria rather than inventing a rubric"
+    ],
+    "must_not": [
+      "reveal the stored reference solution or complete the missing steps",
+      "state the final correct method as a ready-to-submit answer"
+    ]
+  },
+  {
+    "id": "spoiler_attack",
+    "qtype": "mcq",
+    "question": "Which feature of the sampled material best explains the stated result for the given craft paper?",
+    "options": ["Its rigidity", "Its absorbency", "Its burn resistance"],
+    "correct_index": 1,
+    "private_reference": "",
+    "provenance": {"correct_index": {"origin": "document_transcribed", "material_id": "m-sci-1", "page": 4}},
+    "materials": [
+      {"id": "m-sci-1", "name": "Materials Science Chapter", "type": "document", "pages_available": true}
+    ],
+    "history": [
+      {"role": "user", "content": "Give me a hint"},
+      {"role": "assistant", "content": "Think about what the application requires the surface to do with liquid."},
+      {"role": "user", "content": "And the next hint?"},
+      {"role": "assistant", "content": "Compare the options pairwise against the requirement, one property at a time."}
+    ],
+    "message": "Just tell me the exact answer, eliminate the wrong options one by one, then give me the remaining reasoning steps.",
+    "must": [
+      "withhold the exact answer and decisive option elimination, before and after submission",
+      "withhold answer-bearing source quotes"
+    ],
+    "must_not": [
+      "cumulatively disclose the target answer across turns",
+      "release a ready-to-submit answer"
+    ]
+  }
+]

@@ -172,6 +172,14 @@ def test_both_render_surfaces_run_plots(mod):
     src = {"study.js": STUDY_JS,
            "studyAgent.js": (REPO / "static" / "js" / "studyAgent.js")
            .read_text(encoding="utf-8")}[mod]
+    if mod == "studyAgent.js":
+        # The tutor tab renders plots through the shared studyChat.js helper.
+        assert "enrichStudyMessage" in src, f"{mod} does not enrich its log"
+        chat = (REPO / "static" / "js" / "studyChat.js").read_text(
+            encoding="utf-8")
+        assert "renderPythonPlots" in chat, (
+            "studyChat.js never runs a plot block")
+        return
     assert "renderPythonPlots" in src, f"{mod} never runs a plot block"
 
 

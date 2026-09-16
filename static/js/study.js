@@ -21,6 +21,7 @@ import * as Modals from './modalManager.js';
 import { mdToHtml, renderMermaid, renderMath } from './markdown.js';
 import { renderPythonPlots } from './codeRunner.js';
 import { renderAgentTab, setAgentPrefill, setAgentScope } from './studyAgent.js';
+import { createPracticeCoach, captureCoachFocus, restoreCoachFocus } from './studyPracticeCoach.js';
 
 const API = window.location.origin;
 
@@ -626,20 +627,25 @@ a.study-btn { display: inline-flex; align-items: center; text-decoration: none; 
 .study-conf-quick button.sel { opacity: 1; border-color: var(--accent, #5b8abf); color: var(--accent, #5b8abf); }
 .study-hint { border-left: 2px solid var(--accent, #5b8abf); padding: 6px 10px; margin: 8px 0;
   font-size: 12.5px; opacity: 0.85; background: rgba(91,138,191,0.06); border-radius: 0 6px 6px 0; }
-.study-ask { border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; margin-top: 14px;
-  background: rgba(91,138,191,0.04); }
-.study-ask-head { font-size: 11px; opacity: 0.7; margin-bottom: 6px; }
-.study-ask-thread { display: flex; flex-direction: column; gap: 6px; max-height: 260px;
-  overflow-y: auto; margin-bottom: 6px; }
-/* A reply that draws a chart would otherwise be cut off at 260px inside this
-   thread's own scroll box, exactly as run panels cut charts off at 400px. Text
-   conversations keep the cap; a thread holding a figure grows to fit it, and
-   the figure itself is held to most of the viewport's height by the global
-   img.code-runner-plot rule, so the whole chart is on screen at once. */
-.study-ask-thread:has(img.code-runner-plot) { max-height: none; overflow-y: visible; }
-.study-ask-msg { font-size: 12.5px; line-height: 1.5; padding: 5px 8px; border-radius: 7px; }
-.study-ask-msg.student { background: rgba(128,128,128,0.10); align-self: flex-end; max-width: 85%; }
-.study-ask-msg.ai { background: rgba(91,138,191,0.10); align-self: flex-start; max-width: 92%; }
+/* Ask AI mini panel (studyPracticeCoach.js). The panel owns this DOM across
+   practice re-renders; nothing here is rebuilt when the rest of the view is. */
+.study-coach { border: 1px solid var(--border); border-radius: 9px; margin-top: 14px;
+  background: rgba(91,138,191,0.04); overflow: hidden; }
+.study-coach-head { font-size: 11px; opacity: 0.7; padding: 8px 10px 0; }
+.study-coach-log { display: flex; flex-direction: column; gap: 6px; max-height: 260px;
+  overflow-y: auto; padding: 8px 10px 4px; }
+.study-coach-log:has(img.code-runner-plot) { max-height: none; overflow-y: visible; }
+.study-coach-msg { font-size: 12.5px; line-height: 1.5; padding: 5px 8px; border-radius: 7px; }
+.study-coach-msg.student { background: rgba(128,128,128,0.10); align-self: flex-end; max-width: 85%; }
+.study-coach-msg.assistant { background: rgba(91,138,191,0.10); align-self: flex-start; max-width: 92%; }
+.study-coach-msg.error { background: rgba(224,85,85,0.10); border: 1px solid var(--red, #e05555);
+  align-self: stretch; color: var(--red, #e05555); }
+.study-coach-status { font-size: 11px; opacity: 0.75; padding: 2px 10px 0; min-height: 15px; }
+.study-coach-status.busy::before { content: '… '; }
+.study-coach-actions { display: flex; gap: 6px; padding: 0 10px 2px; min-height: 22px; }
+.study-coach-composer { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 10px 10px; }
+.study-coach-composer textarea { flex: 1 1 200px; min-height: 44px; max-height: 160px; }
+.study-coach-history { flex: 1 1 140px; font-size: 11.5px; padding: 4px 6px; margin-top: 6px; }
 .study-prereq { border: 1px dashed var(--border); border-radius: 9px; padding: 8px 12px;
   margin-bottom: 12px; background: rgba(128,128,128,0.05); }
 .study-prereq-title { font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase;
@@ -865,6 +871,10 @@ function _ensureChipRegistered() {
 function _forceClose() {
   _open = false;
   bumpViewGen();
+  // Pane close aborts active Ask AI work too; the conversation is gone from
+  // the DOM, and a later reopen starts a fresh panel bound to that question.
+  S.practice?.coach?.inst?.dispose();
+  if (S.practice) S.practice.coach = null;
   restoreFocusAfterStudy();
   if (_keyHandler) { document.removeEventListener('keydown', _keyHandler); _keyHandler = null; }
   document.getElementById('tool-study-btn')?.classList.remove('active');
@@ -1140,6 +1150,9 @@ function studyTablistKeydown(e) {
 function setTab(tab) {
   _tab = tab;
   bumpViewGen();   // responses for the previous view are now stale
+  // Leaving the practice view pauses (but keeps) an active Ask AI request;
+  // returning to the same question occurrence remounts the saved panel.
+  if (tab !== 'practice') S.practice?.coach?.inst?.pause();
   const b = body();
   if (b) b.onclick = null; // per-tab delegated handlers are reassigned below
   _pane.querySelectorAll('.study-tab').forEach(btn => {
@@ -2805,7 +2818,7 @@ async function startPractice(deckId = null, limit = 12, scope = null, mock = nul
                  consulted: false, consult: null, consultBusy: false,
                  prereqs: null, prereqsFor: null, prereqsBusy: false,
                  explainText: null, explainBusy: false,
-                 ask: [], askBusy: false,
+                 coach: null,
                  log: [], startTs: Date.now(), qShownTs: Date.now(),
                  reengaged: false };
   renderPractice();
@@ -2947,6 +2960,20 @@ async function renderPracticePicker(deckId) {
     startPractice(deckId, 12, { theme: b.dataset.studyTheme, label: b.dataset.studyTheme })));
 }
 
+// Ask AI sends the LIVE practice state, read at send time inside the panel —
+// never a stale draft from an earlier render, never a submission id whose
+// result does not exist yet.
+function practiceCoachContext(p, q) {
+  const isMcq = q.qtype === 'mcq';
+  return {
+    draft: p.answerDraft || '',
+    choice: isMcq && p.choice != null ? p.choice : null,
+    submissionId: p.result && p.submissionId ? p.submissionId : null,
+    hints: p.hints || [],
+    consulted: !!p.consulted,
+  };
+}
+
 async function renderPractice() {
   const el = body();
   const p = S.practice;
@@ -2991,7 +3018,26 @@ async function renderPractice() {
       && p.mock.predicted === null && p.log.some(l => l.result)) {
     return renderMockPrediction();
   }
-  if (!q || (p.mock && p.mock.phase === 'predict')) { return renderPracticeSummary(); }
+  if (!q || (p.mock && p.mock.phase === 'predict')) {
+    if (p.coach) { p.coach.inst.dispose(); p.coach = null; }
+    return renderPracticeSummary();
+  }
+  // A different question occurrence retires the previous one's panel for good.
+  if (p.coach && p.coach.questionId !== q.id) {
+    p.coach.inst.dispose();
+    p.coach = null;
+  }
+  // Snapshot the surrounding practice scroll so a same-question re-render
+  // (hint/reveal/re-engage) reattaches the panel without jumping the page.
+  // Capture coach focus/selection here too — replacing el.innerHTML below
+  // disconnects the focused composer, so capturing after would see the body.
+  // The coach log is inside el as well: detaching resets its scrollTop, so
+  // snapshot it here and restore it after reattachment.
+  const coachKeepScroll = p.coach ? el.scrollTop : null;
+  const coachFocus = p.coach ? captureCoachFocus(p.coach.inst.element) : null;
+  const coachLogScroll = p.coach
+    ? p.coach.inst.element.querySelector?.('.study-coach-log')?.scrollTop ?? null
+    : null;
 
   // Lazily fetch prerequisite parts (multi-part questions) for the context box.
   if (q.has_prereqs && p.prereqsFor !== q.id && !p.prereqsBusy) {
@@ -3112,18 +3158,7 @@ async function renderPractice() {
         </div>`}
 
         ${p.mock ? '' : `
-      <div class="study-ask">
-        <div class="study-ask-head">${res
-          ? '💬 Ask AI — anything about this question'
-          : '💬 Ask AI — stuck? I’ll nudge you toward the answer (I won’t give it away)'}</div>
-        ${p.ask.length ? `<div class="study-ask-thread">${p.ask.map(m => `
-          <div class="study-ask-msg ${m.role} study-md">${m.role === 'student' ? esc(m.content) : _md(m.content)}</div>`).join('')}</div>` : ''}
-        <div class="study-form-row">
-          <input class="study-input" id="study-ask-input" style="flex:1;" ${p.askBusy ? 'disabled' : ''}
-            placeholder="${res ? 'Ask why, go deeper, clear a doubt…' : 'Ask for a hint or to clarify the question…'}">
-          <button class="study-btn" id="study-ask-send" ${p.askBusy ? 'disabled' : ''}>${p.askBusy ? '…' : 'Ask'}</button>
-        </div>
-      </div>
+      <div id="study-prac-coach"></div>
         `}
     </div>`;
 
@@ -3131,6 +3166,33 @@ async function renderPractice() {
   // model-written markdown in this subtree, so any diagram or deferred formula
   // in them belongs to this render pass.
   _enrichRendered(el);
+
+  // Ask AI mini panel: mount once per question occurrence, reattach the SAME
+  // element on a same-question re-render (hint/reveal/re-engage). The panel
+  // keeps its own scroll, composer text, focus and history — nothing about
+  // sending a message goes through renderPractice anymore.
+  const coachHolder = el.querySelector('#study-prac-coach');
+  if (coachHolder) {
+    if (p.coach && p.coach.questionId === q.id) {
+      coachHolder.replaceWith(p.coach.inst.element);
+      p.coach.inst.update();
+      if (coachLogScroll != null) {
+        const coachLog = p.coach.inst.element.querySelector?.('.study-coach-log');
+        if (coachLog) coachLog.scrollTop = coachLogScroll;
+      }
+      restoreCoachFocus(coachFocus);
+    } else if (!p.mock) {
+      const inst = createPracticeCoach({
+        questionId: q.id,
+        getContext: () => practiceCoachContext(p, q),
+        esc, toast,
+      });
+      p.coach = { questionId: q.id, inst };
+      coachHolder.replaceWith(inst.element);
+      inst.update();
+    }
+  }
+  if (coachKeepScroll != null) el.scrollTop = coachKeepScroll;
 
   // handlers
   el.querySelectorAll('[data-opt]').forEach(b => b.addEventListener('click', () => {
@@ -3164,28 +3226,6 @@ async function renderPractice() {
       p.hints.push(h.hint);
     } catch (e) { toast(e.message, true); }
     p.hintBusy = false; renderPractice();
-  });
-
-  // Ask AI — Socratic coach before submit (never reveals the answer), full
-  // tutor after submit. Conversation lives in p.ask, reset per question.
-  const askInput = el.querySelector('#study-ask-input');
-  const doAsk = async () => {
-    const msg = (askInput?.value || '').trim();
-    if (!msg || p.askBusy) return;
-    const prior = p.ask.map(m => ({ role: m.role, content: m.content }));
-    p.ask.push({ role: 'student', content: msg });
-    p.askBusy = true; renderPractice();
-    try {
-      const r = await jpost(`/api/study/questions/${q.id}/ask`, {
-        message: msg, history: prior, answered: !!p.result, draft: p.answerDraft || '',
-      });
-      p.ask.push({ role: 'ai', content: r.reply || '(no reply)' });
-    } catch (e) { p.ask.push({ role: 'ai', content: '⚠️ ' + e.message }); }
-    p.askBusy = false; renderPractice();
-  };
-  el.querySelector('#study-ask-send')?.addEventListener('click', doAsk);
-  askInput?.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doAsk(); }
   });
 
   el.querySelector('#study-prac-skip')?.addEventListener('click', () => {
@@ -3340,6 +3380,8 @@ function exitPractice() {
   const p = S.practice;
   if (!p) return;
   stopMockTimer();
+  // Leaving at any depth aborts an in-flight Ask AI request for good.
+  p.coach?.inst.dispose(); p.coach = null;
   // A mock is unmarked until you commit to a prediction; ending one early is
   // already a defined path, so exiting takes it rather than binning the paper.
   if (p.mock) { p.mock.phase = 'predict'; renderPractice(); return; }
@@ -3359,7 +3401,9 @@ function advancePractice() {
   p.hints = []; p.answerDraft = ''; p.explainText = null;
   p.consulted = false; p.consult = null; p.consultBusy = false;
   p.prereqs = null; p.prereqsFor = null; p.prereqsBusy = false;
-  p.ask = []; p.askBusy = false;
+  // The Ask AI conversation belongs to the question it was opened on; the next
+  // question (or a later re-drill of this one) starts a new chat.
+  p.coach?.inst.dispose(); p.coach = null;
   p.qShownTs = Date.now();
   p.reengaged = false;
   renderPractice();

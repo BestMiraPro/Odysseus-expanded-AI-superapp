@@ -30,7 +30,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
 from core.database import (
@@ -265,27 +265,52 @@ class HintIn(BaseModel):
 
 class AskIn(BaseModel):
     message: str
-    history: List[Dict] = []      # [{role: "student"|"ai", content: str}, ...]
-    answered: bool = False        # have they submitted/checked yet?
-    draft: Optional[str] = None   # their current/submitted answer text
-    elaborate: bool = False       # opt-in: generate a why/how elaboration probe
+    # Legacy compatibility inputs. The server history is authoritative: a
+    # client-supplied history is ignored for persisted conversations rather
+    # than trusted (it could fabricate assistant/tool records). `answered` is
+    # accepted but never unlocks answers in the protected Ask AI policy.
+    history: List[Dict] = Field(default_factory=list)
+    answered: bool = False
+    draft: Optional[str] = None
+    elaborate: bool = False
+    thread_id: Optional[str] = None
+    stream: bool = False
+    choice_index: Optional[int] = None
+    submission_id: Optional[str] = None
+    hints: List[str] = Field(default_factory=list)
+    consulted: bool = False
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 def _question_row_kwargs(item: Dict) -> Dict:
-    """Chapter fields carried from an extracted item onto its StudyQuestion row.
+    """Fields carried from an extracted item onto its StudyQuestion row.
 
-    Kept in one place so extraction and the chapter backfill agree on the shape.
-    Both come back None on a document with no chapter structure - an empty
-    string would surface in the picker as an unnamed chapter."""
+    Chapter fields: kept in one place so extraction and the chapter backfill
+    agree on the shape. Both come back None on a document with no chapter
+    structure - an empty string would surface in the picker as an unnamed
+    chapter.
+
+    ``answer_provenance``: the per-field answer provenance built by
+    ``question_answer_provenance`` (validated against the source material).
+    Stored JSON-encoded; None when every entry is plain unknown, which is the
+    state legacy rows already have without storing anything.
+    """
+    from src.study_ai import provenance_is_blank
+    kwargs: Dict = {}
     try:
         idx = int(item.get("chapter_index") or 0) or None
     except (TypeError, ValueError):
         idx = None
     label = str(item.get("chapter") or "").strip() or None
-    return {"chapter": label, "chapter_index": idx}
+    kwargs["chapter"] = label
+    kwargs["chapter_index"] = idx
+    prov = item.get("answer_provenance")
+    kwargs["answer_provenance"] = (
+        json.dumps(prov) if isinstance(prov, dict) and not provenance_is_blank(prov)
+        else None)
+    return kwargs
 
 
 def _utcnow_naive() -> datetime:
@@ -1162,9 +1187,11 @@ def _question_to_dict(q: StudyQuestion, with_answer: bool = True,
         "has_prereqs": bool(q.prereq_ids and q.prereq_ids != "[]"),
     }
     if with_answer:
+        from src.study_ai import normalize_answer_provenance
         out["correct_index"] = q.correct_index
         out["reference"] = q.reference
         out["explanation"] = q.explanation
+        out["answer_provenance"] = normalize_answer_provenance(q.answer_provenance)
     return out
 
 

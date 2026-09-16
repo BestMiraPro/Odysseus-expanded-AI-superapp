@@ -135,7 +135,26 @@ def tool(name: str, description: str, properties: Optional[Dict] = None,
     return deco
 
 
-def tool_schemas(include_code: bool = False) -> List[Dict]:
+def tool_schemas(include_code: bool = False, *, practice: bool = False) -> List[Dict]:
+    if practice:
+        from src.study_practice_coach import PRACTICE_TOOL_NAMES
+        out = []
+        for t in TOOLS.values():
+            if t.name not in PRACTICE_TOOL_NAMES:
+                continue
+            schema = t.schema()
+            if t.name == "search_materials":
+                schema["function"]["description"] = (
+                    "Find where a term/regex appears in a subject's materials: "
+                    "snippets with material name and page. Ground tutoring "
+                    "answers with this. Query is a case-insensitive substring "
+                    "or regex; prefer short concrete terms or alternatives "
+                    "(e.g. \"protectionism\", \"Corn Laws\", \"France|Britain\") — "
+                    "long sentence-like queries usually match nothing. If there "
+                    "are no hits, simplify the query instead of repeating it; "
+                    "never invent a page a hit did not report.")
+            out.append(schema)
+        return out
     return [t.schema() for t in TOOLS.values() if include_code or not t.code]
 
 
@@ -422,10 +441,13 @@ def _q_row(q: StudyQuestion, full: bool = False) -> Dict:
          "difficulty": q.difficulty, "state": q.state, "suspended": bool(q.suspended),
          "material_id": q.material_id, "reps": q.reps or 0, "lapses": q.lapses or 0}
     if full:
+        from src.study_ai import normalize_answer_provenance
         d.update({"question": q.question, "context": q.context,
                   "options": json.loads(q.options) if q.options else None,
                   "correct_index": q.correct_index, "reference": q.reference,
-                  "origin": q.origin, "due": q.due.isoformat() if q.due else None})
+                  "origin": q.origin, "due": q.due.isoformat() if q.due else None,
+                  "answer_provenance": normalize_answer_provenance(
+                      q.answer_provenance)})
     else:
         d["question"] = (q.question or "")[:160]
     return d
@@ -485,6 +507,7 @@ def save_questions(owner, deck_id: str, items: List[Dict], *, material_id: Optio
             sr._get_material(db, material_id, owner)
         existing = {question_key(t) for (t,) in
                     db.query(StudyQuestion.question).filter(StudyQuestion.deck_id == deck_id).all()}
+        from src.study_ai import question_answer_provenance, provenance_is_blank
         now, ids, dup = _now(), [], 0
         for q in questions:
             key = question_key(q["question"])
@@ -492,11 +515,14 @@ def save_questions(owner, deck_id: str, items: List[Dict], *, material_id: Optio
                 dup += 1
                 continue
             existing.add(key)
+            # The agent is the author: provided answers are ai_generated.
+            prov = question_answer_provenance(q, authored=True)
             row = StudyQuestion(
                 id=str(uuid.uuid4()), owner=owner, deck_id=deck_id, material_id=material_id,
                 qtype=q["qtype"], question=q["question"], context=q.get("context"),
                 options=json.dumps(q["options"]) if q["options"] else None,
                 correct_index=q["correct_index"], reference=q["reference"],
+                answer_provenance=json.dumps(prov) if not provenance_is_blank(prov) else None,
                 topic=q["topic"], difficulty=q["difficulty"], number=q.get("number"),
                 origin=origin, state="new", due=now)
             db.add(row)
@@ -537,31 +563,53 @@ async def _update_question(owner, args):
     sr = _sr()
     db = SessionLocal()
     try:
+        from src.study_ai import normalize_answer_provenance, \
+            provenance_is_blank, updated_answer_provenance
         row = sr._get_question(db, args["question_id"], owner)
+        changed: set = set()
         if args.get("question"):
-            row.question = str(args["question"]).strip()
+            new_q = str(args["question"]).strip()
+            if new_q != row.question:
+                row.question = new_q
+                changed.add("question")
         if args.get("context") is not None:
-            row.context = str(args["context"]).strip() or None
+            new_ctx = str(args["context"]).strip() or None
+            if new_ctx != row.context:
+                row.context = new_ctx
+                changed.add("context")
         if isinstance(args.get("options"), list):
             opts = [str(o).strip() for o in args["options"] if str(o).strip()]
             if row.qtype == "mcq" and len(opts) < 2:
                 raise HTTPException(400, "MCQ needs at least 2 options")
-            row.options = json.dumps(opts) if opts else None
-            row.explanation = None
+            new_options = json.dumps(opts) if opts else None
+            if new_options != row.options:
+                row.options = new_options
+                changed.add("options")
+                row.explanation = None
         if args.get("correct_index") is not None:
             opts = json.loads(row.options) if row.options else []
             ci = int(args["correct_index"])
             if not (0 <= ci < len(opts)):
                 raise HTTPException(400, "correct_index out of range")
-            row.correct_index = ci
-            row.explanation = None
+            if ci != row.correct_index:
+                row.correct_index = ci
+                changed.add("correct_index")
+                row.explanation = None
         if args.get("reference") is not None:
-            row.reference = str(args["reference"])
-            row.explanation = None
+            new_ref = str(args["reference"])
+            if new_ref != row.reference:
+                row.reference = new_ref
+                changed.add("reference")
+                row.explanation = None
         if args.get("topic") is not None:
             row.topic = str(args["topic"]).strip() or None
         if args.get("difficulty") in ("easy", "medium", "hard"):
             row.difficulty = args["difficulty"]
+        if changed:
+            prov = updated_answer_provenance(
+                normalize_answer_provenance(row.answer_provenance),
+                changed_fields=changed, author="ai")
+            row.answer_provenance = json.dumps(prov) if not provenance_is_blank(prov) else None
         db.commit()
         return _q_row(row, full=True)
     finally:
@@ -1006,10 +1054,12 @@ def build_system_prompt(owner, deck_id: Optional[str], allow_code: bool, model: 
 # Persistence
 # ---------------------------------------------------------------------------
 
-def create_thread(owner, deck_id: Optional[str] = None, title: Optional[str] = None) -> Dict:
+def create_thread(owner, deck_id: Optional[str] = None, title: Optional[str] = None,
+                  question_id: Optional[str] = None) -> Dict:
     db = SessionLocal()
     try:
-        t = StudyAgentThread(id=str(uuid.uuid4()), owner=owner, deck_id=deck_id or None, title=title)
+        t = StudyAgentThread(id=str(uuid.uuid4()), owner=owner, deck_id=deck_id or None,
+                             title=title, question_id=question_id)
         db.add(t)
         db.commit()
         return _thread_dict(t)
@@ -1019,14 +1069,28 @@ def create_thread(owner, deck_id: Optional[str] = None, title: Optional[str] = N
 
 def _thread_dict(t: StudyAgentThread) -> Dict:
     return {"id": t.id, "title": t.title or "New chat", "deck_id": t.deck_id,
+            "question_id": t.question_id,
             "updated_at": (t.updated_at or t.created_at).isoformat() if (t.updated_at or t.created_at) else None}
 
 
-def list_threads(owner, limit: int = 50) -> List[Dict]:
+def list_threads(owner, limit: int = 50,
+                 question_id: Optional[str] = None) -> List[Dict]:
+    """Chat threads for the caller (newest first).
+
+    ``question_id=None`` lists ordinary tutor threads only (practice threads
+    belong to the Ask AI panel, not the Tutor tab). Passing a ``question_id``
+    lists only practice threads bound to that question (owned check included),
+    which is the panel's own history selector."""
     db = SessionLocal()
     try:
-        rows = _owned(db.query(StudyAgentThread), StudyAgentThread, owner) \
-            .order_by(StudyAgentThread.updated_at.desc()).limit(limit).all()
+        q = _owned(db.query(StudyAgentThread), StudyAgentThread, owner)
+        if question_id is None:
+            q = q.filter(StudyAgentThread.question_id.is_(None))
+        else:
+            sr = _sr()
+            sr._get_question(db, question_id, owner)  # 404 unless owned
+            q = q.filter(StudyAgentThread.question_id == question_id)
+        rows = q.order_by(StudyAgentThread.updated_at.desc()).limit(limit).all()
         return [_thread_dict(t) for t in rows]
     finally:
         db.close()
@@ -1094,10 +1158,27 @@ def _load_rows(owner, thread_id: str, limit: Optional[int] = None) -> List[Study
 
 
 def thread_messages_for_ui(owner, thread_id: str) -> List[Dict]:
-    """Messages in the shape the Agent tab renders (tool results folded in)."""
-    get_thread(owner, thread_id)
+    """Messages in the shape the UI renders (tool results folded in).
+
+    Practice threads (question-bound) get the protected projection instead:
+    user text and approved assistant replies only. Tool rows, tool calls and
+    their arguments, intermediate content, and review details never leave the
+    server; the projection is as safe as the live stream."""
+    t = get_thread(owner, thread_id)
     out: List[Dict] = []
     for r in _load_rows(owner, thread_id):
+        if t.question_id is not None:
+            if r.role == "tool":
+                continue
+            if r.role == "assistant":
+                if r.tool_calls:
+                    continue  # tool-call turn: private model plumbing
+                out.append({"role": "assistant", "content": r.content or "",
+                            "when": r.created_at.isoformat() if r.created_at else None})
+                continue
+            out.append({"role": "user", "content": r.content or "",
+                        "when": r.created_at.isoformat() if r.created_at else None})
+            continue
         if r.role == "tool":
             out.append({"role": "tool", "name": r.name, "output": _clip(r.content or "", TOOL_RESULT_UI_CHARS),
                         "tool_call_id": r.tool_call_id, "when": r.created_at.isoformat() if r.created_at else None})
@@ -1198,11 +1279,21 @@ def _parse_args(raw) -> Dict:
     return obj if isinstance(obj, dict) else {}
 
 
-async def dispatch_tool(name: str, owner, args: Dict, *, allow_code: bool = False) -> Dict:
-    """Run one tool. Returns {"ok": bool, "result": ...} / {"ok": False, "error": ...}."""
+async def dispatch_tool(name: str, owner, args: Dict, *, allow_code: bool = False,
+                        practice: bool = False) -> Dict:
+    """Run one tool. Returns {"ok": bool, "result": ...} / {"ok": False, "error": ...}.
+
+    ``practice=True`` is the protected Ask AI mode: an explicit allowlist
+    applies before anything else, so a protected thread can never execute a
+    write/code/transcribe tool even when the model emits its name, the browser
+    sends ``allow_code``, or the user asks to enable it."""
     spec = TOOLS.get(name)
     if spec is None:
         return {"ok": False, "error": f"unknown tool '{name}'"}
+    if practice:
+        from src.study_practice_coach import PRACTICE_TOOL_NAMES
+        if name not in PRACTICE_TOOL_NAMES:
+            return {"ok": False, "error": f"tool '{name}' is not available in practice mode"}
     if spec.code:
         from src.tool_security import owner_is_admin_or_single_user
         if not allow_code:
@@ -1262,14 +1353,261 @@ def _iter_sse_events(chunk: str):
                 continue
 
 
+# ---------------------------------------------------------------------------
+# The protected practice turn (Ask AI — plan section 7)
+# ---------------------------------------------------------------------------
+
+# Threads with a practice turn in flight, within this process.
+# ponytail: per-process set; multi-worker deployment would need shared
+# coordination. `finally` cleanup keeps it correct for the current process.
+_PRACTICE_ACTIVE: set = set()
+
+
+def practice_turn_active(thread_id: str) -> bool:
+    """True when this thread already has a protected turn running here."""
+    return thread_id in _PRACTICE_ACTIVE
+
+
+_GENERIC_PRACTICE_ERROR = ("Something went wrong while preparing your reply. "
+                           "You can retry in a moment.")
+
+
+def _repair_dangling_tool_calls(msgs: List[Dict]) -> List[Dict]:
+    """Close dangling tool calls before they reach a provider.
+
+    A turn interrupted mid-tool-group persists the assistant tool-call row but
+    not every tool result. Submitting a dangling call without its result makes
+    providers reject the whole request, so unfinished calls get explicit
+    failed-tool results injected (model-side only, never persisted)."""
+    answered = {m.get("tool_call_id") for m in msgs
+                if m.get("role") == "tool" and m.get("tool_call_id")}
+    out: List[Dict] = []
+    for m in msgs:
+        out.append(m)
+        if m.get("role") != "assistant":
+            continue
+        for c in m.get("tool_calls") or []:
+            cid = c.get("id")
+            if cid and cid not in answered:
+                answered.add(cid)
+                out.append({"role": "tool", "tool_call_id": cid,
+                            "content": "ERROR: tool result unavailable (the "
+                            "previous turn was interrupted)."})
+    return out
+
+
+def _practice_tool_guidance(name: str, res: Dict, model_text: str) -> str:
+    """Practice-mode retrieval recovery hints appended to model-side output.
+
+    The regex search semantics stay unchanged; only the guidance after a dead
+    end improves. The UI never sees tool results in practice mode at all."""
+    if name == "search_materials":
+        result = res.get("result")
+        if res.get("ok") and isinstance(result, dict) and not result.get("hits"):
+            return model_text + (
+                "\n[HINT: zero hits. Your query may be too sentence-like — "
+                "simplify it or try alternatives (e.g. \"protectionism\", "
+                "\"Corn Laws\", \"France|Britain\"). Do not repeat the same "
+                "query.]")
+    if name == "get_material":
+        if not res.get("ok"):
+            return model_text + (
+                "\n[HINT: this material id is not valid. Call list_materials "
+                "and use an exact id it returned; do not retry this id.]")
+        result = res.get("result")
+        if isinstance(result, dict) and not (result.get("text") or "").strip():
+            return model_text + (
+                "\n[NOTE: this material has no readable text layer; this "
+                "panel cannot read it. Tell the learner the source needs "
+                "transcription elsewhere instead of claiming its content.]")
+    return model_text
+
+
+async def _run_practice_turn(owner, thread, user_text: str,
+                             context: Dict) -> AsyncGenerator[str, None]:
+    """One protected Ask AI turn (executor for ``run_study_agent``).
+
+    Buffers every model char and tool output: the only visible outputs are
+    fixed status messages and one atomic, approved reply. Excluded tools are
+    rejected at dispatch even if the model writes their names; a practice
+    thread cannot gain code tools or drop its policy here."""
+    from src.llm_core import stream_llm
+    from src.study_practice_coach import (
+        STATUS_CHECKING,
+        STATUS_READING,
+        approve_practice_reply,
+        practice_system_prompt,
+    )
+
+    sr = _sr()
+    thread_id = thread.id
+    if practice_turn_active(thread_id):
+        yield _sse({"type": "error", "retryable": False,
+                    "message": "This conversation is already answering. "
+                    "Wait for it to finish."})
+        yield DONE
+        return
+    _PRACTICE_ACTIVE.add(thread_id)
+    try:
+        save_message(owner, thread_id, "user", user_text)
+        try:
+            url, model, headers = sr._resolve_study_model(owner, prefer_text=True)
+        except HTTPException as e:
+            yield _sse({"type": "error", "retryable": False,
+                        "message": str(e.detail)})
+            yield DONE
+            return
+
+        schemas = tool_schemas(False, practice=True)
+        rows = _load_rows(owner, thread_id, HISTORY_MESSAGES)
+        base_messages = [{"role": "system",
+                          "content": practice_system_prompt(context, model)}]
+        base_messages += _repair_dangling_tool_calls(
+            trim_history(rows_to_llm_messages(rows)))
+        messages = [dict(m) for m in base_messages]
+        yield _sse({"type": "model_info", "model": model, "code_tools": False})
+        yield _sse({"type": "status", "message": STATUS_READING})
+
+        candidate: Optional[str] = None
+
+        for round_num in range(MAX_ROUNDS):
+            text_parts: List[str] = []
+            native_calls: List[Dict] = []
+            stream_error: Optional[str] = None
+            try:
+                async for chunk in stream_llm(
+                        url, model, messages, temperature=0.3,
+                        max_tokens=REPLY_MAX_TOKENS, headers=headers,
+                        timeout=600, tools=schemas or None):
+                    for event, payload in _iter_sse_events(chunk):
+                        if event == "error":
+                            stream_error = (payload or {}).get("text") or \
+                                (payload or {}).get("error") or "model error"
+                        elif event == "done" or payload is None:
+                            continue
+                        elif "delta" in payload and not payload.get("thinking"):
+                            text_parts.append(payload["delta"])
+                        elif payload.get("type") == "tool_calls":
+                            native_calls = payload.get("calls") or []
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                stream_error = f"{type(e).__name__}: {e}"
+                logger.warning("study practice: generation failed: %s", stream_error)
+
+            if stream_error:
+                # No final reply exists, so nothing unreviewed gets persisted;
+                # the user message stays and Retry starts a fresh turn.
+                yield _sse({"type": "error", "retryable": True,
+                            "message": _GENERIC_PRACTICE_ERROR})
+                yield DONE
+                return
+
+            text = "".join(text_parts)
+            calls = native_calls
+            if not calls:
+                calls = parse_fallback_tool_calls(text)
+                if calls:
+                    text = strip_fallback_blocks(text)
+
+            if not calls:
+                candidate = text
+                break
+
+            # Persist the tool-call turn WITHOUT generated narration (the
+            # text that accompanied fallback fences is plumbing, not reply).
+            stored_calls = [
+                {"id": c.get("id") or f"call_{round_num}_{j}",
+                 "name": c.get("name", ""),
+                 "arguments": c.get("arguments") if isinstance(c.get("arguments"), str)
+                 else json.dumps(c.get("arguments") or {})}
+                for j, c in enumerate(calls)]
+            save_message(owner, thread_id, "assistant", None,
+                         tool_calls=stored_calls)
+            messages.append({"role": "assistant", "content": None,
+                             "tool_calls": [
+                                 {"id": c["id"], "type": "function",
+                                  "function": {"name": c["name"],
+                                               "arguments": c["arguments"]}}
+                                 for c in stored_calls]})
+
+            for c in stored_calls:
+                args = _parse_args(c["arguments"])
+                # allow_code is forced off: practice is learning-only, period.
+                res = await dispatch_tool(c["name"], owner, args,
+                                          allow_code=False, practice=True)
+                model_text = _practice_tool_guidance(
+                    c["name"], res,
+                    result_text(res, TOOL_RESULT_MODEL_CHARS))
+                ui_text = result_text(res, TOOL_RESULT_UI_CHARS)
+                save_message(owner, thread_id, "tool", ui_text,
+                             tool_call_id=c["id"], name=c["name"])
+                messages.append({"role": "tool", "tool_call_id": c["id"],
+                                 "content": model_text})
+        else:
+            yield _sse({"type": "error", "retryable": True,
+                        "message": _GENERIC_PRACTICE_ERROR})
+            yield DONE
+            return
+
+        # The final non-tool reply: review BEFORE anything is saved or shown.
+        yield _sse({"type": "status", "message": STATUS_CHECKING})
+        generator_history = [
+            m for m in messages
+            if (m.get("role") in ("user", "assistant", "tool")
+                and (m.get("role") != "assistant" or not m.get("tool_calls")))]
+        approval = await approve_practice_reply(
+            owner, candidate=candidate or "", context=context,
+            history=generator_history)
+        save_message(owner, thread_id, "assistant", approval["content"])
+        yield _sse({"type": "reply", "content": approval["content"],
+                    "retryable": approval["retryable"]})
+        yield DONE
+    finally:
+        _PRACTICE_ACTIVE.discard(thread_id)
+
+
 async def run_study_agent(owner, thread_id: str, user_text: str, *, deck_id: Optional[str] = None,
-                          allow_code: bool = False) -> AsyncGenerator[str, None]:
+                          allow_code: bool = False,
+                          practice_context: Optional[Dict] = None) -> AsyncGenerator[str, None]:
     """Stream one user turn: persist it, run up to MAX_ROUNDS model/tool
-    rounds, persist every assistant/tool message, and yield SSE events."""
+    rounds, persist every assistant/tool message, and yield SSE events.
+
+    ``practice_context`` engages the protected Ask AI branch. The binding is
+    enforced HERE, not only at the routes: a question-bound thread can only
+    run protected (409), and a protected turn can only run on a thread bound
+    to the same question — internal callers get the same guarantee as HTTP.
+    """
     from src.llm_core import stream_llm
     from src.tool_security import owner_is_admin_or_single_user
 
     sr = _sr()
+    try:
+        thread = get_thread(owner, thread_id)
+    except HTTPException:
+        raise
+    is_practice = thread.question_id is not None
+    if is_practice != (practice_context is not None):
+        if is_practice:
+            yield _sse({"type": "error", "retryable": False,
+                        "message": "This conversation is protected (Ask AI panel). "
+                        "Continue it from the practice question, not the agent chat."})
+        else:
+            yield _sse({"type": "error", "retryable": False,
+                        "message": "This conversation is not a protected "
+                        "practice conversation."})
+        yield DONE
+        return
+    if practice_context is not None:
+        if practice_context.get("question", {}).get("id") != thread.question_id:
+            yield _sse({"type": "error", "retryable": False,
+                        "message": "The practice context does not match this conversation."})
+            yield DONE
+            return
+        async for ev in _run_practice_turn(owner, thread, user_text, practice_context):
+            yield ev
+        return
+
     # Persist the user's turn first so the thread reflects what they typed even
     # when no model is configured yet (the error below is then the reply).
     save_message(owner, thread_id, "user", user_text)
