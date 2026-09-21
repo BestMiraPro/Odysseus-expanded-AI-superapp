@@ -32,3 +32,14 @@ def test_notes_edit_form_uses_safe_image_src_guard():
     assert "const safeInitialImageUrl = _safeImgSrc(initialImageUrl);" in src
     assert "img.src = safeInitialImageUrl;" in src
     assert "img.src = initialImageUrl;" not in src
+
+
+def test_notes_custom_date_picker_assigns_value_as_property_not_markup():
+    src = (_REPO / "static" / "js" / "notes.js").read_text(encoding="utf-8")
+
+    # the datetime-local input is built statically; the reminder value never
+    # enters the HTML string, so nothing can close the attribute early
+    assert '<input type="datetime-local" class="note-reminder-date-input" />' in src
+    assert 'value="${initial}"' not in src
+    assert "dInput.value = initial;" in src
+    assert src.index("dInput.value = initial;") < src.index("dInput.focus();")

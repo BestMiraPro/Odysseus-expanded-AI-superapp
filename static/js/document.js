@@ -10933,7 +10933,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
     return parts.join('<br>');
   }
   function _escHtml(s) {
-    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    return uiModule.esc(String(s ?? ''));
   }
 
   /** Load version history list */

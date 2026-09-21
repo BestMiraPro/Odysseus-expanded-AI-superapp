@@ -3353,6 +3353,10 @@ import { loadPanel } from './panels.js';
                 if (_ub) {
                   const _aw = _ub.querySelector('.attach-cards');
                   if (_aw) {
+                    // Attachment cards are looked up by dataset value, never
+                    // by interpolating the name into a selector string.
+                    const _findAttachCardByName = (name) => Array.from(_aw.querySelectorAll('.attach-card'))
+                      .find(el => el.dataset.name === String(name || ''));
                     for (const _att of json.data) {
                       const _isImg = (_att.mime || '').startsWith('image/') || /\.(png|jpg|jpeg|gif|webp|svg|bmp)$/i.test(_att.name || '');
                       if (_isImg && _att.id) {
@@ -3361,7 +3365,8 @@ import { loadPanel } from './panels.js';
                         // photo and the backend re-emits the attachment event
                         // for the same id; without this guard we'd append a
                         // duplicate (which visually pushes the real photo off).
-                        const _existingPreview = _aw.querySelector('[data-file-id="' + _att.id + '"]');
+                        const _existingPreview = Array.from(_aw.querySelectorAll('[data-file-id]'))
+                          .find(el => el.dataset.fileId === String(_att.id));
                         if (_existingPreview) {
                           if (_att.vision_model && !_existingPreview.querySelector('.attach-vision-model')) {
                             const _vl = document.createElement('div');
@@ -3373,7 +3378,7 @@ import { loadPanel } from './panels.js';
                           }
                           continue;
                         }
-                        const _card = _aw.querySelector('.attach-card[data-name="' + (_att.name || '').replace(/"/g, '\\"') + '"]');
+                        const _card = _findAttachCardByName(_att.name);
                         const _iw = document.createElement('div');
                         _iw.className = 'attach-image-preview';
                         _iw.dataset.fileId = _att.id;
@@ -3398,7 +3403,7 @@ import { loadPanel } from './panels.js';
                         }
                         if (_card) _card.replaceWith(_iw); else _aw.appendChild(_iw);
                       } else {
-                        const _card = _aw.querySelector('.attach-card[data-name="' + (_att.name || '').replace(/"/g, '\\"') + '"]');
+                        const _card = _findAttachCardByName(_att.name);
                         if (_card && _att.id) {
                           _card.dataset.fileId = _att.id;
                           _card.style.cursor = 'pointer';

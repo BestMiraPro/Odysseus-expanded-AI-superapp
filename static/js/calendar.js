@@ -3361,7 +3361,7 @@ function _clockFace(hhmm) {
   // Return the clock split into hh / separator / mm sub-spans so each
   // segment is individually clickable. The wrapping #cal-hero-clock has
   // its innerHTML re-set by _syncHero, so the spans round-trip cleanly.
-  if (!hhmm) {
+  if (!hhmm || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(String(hhmm))) {
     return '<span class="cal-hero-clock-hh" data-seg="hh">—</span><span class="cal-hero-sep"> : </span><span class="cal-hero-clock-mm" data-seg="mm">—</span>';
   }
   const [h, m] = hhmm.split(':');

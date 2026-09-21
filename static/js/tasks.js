@@ -100,8 +100,8 @@ async function _deleteTask(id) {
 }
 
 function _taskCardById(id) {
-  const safe = (window.CSS && CSS.escape) ? CSS.escape(String(id)) : String(id).replace(/"/g, '\\"');
-  return document.querySelector(`.task-card[data-id="${safe}"]`);
+  return Array.from(document.querySelectorAll('.task-card'))
+    .find(el => el.dataset.id === String(id));
 }
 
 function _animateTaskRemoval(ids) {

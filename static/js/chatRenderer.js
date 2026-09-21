@@ -2274,7 +2274,8 @@ export function displayMetrics(messageElement, metrics) {
           } catch (err) {
             clearInterval(waveInterval);
             console.warn('compact failed:', err);
-            compactBody.innerHTML = '<span style="color:var(--red);">Compaction failed: ' + err.message + '</span>';
+            compactBody.textContent = 'Compaction failed: ' + String(err.message || err);
+            compactBody.style.color = 'var(--red)';
           }
         });
       }
