@@ -847,7 +847,8 @@ async def _web_theory(owner, concept_text: str, subject_name: str):
         ctx, sources = await asyncio.to_thread(
             comprehensive_web_search, query, return_sources=True)
     except Exception as e:
-        logger.warning("study web theory: search failed: %s", e)
+        logger.warning("study web theory: search failed error_type=%s",
+                       type(e).__name__)
         return "", []
     if not ctx:
         return "", []
@@ -1116,7 +1117,8 @@ async def _build_figures_section(owner, material_id: str, file_id: str,
     try:
         figs = extract_pdf_figures(pdf_path, _study_figures_dir(material_id))
     except Exception as e:
-        logger.warning("study notes: figure extraction failed: %s", e)
+        logger.warning("study notes: figure extraction failed error_type=%s",
+                       type(e).__name__)
         return ""
     if not figs:
         return ""
@@ -1131,7 +1133,8 @@ async def _build_figures_section(owner, material_id: str, file_id: str,
             f"Caption these {len(urls)} figures, in order.", urls,
             max_tokens=3000, timeout=180)
     except Exception as e:
-        logger.warning("study notes: figure captioning failed: %s", e)
+        logger.warning("study notes: figure captioning failed error_type=%s",
+                       type(e).__name__)
     if isinstance(value, list):
         for item in value:
             if not isinstance(item, dict) or "idx" not in item:
@@ -1308,8 +1311,10 @@ def _extract_file_text(file_id: str, owner) -> str:
     except HTTPException:
         raise
     except Exception as e:
-        logger.warning("study: file text extraction failed: %s", e)
-        raise HTTPException(422, f"Could not extract text from this file: {e}")
+        logger.warning("study: file text extraction failed error_type=%s",
+                       type(e).__name__)
+        raise HTTPException(422, "Could not extract text from this file. Try a "
+                                 "different format, or paste the content as text.")
     text = (text or "").strip()
     if len(text) < 30:
         raise HTTPException(422, "No usable text found in the file. If it is a "
@@ -1337,7 +1342,8 @@ def _vision_candidates(owner) -> List:
         if url and model:
             cands.append((url, model, headers))
     except Exception as e:
-        logger.debug("study vision: vl model resolution failed: %s", e)
+        logger.debug("study vision: vl model resolution failed error_type=%s",
+                     type(e).__name__)
     try:
         from src.endpoint_resolver import resolve_vision_fallback_candidates
         cands.extend(c for c in resolve_vision_fallback_candidates(owner=owner)
@@ -1404,9 +1410,9 @@ async def _llm_json_vision(owner, system: str, instruction: str,
             last_detail = f"Vision model {model} failed: {e.detail}"
             logger.warning("study vision: %s", last_detail)
         except Exception as e:
-            last_detail = (f"Vision model {model} failed ({type(e).__name__}): {e}. "
-                           "It may not support image input.")
-            logger.warning("study vision: %s", last_detail)
+            last_detail = "Vision model failed. It may not support image input."
+            logger.warning("study vision: model %s failed error_type=%s",
+                           model, type(e).__name__)
     raise HTTPException(502, last_detail or "All vision model candidates failed.")
 
 
@@ -1448,8 +1454,8 @@ async def _discover_questions_vision(owner, page_urls: List[str]) -> tuple:
                            start // DISCOVERY_PAGES_PER_CALL + 1, e.detail)
             continue
         except Exception as e:
-            logger.warning("study discovery: vision manifest batch %d failed: %s",
-                           start // DISCOVERY_PAGES_PER_CALL + 1, e)
+            logger.warning("study discovery: vision manifest batch %d failed error_type=%s",
+                           start // DISCOVERY_PAGES_PER_CALL + 1, type(e).__name__)
             continue
         manifest.extend(offset_manifest(parse_question_manifest(value), start))
         key_pages.extend(p + start for p in parse_answer_key_pages(value))
@@ -1815,6 +1821,8 @@ async def _llm_text_vision(owner, system: str, instruction: str, image_urls: Lis
         except HTTPException as e:
             last_detail = f"Vision model {model} failed: {e.detail}"
         except Exception as e:
-            last_detail = f"Vision model {model} failed ({type(e).__name__}): {e}."
+            logger.warning("study vision text: model %s failed error_type=%s",
+                           model, type(e).__name__)
+            last_detail = "Vision model failed. It may not support image input."
         logger.warning("study vision text: %s", last_detail)
     raise HTTPException(502, last_detail or "All vision model candidates failed.")

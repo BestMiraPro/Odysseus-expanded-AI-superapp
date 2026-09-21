@@ -99,8 +99,11 @@ def setup_study_agent_routes() -> APIRouter:
                         user, thread_id, text[:20000], deck_id=body.deck_id, allow_code=body.allow_code):
                     yield chunk
             except Exception as e:  # keep the stream well-formed
-                logger.exception("study agent stream failed")
-                yield study_agent._sse({"type": "error", "message": f"{type(e).__name__}: {e}"})
+                logger.warning("study agent stream failed error_type=%s thread=%s",
+                               type(e).__name__, thread_id)
+                yield study_agent._sse({"type": "error",
+                                        "message": "The reply request failed. "
+                                                   "Try again."})
                 yield study_agent.DONE
 
         return StreamingResponse(_gen(), media_type="text/event-stream",

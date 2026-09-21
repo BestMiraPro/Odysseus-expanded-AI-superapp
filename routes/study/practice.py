@@ -629,8 +629,9 @@ def register(router: APIRouter) -> None:
                 yield study_agent._sse({"type": "error", "retryable": False,
                                         "message": str(e.detail)})
                 yield study_agent.DONE
-            except Exception:
-                logger.exception("study practice coach stream failed")
+            except Exception as e:
+                logger.warning("study practice coach stream failed error_type=%s "
+                               "thread=%s", type(e).__name__, thread_id)
                 yield study_agent._sse({
                     "type": "error", "retryable": True,
                     "message": "Something went wrong while preparing your reply. "

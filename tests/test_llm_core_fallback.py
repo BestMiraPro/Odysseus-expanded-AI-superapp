@@ -589,7 +589,7 @@ def test_chatgpt_subscription_top_level_error_preserves_semantics(monkeypatch):
 
     payload = json.loads(chunks[0].split("data: ", 1)[1])
     assert payload["status"] == 500
-    assert payload["text"] == "Temporarily unavailable"
+    assert payload["text"] == "ChatGPT Subscription is having an outage (HTTP 500)."
 
 
 def test_provider_explicit_status_wins_over_transient_text():

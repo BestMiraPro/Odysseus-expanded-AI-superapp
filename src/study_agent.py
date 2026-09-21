@@ -1307,8 +1307,9 @@ async def dispatch_tool(name: str, owner, args: Dict, *, allow_code: bool = Fals
     except asyncio.CancelledError:
         raise
     except Exception as e:  # tool bugs must not kill the chat
-        logger.exception("study agent tool %s failed", name)
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        logger.warning("study agent tool %s failed error_type=%s",
+                       name, type(e).__name__)
+        return {"ok": False, "error": "The tool could not run. Try again."}
     if isinstance(result, dict) and "ok" in result and "text" in result and spec.code:
         return {"ok": bool(result["ok"]), "result": result["text"]}
     return {"ok": True, "result": result}
@@ -1492,8 +1493,9 @@ async def _run_practice_turn(owner, thread, user_text: str,
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                stream_error = f"{type(e).__name__}: {e}"
-                logger.warning("study practice: generation failed: %s", stream_error)
+                stream_error = "generation failed"
+                logger.warning("study practice: generation failed error_type=%s thread=%s",
+                               type(e).__name__, thread_id)
 
             if stream_error:
                 # No final reply exists, so nothing unreviewed gets persisted;
@@ -1649,7 +1651,9 @@ async def run_study_agent(owner, thread_id: str, user_text: str, *, deck_id: Opt
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            stream_error = f"{type(e).__name__}: {e}"
+            logger.warning("study agent generation failed error_type=%s thread=%s",
+                           type(e).__name__, thread_id)
+            stream_error = "The model reply failed. Try again."
 
         text = "".join(text_parts)
         if stream_error:
