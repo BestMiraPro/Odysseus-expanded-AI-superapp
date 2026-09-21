@@ -434,14 +434,19 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel })
   function buildAdjBody(layer, type, body, popEl) {
     const p = layer._stagedAdj.params;
     const revertIcon = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>';
-    const sliderRow = (key, label, min, max, value, suffix) => `
+    const sliderRow = (key, label, min, max, value, suffix) => {
+      // Params come from persisted layer state, so clamp to the slider's own
+      // bounds before interpolating — only a number may reach the markup.
+      const v = Math.max(min, Math.min(max, Number(value) || 0));
+      return `
       <div class="ge-adj-row" data-adj-key="${key}">
         <label>${label}</label>
-        <input type="range" min="${min}" max="${max}" value="${value}" data-key="${key}" />
-        <span class="ge-adj-value">${value}${suffix || ''}</span>
+        <input type="range" min="${min}" max="${max}" value="${v}" data-key="${key}" />
+        <span class="ge-adj-value">${v}${suffix || ''}</span>
         <button class="ge-adj-revert" type="button" title="Reset this slider" data-revert-key="${key}">${revertIcon}</button>
       </div>
     `;
+    };
     if (type === 'brightness-contrast') {
       const bSlider = Math.round((p.brightness - 1) * 100);
       const cSlider = Math.round((p.contrast - 1) * 100);
@@ -491,19 +496,22 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel })
       });
     } else if (type === 'color-balance') {
       // Color-tinted slider ends so the user sees what direction does what.
-      const cbRow = (key, leftCol, rightCol, label, value) => `
+      const cbRow = (key, leftCol, rightCol, label, value) => {
+        const v = Math.max(-100, Math.min(100, Number(value) || 0));
+        return `
       <div class="ge-adj-row ge-adj-cb-row" data-adj-key="${key}">
         <span class="ge-adj-cb-dot" style="background:${leftCol}"></span>
-        <input type="range" min="-100" max="100" value="${value}" data-key="${key}" />
+        <input type="range" min="-100" max="100" value="${v}" data-key="${key}" />
         <span class="ge-adj-cb-dot" style="background:${rightCol}"></span>
-        <span class="ge-adj-value">${value}</span>
+        <span class="ge-adj-value">${v}</span>
         <button class="ge-adj-revert" type="button" title="Reset this slider" data-revert-key="${key}">${revertIcon}</button>
       </div>
     `;
-      // Tone picker: one tone group visible at a time. Remember the
-      // last picked tone on the popup so re-renders (revert button
-      // etc.) keep it.
-      const tone = popEl._cbTone || 'shadows';
+      };
+      // Tone picker: one tone group visible at a time. The tone is an enum —
+      // accept only the three known groups before it reaches the markup.
+      const tone = ['shadows', 'midtones', 'highlights'].includes(popEl._cbTone)
+        ? popEl._cbTone : 'shadows';
       popEl._cbTone = tone;
       const toneSliders = (t) => `
       ${cbRow(`${t}-r`, '#00d2d2', '#ff5555', 'Cyan ↔ Red',      p[t].r)}

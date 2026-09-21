@@ -17,6 +17,7 @@ practice-view tests drive the REAL renderPractice/advancePractice
 from __future__ import annotations
 
 import json
+import re
 
 from tests._study_js_harness import STUDY_JS, needs_node, run_js
 
@@ -612,6 +613,129 @@ def test_send_completing_across_a_selection_change_never_displays():
     assert result["noLateReply"], (
         "a reply from the abandoned send reached the new conversation's view")
     assert result["backToSend"]
+
+
+# ---------------------------------------------------------------------------
+# S6 - alert #335: the assistant-reply DOM path (appendMessage -> innerHTML =
+# md(content)) must render through the REAL mdToHtml pipeline, so model text
+# lands inert no matter what markup it carries.
+# ---------------------------------------------------------------------------
+
+def _real_markdown_prelude() -> str:
+    """_coach_prelude with the REAL markdown.js wired in as mdToHtml."""
+    import base64
+    from tests.test_markdown_rendering_js import _SANITIZER_DOM
+
+    src = (STUDY_JS.parent / "markdown.js").read_text(encoding="utf-8")
+    src = src.replace("import uiModule from './ui.js';", "")
+    src = src.replace(
+        "import { splitTableRow } from './markdown/tableRow.js';",
+        """function splitTableRow(row) {
+          return (row || '').replace(/^\\s*\\|/, '').replace(/\\|\\s*$/, '').split('|').map(c => c.trim());
+        }""",
+    )
+    emoji = (STUDY_JS.parent / "emojiShortcodes.js").read_text(encoding="utf-8")
+    emoji = re.sub(r"^export default .*$", "", emoji, flags=re.M)
+    emoji = emoji.replace("export const ", "const ").replace("export function ", "function ")
+    src = src.replace(
+        "import { replaceEmojiShortcodes, hasEmojiShortcode } from './emojiShortcodes.js';",
+        emoji,
+    )
+    src = src.replace(
+        "var escapeHtml = uiModule.esc;",
+        """var escapeHtml = (value) => String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');""",
+    )
+    module_js = (
+        "import fs from 'node:fs';\n"
+        + "const miniDoc = (" + _SANITIZER_DOM + ").stable;\n"
+        + "// markdown.js resolves its free `document` from the global scope;\n"
+        + "// the coach's own const document below shadows it for coach code.\n"
+        + "globalThis.document = miniDoc;\n"
+        + "const url = 'data:text/javascript;base64,' + Buffer.from("
+        + json.dumps(src) + ").toString('base64');\n"
+        + "const realMarkdown = await import(url);\n"
+    )
+    prelude = _coach_prelude.replace(
+        "const mdToHtml = (src) => String(src);",
+        "const mdToHtml = realMarkdown.mdToHtml;",
+    ).replace(
+        "createElement(tag) {\n    const n = makeNode(tag);",
+        "createElement(tag) {\n    if (tag === 'template') return miniDoc.createElement('template');\n    const n = makeNode(tag);",
+    ).replace(
+        "const document = {",
+        "globalThis.MutationObserver = class { observe() {} };\n" + module_js + "const document = {",
+    )
+    return prelude
+
+
+_XSS_REPLY = r"""
+const coach = createPracticeCoach({
+  questionId: 'q-1',
+  getContext: () => ({ draft: '', hints: [], consulted: false }),
+  esc, toast,
+});
+coach.update();
+AWAIT
+const log = coach.element.querySelector('.study-coach-log');
+const input = coach.element.querySelector('.study-coach-input');
+const send = coach.element.querySelector('.study-coach-send');
+const select = coach.element.querySelector('.study-coach-history');
+
+const payload = 'Here is <img src=x onerror="alert(1)"> and '
+  + '<a href="javascript:alert(2)">click</a> and '
+  + '<details><img src=z onerror="alert(3)"></details> and '
+  + '&lt;script&gt;alert(4)&lt;/script&gt;.';
+streams.push([{ type: 'reply', content: payload }]);
+input.value = 'question';
+send.dispatch('click');
+AWAIT
+const reply = log.children[1];
+
+// History path funnels through the same appendMessage sink.
+historyByThread = { H: [
+  { role: 'user', content: 'old question' },
+  { role: 'assistant', content: 'Old <svg><script>alert(5)</script></svg> reply' },
+] };
+threadList = [{ id: 'H', title: 'H', question_id: 'q-1' }];
+select.value = 'H';
+select.dispatch('change');
+AWAIT
+const historyNode = log.children[1];
+
+console.log(JSON.stringify({ html: reply.innerHTML, hist: historyNode.innerHTML }));
+"""
+
+
+@needs_node
+def test_coach_reply_renders_through_the_real_markdown_pipeline():
+    result = run_js(
+        _real_markdown_prelude(), "createPracticeCoach",
+        epilogue=_XSS_REPLY.replace("AWAIT", _tick(30)),
+        source_path=COACH_JS,
+    )
+    for key in ("html", "hist"):
+        html = result[key]
+        # every script-capable channel is inert: no handlers, no javascript:
+        # URLs, no script elements; the escaped round-trip stays literal text
+        assert "onerror" not in html
+        assert "javascript:" not in html
+        assert "<svg" not in html.lower()
+        assert "<script" not in html.lower()
+        assert "onclick" not in html
+    html = result["html"]
+    assert "&amp;lt;script&amp;gt;alert(4)&amp;lt;/script&amp;gt;" in html
+    # markdown/math/details support is preserved, not double-escaped away:
+    # the sanitized <img> keeps only its inert src, the <a> keeps its text,
+    # and the details block still renders
+    assert '<img src="x">' in html
+    assert "<a>click</a>" in html
+    assert "<details open" in html
+    assert "Old" in result["hist"] and "reply" in result["hist"]
 
 
 # ---------------------------------------------------------------------------

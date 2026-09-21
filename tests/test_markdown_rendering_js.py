@@ -18,7 +18,123 @@ def node_available():
         pytest.skip("node binary not on PATH")
 
 
-def _run_markdown_case(markdown: str, render_expr: str = "mod.mdToHtml(input)", with_katex: bool = False):
+_PASS_THROUGH_DOM = """{
+      readyState: 'loading',
+      addEventListener() {},
+      createElement(tag) {
+        if (tag !== 'template') throw new Error(`unsupported element: ${tag}`);
+        return {
+          _html: '',
+          content: { querySelectorAll() { return []; } },
+          set innerHTML(value) { this._html = value; },
+          get innerHTML() { return this._html; },
+        };
+      },
+    }"""
+
+# A tolerant-but-real HTML fragment DOM for the sanitizer: parses nested tags
+# and attributes, honours remove()/removeAttribute(), and re-serializes the
+# surviving tree - enough to exercise sanitizeAllowedHtml's fixpoint
+# (reparse-after-serialize) behaviorally under Node without a browser. S9 adds
+# the real-browser pass.
+_SANITIZER_DOM = """(function makeTreeDom() {
+const VOID = /^(area|base|br|col|embed|hr|img|input|link|meta|param|source|track|wbr)$/i;
+function parse(html) {
+  const root = { tag: null, children: [] };
+  const stack = [root];
+  const re = /<(\\/?)([A-Za-z][A-Za-z0-9:-]*)([^<>]*?)>|([^<]+)/g;
+  let m;
+  while ((m = re.exec(html))) {
+    if (m[4] !== undefined) { stack[stack.length - 1].children.push({ text: m[4] }); continue; }
+    const closing = m[1] === '/';
+    const tag = m[2];
+    if (closing) {
+      for (let i = stack.length - 1; i > 0; i--) {
+        if (stack[i].tag && stack[i].tag.toLowerCase() === tag.toLowerCase()) { stack.length = i; break; }
+      }
+      continue;
+    }
+    const selfClosing = /\\/\\s*$/.test(m[3]);
+    const attrs = [];
+    const ar = /([A-Za-z][A-Za-z0-9:._-]*)(?:\\s*=\\s*("([^"]*)"|'([^']*)'|([^\\s"'=<>`]+)))?/g;
+    let am;
+    while ((am = ar.exec(m[3] || ''))) {
+      attrs.push({
+        name: am[1],
+        value: am[3] !== undefined ? am[3] : (am[4] !== undefined ? am[4] : (am[5] !== undefined ? am[5] : '')),
+        dropped: false,
+      });
+    }
+    const el = {
+      tag, tagName: tag, attrs, attributes: attrs, children: [], removed: false,
+      remove() { this.removed = true; },
+      removeAttribute(name) { const a = this.attrs.find((x) => x.name === name); if (a) a.dropped = true; },
+    };
+    stack[stack.length - 1].children.push(el);
+    if (!selfClosing && !VOID.test(tag)) stack.push(el);
+  }
+  return root;
+}
+function serialize(nodes) {
+  let out = '';
+  for (const n of nodes) {
+    if (n.text !== undefined) { out += n.text; continue; }
+    if (n.removed) continue;
+    const as = n.attrs.filter((a) => !a.dropped)
+      .map((a) => a.name + '="' + String(a.value || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '"')
+      .join(' ');
+    out += '<' + n.tag + (as ? ' ' + as : '') + '>' + serialize(n.children) + '</' + n.tag + '>';
+  }
+  return out;
+}
+function templateDoc(unstable) {
+  return {
+    readyState: 'loading',
+    addEventListener() {},
+    createElement(tag) {
+      if (tag !== 'template') throw new Error('unsupported element: ' + tag);
+      const tpl = {
+        _root: { tag: null, children: [] },
+        set innerHTML(v) { this._root = parse(v); },
+        get innerHTML() {
+          // The unstable variant grafts one more surviving element on every
+          // serialization - the fixpoint can never converge, so the sanitizer
+          // must fall back to escaping (the four-pass bound fails closed).
+          const kids = unstable ? [...this._root.children, { tag: 'i', tagName: 'i', attrs: [], attributes: [], children: [], removed: false }] : this._root.children;
+          return serialize(kids);
+        },
+        content: {
+          _tpl: null,
+          querySelectorAll(sel) {
+            const names = sel.split(',').map((s) => s.trim().toLowerCase());
+            const all = names.includes('*');
+            const out = [];
+            const walk = (nodes) => {
+              for (const n of nodes) {
+                if (n.tag && !n.removed) {
+                  if (all || names.includes(n.tag.toLowerCase())) out.push(n);
+                  walk(n.children);
+                }
+              }
+            };
+            walk(this._tpl._root.children);
+            return out;
+          },
+        },
+      };
+      tpl.content._tpl = tpl;
+      return tpl;
+    },
+  };
+}
+return { stable: templateDoc(false), unstable: templateDoc(true) };
+})()"""
+
+
+def _run_markdown_case(markdown: str, render_expr: str = "mod.mdToHtml(input)", with_katex: bool = False,
+                       dom_stub: str = ""):
+    if not dom_stub:
+        dom_stub = _PASS_THROUGH_DOM
     script = textwrap.dedent(
         r"""
         import fs from 'node:fs';
@@ -36,19 +152,7 @@ def _run_markdown_case(markdown: str, render_expr: str = "mod.mdToHtml(input)", 
           globalThis.window.katex = katexStub;
           globalThis.katex = katexStub;
         }
-        globalThis.document = {
-          readyState: 'loading',
-          addEventListener() {},
-          createElement(tag) {
-            if (tag !== 'template') throw new Error(`unsupported element: ${tag}`);
-            return {
-              _html: '',
-              content: { querySelectorAll() { return []; } },
-              set innerHTML(value) { this._html = value; },
-              get innerHTML() { return this._html; },
-            };
-          },
-        };
+        globalThis.document = __DOCUMENT_STUB__;
         globalThis.MutationObserver = class { observe() {} };
 
         let source = fs.readFileSync('./static/js/markdown.js', 'utf8');
@@ -91,7 +195,7 @@ def _run_markdown_case(markdown: str, render_expr: str = "mod.mdToHtml(input)", 
         """
     ).replace("__RENDER_EXPR__", render_expr).replace(
         "__WITH_KATEX__", "true" if with_katex else "false"
-    )
+    ).replace("__DOCUMENT_STUB__", dom_stub)
     result = subprocess.run(
         ["node", "--input-type=module", "-e", script, json.dumps(markdown)],
         cwd=_REPO,
@@ -300,3 +404,94 @@ def test_dotted_python_import_paths_are_not_autolinked(node_available):
     assert 'href="https://imblearn.com' not in html
     assert 'href="https://sklearn.me' not in html
     assert 'href="https://example.com/docs"' in html
+
+
+# ---------------------------------------------------------------------------
+# S6 - sanitizer behavior (item 2): the fixpoint must strip event handlers
+# and dangerous schemes after a serialize/reparse, drop SVG/MathML roots, and
+# fail closed when the reparse never converges.
+# ---------------------------------------------------------------------------
+
+_S6_SANITIZER_STABLE = _SANITIZER_DOM + ".stable"
+_S6_SANITIZER_UNSTABLE = _SANITIZER_DOM + ".unstable"
+
+
+def test_sanitizer_strips_event_handlers_and_dangerous_urls(node_available):
+    payload = ('<a href="javascript:alert(1)" onclick="go()">x</a>'
+               '<img src="y" onerror="alert(2)">'
+               '<a href="data:text/html,x">z</a>')
+    html = _run_markdown_case(
+        payload, "mod.sanitizeAllowedHtml(input)", dom_stub=_S6_SANITIZER_STABLE
+    )
+
+    assert "javascript:" not in html
+    assert "onclick" not in html
+    assert "onerror" not in html
+    assert "data:text/html" not in html
+    assert "<a>x</a>" in html
+    assert '<img src="y">' in html
+    assert "<a>z</a>" in html
+
+
+def test_sanitizer_removes_svg_math_and_foreign_script_roots(node_available):
+    payload = ('<svg><script>alert(1)</script><rect></rect></svg>'
+               '<math><mi>x</mi></math>'
+               '<details open ontoggle="p(1)">hi</details>')
+    html = _run_markdown_case(
+        payload, "mod.sanitizeAllowedHtml(input)", dom_stub=_S6_SANITIZER_STABLE
+    )
+
+    assert "<svg" not in html.lower()
+    assert "<math" not in html.lower()
+    assert "<script" not in html.lower()  # lower-cased foreign content still trips the guard
+    assert "ontoggle" not in html
+    assert "<details open" in html
+    assert "hi" in html
+
+
+def test_sanitizer_four_pass_bound_fails_closed(node_available):
+    # Every serialization grafts another surviving element, so the document
+    # can never reach a fixpoint. After the 4-pass bound the sanitizer must
+    # escape rather than trust the last mutated output.
+    payload = '<a href="https://ok.example">x</a><br>'
+    html = _run_markdown_case(
+        payload, "mod.sanitizeAllowedHtml(input)", dom_stub=_S6_SANITIZER_UNSTABLE
+    )
+
+    assert "<a" not in html
+    assert "&lt;a href=&quot;https://ok.example&quot;&gt;x&lt;/a&gt;&lt;br&gt;" == html
+
+
+# ---------------------------------------------------------------------------
+# S6 - shared helper round trips (item 1): malicious markdown and escaped
+# DOM text must both come out inert through the real mdToHtml pipeline.
+# ---------------------------------------------------------------------------
+
+
+def test_markdown_escaped_markup_stays_literal(node_available):
+    # An already-escaped attack string is user-entered TEXT: mdToHtml must
+    # re-escape it for display, never decode it back into live markup.
+    html = _run_markdown_case(
+        "&lt;img src=x onerror=alert(1)&gt; and "
+        "&amp;lt;script&amp;gt;alert(2)&amp;lt;/script&amp;gt;"
+    )
+
+    assert "<img" not in html
+    assert "<script" not in html.lower()
+    assert "&amp;lt;img src=x onerror=alert(1)&amp;gt;" in html
+
+
+def test_markdown_malicious_raw_html_rendered_inert(node_available):
+    html = _run_markdown_case(
+        '<details><img src=x onerror="alert(2)"></details> '
+        '<a href="javascript:alert(3)">click</a> '
+        '<img src=y onerror="alert(4)">',
+        dom_stub=_S6_SANITIZER_STABLE,
+    )
+
+    assert "<details open" in html
+    assert '<img src="x">' in html
+    assert "<a>click</a>" in html
+    assert '<img src="y">' in html
+    assert "onerror" not in html
+    assert "javascript:" not in html

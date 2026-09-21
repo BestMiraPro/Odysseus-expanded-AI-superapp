@@ -262,13 +262,17 @@ export function sanitizeAllowedHtml(html) {
 
   // Sanitize to a fixpoint. Re-parsing the serialized output can mutate the
   // tree (the basis of mutation-XSS), so re-clean until it stops changing.
+  // The pass only ever removes nodes/attributes, so it converges immediately
+  // on any real parse; the bound is defense against a pathological
+  // serialize/re-parse cycle. If the bound is hit without converging, fail
+  // closed by escaping instead of trusting the last mutated output.
   let out = raw;
   for (let i = 0; i < 4; i++) {
     const next = _cleanAllowedHtmlOnce(out);
-    if (next === out) break;
+    if (next === out) return out;
     out = next;
   }
-  return out;
+  return escapeHtml(raw);
 }
 
 function renderSafeKatex(raw, displayMode) {

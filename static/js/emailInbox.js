@@ -960,17 +960,17 @@ async function _openEmail(em, itemEl, preloadedData = null, mode = 'reply', note
     // and the reply doc opens empty (data.body.split throws).
     let _origBody = (typeof data.body === 'string' && data.body.length) ? data.body : '';
     if (!_origBody && typeof data.body_html === 'string' && data.body_html) {
-      _origBody = data.body_html
-        .replace(/<style[\s\S]*?<\/style>/gi, '')
-        .replace(/<script[\s\S]*?<\/script>/gi, '')
-        .replace(/<br\s*\/?>/gi, '\n')
-        .replace(/<\/p>/gi, '\n\n')
-        .replace(/<[^>]+>/g, '')
-        .replace(/&nbsp;/g, ' ')
-        .replace(/&amp;/g, '&')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&quot;/g, '"')
+      // HTML→text via the document module's inert-template extraction: one
+      // DOM decode, script/style/iframe/object/embed nodes dropped, <br> and
+      // block boundaries kept as line breaks. The old regex chain here
+      // re-decoded the entities it had just written (&amp;lt; → <), so a
+      // crafted body could smuggle live markup into the quoted plain text.
+      const toText = _docModule && typeof _docModule.emailHtmlToPlainText === 'function'
+        ? _docModule.emailHtmlToPlainText
+        : null;
+      _origBody = (toText
+        ? _docModule.emailHtmlToPlainText(String(data.body_html))
+        : String(data.body_html).replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' '))
         .replace(/\n{3,}/g, '\n\n')
         .trim();
     }

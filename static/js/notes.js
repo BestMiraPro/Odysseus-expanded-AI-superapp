@@ -857,7 +857,10 @@ async function _ensureNotificationPermission() {
 function _normalizeRepeat(repeat, originalDate) {
   if (!repeat || repeat === 'none') return 'none';
   if (repeat === 'daily' || repeat === 'yearly') return repeat;
-  if (/^(weekly|monthly):/.test(repeat)) return repeat;
+  // Parametrized forms pass through ONLY in their canonical shape — the
+  // normalized value is later interpolated into reminder-menu markup, so
+  // anything that isn't a bounded integer payload must not round-trip.
+  if (/^(?:weekly:[0-6]|monthly:(?:day:(?:[1-9]|[12]\d|3[01])|nth:[1-4]:[0-6]|last:[0-6]))$/.test(repeat)) return repeat;
   // Legacy bare values — derive params from the original date
   const wd = originalDate.getDay();
   const n = Math.ceil(originalDate.getDate() / 7);
@@ -865,7 +868,7 @@ function _normalizeRepeat(repeat, originalDate) {
   if (repeat === 'monthly') return `monthly:day:${originalDate.getDate()}`;
   if (repeat === 'monthly_nth_weekday') return `monthly:nth:${n}:${wd}`;
   if (repeat === 'monthly_last_weekday') return `monthly:last:${wd}`;
-  return repeat;
+  return 'none';
 }
 
 function _advanceRecurring(dateStr, repeat) {
@@ -3842,7 +3845,7 @@ function _buildChecklistHtml(items) {
   let html = '<div class="note-checklist-inputs">';
   for (const item of items) {
     const indent = Math.min(item.indent || 0, 3);
-    html += `<div class="note-cl-row${item.done ? ' done' : ''}" draggable="true" data-item-id="${item.id || _uid()}" data-indent="${indent}" style="padding-left:${indent * 16}px">
+    html += `<div class="note-cl-row${item.done ? ' done' : ''}" draggable="true" data-item-id="${_esc(String(item.id || _uid()))}" data-indent="${indent}" style="padding-left:${indent * 16}px">
       <span class="note-cl-grip" title="Drag to reorder">⋮⋮</span>
       <span class="note-cl-dot"></span>
       <input type="text" class="note-cl-text" value="${_esc(item.text)}" placeholder="Item..." />

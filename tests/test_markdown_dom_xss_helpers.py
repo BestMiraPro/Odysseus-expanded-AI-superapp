@@ -25,6 +25,17 @@ def test_markdown_raw_html_sanitizer_strips_scriptable_css():
     assert "el.removeAttribute(attr.name);" in src
 
 
+def test_sanitizer_fixpoint_bound_fails_closed_by_escaping():
+    src = (_REPO / "static" / "js" / "markdown.js").read_text(encoding="utf-8")
+
+    # The four-pass mutation-XSS bound must not trust a non-converged output:
+    # leaving the loop by any route other than an exact reparse match escapes.
+    assert "for (let i = 0; i < 4; i++)" in src
+    assert "if (next === out) return out;" in src
+    assert "return escapeHtml(raw);" in src
+    assert "let out = raw;" in src
+
+
 def test_email_rich_body_render_path_reuses_raw_html_sanitizer():
     markdown_src = (_REPO / "static" / "js" / "markdown.js").read_text(encoding="utf-8")
     document_src = (_REPO / "static" / "js" / "document.js").read_text(encoding="utf-8")

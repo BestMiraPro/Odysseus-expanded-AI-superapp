@@ -166,7 +166,12 @@ export function _tzOffset() {
 // "2026-05-13T22:00:00Z" (07:00 May 14 JST) would render on May 13.
 export function _localDateOf(isoStr) {
   if (typeof isoStr !== 'string' || !isoStr) return '';
-  if (isoStr.length === 10) return isoStr;
+  if (isoStr.length === 10) {
+    // This string is interpolated into date-input value="#" attributes on the
+    // event form, so imported/synced event data must not carry raw characters
+    // out of here — only an exact YYYY-MM-DD passes.
+    return /^\d{4}-\d{2}-\d{2}$/.test(isoStr) ? isoStr : '';
+  }
   if (/[Zz]$|[+\-]\d{2}:?\d{2}$/.test(isoStr)) {
     const d = new Date(isoStr);
     if (!isNaN(d)) {
@@ -176,5 +181,6 @@ export function _localDateOf(isoStr) {
       return `${y}-${m}-${dd}`;
     }
   }
-  return isoStr.slice(0, 10);
+  const sliced = isoStr.slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(sliced) ? sliced : '';
 }

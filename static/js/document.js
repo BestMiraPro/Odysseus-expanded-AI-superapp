@@ -2345,9 +2345,7 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
     }).join('');
 
     if (!changed && /<[^>]+>/.test(text) && typeof document !== 'undefined') {
-      const probe = document.createElement('div');
-      probe.innerHTML = text;
-      const plain = (probe.innerText || probe.textContent || '').trim();
+      const plain = _emailHtmlToPlainText(text).trim();
       const plainClean = plain ? _sanitizeOutgoingEmailBody(plain) : plain;
       if (plainClean !== plain) return plainClean;
     }
@@ -2459,9 +2457,22 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
 
   function _emailHtmlToPlainText(html) {
     if (typeof document === 'undefined') return String(html || '');
-    const d = document.createElement('div');
-    d.innerHTML = String(html || '');
-    return d.innerText || d.textContent || '';
+    // HTML→text is a conversion, not a sanitizer: run it against the parts of
+    // the markup that can actually render text. Parse into a <template> —
+    // inert, so assigning innerHTML neither runs scripts nor fetches
+    // resources (the old detached-div innerHTML parse was flagged for exactly
+    // that surface) — then drop the resource/script-capable nodes before
+    // extracting text. A <template>'s content is a DocumentFragment with no
+    // innerText, so the stripped nodes move into a detached div for reading;
+    // detached nodes never load resources either.
+    const tpl = document.createElement('template');
+    tpl.innerHTML = String(html || '');
+    for (const el of Array.from(tpl.content.querySelectorAll('script,style,iframe,object,embed'))) {
+      el.remove();
+    }
+    const probe = document.createElement('div');
+    probe.appendChild(tpl.content);
+    return probe.innerText || probe.textContent || '';
   }
 
   function _emailQuoteMarkerMatch(text) {
@@ -11195,6 +11206,7 @@ const documentModule = {
   getCurrentDocId,
   getActiveEmailComposerContext,
   findEmailDocId,
+  emailHtmlToPlainText: _emailHtmlToPlainText,
   getSelectionContext,
   clearSelection,
   clearAll,

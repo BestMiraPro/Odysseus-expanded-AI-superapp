@@ -675,7 +675,7 @@ function renderSkillsList() {
       delete sk._duplicateNames;
     }
     const conf = Math.round((sk.confidence || 0) * 100);
-    const uses = sk.uses || 0;
+    const uses = Number(sk.uses) || 0;
     const isPublished = (sk.status === 'published');
     const confColor = _confColor(conf);
 

@@ -226,3 +226,177 @@ def test_task_card_never_interpolates_id_into_selector():
     assert "el.dataset.id === String(id)" in body
     assert "querySelector(`" not in body
     assert "CSS.escape" not in body
+
+
+# ---------------------------------------------------------------------------
+# S6 - detached-div HTML-to-text conversions (#16/#17) replaced by an inert
+# template parse; and the emailInbox reply body (#31/#51) reusing it.
+# ---------------------------------------------------------------------------
+
+# A fragment DOM for the email text helper: parses tags, rotates out
+# script/style/iframe/object/embed nodes on querySelectorAll+remove, and
+# models innerText's <br> as line breaks and its one-pass entity decoding.
+_EMAIL_TEXT_DOM = """
+const BLOCK = /^(address|article|blockquote|div|footer|header|h[1-6]|li|main|nav|ol|p|pre|section|table|tbody|tr|ul)$/i;
+function entityDecode(s) {
+  return s.replace(/&(#39|#x27|quot|amp|lt|gt|nbsp);/g, (e) => ({
+    '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&#x27;': "'", '&nbsp;': ' ',
+  })[e]);
+}
+function fragmentText(nodes) {
+  let out = '';
+  for (const n of nodes) {
+    if (n.removed) continue;
+    if (n.text !== undefined) { out += entityDecode(n.text); continue; }
+    if (n.tag && n.tag.toLowerCase() === 'br') { out += '\\n'; continue; }
+    if (n.tag && BLOCK.test(n.tag)) { out += fragmentText(n.children) + '\\n'; continue; }
+    out += fragmentText(n.children);
+  }
+  return out;
+}
+function parse(html) {
+  const root = { tag: null, children: [] };
+  const stack = [root];
+  const re = /<(\\/?)([A-Za-z][A-Za-z0-9:-]*)([^<>]*?)>|([^<]+)/g;
+  let m;
+  while ((m = re.exec(html))) {
+    if (m[4] !== undefined) { stack[stack.length - 1].children.push({ text: m[4] }); continue; }
+    const tag = m[2];
+    if (m[1] === '/') {
+      for (let i = stack.length - 1; i > 0; i--) {
+        if (stack[i].tag && stack[i].tag.toLowerCase() === tag.toLowerCase()) { stack.length = i; break; }
+      }
+      continue;
+    }
+    if (/\\/\\s*$/.test(m[3])) continue;
+    const el = {
+      tag, children: [], removed: false, parent: stack[stack.length - 1],
+      remove() { this.removed = true; },
+    };
+    stack[stack.length - 1].children.push(el);
+    if (!/^(br|img|hr|input|meta|link|col|embed|source|track|wbr)$/i.test(tag)) stack.push(el);
+  }
+  return root;
+}
+const document = {
+  createElement(tag) {
+    if (tag === 'template') {
+      const tpl = {
+        set innerHTML(v) { this._root = parse(v); },
+        content: {
+          _tpl: null,
+          querySelectorAll(sel) {
+            const names = sel.split(',').map((s) => s.trim().toLowerCase());
+            const out = [];
+            const walk = (nodes) => {
+              for (const n of nodes) {
+                if (n.tag && !n.removed) {
+                  if (names.includes(n.tag.toLowerCase())) out.push(n);
+                  walk(n.children);
+                }
+              }
+            };
+            walk(this._tpl._root.children);
+            return out;
+          },
+        },
+        _root: null,
+      };
+      tpl.content._tpl = tpl;
+      return tpl;
+    }
+    if (tag === 'div') {
+      const div = {
+        _nodes: [],
+        appendChild(content) { this._nodes = [...content._tpl._root.children]; },
+        get innerText() { return fragmentText(this._nodes); },
+        get textContent() { return fragmentText(this._nodes); },
+      };
+      return div;
+    }
+    throw new Error('unsupported element: ' + tag);
+  },
+};
+"""
+
+
+@needs_node
+def test_email_html_to_plain_text_drops_payload_nodes_before_extraction():
+    body = _extract_function("_emailHtmlToPlainText", _DOCUMENT_JS)
+    assert "createElement('template')" in body
+    assert "querySelectorAll('script,style,iframe,object,embed')" in body
+    assert "probe.appendChild(tpl.content)" in body
+
+    script = (
+        _EMAIL_TEXT_DOM
+        + body
+        + r"""
+console.log(JSON.stringify(_emailHtmlToPlainText(
+  '<p>Hello <b>world</b></p><script>alert(1)</script><style>*{}</style>' +
+  '<iframe src="x"></iframe>visible <object></object><embed src="y"><span>tail</span>'
+)));
+"""
+    )
+    out = json.loads(_run_node(script))
+    assert 'Hello world' in out and 'visible' in out and 'tail' in out
+    assert 'alert(1)' not in out
+    assert '{}' not in out
+
+
+@needs_node
+def test_email_html_to_plain_text_preserves_breaks_and_decodes_once():
+    body = _extract_function("_emailHtmlToPlainText", _DOCUMENT_JS)
+    script = (
+        _EMAIL_TEXT_DOM
+        + body
+        + r"""
+console.log(JSON.stringify(_emailHtmlToPlainText(
+  'Hello<br>world<br><br>again &amp; &lt; &gt; &quot; &#39; &amp;lt;'
+)));
+"""
+    )
+    out = json.loads(_run_node(script))
+    assert "Hello\nworld\n\nagain" in out
+    tail = out.split("again", 1)[1]
+    # one DOM decode: the raw entities surface once...
+    assert " & < > \" '" in tail
+    # ...and a double-encoded entity decodes exactly one level, never to markup
+    assert "&lt;" in tail
+    assert "&amp;" not in tail
+
+
+@needs_node
+def test_sanitize_outgoing_email_body_goes_through_the_inert_extraction():
+    sanitize = _extract_function("_sanitizeOutgoingEmailBody", _DOCUMENT_JS)
+    to_text = _extract_function("_emailHtmlToPlainText", _DOCUMENT_JS)
+    assert "probe.innerHTML = text" not in sanitize
+    assert "_emailHtmlToPlainText(text).trim()" in sanitize
+    script = (
+        _EMAIL_TEXT_DOM
+        + "const _decodeBase64EmailWrapper = () => null;\n"
+        + "const _looksLikeWrappedEmailContent = () => false;\n"
+        + to_text
+        + "\n"
+        + sanitize
+        + r"""
+console.log(JSON.stringify(_sanitizeOutgoingEmailBody(
+  '<div>A</div><br><br><br><div>B</div><script>steal()</script>'
+)));
+"""
+    )
+    out = json.loads(_run_node(script))
+    # the converted plain text is kept (newline runs collapsed by the
+    # recursion), and the script payload never survives the extraction
+    assert "A\n\nB" in out
+    assert 'steal()' not in out
+    assert '<div' not in out
+
+
+def test_email_inbox_reply_uses_the_shared_template_extraction():
+    src = (_REPO / "static" / "js" / "emailInbox.js").read_text(encoding="utf-8")
+    assert "_docModule.emailHtmlToPlainText(String(data.body_html))" in src
+    assert "typeof _docModule.emailHtmlToPlainText === 'function'" in src
+    # the flagged double-decode chain must be gone: no entity re-decode pass
+    # remains after the DOM extraction
+    assert '.replace(/&amp;/g, \'&\')' not in src
+    assert ".replace(/&lt;/g, '<')" not in src

@@ -1390,8 +1390,8 @@ function _openDetail(img) {
     : 'Unknown';
   const userTags = img.user_tags || img.tags || '';
   const aiTags = img.ai_tags || '';
-  const dims = img.width && img.height ? `${img.width} x ${img.height}` : (img.size || 'Unknown');
-  const fileSize = img.file_size ? _humanSize(img.file_size) : '';
+  const dims = img.width && img.height ? `${Number(img.width)} x ${Number(img.height)}` : (_esc(img.size) || 'Unknown');
+  const fileSize = img.file_size ? _humanSize(Number(img.file_size)) : '';
   // "Edited" row: only show when updated_at is meaningfully later than
   // created_at (>10s). Every photo bumps updated_at on insert via the
   // ORM timestamp mixin, so the gap filters out the trivial case.
@@ -1489,7 +1489,7 @@ function _openDetail(img) {
           <div>${dims}${fileSize ? ` (${fileSize})` : ''}</div>
         </div>
         ${img.camera ? `<div class="gallery-detail-section"><label>Camera</label><div>${_esc(img.camera)}</div></div>` : ''}
-        ${img.gps ? `<div class="gallery-detail-section"><label>Location</label><div>${img.gps.lat}, ${img.gps.lng}</div></div>` : ''}
+        ${img.gps ? `<div class="gallery-detail-section"><label>Location</label><div>${Number(img.gps.lat)}, ${Number(img.gps.lng)}</div></div>` : ''}
         ${img.model ? `<div class="gallery-detail-section"><label>Source</label><div>${_esc(img.model)}</div></div>` : ''}
         ${img.session_name ? `<div class="gallery-detail-section"><label>Session</label><div>${_esc(img.session_name)}</div></div>` : ''}
         ${aiTags ? `<div class="gallery-detail-section"><label>AI Tags</label><div class="gallery-ai-tags">${aiTags.split(',').map(t => t.trim()).filter(Boolean).map(t => `<button class="gallery-ai-chip gallery-aitag-chip" data-tag-filter="${_esc(t)}" title="AI-generated tag — click to filter to photos tagged “${_esc(t)}”"><span class="gallery-aitag-mark" aria-hidden="true">✦</span>${_esc(t)}</button>`).join('')}</div></div>` : ''}
@@ -1506,7 +1506,7 @@ function _openDetail(img) {
           <label>Album</label>
           <select id="gallery-detail-album" class="gallery-tag-input" style="padding:4px 6px;">
             <option value="">None</option>
-            ${_albums.map(a => `<option value="${a.id}" ${img.album_id === a.id ? 'selected' : ''}>${_esc(a.name)}</option>`).join('')}
+            ${_albums.map(a => `<option value="${_esc(a.id)}" ${img.album_id === a.id ? 'selected' : ''}>${_esc(a.name)}</option>`).join('')}
           </select>
         </div>
         <div class="gallery-detail-section" id="gallery-detail-people-section" style="display:none">
@@ -2988,12 +2988,13 @@ function _esc(str) {
 }
 
 function _humanSize(bytes) {
-  if (!bytes) return '';
+  const size = Number(bytes);
+  if (!size) return '';
   const units = ['B', 'KB', 'MB', 'GB'];
   let i = 0;
-  let size = bytes;
-  while (size >= 1024 && i < units.length - 1) { size /= 1024; i++; }
-  return `${size.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+  let v = size;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
 const galleryModule = {

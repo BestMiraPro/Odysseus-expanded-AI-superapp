@@ -3392,13 +3392,19 @@ function _fmtTime(s) {
   // Tz-aware timestamps from CalDAV/import are stored as UTC instants and
   // serialized with Z/offset. Display them in the browser's local timezone;
   // legacy naive timestamps keep their written wall-clock time.
+  let out = '';
   if (/[Zz]$|[+\-]\d{2}:?\d{2}$/.test(s)) {
     const d = new Date(s);
     if (!isNaN(d)) {
-      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+      out = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     }
+  } else {
+    out = s.slice(11, 16);
   }
-  return s.slice(11, 16);
+  // The result is interpolated into value="..." (event form) and markup
+  // (_clockFace); event data can arrive from ICS/CalDAV imports, so only the
+  // exact HH:MM shape may leave this helper.
+  return /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(out) ? out : '';
 }
 
 function _timeToMin(iso) {
