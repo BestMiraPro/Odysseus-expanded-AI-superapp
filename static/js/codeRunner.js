@@ -512,7 +512,29 @@ export async function runServer(code, panel, lang) {
 }
 
 /**
- * Run HTML code in its own popup window
+ * Build the trusted wrapper document for an untrusted HTML preview: ONE
+ * full-size sandboxed iframe carrying the code via `srcdoc`.
+ *
+ * The wrapper document (a popup at about:blank, or any same-origin host)
+ * inherits this app's origin, so the preview must not be serialized into it.
+ * `sandbox="allow-scripts"` without `allow-same-origin` gives the preview an
+ * opaque origin: its own scripts and its own DOM work, the app's storage and
+ * APIs do not. Sandbox is set before srcdoc and before insertion, and `code`
+ * is never interpolated into wrapper markup.
+ */
+export function buildIsolatedPreviewFrame(doc, code) {
+  const frame = doc.createElement('iframe');
+  frame.setAttribute('sandbox', 'allow-scripts');
+  frame.title = 'HTML preview';
+  frame.style.cssText = 'border:0;width:100%;height:100vh;display:block';
+  frame.srcdoc = code;
+  doc.body.style.margin = '0';
+  doc.body.replaceChildren(frame);
+  return frame;
+}
+
+/**
+ * Run HTML code in its own popup window holding only the isolated preview.
  */
 export function runHTML(code, panel) {
   panel.innerHTML = '';
@@ -524,9 +546,7 @@ export function runHTML(code, panel) {
     return;
   }
   try { win.opener = null; } catch (_) {}
-  win.document.open();
-  win.document.write(code);
-  win.document.close();
+  buildIsolatedPreviewFrame(win.document, code);
 
   showOutput(panel, 'Opened in new window', false);
   addCloseBtn(panel);
@@ -616,7 +636,7 @@ export function renderPythonPlots(root) {
 }
 
 const codeRunnerModule = {
-  run, runPython, runJavaScript, runHTML, runServer, codeUsesMatplotlib,
-  renderPythonPlots,
+  run, runPython, runJavaScript, runHTML, buildIsolatedPreviewFrame, runServer,
+  codeUsesMatplotlib, renderPythonPlots,
 };
 export default codeRunnerModule;
