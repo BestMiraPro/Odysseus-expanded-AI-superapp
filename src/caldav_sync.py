@@ -204,12 +204,22 @@ def _google_caldav_events_url(url: str) -> str | None:
     """
     parts = urlparse(url)
     host = (parts.hostname or "").lower()
+    scheme = (parts.scheme or "").lower()
     path = parts.path.rstrip("/")
     if not path.endswith("/user"):
         return None
+    # Hosts must EXACTLY match a known Google CalDAV endpoint (subdomain
+    # suffix or legacy calendar host), over HTTPS and without embedded
+    # userinfo. `https://notgoogleusercontent.com/caldav/v2/a/user` is not a
+    # Google endpoint; a suffix match against "googleusercontent.com" would
+    # otherwise rewrite an attacker-chosen host into our special-case path.
+    if scheme != "https" or parts.username or parts.password:
+        return None
     is_google = (
-        host.endswith("googleusercontent.com")                       # newer /caldav/v2 form
-        or (host in ("www.google.com", "google.com") and "/calendar/dav/" in path)  # legacy form
+        (host in ("apidata.googleusercontent.com",
+                  "calendar.googleusercontent.com") and "/caldav/v2/" in path)
+        or (host in ("www.google.com", "google.com")
+            and "/calendar/dav/" in path)
     )
     if not is_google:
         return None

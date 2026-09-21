@@ -628,10 +628,16 @@ function detectProvider(input) {
     url = url.replace(/\/api\/(chat|tags|generate)\/?$/i, '/api');
     try {
       const parsed = new URL(url);
-      if (parsed.hostname.endsWith('ollama.com')) url = 'https://ollama.com/api';
+      if (parsed.hostname === 'ollama.com') url = 'https://ollama.com/api';
     } catch(e) {}
-    // Add /v1 if bare host:port
-    if (/^https?:\/\/[^/]+$/.test(url) && !url.includes('api.') && !url.includes('ollama.com')) url += '/v1';
+    // Add /v1 if bare host:port, unless the parsed host is a known-cloud
+    // subdomain/API host (host checks, never URL substrings — a custom
+    // endpoint named "my-ollama.com" is not the canonical Ollama API).
+    if (/^https?:\/\/[^/]+$/.test(url)) {
+      let host = '';
+      try { host = new URL(url).hostname; } catch(e) {}
+      if (!host.startsWith('api.') && host !== 'ollama.com') url += '/v1';
+    }
     return { base_url: url, api_key: '', name: '' };
   }
   // Known key patterns
@@ -652,7 +658,12 @@ function detectProvider(input) {
 function setupChatUrlForEndpoint(detected) {
   const base = (detected.base_url || '').replace(/\/+$/, '');
   if (detected.name === 'Anthropic') return base.replace(/\/v1$/, '') + '/v1/messages';
-  if (base.includes('ollama.com')) return 'https://ollama.com/api/chat';
+  // Host equality, not a substring of the whole URL: only the canonical
+  // Ollama API host gets the cloud chat path; operator-selected custom
+  // endpoints keep their own path construction below.
+  let host = '';
+  try { host = new URL(base).hostname; } catch (e) { /* bare or malformed */ }
+  if (host === 'ollama.com') return 'https://ollama.com/api/chat';
   return base + '/chat/completions';
 }
 

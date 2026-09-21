@@ -59,9 +59,29 @@ def init_youtube():
 
 
 def is_youtube_url(url: str) -> bool:
+    """True when the URL's PARSED host is an actual YouTube host.
+
+    A substring match would classify deceptive URLs like
+    `https://evil.example/?next=youtube.com` or
+    `https://youtube.com.evil.example/watch?v=x` as YouTube; parsed-hostname
+    comparison plus the explicit host list closes that. Malformed input
+    returns False rather than raising. Note the host list intentionally
+    includes the YouTube Music subdomain; reject hosts with embedded
+    userinfo so `https://youtube.com@evil/...` cannot masquerade."""
     if not isinstance(url, str):
         return False
-    return "youtube.com" in url or "youtu.be" in url
+    try:
+        parsed = urllib.parse.urlparse(url)
+        # .port raises ValueError for a non-integer port; urlparse raises for
+        # broken IPv6 literals. A URL that cannot even be parsed is False.
+        _port = parsed.port
+        return (
+            parsed.scheme.lower() in {"http", "https"}
+            and parsed.hostname in (*_YT_HOSTS, "youtu.be")
+            and not parsed.username and not parsed.password
+        )
+    except ValueError:
+        return False
 
 
 # youtube.com-shaped hosts. music.youtube.com serves the same /watch and

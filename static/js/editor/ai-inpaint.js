@@ -272,7 +272,19 @@ export function wireInpaintButtons({
   document.getElementById('ge-inpaint-remove').addEventListener('click', async () => {
     const sel = getSelectedAIEndpoint('inpaint');
     const ep = (sel.endpoint || '').toLowerCase();
-    const isOpenAI = ep.includes('api.openai.com');
+    // Host equality, never a substring of the endpoint text: only the
+    // canonical OpenAI API host selects the semantic-removal prompt. A
+    // self-hosted proxy whose name merely CONTAINS "api.openai.com" keeps
+    // the SDXL-style surroundings prompt.
+    let isOpenAI = ep === 'api.openai.com';
+    if (!isOpenAI) {
+      try {
+        const candidate = /^[a-z][a-z0-9+.-]*:\/\//i.test(ep)
+          ? ep : ('https://' + ep);
+        isOpenAI = new URL(candidate).hostname === 'api.openai.com';
+      }
+      catch (e) { isOpenAI = false; }
+    }
     let prompt, strength;
     if (isOpenAI) {
       const userP = document.getElementById('ge-inpaint-prompt')?.value?.trim();

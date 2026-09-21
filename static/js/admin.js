@@ -984,19 +984,24 @@ function initEndpointForm() {
     u = u.split('?')[0].split('#')[0];
     try {
       const parsed = new URL(u);
-      if (parsed.hostname.endsWith('ollama.com')) {
+      if (parsed.hostname === 'ollama.com') {
         u = 'https://ollama.com/api';
       }
     } catch(e) {}
-    // Ensure /v1 suffix for bare host:port URLs (not cloud providers)
-    if (!u.includes('api.') && !u.includes('openrouter') && !u.includes('opencode.ai') && !u.includes('ollama.com') && !u.endsWith('/v1')) {
-      try {
-        const parsed = new URL(u);
-        if (!parsed.pathname || parsed.pathname === '/') {
-          u += '/v1';
-        }
-      } catch(e) {}
-    }
+    // Ensure /v1 suffix for bare host:port URLs (not cloud hosts). Host-level
+    // checks on the PARSED url, not substrings of its text: a custom endpoint
+    // whose host merely contains "api" or "ollama" keeps operator control.
+    try {
+      const parsed = new URL(u);
+      const host = parsed.hostname;
+      const cloud = host.startsWith('api.')
+        || host === 'ollama.com'
+        || host === 'openrouter.ai' || host.endsWith('.openrouter.ai')
+        || host === 'opencode.ai' || host.endsWith('.opencode.ai');
+      if (!cloud && (!parsed.pathname || parsed.pathname === '/')) {
+        u += '/v1';
+      }
+    } catch(e) {}
     return u;
   }
 

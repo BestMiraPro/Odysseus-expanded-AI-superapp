@@ -150,6 +150,25 @@ def test_maps_legacy_google_calendar_dav_url():
     assert caldav_sync._google_caldav_events_url("https://www.google.com/accounts/user") is None
 
 
+def test_google_rewrite_requires_exact_known_host_https_and_no_userinfo():
+    # Security plan S3: suffix matching previously rewrote
+    # notgoogleusercontent.com into the Google special-case path.
+    assert caldav_sync._google_caldav_events_url(
+        "https://notgoogleusercontent.com/caldav/v2/a/user") is None
+    # Same path on a subdomain-of-subdomain host is not a Google endpoint.
+    assert caldav_sync._google_caldav_events_url(
+        "https://evil.apidata.googleusercontent.com/caldav/v2/a/user") is None
+    # http and embedded userinfo are rejected even on a genuine host.
+    assert caldav_sync._google_caldav_events_url(
+        "http://apidata.googleusercontent.com/caldav/v2/a/user") is None
+    assert caldav_sync._google_caldav_events_url(
+        "https://x@apidata.googleusercontent.com/caldav/v2/a/user") is None
+    # calendar.googleusercontent.com (the other real Google CalDAV host) works.
+    assert caldav_sync._google_caldav_events_url(
+        "https://calendar.googleusercontent.com/caldav/v2/a/user") == \
+        "https://calendar.googleusercontent.com/caldav/v2/a/events"
+
+
 def test_google_sync_pulls_events_instead_of_empty(monkeypatch):
     _install_fake_caldav(monkeypatch)
     _clear_db()
