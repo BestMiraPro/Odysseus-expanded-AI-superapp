@@ -31,6 +31,7 @@ import json
 import logging
 import sys
 import types
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -1057,3 +1058,1513 @@ class TestAuthIntegrationConnectivity:
 
         assert result["ok"] is False
         assert "No webhook URL set" in result["message"]
+
+
+# ------------------------------------------------- S5c: cookbook routes
+
+def _cookbook_router(monkeypatch, tmp_path):
+    import routes.cookbook_routes as cr
+
+    monkeypatch.setattr(cr, "TMUX_LOG_DIR", tmp_path)
+    monkeypatch.setattr(cr, "COOKBOOK_STATE_FILE", str(tmp_path / "cookbook_state.json"))
+    router = cr.setup_cookbook_routes()
+    return cr, router
+
+
+def _cookbook_endpoint(router, path, method):
+    method = method.upper()
+    for route in router.routes:
+        if route.path == path and method in getattr(route, "methods", set()):
+            return route.endpoint
+    raise AssertionError(f"route not found: {method} {path}")
+
+
+class _NoAdminReq:
+    """Stand-in Request for admin-gated cookbook routes (require_admin is patched)."""
+
+    cookies = {}
+
+    async def json(self):
+        return self._body
+
+    def __init__(self, body=None):
+        self._body = body or {}
+
+
+class TestCookbookSsh:
+    def _endpoint(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        endpoint = _cookbook_endpoint(router, "/api/cookbook/test-ssh", "POST")
+        return cr, lambda **kw: endpoint(None, SimpleNamespace(**kw))
+
+    def test_ssh_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        cr, call = self._endpoint(monkeypatch, tmp_path)
+
+        async def boom(host, port, cmd, **kw):
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(cr, "run_ssh_command_async", boom)
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(call(host="server", ssh_port=None))
+
+        assert result == {"stdout": "", "stderr": "SSH test failed", "exit_code": -1}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_ssh_valid_request_keeps_process_output(self, monkeypatch, tmp_path):
+        cr, call = self._endpoint(monkeypatch, tmp_path)
+
+        async def ok(host, port, cmd, **kw):
+            return 0, b"ok\n", b""
+
+        monkeypatch.setattr(cr, "run_ssh_command_async", ok)
+
+        result = _run(call(host="server", ssh_port=None))
+        assert result == {"stdout": "ok\n", "stderr": "", "exit_code": 0}
+
+    def test_ssh_bad_host_is_validation_error(self, monkeypatch, tmp_path):
+        from fastapi import HTTPException
+
+        _cr, call = self._endpoint(monkeypatch, tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            _run(call(host="bad host!", ssh_port=None))
+        assert exc.value.status_code == 400
+        assert_no_internal_details(str(exc.value.detail))
+
+
+class TestCookbookModelRoutes:
+    def _router(self, monkeypatch, tmp_path):
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        monkeypatch.setattr(cr, "_binary_available", lambda binary, remote, *a, **k: _yes())
+        return cr, router
+
+    def test_download_launch_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import types as _types
+
+        from routes.cookbook_helpers import ModelDownloadRequest
+
+        cr, router = self._router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "find_bash", lambda: _boom())
+        endpoint = _cookbook_endpoint(router, "/api/model/download", "POST")
+
+        req = ModelDownloadRequest(repo_id="org/some-model")
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_NoAdminReq(), req))
+
+        assert result["ok"] is False
+        assert result["error"] == "Could not launch the download"
+        assert result["session_id"]
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_serve_launch_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        from routes.cookbook_helpers import ServeRequest
+
+        cr, router = self._router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "find_bash", lambda: _boom())
+        endpoint = _cookbook_endpoint(router, "/api/model/serve", "POST")
+
+        req = ServeRequest(repo_id="cached-model", cmd="python -m vllm.entrypoints.openai.api_server --model cached-model")
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_NoAdminReq(), req))
+
+        assert result["ok"] is False
+        assert result["error"] == "Could not launch the serve session"
+        assert result["session_id"]
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_download_bad_repo_is_validation_error(self, monkeypatch, tmp_path):
+        from fastapi import HTTPException
+        from routes.cookbook_helpers import ModelDownloadRequest
+
+        cr, router = self._router(monkeypatch, tmp_path)
+        endpoint = _cookbook_endpoint(router, "/api/model/download", "POST")
+
+        with pytest.raises(HTTPException) as exc:
+            _run(endpoint(_NoAdminReq(), ModelDownloadRequest(repo_id="bad repo")))
+        assert exc.value.status_code == 400
+        assert_no_internal_details(str(exc.value.detail))
+
+    def test_download_valid_request_launches(self, monkeypatch, tmp_path):
+        from routes.cookbook_helpers import ModelDownloadRequest
+
+        cr, router = self._router(monkeypatch, tmp_path)
+        endpoint = _cookbook_endpoint(router, "/api/model/download", "POST")
+
+        result = _run(endpoint(_NoAdminReq(), ModelDownloadRequest(repo_id="org/some-model")))
+        # Either the local detached launch (bash present) succeeded or, without
+        # bash, the cmd.exe error-recording fallback ran — both are a valid 200.
+        assert result["ok"] is True
+        assert result["session_id"]
+
+
+async def _yes():
+    return True
+
+
+def _boom(*args, **kwargs):
+    raise RuntimeError(LEAK)
+
+
+class TestCookbookCachedModels:
+    def test_parse_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import asyncio as aio
+        import types as _types
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+            def kill(self):
+                pass
+
+        async def fake_exec(*args, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(cr, "json", _types.SimpleNamespace(loads=_boom))
+
+        endpoint = _cookbook_endpoint(router, "/api/model/cached", "GET")
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_NoAdminReq()))
+
+        assert result == {"models": [], "host": "local",
+                          "error": "Failed to parse cached models"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_cached_valid_request_returns_models(self, monkeypatch, tmp_path):
+        import asyncio as aio
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        payload = json.dumps([{
+            "repo_id": "org/model-x", "size_bytes": 1073741824,
+            "nb_files": 2, "has_incomplete": False,
+        }])
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return payload.encode(), b""
+
+            def kill(self):
+                pass
+
+        async def fake_exec(*args, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
+
+        endpoint = _cookbook_endpoint(router, "/api/model/cached", "GET")
+        result = _run(endpoint(_NoAdminReq()))
+
+        assert result["host"] == "local"
+        assert result["models"][0]["repo_id"] == "org/model-x"
+
+    def test_cached_bad_host_is_validation_error(self, monkeypatch, tmp_path):
+        from fastapi import HTTPException
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        endpoint = _cookbook_endpoint(router, "/api/model/cached", "GET")
+
+        with pytest.raises(HTTPException) as exc:
+            _run(endpoint(_NoAdminReq(), host="bad host!"))
+        assert exc.value.status_code == 400
+        assert_no_internal_details(str(exc.value.detail))
+
+
+class TestCookbookSetup:
+    def test_setup_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import asyncio as aio
+        from types import SimpleNamespace
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+            def kill(self):
+                pass
+
+        calls = {"n": 0}
+
+        async def fake_shell(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                return _FakeProc()
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(aio, "create_subprocess_shell", fake_shell)
+
+        endpoint = _cookbook_endpoint(router, "/api/cookbook/setup", "POST")
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_NoAdminReq(), SimpleNamespace(host="server", ssh_port=None)))
+
+        assert result["ok"] is False
+        assert result["error"] == "Setup failed"
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_setup_valid_request_runs(self, monkeypatch, tmp_path):
+        import asyncio as aio
+        from types import SimpleNamespace
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+
+        class _FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"OK\n", b""
+
+            def kill(self):
+                pass
+
+        async def fake_shell(*args, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(aio, "create_subprocess_shell", fake_shell)
+
+        endpoint = _cookbook_endpoint(router, "/api/cookbook/setup", "POST")
+        result = _run(endpoint(_NoAdminReq(), SimpleNamespace(host="server", ssh_port=None)))
+
+        assert result["ok"] is True
+        assert "OK" in result["output"]
+
+    def test_setup_missing_host_is_validation_error(self, monkeypatch, tmp_path):
+        from fastapi import HTTPException
+        from types import SimpleNamespace
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        endpoint = _cookbook_endpoint(router, "/api/cookbook/setup", "POST")
+
+        with pytest.raises(HTTPException) as exc:
+            _run(endpoint(_NoAdminReq(), SimpleNamespace(host="", ssh_port=None)))
+        assert exc.value.status_code == 400
+        assert "host is required" in str(exc.value.detail)
+
+
+class TestCookbookGpus:
+    def _endpoint(self, monkeypatch, tmp_path):
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        return cr, _cookbook_endpoint(router, "/api/cookbook/gpus", "GET")
+
+    def test_probe_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import asyncio as aio
+
+        cr, endpoint = self._endpoint(monkeypatch, tmp_path)
+
+        class _ErrProc:
+            returncode = 1
+
+            async def communicate(self):
+                return b"", b"x"
+
+            def kill(self):
+                pass
+
+        async def boom_exec(*args, **kwargs):
+            raise RuntimeError(LEAK)
+
+        async def fake_shell(*args, **kwargs):
+            return _ErrProc()
+
+        monkeypatch.setattr(aio, "create_subprocess_exec", boom_exec)
+        monkeypatch.setattr(aio, "create_subprocess_shell", fake_shell)
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_NoAdminReq()))
+
+        assert result == {"ok": False, "error": "nvidia-smi probe failed", "gpus": []}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_gpus_valid_request_lists_cards(self, monkeypatch, tmp_path):
+        import asyncio as aio
+
+        cr, endpoint = self._endpoint(monkeypatch, tmp_path)
+        csv_line = b"0, GeForce RTX, 1000, 2000, 500, 50, GPU-abc\n"
+
+        class _OutProc:
+            returncode = 0
+
+            async def communicate(self):
+                return csv_line, b""
+
+            def kill(self):
+                pass
+
+        class _ErrProc:
+            returncode = 1
+
+            async def communicate(self):
+                return b"", b"x"
+
+            def kill(self):
+                pass
+
+        async def fake_exec(*args, **kwargs):
+            return _OutProc()
+
+        async def fake_shell(*args, **kwargs):
+            return _ErrProc()
+
+        monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(aio, "create_subprocess_shell", fake_shell)
+
+        result = _run(endpoint(_NoAdminReq()))
+
+        assert result["ok"] is True
+        assert result["gpus"][0]["name"] == "GeForce RTX"
+        assert result["backend"] == "cuda"
+
+    def test_gpus_bad_host_is_validation_error(self, monkeypatch, tmp_path):
+        from fastapi import HTTPException
+
+        _cr, endpoint = self._endpoint(monkeypatch, tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            _run(endpoint(_NoAdminReq(), host="bad host!"))
+        assert exc.value.status_code == 400
+        assert_no_internal_details(str(exc.value.detail))
+
+
+class TestCookbookKillPid:
+    def _endpoint(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        endpoint = _cookbook_endpoint(router, "/api/cookbook/kill-pid", "POST")
+        return cr, lambda **kw: endpoint(_NoAdminReq(), SimpleNamespace(**kw))
+
+    def test_kill_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import asyncio as aio
+
+        cr, call = self._endpoint(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "pid_alive", lambda pid: True)
+        monkeypatch.setattr(cr, "kill_process_tree", _boom)
+        monkeypatch.setattr(aio, "create_subprocess_exec", _boom_async)
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(call(pid=500, host=None, ssh_port=None, signal="TERM"))
+
+        assert result == {"ok": False, "error": "kill command failed"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_kill_valid_request_returns_ok(self, monkeypatch, tmp_path):
+        import asyncio as aio
+
+        cr, call = self._endpoint(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "pid_alive", lambda pid: True)
+        monkeypatch.setattr(cr, "kill_process_tree", lambda pid: None)
+
+        class _OkProc:
+            returncode = 0
+
+            async def communicate(self):
+                return b"", b""
+
+        async def fake_exec(*args, **kwargs):
+            return _OkProc()
+
+        monkeypatch.setattr(aio, "create_subprocess_exec", fake_exec)
+
+        result = _run(call(pid=500, host=None, ssh_port=None, signal="TERM"))
+        assert result["ok"] is True
+        assert result["pid"] == 500
+
+    def test_kill_low_pid_is_validation_error(self, monkeypatch, tmp_path):
+        from fastapi import HTTPException
+
+        _cr, call = self._endpoint(monkeypatch, tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            _run(call(pid=50, host=None, ssh_port=None, signal="TERM"))
+        assert exc.value.status_code == 400
+        assert_no_internal_details(str(exc.value.detail))
+
+
+async def _boom_async(*args, **kwargs):
+    raise RuntimeError(LEAK)
+
+
+class TestCookbookState:
+    def test_state_save_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import core.atomic_io as aio
+
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+        monkeypatch.setattr(aio, "atomic_write_json", _boom)
+
+        endpoint = _cookbook_endpoint(router, "/api/cookbook/state", "POST")
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_NoAdminReq(body={"tasks": [], "env": {}})))
+
+        assert result == {"ok": False, "error": "Failed to save cookbook state"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_state_valid_save_returns_ok(self, monkeypatch, tmp_path):
+        cr, router = _cookbook_router(monkeypatch, tmp_path)
+        monkeypatch.setattr(cr, "require_admin", lambda request: None)
+
+        endpoint = _cookbook_endpoint(router, "/api/cookbook/state", "POST")
+        result = _run(endpoint(_NoAdminReq(body={"tasks": [], "env": {}})))
+
+        assert result["ok"] is True
+
+
+class TestCookbookHfLatest:
+    def test_fetch_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import httpx as httpx_mod
+
+        monkeypatch.setattr(httpx_mod, "AsyncClient", lambda **kw: _RaisingCtxClient())
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/hf-latest", "GET")
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint())
+
+        assert result == {"models": [], "error": "Failed to fetch HuggingFace models"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_hf_latest_valid_request_returns_models(self, monkeypatch, tmp_path):
+        import httpx as httpx_mod
+
+        monkeypatch.setattr(httpx_mod, "AsyncClient",
+                            lambda **kw: _JsonCtxClient([{"modelId": "org/model-7b",
+                                                          "pipeline_tag": "text-generation",
+                                                          "tags": []}]))
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/hf-latest", "GET")
+        result = _run(endpoint())
+
+        assert result["models"]
+        assert result["models"][0]["repo_id"] == "org/model-7b"
+
+
+class _RaisingCtxClient:
+    async def __aenter__(self):
+        raise RuntimeError(LEAK)
+
+    async def __aexit__(self, *args):
+        return False
+
+
+class _JsonCtxClient:
+    def __init__(self, payload):
+        self._payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def get(self, *args, **kwargs):
+        return httpx.Response(200, request=httpx.Request("GET", args[0]),
+                              json=self._payload)
+
+
+# ------------------------------------------------- S5c: cookbook scrapes
+
+class TestCookbookOllamaLibrary:
+    def test_fetch_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import httpx as httpx_mod
+
+        monkeypatch.setattr(httpx_mod, "AsyncClient", lambda **kw: _RaisingCtxClient())
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/ollama/library", "GET")
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint())
+
+        assert result["error"] == "Failed to fetch the Ollama library"
+        assert result["models"]
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_valid_request_falls_back_to_curated_list(self, monkeypatch, tmp_path):
+        import httpx as httpx_mod
+
+        class _EmptyHtmlClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return httpx.Response(200, request=httpx.Request("GET", args[0]),
+                                      text="")
+
+        monkeypatch.setattr(httpx_mod, "AsyncClient", lambda **kw: _EmptyHtmlClient())
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/ollama/library", "GET")
+
+        result = _run(endpoint())
+
+        # No cards parsed from the empty page; the curated fallback is always
+        # merged in, and there is no error label on a successful fetch.
+        assert result["models"]
+        assert result["error"] is None
+
+    def test_http_error_keeps_status_code_label(self, monkeypatch, tmp_path):
+        import httpx as httpx_mod
+
+        class _Http500Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def get(self, *args, **kwargs):
+                return httpx.Response(500, request=httpx.Request("GET", args[0]))
+
+        monkeypatch.setattr(httpx_mod, "AsyncClient", lambda **kw: _Http500Client())
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/ollama/library", "GET")
+
+        result = _run(endpoint())
+
+        assert result["error"] == "HTTP 500"
+        assert result["models"]
+
+
+class TestCookbookVllmRecipe:
+    def test_yaml_parse_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import httpx as httpx_mod
+
+        class _BadYamlClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def get(self, *args, **kwargs):
+                # A NUL byte inside the LEAK string makes pyYAML's scan error
+                # quote the offending content — the old f-string would have
+                # serialized it. The new literal must not.
+                return httpx.Response(200, request=httpx.Request("GET", args[0]),
+                                      text="key: [" + LEAK + "\x00]")
+
+        monkeypatch.setattr(httpx_mod, "Client", lambda **kw: _BadYamlClient())
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/vllm-recipe", "GET")
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(repo="org/some-model"))
+
+        assert result == {"exists": False, "error": "Failed to parse recipe YAML"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=" in caplog.text
+
+    def test_valid_recipe_returns_normalized_payload(self, monkeypatch, tmp_path):
+        import httpx as httpx_mod
+
+        class _OkYamlClient:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+            def get(self, *args, **kwargs):
+                return httpx.Response(200, request=httpx.Request("GET", args[0]),
+                                      text="meta: {}\nmodel: {}\nfeatures: {}\n")
+
+        monkeypatch.setattr(httpx_mod, "Client", lambda **kw: _OkYamlClient())
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/vllm-recipe", "GET")
+
+        result = _run(endpoint(repo="org/some-model"))
+
+        assert result["exists"] is True
+        assert "/recipes/main/models/org/some-model.yaml" in result["source_url"]
+
+    def test_missing_slash_is_validation_error(self, monkeypatch, tmp_path):
+        endpoint = _cookbook_endpoint(_cookbook_router(monkeypatch, tmp_path)[1],
+                                      "/api/cookbook/vllm-recipe", "GET")
+        result = _run(endpoint(repo="no-slash"))
+        assert result == {"exists": False, "error": "repo must be <org>/<model>"}
+
+
+# ------------------------------------------------------- S5c: mcp oauth
+
+class _FakeMcpManager:
+    def __init__(self):
+        self.connect_result = True
+        self.status = {"tool_count": 3}
+        self.connected_args = None
+
+    async def connect_server(self, **kwargs):
+        self.connected_args = kwargs
+        return self.connect_result
+
+    def get_server_status(self, server_id):
+        return self.status
+
+
+class TestMcpOauthCallback:
+    def _endpoint(self, monkeypatch, tmp_path):
+        import routes.mcp.mcp_routes as mr
+
+        manager = _FakeMcpManager()
+        monkeypatch.setattr(mr, "require_admin", lambda request: None)
+        # Path.resolve() yields 8.3 short names on Windows; resolve the base up
+        # front so the sanitizer's confinement check matches its own resolve().
+        monkeypatch.setattr(mr, "_mcp_oauth_base_dir", lambda: tmp_path.resolve())
+
+        class FakeSrv:
+            id = "srv-1"
+            name = "test-server"
+            transport = "stdio"
+            command = "npx"
+            args = "[]"
+            env = "{}"
+            url = None
+            oauth_config = json.dumps({"keys_file": "keys.json", "token_file": "tokens.json"})
+
+        class _FakeDb:
+            def query(self, *a, **k):
+                return self
+
+            def filter(self, *a, **k):
+                return self
+
+            def first(self):
+                return FakeSrv()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(mr, "SessionLocal", lambda: _FakeDb())
+
+        keys_path = tmp_path / "keys.json"
+        keys_path.write_text(json.dumps(
+            {"installed": {"client_id": "cid", "client_secret": "csec"}}), encoding="utf-8")
+
+        router = mr.setup_mcp_routes(manager)
+        # mcp_routes reuses a module-level APIRouter: every setup call appends
+        # to it, so pick the LAST registration (this fixture's closures).
+        endpoint = None
+        for route in router.routes:
+            if route.path == "/api/mcp/oauth/callback":
+                endpoint = route.endpoint
+        assert endpoint is not None
+        return mr, manager, endpoint
+
+    def test_callback_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
+        import httpx as httpx_mod
+
+        mr, _manager, endpoint = self._endpoint(monkeypatch, tmp_path)
+
+        class _BoomClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                raise RuntimeError(LEAK)
+
+            async def __aexit__(self, *args):
+                return False
+
+        monkeypatch.setattr(httpx_mod, "AsyncClient", _BoomClient)
+        monkeypatch.setattr("src.mcp_oauth.resolve_pending",
+                            lambda state, code: False)
+
+        class _Req:
+            cookies = {}
+
+        with caplog.at_level(logging.WARNING):
+            resp = _run(endpoint("code-1", "srv-1", _Req()))
+
+        assert resp.status_code == 500
+        assert "The MCP OAuth callback failed" in resp.body.decode()
+        assert_no_internal_details(resp.body.decode())
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_callback_valid_exchange_connects_server(self, monkeypatch, tmp_path):
+        import httpx as httpx_mod
+
+        _mr, manager, endpoint = self._endpoint(monkeypatch, tmp_path)
+
+        class _OkClient:
+            def __init__(self, *a, **k):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def post(self, *args, **kwargs):
+                return httpx.Response(200, request=httpx.Request("POST", args[0]),
+                                      json={"access_token": "t", "refresh_token": "r"})
+
+        monkeypatch.setattr(httpx_mod, "AsyncClient", _OkClient)
+        monkeypatch.setattr("src.mcp_oauth.resolve_pending",
+                            lambda state, code: False)
+
+        class _Req:
+            cookies = {}
+
+        resp = _run(endpoint("code-1", "srv-1", _Req()))
+        assert "test-server connected with 3 tools" in resp.body.decode()
+        assert manager.connected_args["server_id"] == "srv-1"
+
+    def test_callback_missing_server_is_404(self, monkeypatch, tmp_path):
+        mr, _manager, endpoint = self._endpoint(monkeypatch, tmp_path)
+
+        class _NoServerDb:
+            def query(self, *a, **k):
+                return self
+
+            def filter(self, *a, **k):
+                return self
+
+            def first(self):
+                return None
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(mr, "SessionLocal", lambda: _NoServerDb())
+        monkeypatch.setattr("src.mcp_oauth.resolve_pending",
+                            lambda state, code: False)
+
+        class _Req:
+            cookies = {}
+
+        resp = _run(endpoint("code-1", "srv-missing", _Req()))
+        assert resp.status_code == 404
+        assert_no_internal_details(resp.body.decode())
+
+
+# ------------------------------------------------- S5c: memory import
+
+async def _read_async(file):
+    return file.read()
+
+
+class TestMemoryAuditSerialization:
+    """audit_memories serializes failures into ``result["error"]``, which the
+    /audit route re-emits — the source must only ever produce fixed codes."""
+
+    def test_audit_failure_returns_fixed_code(self, monkeypatch, caplog):
+        import services.memory.memory_extractor as me
+        from src import llm_core as lc
+
+        class _Store:
+            def load(self, owner=None):
+                return [{"id": "m1", "text": "fact", "category": "fact"}]
+
+        store = _Store()
+        monkeypatch.setattr(me, "_load_tidy_state", lambda mm: {})
+        monkeypatch.setattr(me, "_save_tidy_state", lambda mm, owner, fp: None)
+
+        async def boom(url, model, messages, **kw):
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(lc, "llm_call_async", boom)
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(me.audit_memories(store, None, "http://x", "m",
+                                            headers={}))
+
+        assert result == {"error": "audit_failed"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+
+class TestMemoryImportExtraction:
+    def _endpoint(self, monkeypatch):
+        import routes.memory.memory_routes as mr
+
+        monkeypatch.setattr(mr, "get_current_user", lambda request: OWNER)
+        monkeypatch.setattr("src.auth_helpers.require_privilege",
+                            lambda request, priv: None)
+        monkeypatch.setattr(mr, "resolve_task_endpoint",
+                            lambda *a, owner=None: ("http://model.example/v1", "m", {}))
+        monkeypatch.setattr(mr, "resolve_endpoint",
+                            lambda kind, owner=None: ("http://model.example/v1", "m", {}))
+        monkeypatch.setattr(mr, "read_upload_limited",
+                            lambda file, limit, what: _read_async(file))
+
+        router = mr.setup_memory_routes(MagicMock(), MagicMock(), memory_vector=None)
+        endpoint = _route_endpoint(router, "/api/memory/import", "POST")
+        return mr, endpoint
+
+    def _upload(self, filename, content):
+        from io import BytesIO
+
+        class _File:
+            def __init__(self):
+                self.filename = None
+
+            def read(self):
+                return content
+
+        f = _File()
+        f.filename = filename
+        return f
+
+    def test_llm_failure_is_fixed(self, monkeypatch, caplog):
+        async def boom(url, model, messages, **kw):
+            raise RuntimeError(LEAK)
+
+        mr, endpoint = self._endpoint(monkeypatch)
+        monkeypatch.setattr(mr, "llm_call_async", boom)
+
+        class _Req:
+            cookies = {}
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(HTTPException) as exc:
+                _run(endpoint(_Req(), session=None,
+                              file=self._upload("notes.txt", b"some content")))
+
+        assert exc.value.status_code == 502
+        assert exc.value.detail == "Could not extract memories from the uploaded document"
+        assert_no_internal_details(str(exc.value.detail))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_valid_import_returns_suggestions(self, monkeypatch):
+        async def ok(url, model, messages, **kw):
+            return '[{"text": "Alice lives in Berlin", "category": "fact"}]'
+
+        mr, endpoint = self._endpoint(monkeypatch)
+        monkeypatch.setattr(mr, "llm_call_async", ok)
+
+        class _Req:
+            cookies = {}
+
+        result = _run(endpoint(_Req(), session=None,
+                               file=self._upload("notes.txt", b"some content")))
+
+        assert result["filename"] == "notes.txt"
+        assert result["suggestions"][0]["text"] == "Alice lives in Berlin"
+
+    def test_unsupported_type_is_validation_error(self, monkeypatch):
+        _mr, endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            cookies = {}
+
+        with pytest.raises(HTTPException) as exc:
+            _run(endpoint(_Req(), session=None,
+                          file=self._upload("photo.png", b"binary")))
+        assert exc.value.status_code == 400
+        assert "Unsupported file type" in str(exc.value.detail)
+
+
+# ------------------------------------------------------- S5c: omnigent
+
+class _FakeOmnigentManager:
+    def __init__(self):
+        self.start_calls = 0
+        self.restart_calls = 0
+        self.stop_calls = 0
+        self.start_error = None
+        self.restart_error = None
+        self.stop_error = None
+
+    def status(self):
+        return {"status": "stopped"}
+
+    def sessions(self):
+        return [{"id": "s-1"}]
+
+    def workers(self):
+        return []
+
+    def presets(self):
+        return {}
+
+    def worker_roster(self):
+        return []
+
+    def start(self, env_extra=None):
+        self.start_calls += 1
+        if self.start_error:
+            raise self.start_error
+        return {"status": "running"}
+
+    def restart(self, env_extra=None):
+        self.restart_calls += 1
+        if self.restart_error:
+            raise self.restart_error
+        return {"status": "running"}
+
+    def stop(self):
+        self.stop_calls += 1
+        if self.stop_error:
+            raise self.stop_error
+        return {"status": "stopped"}
+
+
+def _omnigent_router_client(monkeypatch):
+    import routes.omnigent_routes as og
+
+    monkeypatch.setattr(og, "require_admin", lambda request: None)
+    monkeypatch.setattr(og, "get_current_user", lambda request: OWNER)
+    monkeypatch.setattr(og, "require_authenticated_request", lambda request: None)
+    monkeypatch.setattr(og, "_builtin_agent_env", lambda: {})
+    monkeypatch.setattr(og, "_gateway_credentials_env", lambda user: {})
+
+    class _NoDb:
+        def query(self, *a, **k):
+            return self
+
+        def filter(self, *a, **k):
+            return self
+
+        def all(self, *a, **k):
+            return []
+
+        def first(self, *a, **k):
+            return None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(og, "SessionLocal", lambda: _NoDb())
+    return og
+
+
+def _omnigent_request():
+    from starlette.requests import Request
+
+    request = Request({"type": "http", "method": "POST",
+                       "path": "/api/omnigent/server/start",
+                       "headers": [], "state": {}})
+    request.state.current_user = OWNER
+    return request
+
+
+class TestOmnigentServerRoutes:
+    def test_start_install_failure_is_fixed(self, monkeypatch, caplog):
+        import routes.omnigent_routes as og
+
+        og = _omnigent_router_client(monkeypatch)
+        monkeypatch.setattr(og, "_install_api_models", _boom)
+        router = og.setup_omnigent_routes(manager=_FakeOmnigentManager(),
+                                          native_manager=MagicMock())
+        endpoint = _route_endpoint(router, "/api/omnigent/server/start", "POST")
+
+        with caplog.at_level(logging.WARNING):
+            result = endpoint(_omnigent_request())
+
+        assert result["api_models"] == {"endpoints": 0, "models": 0,
+                                        "error": "Could not install API model endpoints"}
+        assert result["status"] == "running"
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_start_manager_failure_is_fixed_500(self, monkeypatch, caplog):
+        import routes.omnigent_routes as og
+
+        og = _omnigent_router_client(monkeypatch)
+        mgr = _FakeOmnigentManager()
+        mgr.start_error = RuntimeError(LEAK)
+        router = og.setup_omnigent_routes(manager=mgr, native_manager=MagicMock())
+        endpoint = _route_endpoint(router, "/api/omnigent/server/start", "POST")
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(HTTPException) as exc:
+                endpoint(_omnigent_request())
+
+        assert exc.value.status_code == 500
+        assert exc.value.detail == "Could not start the Omnigent server"
+        assert_no_internal_details(str(exc.value.detail))
+        assert_no_internal_details(caplog.text)
+
+    def test_stop_manager_failure_is_fixed_500(self, monkeypatch, caplog):
+        import routes.omnigent_routes as og
+
+        og = _omnigent_router_client(monkeypatch)
+        mgr = _FakeOmnigentManager()
+        mgr.stop_error = RuntimeError(LEAK)
+        router = og.setup_omnigent_routes(manager=mgr, native_manager=MagicMock())
+        endpoint = _route_endpoint(router, "/api/omnigent/server/stop", "POST")
+
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(HTTPException) as exc:
+                endpoint(_omnigent_request())
+
+        assert exc.value.status_code == 500
+        assert exc.value.detail == "Could not stop the Omnigent server"
+        assert_no_internal_details(str(exc.value.detail))
+        assert_no_internal_details(caplog.text)
+
+    def test_start_valid_request_runs(self, monkeypatch):
+        import routes.omnigent_routes as og
+
+        og = _omnigent_router_client(monkeypatch)
+        router = og.setup_omnigent_routes(manager=_FakeOmnigentManager(),
+                                          native_manager=MagicMock())
+        endpoint = _route_endpoint(router, "/api/omnigent/server/start", "POST")
+
+        result = endpoint(_omnigent_request())
+        assert result["status"] == "running"
+        assert result["api_models"]["endpoints"] == 0
+
+    def test_launch_restart_failure_keeps_status_envelope(self, monkeypatch, caplog):
+        import routes.omnigent_routes as og
+
+        og = _omnigent_router_client(monkeypatch)
+        mgr = _FakeOmnigentManager()
+        mgr.restart_error = RuntimeError(LEAK)
+        router = og.setup_omnigent_routes(manager=mgr, native_manager=MagicMock())
+        endpoint = _route_endpoint(router, "/api/omnigent/launch", "POST")
+
+        with caplog.at_level(logging.WARNING):
+            result = endpoint(_omnigent_request())
+
+        assert result["status"] == "stopped"
+        assert result["error"] == "Could not restart the Omnigent server"
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_sessions_passthrough_is_preserved(self, monkeypatch):
+        import routes.omnigent_routes as og
+
+        og = _omnigent_router_client(monkeypatch)
+        router = og.setup_omnigent_routes(manager=_FakeOmnigentManager(),
+                                          native_manager=MagicMock())
+        endpoint = _route_endpoint(router, "/api/omnigent/sessions", "GET")
+
+        result = endpoint(None)
+        assert result == [{"id": "s-1"}]
+
+
+# ------------------------------------------------------- S5c: preset expand
+
+class TestPresetExpand:
+    def _endpoint(self, monkeypatch):
+        import routes.preset_routes as pr
+
+        monkeypatch.setattr(pr, "effective_user", lambda request: OWNER)
+        router = pr.setup_preset_routes(MagicMock())
+        return _route_endpoint(router, "/api/presets/expand", "POST")
+
+    def test_expansion_failure_is_fixed(self, monkeypatch, caplog):
+        import src.ai_interaction as ai
+
+        def boom(spec, owner=None):
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(ai, "_resolve_model", boom)
+        endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            async def json(self):
+                return {"name": "Pirate", "prompt": "rough notes"}
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_Req()))
+
+        assert result == {"success": False, "message": "Could not expand the prompt"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_http_exception_detail_stays_controlled(self, monkeypatch):
+        import src.ai_interaction as ai
+        from src import llm_core as lc
+
+        monkeypatch.setattr(ai, "_resolve_model",
+                            lambda spec, owner=None: ("http://x", "m", {}))
+
+        async def denied(url, model, messages, **kw):
+            raise HTTPException(401, "The endpoint rejected the API key. Re-paste it.")
+
+        monkeypatch.setattr(lc, "llm_call_async", denied)
+        endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            async def json(self):
+                return {"name": "Pirate"}
+
+        result = _run(endpoint(_Req()))
+        assert result["success"] is False
+        assert "rejected the API key" in result["message"]
+        assert_no_internal_details(json.dumps(result))
+
+    def test_valid_expansion_returns_prompt(self, monkeypatch):
+        import src.ai_interaction as ai
+        from src import llm_core as lc
+
+        monkeypatch.setattr(ai, "_resolve_model",
+                            lambda spec, owner=None: ("http://x", "m", {}))
+
+        async def ok(url, model, messages, **kw):
+            return "  expanded prompt  "
+
+        monkeypatch.setattr(lc, "llm_call_async", ok)
+        endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            async def json(self):
+                return {"name": "Pirate"}
+
+        result = _run(endpoint(_Req()))
+        assert result == {"success": True, "prompt": "expanded prompt"}
+
+    def test_empty_input_is_validation_error(self, monkeypatch):
+        endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            async def json(self):
+                return {"name": "", "prompt": ""}
+
+        result = _run(endpoint(_Req()))
+        assert result == {"success": False, "message": "Nothing to expand"}
+
+
+# ------------------------------------------------- S5c: search routes
+
+class TestSearchRoutes:
+    def _router(self):
+        import routes.search.search_routes as sr
+
+        return sr.setup_search_routes(MagicMock())
+
+    class _Req:
+        headers = {}
+        query_params = {}
+
+        def __init__(self, body=None):
+            self._body = body or {}
+
+        async def json(self):
+            return self._body
+
+        async def form(self):
+            return self._body
+
+    def test_web_search_failure_is_fixed(self, monkeypatch, caplog):
+        import routes.search.search_routes as sr
+
+        router = self._router()
+        monkeypatch.setattr(sr, "comprehensive_web_search", _boom)
+        endpoint = _route_endpoint(router, "/api/search", "POST")
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(self._Req({"query": "news"})))
+
+        assert result == {"context": "", "sources": [],
+                          "error": "The web search failed. Try again."}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_web_search_valid_request_returns_context(self, monkeypatch):
+        import routes.search.search_routes as sr
+
+        router = self._router()
+        monkeypatch.setattr(sr, "comprehensive_web_search",
+                            lambda query, return_sources=False, time_filter=None:
+                            ("context text", [{"title": "T", "url": "https://e"}]))
+
+        endpoint = _route_endpoint(router, "/api/search", "POST")
+
+        result = _run(endpoint(self._Req({"query": "news"})))
+        assert result["context"] == "context text"
+        assert result["sources"][0]["title"] == "T"
+
+    def test_web_search_missing_query_is_validation_error(self, monkeypatch):
+        router = self._router()
+        endpoint = _route_endpoint(router, "/api/search", "POST")
+
+        result = _run(endpoint(self._Req({"query": "  "})))
+        assert result["error"] == "query is required"
+
+    def test_provider_failure_is_fixed(self, monkeypatch, caplog):
+        import routes.search.search_routes as sr
+
+        router = self._router()
+        monkeypatch.setattr(sr, "_call_provider", _boom)
+        endpoint = _route_endpoint(router, "/api/search/query", "POST")
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(self._Req({"query": "news", "provider": "searxng"})))
+
+        assert result["error"] == "The search request failed. Try again."
+        assert result["provider"] == "searxng"
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+
+    def test_unknown_provider_is_validation_error(self, monkeypatch):
+        router = self._router()
+        endpoint = _route_endpoint(router, "/api/search/query", "POST")
+
+        result = _run(endpoint(self._Req({"query": "news", "provider": "nope"})))
+        assert result["error"] == "Unknown provider"
+
+
+# ------------------------------------------------- S5c: skills builtin
+
+class TestSkillsBuiltin:
+    def test_import_failure_is_fixed(self, monkeypatch, caplog):
+        import builtins as _builtins
+        import routes.skills_routes as skr
+
+        router = skr.setup_skills_routes(MagicMock())
+        endpoint = _route_endpoint(router, "/api/skills/builtin", "GET")
+        real_import = _builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "src.agent_loop":
+                raise RuntimeError(LEAK)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(_builtins, "__import__", guarded_import)
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(None))
+
+        assert result == {"builtin": [], "count": 0,
+                          "error": "Could not list built-in skills"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_valid_list_runs(self, monkeypatch):
+        import routes.skills_routes as skr
+
+        router = skr.setup_skills_routes(MagicMock())
+        endpoint = _route_endpoint(router, "/api/skills/builtin", "GET")
+
+        result = _run(endpoint(None))
+        assert result["count"] == len(result["builtin"])
+
+
+# ------------------------------------------------- S5c: task parse
+
+class TestTaskParse:
+    def _endpoint(self, monkeypatch):
+        import routes.task.task_routes as tr
+
+        monkeypatch.setattr(tr, "get_current_user", lambda request: OWNER)
+        router = tr.setup_task_routes(MagicMock())
+        return _route_endpoint(router, "/api/tasks/parse", "POST")
+
+    def test_parse_failure_is_fixed(self, monkeypatch, caplog):
+        from src import llm_core as lc
+        from src import endpoint_resolver as er
+
+        monkeypatch.setattr(er, "resolve_endpoint",
+                            lambda kind, owner=None: ("http://x", "m", {}))
+
+        async def boom(url, model, messages, **kw):
+            raise RuntimeError(LEAK)
+
+        monkeypatch.setattr(lc, "llm_call_async", boom)
+        endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            async def json(self):
+                return {"description": "daily digest at 7am"}
+
+        with caplog.at_level(logging.WARNING):
+            result = _run(endpoint(_Req()))
+
+        assert result == {"success": False, "message": "Could not parse the task. Try again."}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_valid_parse_returns_draft(self, monkeypatch):
+        from src import llm_core as lc
+        from src import endpoint_resolver as er
+
+        monkeypatch.setattr(er, "resolve_endpoint",
+                            lambda kind, owner=None: ("http://x", "m", {}))
+
+        async def ok(url, model, messages, **kw):
+            return '{"name": "Digest", "prompt": "Summarize today" , "task_type": "research"}'
+
+        monkeypatch.setattr(lc, "llm_call_async", ok)
+        endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            async def json(self):
+                return {"description": "daily digest"}
+
+        result = _run(endpoint(_Req()))
+        assert result["success"] is True
+        assert result["draft"]["name"] == "Digest"
+
+    def test_empty_description_is_validation_error(self, monkeypatch):
+        endpoint = self._endpoint(monkeypatch)
+
+        class _Req:
+            async def json(self):
+                return {"description": "  "}
+
+        result = _run(endpoint(_Req()))
+        assert result == {"success": False, "message": "Nothing to parse"}
+
+
+# ------------------------------------------------- S5c: gallery exif
+
+class TestGalleryExif:
+    def test_exif_failure_is_fixed_label(self, monkeypatch, caplog):
+        import sys as _sys
+        import types as _types
+        from routes.gallery.gallery_helpers import _extract_exif
+
+        pil_stub = _types.ModuleType("PIL")
+
+        class _ImageStub:
+            @staticmethod
+            def open(*args, **kwargs):
+                raise RuntimeError(LEAK)
+
+        pil_stub.Image = _ImageStub()
+        monkeypatch.setitem(_sys.modules, "PIL", pil_stub)
+
+        with caplog.at_level(logging.WARNING):
+            result = _extract_exif(b"not really an image")
+
+        assert result == {"width": None, "height": None,
+                          "exif_error": "Could not read image metadata"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_exif_valid_image_returns_dimensions(self, monkeypatch):
+        import sys as _sys
+        import types as _types
+        from routes.gallery.gallery_helpers import _extract_exif
+
+        pil_stub = _types.ModuleType("PIL")
+        pil_stub.Image = _types.SimpleNamespace(
+            open=lambda *a, **k: _FakeImg(640, 480, None))
+        monkeypatch.setitem(_sys.modules, "PIL", pil_stub)
+
+        result = _extract_exif(b"png-bytes")
+
+        assert result["width"] == 640
+        assert result["height"] == 480
+        assert "exif_error" not in result
+
+
+class _FakeImg:
+    def __init__(self, width, height, exif):
+        self.width = width
+        self.height = height
+        self._exif = exif
+
+    def _getexif(self):
+        return self._exif
+
+
+# ------------------------------------------------- S5c: hwfit models
+
+class TestHwfitModels:
+    def test_catalog_refresh_failure_is_fixed(self, monkeypatch, caplog):
+        import services.hwfit.models as hm
+        import services.hwfit.fit as hf
+        import services.hwfit.hardware as hh
+
+        import routes.hwfit_routes as hr
+
+        monkeypatch.setattr(hh, "detect_system",
+                            lambda host=None, ssh_port=None, platform="", fresh=False:
+                            {"has_gpu": False, "gpu_count": 0, "gpu_vram_gb": 0,
+                             "gpus": [], "gpu_groups": [], "gpu_name": None,
+                             "backend": "cpu_x86", "available_ram_gb": 16,
+                             "total_ram_gb": 16, "cpu_name": "test"})
+        monkeypatch.setattr(hm, "get_models", lambda: [{"name": "m1"}])
+        monkeypatch.setattr(hm, "refresh_dynamic_catalogs", _boom)
+        monkeypatch.setattr(hf, "rank_models", lambda system, **kw: [])
+
+        router = hr.setup_hwfit_routes()
+        endpoint = _route_endpoint(router, "/api/hwfit/models", "GET")
+
+        with caplog.at_level(logging.WARNING):
+            result = endpoint(refresh_catalog=True)
+
+        assert result["models"] == []
+        assert result["catalog_refresh"] == {"error": "Failed to refresh dynamic catalogs"}
+        assert_no_internal_details(json.dumps(result))
+        assert_no_internal_details(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_valid_request_ranks_models(self, monkeypatch):
+        import services.hwfit.models as hm
+        import services.hwfit.fit as hf
+        import services.hwfit.hardware as hh
+
+        import routes.hwfit_routes as hr
+
+        monkeypatch.setattr(hh, "detect_system",
+                            lambda host=None, ssh_port=None, platform="", fresh=False:
+                            {"has_gpu": False, "gpu_count": 0, "gpu_vram_gb": 0,
+                             "gpus": [], "gpu_groups": [], "gpu_name": None,
+                             "backend": "cpu_x86", "available_ram_gb": 16,
+                             "total_ram_gb": 16, "cpu_name": "test"})
+        monkeypatch.setattr(hm, "get_models", lambda: [{"name": "m1"}])
+        monkeypatch.setattr(hf, "rank_models", lambda system, **kw: [{"name": "m1"}])
+
+        router = hr.setup_hwfit_routes()
+        endpoint = _route_endpoint(router, "/api/hwfit/models", "GET")
+
+        result = endpoint()
+        assert result["models"][0]["name"] == "m1"
+
+    def test_ssh_port_without_host_is_validation_error(self, monkeypatch):
+        from fastapi import HTTPException
+
+        import routes.hwfit_routes as hr
+
+        router = hr.setup_hwfit_routes()
+        endpoint = _route_endpoint(router, "/api/hwfit/models", "GET")
+
+        with pytest.raises(HTTPException) as exc:
+            endpoint(host="", ssh_port="22")
+        assert exc.value.status_code == 400
+        assert "ssh_port requires host" in str(exc.value.detail)

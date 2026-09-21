@@ -86,8 +86,10 @@ def _extract_exif(content: bytes) -> dict:
     except Exception as e:
         # User-visible failure (photo loses metadata): surface at WARNING
         # and record on the result so the upload endpoint can pass it back.
-        logger.warning(f"EXIF extraction failed: {e}")
-        result["exif_error"] = str(e)
+        # Only a fixed label is returned — PIL parse errors are internal
+        # detail and must not reach the response.
+        logger.warning("gallery EXIF extraction failed error_type=%s", type(e).__name__)
+        result["exif_error"] = "Could not read image metadata"
     return result
 
 

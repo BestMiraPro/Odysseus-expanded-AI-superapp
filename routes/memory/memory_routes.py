@@ -281,7 +281,7 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
 
             return {"suggestions": [s for s in suggestions if s]}
         except Exception as e:
-            logger.error(f"LLM memory extraction failed (session {session}): {e}")
+            logger.warning("LLM memory extraction failed (session %s) error_type=%s", session, type(e).__name__)
             fallback = memory_manager.extract_memory_from_chat(sess.history, session)
             return {"suggestions": [item["text"] for item in fallback]}
 
@@ -496,8 +496,8 @@ def setup_memory_routes(memory_manager: MemoryManager, session_manager: SessionM
             lines = [_strip_list_prefix(l.strip()) for l in raw.splitlines() if l.strip() and len(l.strip()) > 5]
             return {"suggestions": [{"text": l, "category": "fact"} for l in lines[:20]], "filename": filename}
         except Exception as e:
-            logger.error(f"Memory import extraction failed: {e}")
-            raise HTTPException(502, f"LLM extraction failed: {str(e)}")
+            logger.warning("memory import extraction failed error_type=%s", type(e).__name__)
+            raise HTTPException(502, "Could not extract memories from the uploaded document")
 
     @router.post("/{memory_id}/pin")
     def pin_memory(request: Request, memory_id: str, pinned: bool = Form(True)):

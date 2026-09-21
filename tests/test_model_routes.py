@@ -1,6 +1,7 @@
 """Tests for model route helper functions — pure logic, no server needed."""
 import asyncio
 import json
+import logging
 import sys
 import threading
 import time
@@ -2177,3 +2178,166 @@ def test_manual_refresh_timeout_keeps_cached_models_and_warns(monkeypatch):
     assert db.commits == 0
     assert response.headers["X-Model-Refresh-Status"] == "failed"
     assert "kept cached models" in response.headers["X-Model-Refresh-Warning"]
+
+
+# ── S5c security: probe/ping exception details must not reach responses ──
+
+_LEAK = "private-marker /srv/private/auth.json postgresql://u:secret-marker@db/app"
+
+
+def _assert_no_internal(serialized):
+    for marker in ("private-marker", "/srv/private/auth.json", "secret-marker"):
+        assert marker not in serialized
+
+
+class TestModelProbeErrorSafety:
+    def test_probe_single_model_unknown_failure_is_fixed(self, monkeypatch, caplog):
+        from routes.model_routes import _probe_single_model
+
+        def fake_post(*args, **kwargs):
+            raise RuntimeError(_LEAK)
+
+        monkeypatch.setattr(model_routes.httpx, "post", fake_post)
+
+        with caplog.at_level(logging.WARNING):
+            result = _probe_single_model("http://localhost:9999/v1", "key", "m1",
+                                         timeout=1)
+
+        assert result == {"status": "fail",
+                          "error": "The model probe request failed"}
+        _assert_no_internal(json.dumps(result))
+        _assert_no_internal(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_probe_single_model_provider_message_stays_capped(self, monkeypatch):
+        from routes.model_routes import _probe_single_model
+
+        def fake_post(*args, **kwargs):
+            return httpx.Response(401, request=httpx.Request("POST", args[0]),
+                                  json={"error": {"message": "provider says no"}})
+
+        monkeypatch.setattr(model_routes.httpx, "post", fake_post)
+        result = _probe_single_model("http://localhost:9999/v1", "key", "m1",
+                                     timeout=1)
+        assert result["status"] == "fail"
+        assert result["error"] == "provider says no"
+
+    def test_probe_single_model_success(self, monkeypatch):
+        from routes.model_routes import _probe_single_model
+
+        def fake_post(*args, **kwargs):
+            return httpx.Response(200, request=httpx.Request("POST", args[0]),
+                                  json={})
+
+        monkeypatch.setattr(model_routes.httpx, "post", fake_post)
+        result = _probe_single_model("http://localhost:9999/v1", "key", "m1",
+                                     timeout=1)
+        assert result["status"] == "ok"
+
+    def test_ping_endpoint_connection_failure_is_fixed(self, monkeypatch, caplog):
+        monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url,
+                            raising=False)
+
+        def fake_get(*args, **kwargs):
+            raise RuntimeError(_LEAK)
+
+        monkeypatch.setattr(model_routes.httpx, "get", fake_get)
+
+        with caplog.at_level(logging.WARNING):
+            result = _ping_endpoint("http://10.1.2.3:8080/v1", "key", timeout=1)
+
+        assert result == {"reachable": False, "status_code": None,
+                          "error": "Connection test failed"}
+        _assert_no_internal(json.dumps(result))
+        _assert_no_internal(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_ping_endpoint_fixed_http_labels_survive(self, monkeypatch):
+        monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url,
+                            raising=False)
+
+        def fake_get(url, headers=None, timeout=None, verify=None, **kwargs):
+            return httpx.Response(500, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(model_routes.httpx, "get", fake_get)
+        result = _ping_endpoint("http://10.1.2.3:8080/v1", "key", timeout=1)
+
+        assert result["reachable"] is False
+        assert result["error"] == "HTTP 500"
+
+    def test_ping_route_uses_fixed_label_for_unexpected_failure(
+            self, monkeypatch, caplog):
+        ep = _make_endpoint()
+        db = _RouteDb([ep])
+        monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+        monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+        monkeypatch.setattr(endpoint_resolver, "resolve_url",
+                            lambda url: _raise_leak(), raising=False)
+        router = model_routes.setup_model_routes(model_discovery=None)
+        endpoint = _route_endpoint(router, "/api/ping")
+
+        class _Req:
+            cookies = {}
+
+        with caplog.at_level(logging.WARNING):
+            result = endpoint(_Req())
+
+        assert result["endpoints"][0]["error"] == "Connection test failed"
+        _assert_no_internal(json.dumps(result))
+        _assert_no_internal(caplog.text)
+        assert "error_type=RuntimeError" in caplog.text
+
+    def test_ping_route_success_envelope(self, monkeypatch):
+        ep = _make_endpoint(cached_models=json.dumps(["m1"]))
+        db = _RouteDb([ep])
+        monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+        monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+        monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url,
+                            raising=False)
+
+        def fake_get(url, headers=None, timeout=None, verify=None, **kwargs):
+            return httpx.Response(200, request=httpx.Request("GET", url))
+
+        monkeypatch.setattr(model_routes.httpx, "get", fake_get)
+        router = model_routes.setup_model_routes(model_discovery=None)
+        endpoint = _route_endpoint(router, "/api/ping")
+
+        class _Req:
+            cookies = {}
+
+        result = endpoint(_Req())
+        assert result["endpoints"][0]["name"] == "EP"
+        assert result["endpoints"][0]["status"] == "online"
+
+    def test_probe_selected_missing_model_is_validation_error(self, monkeypatch):
+        db = _RouteDb([])
+        monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+        monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+        router = model_routes.setup_model_routes(model_discovery=None)
+        endpoint = _route_endpoint(router, "/api/probe-selected", "POST")
+
+        result = endpoint(None, request_body={"models": [{"endpoint_id": "ep1"}]})
+        assert result["results"] == [{"model": "", "status": "fail",
+                                      "error": "No model specified"}]
+
+    def test_probe_selected_valid_probe_returns_result(self, monkeypatch):
+        db = _RouteDb([])
+        monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+        monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+
+        def fake_post(*args, **kwargs):
+            return httpx.Response(200, request=httpx.Request("POST", args[0]),
+                                  json={})
+
+        monkeypatch.setattr(model_routes.httpx, "post", fake_post)
+        router = model_routes.setup_model_routes(model_discovery=None)
+        endpoint = _route_endpoint(router, "/api/probe-selected", "POST")
+
+        result = endpoint(None, request_body={"models": [
+            {"model": "m1", "endpoint": "http://localhost:9999/v1"}]})
+        assert result["results"][0]["model"] == "m1"
+        assert result["results"][0]["status"] == "ok"
+
+
+def _raise_leak():
+    raise RuntimeError(_LEAK)

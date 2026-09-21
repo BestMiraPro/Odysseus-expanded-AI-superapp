@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shlex
@@ -9,6 +10,8 @@ from fastapi import APIRouter, HTTPException
 
 from core.platform_compat import run_ssh_command
 from routes._validators import validate_remote_host, validate_ssh_port
+
+logger = logging.getLogger(__name__)
 
 
 # Backends the manual hardware simulator accepts. Must stay a subset of what
@@ -210,7 +213,8 @@ def setup_hwfit_routes():
             try:
                 catalog_refresh = refresh_dynamic_catalogs(force=True)
             except Exception as e:
-                catalog_refresh = {"error": str(e)}
+                logger.warning("hwfit dynamic catalog refresh failed error_type=%s", type(e).__name__)
+                catalog_refresh = {"error": "Failed to refresh dynamic catalogs"}
         if not get_models():
             return {
                 "system": system,

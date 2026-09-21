@@ -62,8 +62,8 @@ def setup_search_routes(config) -> APIRouter:
             )
             return {"context": context, "sources": sources}
         except Exception as e:
-            logger.error(f"Standalone web search failed: {e}")
-            return {"context": "", "sources": [], "error": str(e)}
+            logger.warning("standalone web search failed error_type=%s", type(e).__name__)
+            return {"context": "", "sources": [], "error": "The web search failed. Try again."}
 
     @router.get("/api/search/providers")
     async def list_search_providers():
@@ -105,7 +105,7 @@ def setup_search_routes(config) -> APIRouter:
             return {"results": results, "provider": provider, "time": elapsed}
         except Exception as e:
             elapsed = round(time.time() - t0, 2)
-            logger.error(f"Search provider {provider} failed: {e}")
-            return {"results": [], "provider": provider, "time": elapsed, "error": str(e)}
+            logger.warning("search provider %s failed error_type=%s", provider, type(e).__name__)
+            return {"results": [], "provider": provider, "time": elapsed, "error": "The search request failed. Try again."}
 
     return router

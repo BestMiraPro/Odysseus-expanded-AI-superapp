@@ -463,7 +463,7 @@ async def extract_and_store(
                 try:
                     memory_vector.add(entry["id"], fact_text)
                 except Exception as e:
-                    logger.warning(f"Memory vector add failed for {entry['id']}: {e}")
+                    logger.warning("memory vector add failed for %s error_type=%s", entry["id"], type(e).__name__)
 
             added += 1
 
@@ -489,7 +489,7 @@ async def extract_and_store(
             logger.info("Auto memory extraction ran: 0 added")
 
     except Exception as e:
-        logger.error(f"Memory extraction failed: {e}")
+        logger.warning("memory extraction failed error_type=%s", type(e).__name__)
 
 
 async def audit_memories(
@@ -674,5 +674,5 @@ async def audit_memories(
         return {"before": before_count, "after": after_count}
 
     except Exception as e:
-        logger.error(f"Memory audit failed: {e}")
-        return {"error": str(e)}
+        logger.warning("memory audit failed error_type=%s", type(e).__name__)
+        return {"error": "audit_failed"}

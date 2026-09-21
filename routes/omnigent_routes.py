@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -20,6 +21,8 @@ from src.constants import DATA_DIR
 from src.omnigent_catalog import load_declared, select_workers
 from src.omnigent_native import NativeOmnigentManager
 from src.omnigent_manager import INSTALL_GUIDANCE, OmnigentManager
+
+logger = logging.getLogger(__name__)
 
 
 # Prefer a reasoning-capable general model as the default when installing API
@@ -963,7 +966,8 @@ def setup_omnigent_routes(
         try:
             api = _install_api_models(user)
         except Exception as exc:
-            api = {"endpoints": 0, "models": 0, "error": str(exc)}
+            logger.warning("omnigent start: install API models failed error_type=%s", type(exc).__name__)
+            api = {"endpoints": 0, "models": 0, "error": "Could not install API model endpoints"}
         env_extra = dict(_builtin_agent_env() or {})
         try:
             creds = _gateway_credentials_env(user)
@@ -978,7 +982,8 @@ def setup_omnigent_routes(
             except Exception:
                 data["refreshed_generated_agent_rows"] = 0
         except Exception as exc:
-            raise HTTPException(500, str(exc))
+            logger.warning("omnigent start: server start failed error_type=%s", type(exc).__name__)
+            raise HTTPException(500, "Could not start the Omnigent server")
         data["install"] = INSTALL_GUIDANCE
         data["api_models"] = api
         return data
@@ -989,7 +994,8 @@ def setup_omnigent_routes(
         try:
             data = manager.stop()
         except Exception as exc:
-            raise HTTPException(500, str(exc))
+            logger.warning("omnigent stop: server stop failed error_type=%s", type(exc).__name__)
+            raise HTTPException(500, "Could not stop the Omnigent server")
         data["install"] = INSTALL_GUIDANCE
         return data
 
@@ -1051,7 +1057,8 @@ def setup_omnigent_routes(
         try:
             api = _install_api_models(user)
         except Exception as exc:
-            api = {"endpoints": 0, "models": 0, "error": str(exc)}
+            logger.warning("omnigent launch: install API models failed error_type=%s", type(exc).__name__)
+            api = {"endpoints": 0, "models": 0, "error": "Could not install API model endpoints"}
         # Restart so the freshly-generated crew + workers seed as built-in
         # agents (the picker only shows built-ins; they seed at startup), and
         # thread the imported gateway key into the server env so delegated/
@@ -1071,8 +1078,9 @@ def setup_omnigent_routes(
             except Exception:
                 data["refreshed_generated_agent_rows"] = 0
         except Exception as exc:
+            logger.warning("omnigent launch: server restart failed error_type=%s", type(exc).__name__)
             data = manager.status()
-            data["error"] = str(exc)
+            data["error"] = "Could not restart the Omnigent server"
         data["install"] = INSTALL_GUIDANCE
         data["api_models"] = api
         return data

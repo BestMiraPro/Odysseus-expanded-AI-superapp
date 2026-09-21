@@ -106,9 +106,11 @@ def setup_preset_routes(preset_manager) -> APIRouter:
             url, model, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=user)
             result = await llm_call_async(url, model, messages, temperature=0.8, max_tokens=500, headers=headers)
             return {"success": True, "prompt": result.strip()}
+        except HTTPException as http_exc:
+            return {"success": False, "message": str(http_exc.detail)}
         except Exception as e:
-            logger.error(f"Expand prompt failed: {e}")
-            return {"success": False, "message": str(e)}
+            logger.warning("preset expand: prompt expansion failed error_type=%s", type(e).__name__)
+            return {"success": False, "message": "Could not expand the prompt"}
 
     # ── Group presets ──
     @router.get("/api/presets/groups")

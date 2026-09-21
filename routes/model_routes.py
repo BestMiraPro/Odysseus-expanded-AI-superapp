@@ -762,7 +762,8 @@ def _probe_single_model(base: str, api_key: str, model_id: str, timeout: int = 1
     except httpx.TimeoutException:
         return {"status": "timeout", "latency_ms": timeout * 1000, "error": f"Timed out ({timeout}s)"}
     except Exception as e:
-        return {"status": "fail", "error": str(e)[:80]}
+        logger.warning("model probe failed for %s error_type=%s", model_id, type(e).__name__)
+        return {"status": "fail", "error": "The model probe request failed"}
 
 
 # Hostnames / IP prefixes that indicate a local endpoint
@@ -1132,7 +1133,8 @@ def _ping_endpoint(base_url: str, api_key: str = None, timeout: float = 1.5) -> 
                         return result
                     last_error = result.get("error")
                 except Exception as e:
-                    last_error = str(e)[:120]
+                    logger.warning("model endpoint ping failed on %s error_type=%s", path, type(e).__name__)
+                    last_error = "Connection test failed"
     except Exception:
         pass
 
@@ -1155,7 +1157,8 @@ def _ping_endpoint(base_url: str, api_key: str = None, timeout: float = 1.5) -> 
             return result
         last_error = result.get("error") or last_error
     except Exception as e:
-        last_error = str(e)[:120]
+        logger.warning("model endpoint ping failed error_type=%s", type(e).__name__)
+        last_error = "Connection test failed"
 
     return {"reachable": False, "status_code": None, "error": last_error}
 
@@ -1785,9 +1788,10 @@ def setup_model_routes(model_discovery):
                 entry["error"] = ping.get("error")
                 entry["model_count"] = cached_count or (len(ANTHROPIC_MODELS) if provider == "anthropic" else 0)
             except Exception as e:
+                logger.warning("model endpoint ping failed for %s error_type=%s", ep.id, type(e).__name__)
                 entry["latency_ms"] = None
                 entry["status"] = "online" if cached_count else "offline"
-                entry["error"] = str(e)
+                entry["error"] = "Connection test failed"
                 entry["model_count"] = cached_count
             results.append(entry)
 

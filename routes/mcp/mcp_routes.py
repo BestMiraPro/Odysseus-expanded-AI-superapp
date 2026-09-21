@@ -601,8 +601,8 @@ def setup_mcp_routes(mcp_manager: McpManager):
             logger.warning(f"OAuth callback rejected: {e.detail}")
             return HTMLResponse(_oauth_result_page("Error", str(e.detail)), status_code=e.status_code)
         except Exception as e:
-            logger.exception(f"OAuth callback error: {e}")
-            return HTMLResponse(_oauth_result_page("Error", str(e)), status_code=500)
+            logger.warning("MCP OAuth callback failed error_type=%s", type(e).__name__)
+            return HTMLResponse(_oauth_result_page("Error", "The MCP OAuth callback failed. Try reconnecting from Settings."), status_code=500)
         finally:
             db.close()
 

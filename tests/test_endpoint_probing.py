@@ -265,7 +265,9 @@ class TestPingEndpoint:
         result = _ping_endpoint("https://api.example.com/v1")
         assert result["reachable"] is False
         assert result["status_code"] is None
-        assert "Connection refused" in result["error"]
+        # S5c: transport exception text is internal — only the fixed label
+        # reaches the response, never the httpx error string.
+        assert result["error"] == "Connection test failed"
 
     def test_ollama_native_version_fallback(self, monkeypatch):
         _patch_resolve(monkeypatch)
@@ -402,7 +404,9 @@ class TestProbeSingleModel:
         monkeypatch.setattr(model_routes.httpx, "post", fake_post)
         result = _probe_single_model("https://api.example.com/v1", "key", "m")
         assert result["status"] == "fail"
-        assert "refused" in result["error"]
+        # S5c: transport exception text is internal — only a fixed label
+        # reaches the response, never the httpx error string.
+        assert result["error"] == "The model probe request failed"
 
     def test_routes_anthropic_messages_with_x_api_key(self, monkeypatch):
         _patch_resolve(monkeypatch)

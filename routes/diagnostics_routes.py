@@ -89,7 +89,8 @@ def setup_diagnostics_routes(
                 "error": data.get("error") if not data.get("success") else None,
             }
         except Exception as e:
-            return {"error": str(e)}
+            logger.warning("YouTube transcript test failed error_type=%s", type(e).__name__)
+            return {"error": "Could not test YouTube transcript extraction"}
 
     @router.post("/api/test-research")
     async def test_research(request: Request, query: str = Form("What is machine learning?")) -> Dict[str, Any]:
@@ -105,6 +106,7 @@ def setup_diagnostics_routes(
                 "result_length": len(result),
             }
         except Exception as e:
-            return {"status": "error", "error": str(e), "query": query}
+            logger.warning("Research service test failed error_type=%s", type(e).__name__)
+            return {"status": "error", "error": "The research service test failed", "query": query}
 
     return router

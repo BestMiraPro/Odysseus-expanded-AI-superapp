@@ -1038,7 +1038,8 @@ def setup_cookbook_routes() -> APIRouter:
         except asyncio.TimeoutError:
             return {"stdout": "", "stderr": "SSH test timed out", "exit_code": 124}
         except Exception as e:
-            return {"stdout": "", "stderr": str(e), "exit_code": -1}
+            logger.warning("cookbook SSH test failed error_type=%s", type(e).__name__)
+            return {"stdout": "", "stderr": "SSH test failed", "exit_code": -1}
         return {
             "stdout": stdout.decode("utf-8", errors="replace"),
             "stderr": stderr.decode("utf-8", errors="replace"),
@@ -1431,8 +1432,8 @@ def setup_cookbook_routes() -> APIRouter:
             try:
                 _launch_local_detached(session_id, lines)
             except Exception as e:
-                logger.error(f"Local detached download launch failed: {e}")
-                return {"ok": False, "error": str(e), "session_id": session_id}
+                logger.warning("cookbook model download launch failed error_type=%s", type(e).__name__)
+                return {"ok": False, "error": "Could not launch the download", "session_id": session_id}
         else:
             proc = await asyncio.create_subprocess_shell(
                 setup_cmd,
@@ -1569,10 +1570,10 @@ def setup_cookbook_routes() -> APIRouter:
                     entry["gguf_files"] = m["gguf_files"]
                 models.append(entry)
         except Exception as e:
-            logger.warning(f"Failed to parse cached models host={host or 'local'}: {e}")
+            logger.warning("cookbook cached model parse failed host=%s error_type=%s", host or "local", type(e).__name__)
             if stderr_txt:
                 logger.warning(f"stderr: {stderr_txt[:500]}")
-            msg = stderr_txt or stdout_txt[:500] or str(e)
+            msg = stderr_txt or stdout_txt[:500] or "Failed to parse cached models"
             return {"models": [], "host": host or "local", "error": msg}
 
         return {"models": models, "host": host or "local"}
@@ -2796,8 +2797,8 @@ def setup_cookbook_routes() -> APIRouter:
             try:
                 _launch_local_detached(session_id, runner_lines)
             except Exception as e:
-                logger.error(f"Local detached serve launch failed: {e}")
-                return {"ok": False, "error": str(e), "session_id": session_id}
+                logger.warning("cookbook serve launch failed error_type=%s", type(e).__name__)
+                return {"ok": False, "error": "Could not launch the serve session", "session_id": session_id}
         else:
             proc = await asyncio.create_subprocess_shell(
                 setup_cmd,
@@ -2951,7 +2952,8 @@ def setup_cookbook_routes() -> APIRouter:
         except asyncio.TimeoutError:
             return {"ok": False, "error": "Setup timed out (120s)", "platform": platform}
         except Exception as e:
-            return {"ok": False, "error": str(e), "platform": platform}
+            logger.warning("cookbook remote setup failed error_type=%s", type(e).__name__)
+            return {"ok": False, "error": "Setup failed", "platform": platform}
 
     # ── GPU availability probe ──
 
@@ -3201,7 +3203,8 @@ def setup_cookbook_routes() -> APIRouter:
             nvidia_error = "nvidia-smi not found"
             gpu_out = ""
         except Exception as e:
-            nvidia_error = str(e)[:200]
+            logger.warning("cookbook nvidia-smi probe failed error_type=%s", type(e).__name__)
+            nvidia_error = "nvidia-smi probe failed"
             gpu_out = ""
 
         gpus = []
@@ -3295,7 +3298,7 @@ def setup_cookbook_routes() -> APIRouter:
                         "nvidia_error": nvidia_error,
                     }
             except Exception as e:
-                logger.warning("Apple Metal GPU fallback failed: %s", e)
+                logger.warning("cookbook Apple Metal GPU fallback failed error_type=%s", type(e).__name__)
 
         apple_gpus = await _probe_apple_unified_memory(host, ssh_port)
         if apple_gpus:
@@ -3390,7 +3393,8 @@ def setup_cookbook_routes() -> APIRouter:
         except asyncio.TimeoutError:
             return {"ok": False, "error": "kill command timed out"}
         except Exception as e:
-            return {"ok": False, "error": str(e)[:200]}
+            logger.warning("cookbook kill-pid failed error_type=%s", type(e).__name__)
+            return {"ok": False, "error": "kill command failed"}
 
     # ── Cookbook state persistence (cross-device sync) ──
 
@@ -3543,7 +3547,8 @@ def setup_cookbook_routes() -> APIRouter:
                 pass
             return {"ok": True, "preserved": len(preserved)}
         except Exception as e:
-            return {"ok": False, "error": str(e)}
+            logger.warning("cookbook state save failed error_type=%s", type(e).__name__)
+            return {"ok": False, "error": "Failed to save cookbook state"}
 
     @router.get("/api/cookbook/hf-latest")
     async def hf_latest(vram_gb: float = 0, limit: int = 10, pipeline: str = "text-generation", owner: str = Depends(require_user)):
@@ -3569,7 +3574,8 @@ def setup_cookbook_routes() -> APIRouter:
                     return {"models": [], "error": f"HF API HTTP {resp.status_code}"}
                 raw = resp.json()
         except Exception as e:
-            return {"models": [], "error": str(e)}
+            logger.warning("cookbook HF latest fetch failed error_type=%s", type(e).__name__)
+            return {"models": [], "error": "Failed to fetch HuggingFace models"}
 
         # Estimate VRAM from the model id. Looks for patterns like "7B", "70B", "1.5B" etc.
         # Returns approx VRAM in GB at fp16 (params*2). Caller adjusts for quant.
@@ -4015,7 +4021,8 @@ def setup_cookbook_routes() -> APIRouter:
                 else:
                     err = f"HTTP {resp.status_code}"
             except Exception as e:
-                err = str(e)[:160]
+                logger.warning("cookbook Ollama library fetch failed error_type=%s", type(e).__name__)
+                err = "Failed to fetch the Ollama library"
             # Merge curated fallback so classics (qwen2.5, llama3, deepseek-r1,
             # …) stay reachable even when ollama.com's front page is dominated
             # by brand-new releases the user might not be looking for.
@@ -4137,7 +4144,8 @@ def setup_cookbook_routes() -> APIRouter:
                     r = client.get(url)
                     return r.status_code, r.text
             except Exception as e:
-                return 0, f"fetch error: {e}"
+                logger.warning("cookbook vLLM recipe fetch failed error_type=%s", type(e).__name__)
+                return 0, ""
 
         status, text = await asyncio.to_thread(_fetch_sync)
         if status == 404:
@@ -4149,7 +4157,8 @@ def setup_cookbook_routes() -> APIRouter:
         try:
             doc = _yaml.safe_load(text) or {}
         except Exception as e:
-            return {"exists": False, "error": f"yaml parse: {e}"}
+            logger.warning("cookbook vLLM recipe YAML parse failed error_type=%s", type(e).__name__)
+            return {"exists": False, "error": "Failed to parse recipe YAML"}
 
         meta = doc.get("meta") or {}
         model = doc.get("model") or {}

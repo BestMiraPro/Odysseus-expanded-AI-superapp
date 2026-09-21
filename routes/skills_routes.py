@@ -1266,7 +1266,8 @@ def setup_skills_routes(skills_manager: SkillsManager) -> APIRouter:
         try:
             from src.agent_loop import TOOL_SECTIONS, get_builtin_overrides
         except Exception as e:
-            return {"builtin": [], "count": 0, "error": str(e)}
+            logger.warning("builtin skills listing failed error_type=%s", type(e).__name__)
+            return {"builtin": [], "count": 0, "error": "Could not list built-in skills"}
 
         overrides = get_builtin_overrides()
         out = []

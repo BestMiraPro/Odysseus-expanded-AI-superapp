@@ -1174,8 +1174,10 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             if not out.get("prompt"):
                 return {"success": False, "message": "Could not extract a task instruction"}
             return {"success": True, "draft": out}
+        except HTTPException as http_exc:
+            return {"success": False, "message": str(http_exc.detail)}
         except Exception as e:
-            logger.error(f"parse_task failed: {e}")
-            return {"success": False, "message": str(e)}
+            logger.warning("task parse failed error_type=%s", type(e).__name__)
+            return {"success": False, "message": "Could not parse the task. Try again."}
 
     return router
