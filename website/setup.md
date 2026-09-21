@@ -15,9 +15,21 @@ inside **Settings**. Only edit `.env` for deployment-level overrides like
 `APP_BIND`, `APP_PORT`, `AUTH_ENABLED`, `DATABASE_URL`, or a pre-seeded admin password.
 
 On first setup, Odysseus creates an admin account (`admin` unless
-`ODYSSEUS_ADMIN_USER` is set) and prints a temporary password in the terminal.
-For Docker installs, the same line is in `docker compose logs odysseus`.
-Use that for the first login, then change it in **Settings**.
+`ODYSSEUS_ADMIN_USER` is set). Where does the password come from?
+
+- **Interactive setup** (a terminal, not Docker): you are prompted for it —
+  nothing is ever printed.
+- **Headless setup** (Docker, CI, scripts): you MUST supply
+  `ODYSSEUS_ADMIN_PASSWORD` (at least 8 characters) in the environment or in
+  `.env` BEFORE the first run. If it is missing, setup fails with a clear
+  message instead of starting without a usable admin account — generated
+  passwords are no longer printed, because container/CI logs are not a
+  secret channel. Find the failure with `docker compose logs odysseus`.
+- Setting both `ODYSSEUS_ADMIN_USER` and `ODYSSEUS_ADMIN_PASSWORD` is only
+  honored on FIRST setup (before `data/auth.json` exists); it never resets an
+  existing credential.
+
+Use that first credential for the first login, then change it in **Settings**.
 
 Contributing? See [CONTRIBUTING.md](https://github.com/BestMiraPro/Odysseus-expanded-AI-superapp/blob/dev/CONTRIBUTING.md) for setup, testing, and pull request guidelines.
 
@@ -402,7 +414,8 @@ Local GPU *serving* of vLLM/SGLang needs Linux/WSL2; for a local model on Window
 [Ollama](https://ollama.com/download) is the easiest path — point Odysseus at
 `http://localhost:11434/v1` in Settings.
 
-Open `http://localhost:7000`, log in with the generated admin password,
+Open `http://localhost:7000`, log in with the admin password you set
+(interactively, or via `ODYSSEUS_ADMIN_PASSWORD` before the first run),
 and configure everything else inside **Settings**.
 
 ## Troubleshooting & Advanced Setup

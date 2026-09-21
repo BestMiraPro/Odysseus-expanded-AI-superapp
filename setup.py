@@ -97,27 +97,37 @@ def create_default_admin():
         import bcrypt
         import json
 
-        # Priority: env vars > interactive prompt > random password
-        username = os.getenv("ODYSSEUS_ADMIN_USER", "").strip().lower()
+        # Priority: env vars > interactive prompt. There is deliberately NO
+        # generated-password fallback: a credential invented here would have to
+        # be printed to stdout to reach the operator, and container/CI log
+        # readers would obtain it. Headless installs must supply the password.
+        username_raw = os.getenv("ODYSSEUS_ADMIN_USER", "").strip().lower()
         password = os.getenv("ODYSSEUS_ADMIN_PASSWORD", "").strip()
 
-        if username and password:
-            # Both provided via env — validate before using
-            if username in RESERVED_USERNAMES:
-                print(f"  [error] ODYSSEUS_ADMIN_USER '{username}' is a reserved username")
-                return "failed"
-            if len(password) < PASSWORD_MIN_LENGTH:
-                print(f"  [error] ODYSSEUS_ADMIN_PASSWORD must be at least {PASSWORD_MIN_LENGTH} characters")
-                return "failed"
+        if username_raw and password:
+            username = username_raw
         elif sys.stdin.isatty() and not os.getenv("ODYSSEUS_SKIP_ADMIN_PROMPT"):
-            # Interactive terminal — ask the user
+            # Interactive terminal — ask the user (validates its own input).
             username, password = _prompt_admin_credentials()
+        elif password:
+            username = username_raw or "admin"
         else:
-            # Non-interactive (Docker, CI) — fall back to generated password
-            username = username or "admin"
-            password = password or __import__("secrets").token_urlsafe(18)
+            print("  [error] Set ODYSSEUS_ADMIN_PASSWORD for headless setup, "
+                  "or run setup interactively.")
+            return "failed"
 
-        username = username or "admin"
+        # Validate the eventual credentials before hashing or writing, for
+        # EVERY path that reached this point (interactive already enforced
+        # its own minimum/mismatch checks).
+        if len(password) < PASSWORD_MIN_LENGTH:
+            print(f"  [error] ODYSSEUS_ADMIN_PASSWORD must be at least "
+                  f"{PASSWORD_MIN_LENGTH} characters")
+            return "failed"
+        if username in RESERVED_USERNAMES:
+            print(f"  [error] ODYSSEUS_ADMIN_USER '{username}' is a reserved "
+                  f"username")
+            return "failed"
+
         hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
         auth_data = {
             "users": {
@@ -130,13 +140,7 @@ def create_default_admin():
         with open(auth_path, "w", encoding="utf-8") as f:
             json.dump(auth_data, f, indent=2)
 
-        if sys.stdin.isatty() and not os.getenv("ODYSSEUS_ADMIN_PASSWORD"):
-            print(f"  [ok] Admin account created ({username})")
-        else:
-            print(f"  [ok] Initial admin user created ({username})")
-            if not os.getenv("ODYSSEUS_ADMIN_PASSWORD"):
-                print(f"        Temporary password: {password}")
-                print(f"        ** Change it after first login. Set ODYSSEUS_ADMIN_PASSWORD to choose your own. **")
+        print(f"  [ok] Admin account created ({username})")
         return "created"
     except ImportError as e:
         if "incompatible architecture" in str(e).lower():
@@ -293,10 +297,17 @@ def main():
         print("Login with your existing admin credentials.\n")
     elif admin_status == "skipped":
         print("Admin creation did not happen: dependencies are missing.\nRun 'pip install bcrypt' and rerun setup.\n")
-    elif admin_status == "failed":
-        print("Admin creation did not happen: a system or file error occurred.\nCheck write permissions for the 'data' directory and rerun setup.\n")
-    else:  # handling "failed" or any unhandled edge case
-        print("Admin creation did not happen: a system or file error occurred.\nCheck write permissions for the 'data' directory and rerun setup.\n")
+    else:
+        # "failed": either the headless install has no ODYSSEUS_ADMIN_PASSWORD
+        # (or the supplied credentials did not pass validation), or a
+        # system/file error occurred. Neither state is a completed
+        # installation, so say so plainly and fail the run.
+        print("Admin account setup did NOT complete: for headless setup pass a "
+              "valid ODYSSEUS_ADMIN_PASSWORD (and optionally "
+              "ODYSSEUS_ADMIN_USER), or run setup interactively; otherwise "
+              "check write permissions for the 'data' directory and rerun "
+              "setup.\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
