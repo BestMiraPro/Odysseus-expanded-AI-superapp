@@ -5,6 +5,7 @@ import json
 import shutil
 import logging
 import asyncio
+import urllib.parse
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, Form, Depends
 from core.constants import EMBEDDING_ENDPOINT_FILE, FASTEMBED_CACHE_DIR
@@ -17,6 +18,26 @@ _ENDPOINT_FILE = EMBEDDING_ENDPOINT_FILE
 
 # Track in-progress downloads
 _downloading: dict = {}
+
+# Query-parameter names that conventionally carry credentials. The endpoint
+# URL is persisted verbatim (only the api_key field is encrypted), so these
+# must never be accepted embedded in the URL.
+_CREDENTIAL_QUERY_KEYS = frozenset({
+    "api_key", "apikey", "api-key", "key", "token", "access_token",
+    "access-token", "auth", "authorization", "password", "passwd",
+    "secret", "bearer",
+})
+
+
+def _url_has_credentials(url: str) -> bool:
+    """True when a URL carries credentials in userinfo or query parameters."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.username or parsed.password:
+        return True
+    return any(
+        key.lower() in _CREDENTIAL_QUERY_KEYS
+        for key, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+    )
 
 # Curated recommendations — good coverage of size/quality tiers
 RECOMMENDED_MODELS = {
@@ -258,6 +279,18 @@ def setup_embedding_routes():
         url = url.strip()
         if not url:
             raise HTTPException(400, "URL is required")
+
+        # The saved endpoint file keeps the URL verbatim (only api_key is
+        # encrypted), so credentials embedded in userinfo or query parameters
+        # would be persisted in clear text. Point operators at the api_key
+        # field instead of silently storing a secret this route cannot see.
+        if _url_has_credentials(url):
+            raise HTTPException(
+                400,
+                "Endpoint URL must not embed credentials (userinfo or "
+                "credential-style query parameters). Put the key in the API "
+                "key field instead.",
+            )
 
         # SSRF hardening: validate the user-supplied URL before any outbound
         # request. Local-first means loopback/LAN endpoints are allowed by

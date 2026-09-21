@@ -196,3 +196,39 @@ def test_main_failed_status_exits_nonzero_with_configuration_message(
     out = capsys.readouterr().out
     assert "did NOT complete" in out
     assert "ODYSSEUS_ADMIN_PASSWORD" in out
+
+
+def test_interactive_guidance_echoes_constant_not_the_typed_password(
+        tmp_path, monkeypatch, capsys):
+    """S7 #154/#155: the interactive length-guidance line prints the constant
+    PASSWORD_MIN_LENGTH, never the password the operator typed — including on
+    the too-short rejection retry. Sentinel-credential stdout assertion."""
+    import bcrypt
+
+    setup_module = _load_setup_module()
+    monkeypatch.setattr(setup_module, "AUTH_FILE", str(tmp_path / "auth.json"))
+    monkeypatch.delenv("ODYSSEUS_ADMIN_USER", raising=False)
+    monkeypatch.delenv("ODYSSEUS_ADMIN_PASSWORD", raising=False)
+
+    answers = iter([
+        "admin",                        # username prompt
+        "short",                        # too short -> rejected, retry
+        "s3cret-interactive-sentinel-9",  # accepted
+        "s3cret-interactive-sentinel-9",  # confirm
+    ])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr("getpass.getpass", lambda _prompt="": next(answers))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    assert setup_module.create_default_admin() == "created"
+    out, err = capsys.readouterr()
+
+    assert f"at least {setup_module.PASSWORD_MIN_LENGTH} characters" in out
+    assert "short" not in out and "short" not in err
+    assert "s3cret-interactive-sentinel-9" not in out
+    assert "s3cret-interactive-sentinel-9" not in err
+    data = json.loads((tmp_path / "auth.json").read_text(encoding="utf-8"))
+    assert bcrypt.checkpw(
+        b"s3cret-interactive-sentinel-9",
+        data["users"]["admin"]["password_hash"].encode(),
+    )

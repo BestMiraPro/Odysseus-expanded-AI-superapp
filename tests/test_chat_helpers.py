@@ -580,3 +580,35 @@ async def test_build_chat_context_keeps_cookie_user_owner_scope(monkeypatch):
         "preface_owner": "bob",
         "compact_owner": "bob",
     }
+
+
+@pytest.mark.asyncio
+async def test_memory_debug_log_carries_username_not_request_secrets(monkeypatch, caplog):
+    """S7 / #149: the flagged debug line (chat_helpers.py:689) logs memory
+    booleans plus the effective user — effective_user() derives a plain
+    username string from request.state, never the bearer token or any other
+    request state. A hostile extra state field must not leak into it."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="routes.chat_helpers")
+    ctx, captured = await _build_context_owner_probe(
+        monkeypatch,
+        {
+            "api_token": True,
+            "api_token_owner": "bob",
+            "current_user": "api",
+            "auth_credential": "sekret-marker-7f9c",
+        },
+    )
+
+    assert isinstance(ctx.user, str)
+    assert ctx.user == "bob"
+    memory_rows = [
+        rec.getMessage() for rec in caplog.records
+        if "Memory enabled" in rec.getMessage()
+    ]
+    assert memory_rows, "expected the memory-enablement debug line"
+    for msg in memory_rows:
+        assert "user=bob" in msg
+        assert "sekret-marker-7f9c" not in msg
+    assert "sekret-marker-7f9c" not in caplog.text

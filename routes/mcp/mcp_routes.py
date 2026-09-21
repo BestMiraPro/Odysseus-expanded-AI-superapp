@@ -13,6 +13,7 @@ import httpx
 
 from core.database import McpServer, SessionLocal
 from core.middleware import require_admin
+from core.platform_compat import safe_chmod
 from src.constants import DATA_DIR, MCP_OAUTH_DIR
 from src.mcp_manager import McpManager
 
@@ -202,8 +203,10 @@ def setup_mcp_routes(mcp_manager: McpManager):
                 pass
         _apply_mcp_oauth_env(parsed_env, parsed_oauth_config)
 
-        # Write OAuth credentials file if provided (for Google MCP servers)
-        logger.info(f"MCP add_server: oauth_file={oauth_file!r}")
+        # Write OAuth credentials file if provided (for Google MCP servers).
+        # Log presence only: the payload carries the raw client secret,
+        # which must never reach logs.
+        logger.info("MCP add_server: oauth_file=%s", "provided" if oauth_file else "not provided")
         if oauth_file:
             try:
                 oauth_data = json.loads(oauth_file)
@@ -228,6 +231,9 @@ def setup_mcp_routes(mcp_manager: McpManager):
                     }
                     with open(filepath, "w", encoding="utf-8") as f:
                         json.dump(creds, f, indent=2)
+                    # POSIX: default umask leaves group/other read on this
+                    # client-secret file; lock it to the owner.
+                    safe_chmod(filepath, 0o600)
                     logger.info(f"Wrote OAuth credentials to {filepath}")
                     parsed_env.pop("GOOGLE_CLIENT_ID", None)
                     parsed_env.pop("GOOGLE_CLIENT_SECRET", None)
@@ -568,6 +574,8 @@ def setup_mcp_routes(mcp_manager: McpManager):
             os.makedirs(os.path.dirname(token_file), exist_ok=True)
             with open(token_file, "w", encoding="utf-8") as f:
                 json.dump(tokens, f, indent=2)
+            # POSIX: token file contains bearer tokens; keep it owner-only.
+            safe_chmod(token_file, 0o600)
             logger.info(f"Saved OAuth tokens to {token_file}")
 
             # Attempt to connect the MCP server now

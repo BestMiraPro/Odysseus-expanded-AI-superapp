@@ -1243,6 +1243,66 @@ def test_api_key_fingerprint_is_stable_and_non_secret():
     assert "key-one" not in fp_one
 
 
+# ── S7 / #299: the 8-char fingerprint is a display label, never a key ──
+
+_SENTINEL_API_KEY = "sk-s7-fingerprint-sentinel-key"
+
+
+def test_fingerprint_label_cannot_recover_or_substitute_for_the_key():
+    fp = _api_key_fingerprint(_SENTINEL_API_KEY)
+
+    assert fp != _SENTINEL_API_KEY
+    assert _SENTINEL_API_KEY not in fp
+    assert len(fp) == 8
+    # The label is not an invertible transform of the credential.
+    assert _SENTINEL_API_KEY != fp
+
+
+def test_list_model_endpoints_emits_fingerprint_never_the_raw_key(monkeypatch):
+    ep = _make_endpoint(
+        id="ep-sentinel",
+        api_key=_SENTINEL_API_KEY,
+        cached_models=json.dumps(["m1"]),
+    )
+    db = _PinnedFakeDb([ep])
+    monkeypatch.setattr(model_routes, "SessionLocal", lambda: db)
+    monkeypatch.setattr(model_routes, "require_admin", lambda request: None)
+    endpoint = _get_route("/api/model-endpoints", "GET")
+
+    result = endpoint(_PinnedFakeRequest())
+
+    assert _SENTINEL_API_KEY not in json.dumps(result)
+    assert result[0]["has_key"] is True
+    assert result[0]["api_key_fingerprint"] == _api_key_fingerprint(_SENTINEL_API_KEY)
+
+
+def test_frontend_uses_fingerprint_only_as_escaped_display_label():
+    """S7 / #299 consumer trace: admin.js renders the fingerprint once, as an
+    escaped label beside "key set". Source assertion is the narrow exception —
+    the script has no Node harness (it is not an ES module) — and the pinned
+    invariant is that the label never feeds auth or selection code."""
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[1] / "static" / "js" / "admin.js"
+    ).read_text(encoding="utf-8")
+    hits = [
+        i for i in range(len(src))
+        if src.startswith("api_key_fingerprint", i)
+    ]
+    assert hits, "admin.js no longer references the fingerprint"
+    # The label appears only on the "key set" display line (twice there).
+    matching_lines = {
+        line_index for pos in hits
+        for line_index in (src.count("\n", 0, pos) + 1,)
+    }
+    assert len(matching_lines) == 1
+    pos = hits[0]
+    line = src[src.rfind("\n", 0, pos):src.find("\n", pos)]
+    assert "esc(ep.api_key_fingerprint)" in line
+    assert " (key " in line
+
+
 def _create_form_kwargs(**overrides):
     """Defaults for every Form() param create_model_endpoint reads directly.
 
