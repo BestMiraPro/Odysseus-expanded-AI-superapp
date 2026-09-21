@@ -1,0 +1,78 @@
+name: CodeQL comparison scan (no exclusions)
+
+# A MANUAL comparison scan that runs the DEFAULT CodeQL suites with NO query
+# exclusions, for evidence-driven review of the exclusion list in
+# .github/codeql/codeql-config.yml (security plan S8/S9). Deliberate design
+# choices:
+#
+# - Runs ONLY on workflow_dispatch (an operator or reviewer triggers it) —
+#   never on push/PR, so it cannot surprise the normal advisory alerts on
+#   dev/main.
+# - Alternatively triggered on pushes to branches named security/* so the
+#   remediation branch's candidate SHA gets its comparison evidence in the
+#   same run as the normal scan.
+# - Results are attached as workflow ARTIFACTS, NOT uploaded to code scanning:
+#   the comparison deliberately avoids re-filing the excluded findings as
+#   alerts. Download the artifact and classify per the disposition ledger.
+#
+# Usage: gh workflow run codeql-comparison.yml --ref <branch>  (or Actions tab
+# -> "Run workflow"), then download "comparison-sarif-*" from the run summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch/tag/SHA to scan
+        required: false
+        default: ""
+  push:
+    branches:
+      - "security/*"
+
+permissions: {}
+
+concurrency:
+  group: codeql-comparison-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: Comparison (no exclusions)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: read
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [actions, javascript-typescript, python]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Initialize CodeQL (default suites, NO config file)
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+        with:
+          category: "/comparison:${{ matrix.language }}"
+          # results: keep them off the alerts dashboard; this scan is evidence
+          # for the exclusion review, not a new alert stream
+          upload: false
+          ram: 8096
+          output: comparison-results
+
+      - name: Attach comparison SARIF as an artifact
+        uses: actions/upload-artifact@6f51ac03b9356f520e9bbe1d9c5c06b212be10ed  # v4.7.0
+        with:
+          name: comparison-sarif-${{ matrix.language }}
+          path: comparison-results
+          if-no-files-found: error

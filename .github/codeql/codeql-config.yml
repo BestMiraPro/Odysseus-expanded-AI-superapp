@@ -1,9 +1,17 @@
 # CodeQL configuration
 #
 # Five rules are excluded below, covering 147 of the 291 findings the first full
-# scan produced. Each exclusion is a claim that the finding is either by design,
-# already guarded, or structurally misread, and each names the evidence so a
-# reviewer can check the claim rather than take it on trust.
+# scan produced. THESE COUNTS ARE A HISTORICAL BASELINE from that initial scan,
+# recorded for provenance — the current totals live in the repository Security
+# tab, not here. Each exclusion is a claim that the finding is either by
+# design, already guarded, or structurally misread, and each names the evidence
+# so a reviewer can check the claim rather than take it on trust.
+#
+# Nothing else is filtered; no `paths-ignore` narrowing exists anywhere in this
+# file. The exclusion list is reviewed (not expanded) as part of the security
+# remediation plan; a comparison scan workflow WITHOUT exclusions is provided in
+# `.github/workflows/codeql-comparison.yml` so any batch re-enablement is
+# evidence-driven.
 #
 # Nothing else is filtered. The remaining ~144 findings stay visible, including
 # all 77 py/stack-trace-exposure results -- a real class, deliberately left open
@@ -75,7 +83,8 @@ query-filters:
   - exclude:
       id: py/path-injection
 
-  # js/incomplete-multi-character-sanitization (18 findings, 14 distinct sites)
+  # js/incomplete-multi-character-sanitization (18 findings, 14 distinct sites;
+  # historical baseline)
   #
   # The rule assumes a .replace() that strips markup is a sanitiser protecting a
   # later HTML sink, and warns that a nested or malformed construct can survive
@@ -83,24 +92,30 @@ query-filters:
   # where the output is measured, matched or shown as text and never returned to
   # innerHTML. An incomplete strip there is a cosmetic defect, not an injection.
   #
-  # Seven of the fourteen read in full, covering every distinct pattern:
+  # Seven of the fourteen were read in full at the baseline, covering every
+  # distinct pattern (line numbers are the historical ones; several sites have
+  # since moved onto the shared inert-template helper):
   #
-  #   static/js/chat.js:4044              strips tags only to measure length
-  #                                       (_proseLen); the result is compared to
-  #                                       24 and then discarded.
-  #   static/js/settings.js:3816          strips tags, then passes the result
-  #                                       through esc() into a title attribute.
-  #                                       The escaper is the actual defence.
-  #   static/js/emailInbox.js:963         html -> plain text for a reply draft.
-  #   static/js/emailLibrary/utils.js:108 pulls author/date out of a quote header
-  #                                       as text.
-  #   .../signatureFold.js:190            strips tags so a heuristic can regex
-  #                                       the remaining prose.
-  #   static/js/slashCommands.js:468      builds a plain-text copy for the
-  #                                       typewriter animation.
-  #   .github/scripts/check-issue-description.js:21
-  #                                       strips <!-- --> in CI to test whether
-  #                                       a template body is empty.
+  #   static/js/chat.js            strips tags only to measure length
+  #                                (_proseLen); the result is compared to
+  #                                24 and then discarded.
+  #   static/js/settings.js        strips tags, then passes the result
+  #                                through esc() into a title attribute.
+  #                                The escaper is the actual defence.
+  #   static/js/emailInbox.js      html -> plain text for a reply draft; since
+  #                                the S6 remediation this goes through
+  #                                document.js `_emailHtmlToPlainText`
+  #                                (inert <template>, payload nodes removed).
+  #   static/js/emailLibrary/utils.js pulls author/date out of a quote header
+  #                                as text.
+  #   .../signatureFold.js         strips tags so a heuristic can regex
+  #                                the remaining prose (verified in S6: the
+  #                                decoded text cannot reach markup).
+  #   static/js/slashCommands.js   builds a plain-text copy for the
+  #                                typewriter animation.
+  #   .github/scripts/check-issue-description.js
+  #                                strips <!-- --> in CI to test whether
+  #                                a template body is empty.
   #
   # Kept in mind: the one site that DID matter -- text stripped and then put
   # back into HTML -- was caught by js/xss-through-dom, which stays enabled.

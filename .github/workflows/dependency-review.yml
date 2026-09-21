@@ -50,6 +50,10 @@ jobs:
     name: pip-audit (advisory)
     runs-on: ubuntu-latest
     # Advisory: report known-vulnerable Python deps without blocking the merge.
+    # NOTE: findings appear in the job LOG OUTPUT, not the Security tab — and a
+    # "green" result here only means the workflow step completed
+    # (continue-on-error masks non-zero pip-audit exits). Read the job logs:
+    # a clean audit is `pip-audit` reporting no advisories, not a green tick.
     continue-on-error: true
     permissions:
       contents: read
@@ -62,10 +66,19 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
-          python-version: '3.12'
+          # The SHIPPED runtime: CPython 3.14 matches the Docker image build
+          # (python:3.14-slim) and CI's LOCK_TARGET_PYTHON. Auditing 3.12 with
+          # loose requirements compared a different resolution than Docker
+          # installs — which told operators nothing about the shipped image.
+          python-version: '3.14'
 
-      - name: Run pip-audit on requirements
+      - name: Run pip-audit on the shipped locked requirements
         run: |
           set -euo pipefail
           pip install pip-audit==2.10.0
-          pip-audit -r requirements.txt -r requirements-optional.txt --strict
+          pip-audit -r requirements.lock.txt --strict
+
+      - name: Run pip-audit on optional extras (separately labeled)
+        run: |
+          pip-audit -r requirements.txt -r requirements-optional.txt --strict ||
+            echo "::warning::pip-audit found advisories in the OPTIONAL extras — these are not part of the shipped-image claim above."

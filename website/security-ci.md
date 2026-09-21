@@ -28,10 +28,21 @@ automatically; you do not start them.
 "Blocks a merge" means a red X appears on the pull request and, once you enable
 the setting below, the **Merge** button is disabled until it is fixed.
 
-"Advisory" means it reports problems into the repository's **Security** tab so
-you can review them on your own schedule, but it never stops a merge. These are
-advisory on purpose: they often flag long-standing issues in other people's
-libraries, not something a given pull request introduced.
+"Advisory" means it reports problems on your own schedule, but it never stops a
+merge. Two details that matter when reading the dashboard:
+
+- **pip-audit findings are NOT in the Security tab.** They appear in the job's
+  **log output** (and as warning annotations on the optional-extras lane). A
+  green tick on the pip-audit check only means the workflow ran — the advisory
+  job is `continue-on-error` by design. To verify a clean audit, open the job
+  logs and confirm `pip-audit` printed no advisories. The primary lane audits
+  `requirements.lock.txt` on CPython 3.14 (the shipped Docker runtime); the
+  optional extras (requirements-optional) are audited in a separately labeled
+  lane and are NOT part of the shipped-image claim.
+- **Trivy's PR/manual runs print a table only.** SARIF is uploaded only on
+  trusted pushes to main, and `ignore-unfixed: true` keeps the scan silent
+  about CVEs without a fixed version — if you need the complete picture,
+  re-run with unfixed CVEs collected separately.
 
 ## Where results appear
 
@@ -93,9 +104,25 @@ let the workflows run on one pull request first, then add them here.
 2. Turn on **Dependency graph** (usually on by default for public repos) -- this
    powers Dependency review and Dependabot.
 3. Turn on **Dependabot alerts** and **Dependabot security updates**.
-4. Under **Code scanning**, keep **Default setup** disabled. CodeQL is
+4. Turn on **Secret scanning** and, where the plan supports it, **Push
+   protection**. Then review the resulting state once it completes: enabling a
+   scanner is not the same as a successful initial scan — check the Security
+   tab for the first result set (which may contain historical findings) and
+   disposition each one individually in the security-alert ledger.
+5. Under **Code scanning**, keep **Default setup** disabled. CodeQL is
    configured by `.github/workflows/codeql.yml`; enabling default setup at the
    same time causes GitHub to reject uploads from the checked-in workflow.
+
+### 3. CodeQL exclusions and the comparison scan
+
+`.github/codeql/codeql-config.yml` excludes five rules with inline evidence;
+its finding counts are a **historical baseline**, and nothing else is
+filtered. To re-evaluate an exclusion, run `.github/workflows/
+codeql-comparison.yml` (workflow_dispatch, or any push to a `security/*`
+branch): it runs the DEFAULT suites with no config file and attaches SARIF as
+a **workflow artifact** rather than filing alerts. Download the artifact,
+classify the newly visible paths against the same auth/owner-scope analysis,
+and re-enable rules in reviewed batches.
 
 ## Keeping it current
 
@@ -103,3 +130,10 @@ let the workflows run on one pull request first, then add them here.
 npm packages, the Docker base image, and the pinned automation actions
 themselves. Review and merge those like any other pull request; they keep the
 project patched without manual tracking.
+
+`package-lock.json` is audited alongside runtime dependencies, but its packages
+belong to the development toolchain (for example `@antithesishq/bombadil` is a
+dev dependency, not something the shipped Docker image installs) — check the
+image's own Trivy report for what production actually exposes. Vendored
+browser libraries inside `static/vendor/` are not in the npm graph; audit them
+manually when one of their upstream CVEs is announced.
