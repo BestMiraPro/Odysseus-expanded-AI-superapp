@@ -1076,12 +1076,14 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
             if 300 <= r.status_code < 400:
                 return {"ok": False, "error": "Redirects are not followed for CalDAV safety; use the final URL"}
             return {"ok": False, "error": f"HTTP {r.status_code}"}
-        except httpx.ConnectError as e:
-            return {"ok": False, "error": f"Connection refused: {e}"[:200]}
+        except httpx.ConnectError:
+            logger.warning("CalDAV test connection failed error_type=ConnectError")
+            return {"ok": False, "error": "Could not connect to the CalDAV server"}
         except httpx.TimeoutException:
             return {"ok": False, "error": "Connection timed out"}
         except Exception as e:
-            return {"ok": False, "error": str(e)[:200]}
+            logger.warning("CalDAV test connection failed error_type=%s", type(e).__name__)
+            return {"ok": False, "error": "The CalDAV pre-flight check failed"}
 
     @router.post("/sync")
     async def sync_caldav_endpoint(request: Request, direction: str = "pull"):
@@ -1698,8 +1700,11 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
                 max_tokens=512,
                 timeout=20,
             )
+        except HTTPException as http_exc:
+            return {"ok": False, "error": str(http_exc.detail)}
         except Exception as e:
-            return {"ok": False, "error": f"LLM call failed: {e}"}
+            logger.warning("calendar quick parse LLM call failed error_type=%s", type(e).__name__)
+            return {"ok": False, "error": "Could not parse the event. Try again."}
 
         cleaned = strip_think(raw or "", prose=False, prompt_echo=True)
         cleaned = _re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=_re.MULTILINE).strip()
@@ -1709,7 +1714,8 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         try:
             parsed = _json.loads(m.group())
         except Exception as e:
-            return {"ok": False, "error": f"Invalid JSON: {e}", "raw": cleaned[:400]}
+            logger.warning("calendar quick parse model JSON invalid error_type=%s", type(e).__name__)
+            return {"ok": False, "error": "The model returned invalid JSON", "raw": cleaned[:400]}
 
         # Light validation / defaults so the frontend can trust the shape.
         summary = (parsed.get("summary") or text)[:200]

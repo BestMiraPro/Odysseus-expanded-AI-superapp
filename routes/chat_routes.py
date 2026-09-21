@@ -2061,7 +2061,10 @@ def setup_chat_routes(
                             except json.JSONDecodeError:
                                 yield chunk
                         elif chunk.startswith("event: error"):
-                            logger.warning(f"Stream error for {sess.model} on {sess.endpoint_url}: {chunk!r}")
+                            # Provider SSE error events from the shared transport are
+                            # already fixed, sanitized messages; never log the raw chunk
+                            # (upstream-controlled bytes) or a URL that may embed creds.
+                            logger.warning("Stream error for %s on %s", sess.model, redact_url(sess.endpoint_url))
                             if (
                                 not _chat_terminal_saved
                                 and (full_response.strip() or thinking_response.strip())
@@ -2541,8 +2544,8 @@ def setup_chat_routes(
                             )
                             sess.add_message(ChatMessage("assistant", _stopped_content2, metadata=_stopped_md2))
                             session_manager.save_sessions()
-                    except Exception:
-                        logger.exception("Failed to save partial response on disconnect (session %s)", session)
+                    except Exception as e:
+                        logger.warning("Failed to save partial response on disconnect session=%s error_type=%s", session, type(e).__name__)
                     raise
                 finally:
                     _active_streams.pop(session, None)
@@ -2771,15 +2774,15 @@ def setup_chat_routes(
                                     db_msg.content = full_response
                                     db.commit()
                             except Exception as e:
-                                logger.warning("Failed to update rewritten message in DB: %s", e)
+                                logger.warning("Failed to update rewritten message in DB error_type=%s", type(e).__name__)
                                 db.rollback()
                             finally:
                                 db.close()
                             session_manager.save_sessions()
                         yield chunk
             except Exception as e:
-                logger.error("Rewrite stream error: %s", e)
-                yield f'event: error\ndata: {json.dumps({"error": str(e), "status": 500})}\n\n'
+                logger.error("Rewrite stream error error_type=%s", type(e).__name__)
+                yield f'event: error\ndata: {json.dumps({"error": "The rewrite request failed. Try again.", "status": 500})}\n\n'
 
         return StreamingResponse(stream_rewrite(), media_type="text/event-stream")
 

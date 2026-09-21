@@ -42,6 +42,7 @@ from src.constants import DATA_DIR
 
 from src.llm_core import llm_call_async
 from src.upload_limits import read_upload_limited, EMAIL_COMPOSE_UPLOAD_MAX_BYTES
+from core.log_safety import redact_url
 
 from routes.email_helpers import (
     _strip_think, _extract_reply, _apply_email_style_mechanics, require_owner, require_user, _assert_owns_account,
@@ -67,6 +68,22 @@ from routes.email_helpers import (
 from routes.email_pollers import _start_poller
 
 logger = logging.getLogger(__name__)
+
+
+def _email_endpoint_labels(candidates) -> str:
+    """'model@host' list of attempted endpoints, credential-free.
+
+    Endpoint URLs can embed credentials in the userinfo; only the hostname is
+    ever shown to the user in failure messages.
+    """
+    labels = []
+    for url, model, _ in candidates or []:
+        try:
+            host = urlparse(url).hostname
+        except Exception:
+            host = None
+        labels.append(f"{model}@{host or 'unknown-host'}")
+    return ", ".join(labels)
 
 ODYSSEUS_MAIL_ORIGIN = "odysseus-ui"
 EMAIL_READ_ATTACHMENT_VERSION = 2
@@ -2669,9 +2686,10 @@ def setup_email_routes():
                 "moved_to_spam": moved,
             }
         except ValueError as e:
+            logger.warning("unsubscribe execute failed error_type=%s uid=%s", type(e).__name__, uid)
             return {"success": False, "error": str(e)}
         except Exception as e:
-            logger.error(f"unsubscribe execute failed uid={uid}: {e}")
+            logger.error("unsubscribe execute failed error_type=%s uid=%s", type(e).__name__, uid)
             return {"success": False, "error": "Mail operation failed"}
 
     @router.post("/unsubscribe/cleanup")
@@ -3647,8 +3665,8 @@ def setup_email_routes():
 
                 try:
                     content = _attached_email_markdown(_attachment_bytes_from_msg())
-                except Exception:
-                    logger.exception("Failed to read email attachment %s", base)
+                except Exception as e:
+                    logger.warning("Failed to read email attachment %s error_type=%s", base, type(e).__name__)
                     return {"error": "Failed to read email attachment", "filename": base}
                 doc_id = _create_markdown_doc(content, "Imported attached email")
                 return {"doc_id": doc_id, "filename": filepath.name}
@@ -3662,7 +3680,8 @@ def setup_email_routes():
                 try:
                     d = _Docx(str(filepath))
                 except Exception as e:
-                    return {"error": f"Failed to read docx: {e}", "filename": base}
+                    logger.warning("attachment-as-doc docx read failed error_type=%s", type(e).__name__)
+                    return {"error": "Failed to read docx file", "filename": base}
                 # Convert paragraphs to markdown — preserve heading styles as #/##/###,
                 # bullet lists as `- `, numbered lists as `1.`, and keep tables as
                 # simple pipe-delimited rows.
@@ -3698,13 +3717,14 @@ def setup_email_routes():
                 try:
                     content = filepath.read_text(encoding="utf-8", errors="replace")
                 except Exception as e:
-                    return {"error": f"Failed to read text file: {e}", "filename": base}
+                    logger.warning("attachment-as-doc text read failed error_type=%s", type(e).__name__)
+                    return {"error": "Failed to read text file", "filename": base}
                 doc_id = _create_markdown_doc(content, "Imported from email attachment")
                 return {"doc_id": doc_id, "filename": filepath.name}
 
             return {"error": f"Unsupported attachment type: {ext}", "filename": base}
         except Exception as e:
-            logger.error(f"attachment-as-doc {uid}/{index} failed: {e}")
+            logger.error("attachment-as-doc %s/%s failed error_type=%s", uid, index, type(e).__name__)
             return {"error": "Mail operation failed"}
 
     @router.post("/attachment-path/{uid}/{index}")
@@ -4527,7 +4547,7 @@ def setup_email_routes():
         try:
             cfg = _resolve_send_config(req.account_id, owner=owner)
         except Exception as e:
-            logger.warning(f"No SMTP-capable account resolved: {e}")
+            logger.warning("No SMTP-capable account resolved error_type=%s", type(e).__name__)
             return {"success": False, "error": str(e) or "No SMTP-capable email account configured"}
 
         # Use 'mixed' if we have attachments, 'alternative' otherwise
@@ -5262,9 +5282,9 @@ def setup_email_routes():
                     _match = next((a for a in _avail if _os.path.basename(a.rstrip("/")) == _base), None)
                     model = _match or _avail[0]
             except Exception as _e:
-                logger.warning(f"AI reply model resolve failed: {_e}")
+                logger.warning("AI reply model resolve failed error_type=%s", type(_e).__name__)
 
-            logger.info(f"AI reply using model={model} url={url}")
+            logger.info("AI reply using model=%s url=%s", model, redact_url(url))
 
             # Manual AI Reply should feel immediate. The heavier context mining
             # can involve multiple IMAP folder searches and attachment parsing;
@@ -5369,9 +5389,14 @@ def setup_email_routes():
                     timeout=60 if fast_reply else 180,
                 )
             except Exception as e:
-                detail = getattr(e, "detail", None) or str(e)
-                _attempted = ", ".join(f"{m}@{u.split('/')[2] if '/' in u else u}" for u, m, _ in _candidates) or "no candidates"
-                return {"success": False, "error": f"All endpoints failed ({_attempted}): {detail}. Check your API keys in Settings → Services."}
+                logger.warning("AI reply failed for all endpoints error_type=%s", type(e).__name__)
+                _attempted = _email_endpoint_labels(_candidates) or "no candidates"
+                _detail = (
+                    str(e.detail)
+                    if isinstance(e, HTTPException)
+                    else "the model endpoints returned an error"
+                )
+                return {"success": False, "error": f"All endpoints failed ({_attempted}): {_detail}. Check your API keys in Settings → Services."}
 
             reply = _apply_email_style_mechanics(_extract_reply(reply_raw or ""))
             if not reply:
@@ -5414,9 +5439,9 @@ def setup_email_routes():
                             len(raw_retry or ""),
                         )
                     except Exception as retry_exc:
-                        logger.warning("AI reply retry failed model=%s: %s", cand_model, retry_exc)
+                        logger.warning("AI reply retry failed model=%s error_type=%s", cand_model, type(retry_exc).__name__)
             if not reply:
-                _attempted = ", ".join(f"{m}@{u.split('/')[2] if '/' in u else u}" for u, m, _ in _candidates) or "no candidates"
+                _attempted = _email_endpoint_labels(_candidates) or "no candidates"
                 return {"success": False, "error": f"AI reply returned blank text after retrying: {_attempted}"}
 
             # Cache so next click is instant

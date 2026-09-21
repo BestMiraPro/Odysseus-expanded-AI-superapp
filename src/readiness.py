@@ -6,10 +6,13 @@ writable, and storage is local-first. Served by ``GET /api/ready`` and suitable
 for an orchestrator readiness probe (200 only when every critical check passes).
 """
 
+import logging
 import os
 import uuid
 from datetime import datetime
 from typing import Dict
+
+logger = logging.getLogger(__name__)
 
 
 def check_readiness() -> Dict[str, object]:
@@ -31,7 +34,8 @@ def check_readiness() -> Dict[str, object]:
             conn.execute(sql_text("SELECT 1"))
         checks["database"] = {"ok": True}
     except Exception as e:
-        checks["database"] = {"ok": False, "error": str(e)}
+        logger.warning("readiness database check failed error_type=%s", type(e).__name__)
+        checks["database"] = {"ok": False, "error": "database check failed"}
 
     # Data directory present and writable — home must be able to hold its own data.
     try:
@@ -42,7 +46,8 @@ def check_readiness() -> Dict[str, object]:
         os.remove(probe)
         checks["data_dir"] = {"ok": True, "path": DATA_DIR}
     except Exception as e:
-        checks["data_dir"] = {"ok": False, "error": str(e)}
+        logger.warning("readiness data_dir check failed error_type=%s", type(e).__name__)
+        checks["data_dir"] = {"ok": False, "error": "data directory check failed", "path": DATA_DIR}
 
     # Local-first: storage stays on the home machine (informational, never fatal).
     local_first = (

@@ -1003,10 +1003,11 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                     }
                 return {"ok": False, "message": f"ntfy returned HTTP {r.status_code} from {full_url}: {r.text[:200]}"}
             except Exception as e:
+                logger.warning("ntfy connectivity test failed error_type=%s", type(e).__name__)
                 hint = ""
                 if parsed.hostname not in ("127.0.0.1", "localhost"):
                     hint = " If this is Docker Compose ntfy, set NTFY_BIND to that host/Tailscale IP and NTFY_BASE_URL to the same server URL in .env, then recreate ntfy."
-                return {"ok": False, "message": f"ntfy publish to {full_url} failed: {e}.{hint}"[:500]}
+                return {"ok": False, "message": f"ntfy publish to {full_url} failed ({type(e).__name__}).{hint}"[:500]}
 
         if preset == "discord_webhook":
             import httpx
@@ -1027,7 +1028,8 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                     return {"ok": True, "message": "Test embed sent — check your Discord channel to confirm it arrived."}
                 return {"ok": False, "message": f"Discord returned HTTP {r.status_code}: {r.text[:200]}"}
             except Exception as e:
-                return {"ok": False, "message": f"Request failed: {e}"[:400]}
+                logger.warning("discord connectivity test failed error_type=%s", type(e).__name__)
+                return {"ok": False, "message": f"Request failed ({type(e).__name__})."[:400]}
 
         # All other presets: GET against a known health endpoint.
         # Fall back to detecting from name if preset is missing.

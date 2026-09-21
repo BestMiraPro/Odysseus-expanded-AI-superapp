@@ -9,6 +9,7 @@ These tests exercise the *route handler* directly (via ASGI TestClient)
 and capture the verify= kwarg passed to httpx.AsyncClient, ensuring the
 route code — not a test-side duplicate — builds the SSL context correctly.
 """
+import logging
 import os
 import ssl
 import sys
@@ -192,3 +193,66 @@ def test_route_empty_env_vars_use_system_defaults(client):
     ctx = captured["verify"]
     assert isinstance(ctx, ssl.SSLContext)
     assert not (ctx.verify_flags & ssl.VERIFY_X509_STRICT)
+
+
+# ---------------------------------------------------------------------------
+# S5b: connection failures must never serialize exception text / URLs
+# ---------------------------------------------------------------------------
+
+LEAK = "private-marker /srv/private/auth.json postgresql://u:secret-marker@db/app"
+
+
+def _assert_no_internal_details(text):
+    for marker in ("private-marker", "/srv/private/auth.json", "secret-marker"):
+        assert marker not in text
+
+
+class _BoomAsyncClient:
+    """AsyncClient stand-in whose PROPFIND raises the injected exception."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def request(self, *args, **kwargs):
+        raise self._exc
+
+
+@pytest.mark.parametrize(
+    "exc,expected_error",
+    [
+        (httpx.ConnectError(LEAK), "Could not connect to the CalDAV server"),
+        (RuntimeError(LEAK), "The CalDAV pre-flight check failed"),
+    ],
+)
+def test_route_connection_failure_never_serializes_exception(client, caplog, exc, expected_error):
+    caldav_sync_stub = MagicMock()
+    caldav_sync_stub.validate_caldav_url = lambda u: u
+
+    with patch.object(httpx, "AsyncClient", lambda **kw: _BoomAsyncClient(exc)), \
+         patch.dict(sys.modules, {"src.caldav_sync": caldav_sync_stub}), \
+         patch("routes.calendar_routes._require_user", return_value="test-owner"), \
+         caplog.at_level(logging.WARNING, logger="routes.calendar_routes"):
+        resp = client.post(
+            "/api/calendar/test",
+            json={"url": "https://cal.example.com", "username": "u", "password": "p"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": False, "error": expected_error}
+    _assert_no_internal_details(resp.text)
+    _assert_no_internal_details(caplog.text)
+    assert "error_type=" in caplog.text
+
+
+def test_route_connection_success_still_accepted(client):
+    """A successful pre-flight keeps the exact ok envelope."""
+    captured = {}
+    resp = _post_test(client, captured)
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
