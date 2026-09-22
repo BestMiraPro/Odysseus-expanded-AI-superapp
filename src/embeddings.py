@@ -178,7 +178,21 @@ class FastEmbedClient:
             except Exception as _e:
                 logger.debug("embedding cache symlink-heal skipped: %s", _e)
         kwargs = {"model_name": self.model, "cache_dir": cache_dir}
-        self._embedding = TextEmbedding(**kwargs)
+        # Offline-first. fastembed's default path verifies the cache and, when
+        # that verification fails, retries over the network: model_info() and
+        # list_repo_tree() against huggingface.co before any download. On a
+        # container whose egress to huggingface.co is slow or filtered, those
+        # calls hang for minutes (observed: a single construction stalled
+        # ~303s before falling back to the cached files) — which is how a
+        # restart grew to 7 minutes. A fully cached model needs no network at
+        # all, so try the cache first; only a genuinely missing/incomplete
+        # cache pays for the networked download path.
+        try:
+            self._embedding = TextEmbedding(local_files_only=True, **kwargs)
+        except Exception:
+            logger.info(
+                "FastEmbed cache incomplete for %s — downloading", self.model)
+            self._embedding = TextEmbedding(**kwargs)
         self._dim: Optional[int] = None
         self.url = "local://fastembed"
         logger.info(f"FastEmbed loaded model={self.model}")
@@ -227,6 +241,24 @@ def _load_persisted_endpoint() -> dict:
 
 _http_embed_down = False  # process-level latch: skip re-probing a dead endpoint
 
+# One FastEmbed client per model, per process. Odysseus builds embedding lanes
+# for RAG, memory and the tool index; each construction re-ran fastembed's
+# cache verification (and, on failure, the multi-minute network fallback
+# above). Sharing the client also shares one ONNX session, which is
+# thread-safe for inference.
+_fastembed_clients: dict = {}
+
+
+def get_fastembed_client(model: Optional[str] = None) -> "FastEmbedClient":
+    """Return the process-wide FastEmbed client for ``model`` (built once)."""
+    key = model or os.getenv("FASTEMBED_MODEL", _DEFAULT_FASTEMBED_MODEL)
+    client = _fastembed_clients.get(key)
+    if client is None:
+        client = FastEmbedClient(model=model)
+        client.get_sentence_embedding_dimension()  # health check
+        _fastembed_clients[key] = client
+    return client
+
 
 def reset_http_embed_state():
     """Clear the 'HTTP embedding endpoint is down' latch so the next
@@ -269,8 +301,7 @@ def get_embedding_client():
 
     # Fall back to local fastembed
     try:
-        client = FastEmbedClient()
-        client.get_sentence_embedding_dimension()
+        client = get_fastembed_client()
         logger.info(f"Using local FastEmbed: model={client.model}")
         return client
     except ImportError:

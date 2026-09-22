@@ -112,11 +112,13 @@ def _load_custom_endpoint() -> Dict[str, str]:
 
 
 def _build_fastembed_client():
-    from src.embeddings import FastEmbedClient
+    # Process-wide cache: RAG, memory and the tool index each build lanes, and
+    # each used to construct a fresh ONNX model of the same file (a full
+    # cache-verify +, on a filtered network, a multi-minute download retry per
+    # construction). The factory shares one client per model.
+    from src.embeddings import get_fastembed_client
 
-    client = FastEmbedClient()
-    client.get_sentence_embedding_dimension()
-    return client
+    return get_fastembed_client()
 
 
 def _build_custom_client():
