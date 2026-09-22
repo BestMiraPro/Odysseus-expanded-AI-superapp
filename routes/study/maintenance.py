@@ -417,16 +417,25 @@ def register(router: APIRouter) -> None:
 
     @router.get("/questions/{question_id}/prereqs")
     def question_prereqs(request: Request, question_id: str):
-        """The previous part this question depends on, with its question,
+        """Every earlier part this question depends on, with its question,
         the user's latest answer to it, and the correct answer — for the
-        'Earlier in this problem' context box during practice."""
+        'Earlier in this problem' context box during practice.
+
+        ``prereq_ids`` stores the whole chain (see _link_deck_parts), and the
+        box shows all of it: stopping at the immediately preceding part hid
+        the rest of the problem. Stored order (earliest first) is preserved;
+        self/later-part, duplicate and owner filters still apply."""
         user = _owner(request)
         db = _common.SessionLocal()
         try:
             row = study_service.get_question(db, question_id, user)
             ids = json.loads(row.prereq_ids) if row.prereq_ids else []
             out = []
-            for pid in reversed(ids):
+            seen: set = set()
+            for pid in ids:
+                if pid in seen:
+                    continue
+                seen.add(pid)
                 pq = db.query(StudyQuestion).filter(StudyQuestion.id == pid).first()
                 if not pq or (user is not None and pq.owner != user):
                     continue
@@ -448,7 +457,6 @@ def register(router: APIRouter) -> None:
                     "your_answer": att.answer if att else None,
                     "correct": correct,
                 })
-                break
             return {"prereqs": out}
         finally:
             db.close()
