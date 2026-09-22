@@ -907,6 +907,19 @@ def rating_from_outcome(qtype: str, *, correct: Optional[bool] = None,
 # prompts
 # ---------------------------------------------------------------------------
 
+# Where the maths ends. KaTeX typesets only what sits inside the delimiters, so
+# a formula left bare, or a LaTeX-typeset exam's text markup copied along with
+# its maths (\textbf{true}, \begin{itemize} ... \item), reaches the student as
+# raw source code.
+_MATH_ONLY_RULE = (
+    " Every LaTeX command belongs inside $...$ or $$...$$: a bare \\frac or "
+    "\\bar{x} outside them is shown to the student as source code. LaTeX is for "
+    "mathematics only - format text with Markdown (**bold**, *italic*, \"- \" "
+    "list items), never \\textbf, \\textit, \\emph, \\underline, "
+    "\\begin{itemize}, \\item or \\bullet, even when the source was typeset in "
+    "LaTeX."
+)
+
 # Faithful-formatting guidance. _MATH_JSON_NOTE for prompts whose reply is JSON
 # (the math lives in string-field values, so backslashes must be doubled);
 # _MATH_TEXT_NOTE for prompts that reply in plain Markdown.
@@ -914,14 +927,14 @@ _MATH_JSON_NOTE = (
     "\n- Faithful formatting: keep the source's structure and notation (bold, "
     "lists, sub/superscripts, fractions, vectors, matrices, tables) — don't "
     "flatten to plain text. Write ALL mathematics as LaTeX: $...$ inline, "
-    "$$...$$ display. Because the field values are inside JSON strings, every "
-    "backslash MUST be doubled — write \\\\frac, \\\\int, \\\\sqrt, \\\\alpha "
-    "(not \\frac)."
+    "$$...$$ display." + _MATH_ONLY_RULE + " Because the field values are "
+    "inside JSON strings, every backslash MUST be doubled — write \\\\frac, "
+    "\\\\int, \\\\sqrt, \\\\alpha (not \\frac)."
 )
 _MATH_TEXT_NOTE = (
     "\n\nFormatting: reply in Markdown, preserving the source's structure "
     "(bold, lists, sub/superscripts, tables). Write all mathematics as LaTeX: "
-    "$...$ inline, $$...$$ display."
+    "$...$ inline, $$...$$ display." + _MATH_ONLY_RULE
 )
 
 # Appended to the two post-answer explanation prompts (tutor + explain-further).
@@ -1260,6 +1273,8 @@ Rules:
 
 Output ONLY the JSON array. No markdown fences or commentary around it."""
 
+TRANSCRIBE_SYSTEM += "\n\nFormatting:" + _MATH_ONLY_RULE
+REFORMAT_SYSTEM += "\n\nFormatting:" + _MATH_ONLY_RULE
 HINT_SYSTEM += _MATH_TEXT_NOTE
 ASK_COACH_SYSTEM += _MATH_TEXT_NOTE
 ASK_ELABORATE_SYSTEM += _MATH_TEXT_NOTE
