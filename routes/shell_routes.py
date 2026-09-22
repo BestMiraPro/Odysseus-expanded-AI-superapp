@@ -598,7 +598,8 @@ async def _exec_shell(command: str, timeout: int = EXEC_TIMEOUT) -> Dict[str, An
             "exit_code": -1,
         }
     except Exception as e:
-        return {"stdout": "", "stderr": str(e), "exit_code": -1}
+        logger.warning("shell_exec_failed error_type=%s", type(e).__name__)
+        return {"stdout": "", "stderr": "The command could not run.", "exit_code": -1}
 
 
 async def _generate_pty(cmd: str, timeout: int, request: Request):
@@ -717,7 +718,8 @@ async def _generate_pty(cmd: str, timeout: int, request: Request):
             await proc.wait()
         except ProcessLookupError:
             pass
-        yield f"data: {json.dumps({'stream': 'stderr', 'data': str(e)})}\n\n"
+        logger.warning("shell_pty_failed error_type=%s", type(e).__name__)
+        yield f"data: {json.dumps({'stream': 'stderr', 'data': 'The command could not run.'})}\n\n"
         yield f"data: {json.dumps({'exit_code': -1})}\n\n"
     finally:
         wait_task.cancel()
@@ -816,7 +818,7 @@ async def _generate_tmux(cmd: str, request: Request):
                         yield f"data: {json.dumps({'stream': 'stdout', 'data': line})}\n\n"
                 lines_sent = len(lines)
         except Exception as e:
-            logger.debug(f"tmux log read error: {e}")
+            logger.debug("tmux log read error: %s", type(e).__name__)
 
         if exit_code is not None:
             break
@@ -922,7 +924,7 @@ async def _generate_win_detached(cmd: str, request: Request):
                     yield f"data: {json.dumps({'stream': 'stdout', 'data': line})}\n\n"
                 lines_sent = len(lines)
         except Exception as e:
-            logger.debug("win detached log read error: %s", e)
+            logger.debug("win detached log read error: %s", type(e).__name__)
 
         if exit_path.exists():
             # Drain any final lines, then read the recorded exit code.
@@ -1101,7 +1103,9 @@ def setup_shell_routes() -> APIRouter:
                 yield f"data: {json.dumps({'stream': 'stderr', 'data': f'Command timed out after {timeout}s'})}\n\n"
                 yield f"data: {json.dumps({'exit_code': -1})}\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'stream': 'stderr', 'data': str(e)})}\n\n"
+                logger.warning("shell_stream_failed error_type=%s",
+                               type(e).__name__)
+                yield f"data: {json.dumps({'stream': 'stderr', 'data': 'The command could not run.'})}\n\n"
                 yield f"data: {json.dumps({'exit_code': -1})}\n\n"
             finally:
                 for t in reader_tasks:

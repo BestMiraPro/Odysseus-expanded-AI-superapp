@@ -555,3 +555,79 @@ class TestRejectCrossSite:
 
     def test_missing_header_allowed(self):
         assert _reject_cross_site(self._req({})) is None
+
+class TestShellFailureSerialization:
+    """Security plan S5 (§shell #130–132): process-spawn/read failures must
+    surface a fixed literal — never the raw exception text, which can carry
+    filesystem paths or command fragments. Success chunks are the owner'"'"'s
+    own command output: an intentional product contract, verified intact."""
+
+    LEAK = ("private-marker /srv/private/auth.json "
+            "postgresql://u:secret-marker@db/app")
+
+    @staticmethod
+    def _markers_absent(text):
+        for marker in ("private-marker", "/srv/private/auth.json",
+                       "secret-marker"):
+            assert marker not in text
+
+    async def test_exec_shell_failure_is_a_fixed_literal(self, monkeypatch,
+                                                         caplog):
+        import routes.shell_routes as shell_routes
+
+        async def _boom(*_a, **_k):
+            raise RuntimeError(self.LEAK)
+
+        monkeypatch.setattr(shell_routes, "_create_shell", _boom)
+        with caplog.at_level("WARNING", logger="routes.shell_routes"):
+            result = await shell_routes._exec_shell("echo hi", timeout=5)
+        assert result == {"stdout": "",
+                          "stderr": "The command could not run.",
+                          "exit_code": -1}
+        self._markers_absent(json.dumps(result))
+        self._markers_absent(caplog.text)
+
+    async def test_exec_shell_success_streams_owner_command_output(self):
+        import routes.shell_routes as shell_routes
+
+        result = await shell_routes._exec_shell("echo hi", timeout=10)
+        assert result["exit_code"] == 0
+        assert "hi" in result["stdout"]
+
+    def test_stream_route_failure_is_a_fixed_literal(self, monkeypatch):
+        """The /api/shell/stream pipe path (#130–132 sink family): injection
+        at process creation surfaces the same fixed literal over SSE."""
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        import routes.shell_routes as shell_routes
+
+        async def _boom(*_a, **_k):
+            raise RuntimeError(self.LEAK)
+
+        monkeypatch.setattr(shell_routes, "_create_shell", _boom)
+        app = FastAPI()
+        app.include_router(shell_routes.setup_shell_routes())
+        client = TestClient(app)
+        resp = client.post("/api/shell/stream",
+                           json={"command": "echo hi"})
+        assert resp.status_code == 200
+        body = resp.text
+        self._markers_absent(body)
+        assert "The command could not run." in body
+        assert '"exit_code": -1' in body
+
+    def test_stream_route_success_passthrough_unchanged(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        import routes.shell_routes as shell_routes
+
+        app = FastAPI()
+        app.include_router(shell_routes.setup_shell_routes())
+        client = TestClient(app)
+        resp = client.post("/api/shell/stream",
+                           json={"command": "echo hi"})
+        assert resp.status_code == 200
+        assert "hi" in resp.text
+        assert '"exit_code": 0' in resp.text
