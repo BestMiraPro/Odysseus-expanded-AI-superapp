@@ -7,7 +7,7 @@
 # design, already guarded, or structurally misread, and each names the evidence
 # so a reviewer can check the claim rather than take it on trust.
 #
-# Nothing else is filtered; no `paths-ignore` narrowing exists anywhere in this
+# Nothing else is filtered; no path-based narrowing exists anywhere in this
 # file. The exclusion list is reviewed (not expanded) as part of the security
 # remediation plan; a comparison scan workflow WITHOUT exclusions is provided in
 # `.github/workflows/codeql-comparison.yml` so any batch re-enablement is
