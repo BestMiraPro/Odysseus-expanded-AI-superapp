@@ -70,8 +70,10 @@ function addCloseBtn(panel) { closeCount += 1; }
 
 
 def _run(epilogue: str) -> dict:
-    return run_js(PRELUDE, "runHTML", epilogue=epilogue,
-                  source_path=CODE_RUNNER_JS)
+    # runHTML delegates its frame construction to buildIsolatedPreviewFrame,
+    # so the harness must lift both functions.
+    return run_js(PRELUDE, "buildIsolatedPreviewFrame", "runHTML",
+                  epilogue=epilogue, source_path=CODE_RUNNER_JS)
 
 
 _HAPPY = r"""
