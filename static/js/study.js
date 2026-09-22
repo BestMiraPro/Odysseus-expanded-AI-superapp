@@ -508,6 +508,9 @@ function injectStyles() {
 .study-search-hit:hover { background: rgba(128,128,128,0.10); }
 .study-search-hit:focus-visible { outline: 2px solid var(--accent, currentColor);
   outline-offset: -2px; }
+.study-search-excerpt { display: -webkit-box; -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.study-search-excerpt p, .study-search-excerpt ul, .study-search-excerpt ol { margin: 0; }
 .study-highlight { animation: study-flash 1.6s ease-out 1; }
 @keyframes study-flash {
   from { background: rgba(255, 214, 0, 0.35); }
@@ -1351,7 +1354,7 @@ function renderHistoryEntry(e) {
     const ok = e.rating >= 3;
     return `<div class="study-histrow ${ok ? 'ok' : 'bad'}">
       <span class="study-qchip">card</span>
-      <div class="grow">${esc(e.title)}</div>
+      <div class="grow study-md">${_mdInline(e.title)}</div>
       <span class="study-state">${label} · ${time}</span>
     </div>`;
   }
@@ -1363,9 +1366,9 @@ function renderHistoryEntry(e) {
   return `<div class="study-histrow ${ok ? 'ok' : 'bad'}">
     <span class="study-qchip ${e.qtype || ''}">${esc(e.qtype || 'q')}</span>
     <div class="grow">
-      <div>${esc(e.title)}</div>
-      ${e.answer ? `<div class="study-subtle" style="margin-top:2px;">Your answer: ${esc(e.answer)}</div>` : ''}
-      ${e.feedback ? `<div class="study-subtle" style="margin-top:2px;">Feedback: ${esc(e.feedback)}</div>` : ''}
+      <div class="study-md">${_mdInline(e.title)}</div>
+      ${e.answer ? `<div class="study-subtle study-md" style="margin-top:2px;">Your answer: ${_mdInline(e.answer)}</div>` : ''}
+      ${e.feedback ? `<div class="study-subtle study-md" style="margin-top:2px;">Feedback: ${_mdInline(e.feedback)}</div>` : ''}
     </div>
     <span class="study-state">${outcome}${conf} · ${time}</span>
   </div>`;
@@ -1621,10 +1624,12 @@ function searchResultRow(kind, id, deckId, text, typeLabel) {
   const subject = subjectNameFor(deckId);
   const excerpt = String(text || '').slice(0, kind === 'question' ? 100 : 80);
   const label = `Open ${kind} in ${subject}: ${excerpt}`;
+  // The visible text is typeset whole and clamped by CSS: a character slice
+  // can cut a formula in half, and an unclosed one shows as its TeX source.
   return `<button type="button" class="study-row study-search-hit"
     data-result-kind="${esc(kind)}" data-result-id="${esc(id)}"
     data-deck-id="${esc(deckId || '')}" aria-label="${esc(label)}"
-    ><span class="grow">${esc(excerpt)}</span
+    ><span class="grow study-md study-search-excerpt">${_mdInline(text)}</span
     ><span class="study-subtle">${esc(subject)} · ${esc(typeLabel)}</span></button>`;
 }
 
@@ -2305,6 +2310,10 @@ function renderQuestionList() {
            <button class="study-btn small" id="study-q-more">Show more (${shown.length} of ${rows.length})</button>
          </div>`
       : '');
+  // A row cached before KaTeX finished loading holds its formulas as pending
+  // placeholders, and a cache hit never re-runs mdToHtml to schedule them — so
+  // typeset here, on every render. A no-op when nothing is pending.
+  _enrichRendered(wrap);
   wrap.onclick = async (e) => {
     if (e.target.closest('#study-q-more')) { s.qLimit = (s.qLimit || 40) + 40; renderQuestionList(); return; }
     const su = e.target.closest('[data-qsusp]')?.dataset.qsusp;
@@ -3489,7 +3498,7 @@ function renderPracticeSummary() {
       ${sureWrong.length ? `
         <div style="text-align:left;max-width:560px;margin:18px auto 0;">
           <div class="study-section-title">Calibration alarms — sure but wrong</div>
-          ${sureWrong.map(l => `<div class="study-row"><span class="grow" style="font-size:12px;">${esc(l.q.question)}</span></div>`).join('')}
+          ${sureWrong.map(l => `<div class="study-row"><span class="grow study-md" style="font-size:12px;">${_mdInline(l.q.question)}</span></div>`).join('')}
           <div class="study-subtle" style="margin-top:6px;">These are the highest-value misses you have: confident, wrong, and now scheduled for early re-test.</div>
         </div>` : ''}
       ${weakTopics.length ? `<div class="study-subtle" style="margin-top:14px;">Weak topics this session: <b>${weakTopics.map(esc).join(', ')}</b></div>` : ''}

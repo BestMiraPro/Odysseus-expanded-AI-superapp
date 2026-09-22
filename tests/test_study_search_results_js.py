@@ -11,6 +11,8 @@ answering it.
 
 from __future__ import annotations
 
+import json
+
 from tests._study_js_harness import needs_node, run_js
 
 pytestmark = needs_node
@@ -28,6 +30,8 @@ const S = { subject: null, decks: [{ id: 'd1', name: 'Biology' }, { id: 'd2', na
 const writes = [];
 function esc(s) { return String(s).replace(/[&<>"]/g, c => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+// Stands in for study.js's markdown+KaTeX renderer; <md> marks what went through it.
+function _mdInline(s) { return '<md>' + esc(s) + '</md>'; }
 const resEl = { set innerHTML(v) { writes.push(v); }, get innerHTML() { return ''; } };
 const el = { querySelector: () => resEl };
 
@@ -104,6 +108,21 @@ def test_the_excerpt_is_still_shown():
     html = _search_html()
     assert "What is ATP?" in html
     assert "Avogadro number" in html
+
+
+def test_the_excerpt_is_typeset_whole():
+    """A formula reached the reader as source: the excerpt was escaped text,
+    and slicing it at 100 characters could also cut a formula in half. It now
+    goes through the renderer whole and CSS clamps it to two lines."""
+    question = "x" * 95 + r" \(q= 3\sqrt{l}\) and the rest"
+    out = _run(f"""
+setPlan({{ x: {{ body: {{ questions: [
+  {{ id: 'q1', deck_id: 'd1', question: {json.dumps(question)}, qtype: 'open' }},
+], cards: [] }} }} }});
+await runGlobalSearch(el, 'x');
+console.log(JSON.stringify({{ html: writes[writes.length - 1] }}));
+""")
+    assert f"<md>{question}</md>" in out["html"]
 
 
 # --------------------------------------------------------------------------

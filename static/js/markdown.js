@@ -216,14 +216,37 @@ function _isDangerousSrcset(value) {
   return String(value || '').split(',').some(candidate => _isDangerousUrl(candidate));
 }
 
-function _cleanAllowedHtmlOnce(htmlString) {
+// KaTeX draws a few glyphs as inline SVG rather than font characters: the
+// radical of \sqrt, the arrows of \vec and \xrightarrow, \widehat, braces and
+// \cancel strokes. Dropping every <svg> root is right for model-written HTML,
+// but in typeset maths it erased those glyphs ("q = 3\sqrt{l}" read "q = 3 l").
+// KaTeX's SVG is a small fixed vocabulary, so KaTeX output may keep exactly
+// that: an <svg> holding only <path>/<line> geometry. Anything else inside it
+// (script, use, image, foreignObject, animation, any href or handler) still
+// drops the whole root.
+const _KATEX_SVG_CHILD_TAGS = new Set(['PATH', 'LINE']);
+const _KATEX_SVG_ATTRS = new Set([
+  'xmlns', 'width', 'height', 'viewbox', 'preserveaspectratio', 'style',
+  'd', 'x1', 'y1', 'x2', 'y2', 'stroke-width',
+]);
+
+function _isKatexSvg(el) {
+  const geometryOnly = (node) => Array.from(node.attributes)
+    .every((attr) => _KATEX_SVG_ATTRS.has(attr.name.toLowerCase()));
+  return el.tagName.toUpperCase() === 'SVG' && geometryOnly(el)
+    && Array.from(el.querySelectorAll('*')).every(
+      (child) => _KATEX_SVG_CHILD_TAGS.has(child.tagName.toUpperCase()) && geometryOnly(child));
+}
+
+function _cleanAllowedHtmlOnce(htmlString, allowKatexSvg = false) {
   const tpl = document.createElement('template');
   tpl.innerHTML = htmlString;
   for (const el of Array.from(tpl.content.querySelectorAll('*'))) {
     // Upper-case the tag for comparison: HTML tagNames are upper-case, but
     // SVG/MathML elements preserve their original (lower/camel) case, so a
     // raw `Set.has(el.tagName)` would miss e.g. a namespaced <script>.
-    if (_ALLOWED_HTML_BAD_TAGS.has(el.tagName.toUpperCase())) {
+    if (_ALLOWED_HTML_BAD_TAGS.has(el.tagName.toUpperCase())
+        && !(allowKatexSvg && _isKatexSvg(el))) {
       el.remove();
       continue;
     }
@@ -255,6 +278,15 @@ function _cleanAllowedHtmlOnce(htmlString) {
 }
 
 export function sanitizeAllowedHtml(html) {
+  return _sanitizeHtml(html, false);
+}
+
+// KaTeX output: the same scrub, keeping KaTeX's glyph SVG (see _isKatexSvg).
+function sanitizeKatexHtml(html) {
+  return _sanitizeHtml(html, true);
+}
+
+function _sanitizeHtml(html, allowKatexSvg) {
   const raw = String(html == null ? '' : html);
   // Non-browser context (e.g. a future SSR/Node import): fail closed by
   // escaping rather than trusting the markup.
@@ -268,7 +300,7 @@ export function sanitizeAllowedHtml(html) {
   // closed by escaping instead of trusting the last mutated output.
   let out = raw;
   for (let i = 0; i < 4; i++) {
-    const next = _cleanAllowedHtmlOnce(out);
+    const next = _cleanAllowedHtmlOnce(out, allowKatexSvg);
     if (next === out) return out;
     out = next;
   }
@@ -277,7 +309,7 @@ export function sanitizeAllowedHtml(html) {
 
 function renderSafeKatex(raw, displayMode) {
   const html = katex.renderToString(raw.trim(), { displayMode, throwOnError: false });
-  return sanitizeAllowedHtml(html);
+  return sanitizeKatexHtml(html);
 }
 
 /**
@@ -987,11 +1019,10 @@ export function renderMath(container) {
         try {
           // Sanitise here too: this path writes straight into outerHTML, so
           // rendering unsanitised KaTeX output would reintroduce the injection
-          // the sanitiser exists to stop.
-          // Sanitise here too — this writes straight into outerHTML. Uses the
-          // katex resolved by ensureKatex() rather than renderSafeKatex, which
-          // reads the module-global and is not bound on this path.
-          el.outerHTML = sanitizeAllowedHtml(
+          // the sanitiser exists to stop. Uses the katex resolved by
+          // ensureKatex() rather than renderSafeKatex, which reads the
+          // module-global and is not bound on this path.
+          el.outerHTML = sanitizeKatexHtml(
             katex.renderToString(el.textContent || '', { displayMode, throwOnError: false }));
         } catch (e) {
           // Leave the source visible — readable, just not typeset.

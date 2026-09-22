@@ -69,6 +69,13 @@ function parse(html) {
       tag, tagName: tag, attrs, attributes: attrs, children: [], removed: false,
       remove() { this.removed = true; },
       removeAttribute(name) { const a = this.attrs.find((x) => x.name === name); if (a) a.dropped = true; },
+      // Descendant elements, for querySelectorAll('*') only.
+      querySelectorAll() {
+        const out = [];
+        const walk = (nodes) => { for (const n of nodes) if (n.tag && !n.removed) { out.push(n); walk(n.children); } };
+        walk(this.children);
+        return out;
+      },
     };
     stack[stack.length - 1].children.push(el);
     if (!selfClosing && !VOID.test(tag)) stack.push(el);
@@ -132,7 +139,7 @@ return { stable: templateDoc(false), unstable: templateDoc(true) };
 
 
 def _run_markdown_case(markdown: str, render_expr: str = "mod.mdToHtml(input)", with_katex: bool = False,
-                       dom_stub: str = ""):
+                       dom_stub: str = "", real_katex: bool = False):
     if not dom_stub:
         dom_stub = _PASS_THROUGH_DOM
     script = textwrap.dedent(
@@ -151,6 +158,14 @@ def _run_markdown_case(markdown: str, render_expr: str = "mod.mdToHtml(input)", 
           };
           globalThis.window.katex = katexStub;
           globalThis.katex = katexStub;
+        }
+        if (__REAL_KATEX__) {
+          // The vendored KaTeX itself, for tests about the markup it really
+          // emits (its <svg> glyphs) rather than what reaches it.
+          const { createRequire } = await import('node:module');
+          const realKatex = createRequire(process.cwd() + '/')('./static/lib/katex/katex.min.js');
+          globalThis.window.katex = realKatex;
+          globalThis.katex = realKatex;
         }
         globalThis.document = __DOCUMENT_STUB__;
         globalThis.MutationObserver = class { observe() {} };
@@ -195,6 +210,8 @@ def _run_markdown_case(markdown: str, render_expr: str = "mod.mdToHtml(input)", 
         """
     ).replace("__RENDER_EXPR__", render_expr).replace(
         "__WITH_KATEX__", "true" if with_katex else "false"
+    ).replace(
+        "__REAL_KATEX__", "true" if real_katex else "false"
     ).replace("__DOCUMENT_STUB__", dom_stub)
     result = subprocess.run(
         ["node", "--input-type=module", "-e", script, json.dumps(markdown)],
@@ -460,6 +477,59 @@ def test_sanitizer_four_pass_bound_fails_closed(node_available):
 
     assert "<a" not in html
     assert "&lt;a href=&quot;https://ok.example&quot;&gt;x&lt;/a&gt;&lt;br&gt;" == html
+
+
+# ---------------------------------------------------------------------------
+# KaTeX glyph SVG: KaTeX draws a few glyphs as inline <svg> rather than font
+# characters. Sanitising its output must keep them without reopening the SVG
+# door the sanitizer shuts for every other fragment.
+# ---------------------------------------------------------------------------
+
+
+def test_katex_svg_glyphs_survive_sanitising(node_available):
+    # The radical of \sqrt and the arrow of \vec are <svg><path>. Dropping them
+    # rendered "q = 3\sqrt{l}" as "q = 3 l", a gap where the root sign was.
+    html = _run_markdown_case(
+        r"\(q= 3\sqrt{l}\) and \(\vec{v}\)", real_katex=True, dom_stub=_S6_SANITIZER_STABLE
+    )
+
+    assert html.count("<svg") == 2
+    assert "<path d=" in html
+    assert "<math" not in html  # the MathML copy is still dropped
+
+
+def test_katex_svg_allowance_admits_only_katex_shaped_svg(node_available):
+    # The stub hands the TeX source back as KaTeX output, so each formula below
+    # arrives at the sanitizer as the SVG written in it. Only the first is the
+    # shape KaTeX emits: <svg> holding <path>/<line> geometry and nothing else.
+    formulas = [
+        '<svg viewBox="0 0 1 1"><path d="M0,0L1,1"></path></svg>',
+        "<svg><script>alert(1)</script></svg>",
+        '<svg onload="alert(2)"><path d="M0"></path></svg>',
+        '<svg><path d="M0" onclick="alert(3)"></path></svg>',
+        '<svg><use href="#x"></use></svg>',
+        "<svg><foreignObject><p>smuggled</p></foreignObject></svg>",
+    ]
+    html = _run_markdown_case(
+        "\n\n".join(f"${f}$" for f in formulas), with_katex=True, dom_stub=_S6_SANITIZER_STABLE
+    )
+
+    assert html.count("<svg") == 1
+    assert '<svg viewBox="0 0 1 1"><path d="M0,0L1,1"></path></svg>' in html
+    for banned in ("alert", "onload", "onclick", "<use", "foreignObject", "smuggled", "<script"):
+        assert banned not in html, banned
+
+
+def test_katex_svg_allowance_does_not_reach_other_fragments(node_available):
+    # Model-written raw HTML goes through sanitizeAllowedHtml, which still drops
+    # SVG outright - even the exact shape KaTeX output may keep.
+    html = _run_markdown_case(
+        '<svg viewBox="0 0 1 1"><path d="M0,0L1,1"></path></svg><b>x</b>',
+        "mod.sanitizeAllowedHtml(input)", dom_stub=_S6_SANITIZER_STABLE,
+    )
+
+    assert "<svg" not in html
+    assert "<b>x</b>" in html
 
 
 # ---------------------------------------------------------------------------

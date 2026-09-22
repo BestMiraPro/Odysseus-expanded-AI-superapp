@@ -105,6 +105,7 @@ let _lastSearchQuery = '';
 const S = { subject: null, decks: [] };
 const writes = [];
 function esc(s) { return String(s); }
+function _mdInline(s) { return esc(s); }
 const resEl = { set innerHTML(v) { writes.push(v); }, get innerHTML() { return ''; } };
 const el = { querySelector: () => resEl };
 
