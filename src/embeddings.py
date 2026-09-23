@@ -129,6 +129,44 @@ class EmbeddingClient:
         return [emb["embedding"] for emb in embeddings]
 
 
+def _normalize_cache_metadata(cache_dir: str) -> None:
+    r"""Make a cache written on the other OS verifiable here.
+
+    fastembed records each cached file in ``files_metadata.json`` keyed by its
+    path relative to the model directory, using the separator of the OS that
+    wrote it. The cache lives under ``data/``, which is shared between a native
+    Windows run and the Linux container, so a cache written by one keys
+    ``snapshots\<rev>\model.onnx`` while the other looks for
+    ``snapshots/<rev>/model.onnx``. The lookup then fails for every file and
+    each start logs "Local file sizes do not match the metadata" as though the
+    model were being re-downloaded — and the check that exists to spot a truly
+    corrupt cache never gets to do its job.
+
+    Rewrite the keys with forward slashes, which ``Path`` accepts on both. Only
+    the separator changes; sizes and blob ids are untouched. Best-effort: a
+    cache we cannot read is left for fastembed to deal with.
+    """
+    import glob
+    import json
+
+    try:
+        for meta_path in glob.glob(os.path.join(cache_dir, "models--*", "files_metadata.json")):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    meta = json.load(fh)
+                if not isinstance(meta, dict) or not any("\\" in k for k in meta):
+                    continue
+                fixed = {k.replace("\\", "/"): v for k, v in meta.items()}
+                with open(meta_path, "w", encoding="utf-8") as fh:
+                    json.dump(fixed, fh)
+                logger.info(
+                    "Rewrote %s with portable paths (was written on another OS)", meta_path)
+            except (OSError, ValueError) as e:
+                logger.debug("embedding cache metadata left as-is (%s): %s", meta_path, e)
+    except Exception as e:  # never let a cache quirk stop startup
+        logger.debug("embedding cache metadata normalization skipped: %s", e)
+
+
 class FastEmbedClient:
     """Local embedding client using fastembed (ONNX). No external service needed."""
 
@@ -177,6 +215,9 @@ class FastEmbedClient:
                             shutil.rmtree(_root, ignore_errors=True)
             except Exception as _e:
                 logger.debug("embedding cache symlink-heal skipped: %s", _e)
+        # Before fastembed verifies the cache, make a cache written by the
+        # other OS verifiable (see _normalize_cache_metadata).
+        _normalize_cache_metadata(cache_dir)
         kwargs = {"model_name": self.model, "cache_dir": cache_dir}
         # Offline-first. fastembed's default path verifies the cache and, when
         # that verification fails, retries over the network: model_info() and

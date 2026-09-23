@@ -14,6 +14,7 @@ multi-minute startup stall:
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -78,3 +79,68 @@ def test_client_is_built_once_per_model():
     other = embeddings.get_fastembed_client("BAAI/bge-small-en-v1.5")
     assert other is not first
     assert len(FakeTextEmbedding.constructions) == 2
+
+
+# ---------------------------------------------------------------------------
+# Cache metadata written on the other OS
+# ---------------------------------------------------------------------------
+
+WINDOWS_KEYS = {
+    r"snapshots\5f1b8cd7\model.onnx": {"size": 90387630, "blob_id": "bbd7b466"},
+    r"snapshots\5f1b8cd7\config.json": {"size": 650, "blob_id": "56c8c186"},
+}
+
+
+def _metadata_file(tmp_path, payload):
+    model_dir = tmp_path / "models--qdrant--all-MiniLM-L6-v2-onnx"
+    model_dir.mkdir()
+    path = model_dir / "files_metadata.json"
+    path.write_text(payload, encoding="utf-8")
+    return path
+
+
+def test_metadata_written_on_windows_is_normalized(tmp_path):
+    """fastembed keys each cached file by its path relative to the model dir,
+    with the separator of the OS that wrote it. A cache written by a Windows
+    run keys "snapshots\\<rev>\\model.onnx", which the Linux container cannot
+    find, so verification fails and every start logs "Local file sizes do not
+    match the metadata" as though the model were being re-downloaded."""
+    path = _metadata_file(tmp_path, json.dumps(WINDOWS_KEYS))
+
+    embeddings._normalize_cache_metadata(str(tmp_path))
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "snapshots/5f1b8cd7/model.onnx": {"size": 90387630, "blob_id": "bbd7b466"},
+        "snapshots/5f1b8cd7/config.json": {"size": 650, "blob_id": "56c8c186"},
+    }, "sizes and blob ids must survive; only the separator changes"
+
+
+def test_normalizing_rewrites_nothing_when_already_portable(tmp_path):
+    payload = json.dumps({"snapshots/5f1b8cd7/model.onnx": {"size": 1, "blob_id": "a"}})
+    path = _metadata_file(tmp_path, payload)
+    before = path.stat().st_mtime_ns
+
+    embeddings._normalize_cache_metadata(str(tmp_path))
+
+    assert path.read_text(encoding="utf-8") == payload
+    assert path.stat().st_mtime_ns == before, "an untouched cache must not be rewritten"
+
+
+def test_building_the_client_repairs_the_cache_it_is_about_to_verify(tmp_path, monkeypatch):
+    path = _metadata_file(tmp_path, json.dumps(WINDOWS_KEYS))
+    monkeypatch.setattr(embeddings, "FASTEMBED_CACHE_DIR", str(tmp_path))
+
+    embeddings.FastEmbedClient()
+
+    assert all("\\" not in k for k in json.loads(path.read_text(encoding="utf-8"))), (
+        "the repair must run before fastembed verifies the cache, or the first "
+        "start after a Windows run still logs the bogus mismatch"
+    )
+
+
+def test_unreadable_metadata_never_breaks_startup(tmp_path):
+    path = _metadata_file(tmp_path, "{not json")
+
+    embeddings._normalize_cache_metadata(str(tmp_path))  # must not raise
+
+    assert path.read_text(encoding="utf-8") == "{not json"
