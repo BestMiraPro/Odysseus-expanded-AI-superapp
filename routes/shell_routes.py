@@ -606,8 +606,6 @@ async def _generate_pty(cmd: str, timeout: int, request: Request):
     """Run command in a pseudo-TTY so tqdm/progress bars work natively."""
     if not PTY_SUPPORTED:
         msg = "PTY streaming is not supported on this platform"
-        if _PTY_IMPORT_ERROR:
-            msg += f": {_PTY_IMPORT_ERROR}"
         yield f"data: {json.dumps({'stream': 'stderr', 'data': msg, 'error': PTY_UNSUPPORTED_ERROR})}\n\n"
         yield f"data: {json.dumps({'exit_code': -1, 'error': PTY_UNSUPPORTED_ERROR})}\n\n"
         return
@@ -903,7 +901,8 @@ async def _generate_win_detached(cmd: str, request: Request):
             **detached_popen_kwargs(),
         )
     except Exception as e:
-        yield f"data: {json.dumps({'stream': 'stderr', 'data': f'Failed to launch background job: {e}'})}\n\n"
+        logger.warning("Background job launch failed error_type=%s", type(e).__name__)
+        yield f"data: {json.dumps({'stream': 'stderr', 'data': 'Failed to launch background job'})}\n\n"
         yield f"data: {json.dumps({'exit_code': -1})}\n\n"
         return
 

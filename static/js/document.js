@@ -2460,19 +2460,17 @@ import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
     // HTML→text is a conversion, not a sanitizer: run it against the parts of
     // the markup that can actually render text. Parse into a <template> —
     // inert, so assigning innerHTML neither runs scripts nor fetches
-    // resources (the old detached-div innerHTML parse was flagged for exactly
-    // that surface) — then drop the resource/script-capable nodes before
-    // extracting text. A <template>'s content is a DocumentFragment with no
-    // innerText, so the stripped nodes move into a detached div for reading;
-    // detached nodes never load resources either.
+    // resources — then drop non-text nodes before extracting text. Keep the
+    // nodes in the inert fragment: adopting images into the active document,
+    // even through a detached div, can fetch their URLs.
     const tpl = document.createElement('template');
     tpl.innerHTML = String(html || '');
     for (const el of Array.from(tpl.content.querySelectorAll('script,style,iframe,object,embed'))) {
       el.remove();
     }
-    const probe = document.createElement('div');
-    probe.appendChild(tpl.content);
-    return probe.innerText || probe.textContent || '';
+    for (const el of tpl.content.querySelectorAll('br')) el.replaceWith('\n');
+    for (const el of tpl.content.querySelectorAll('p,div,li,blockquote,tr')) el.append('\n');
+    return tpl.content.textContent || '';
   }
 
   function _emailQuoteMarkerMatch(text) {

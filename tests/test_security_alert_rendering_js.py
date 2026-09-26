@@ -248,8 +248,6 @@ function fragmentText(nodes) {
   for (const n of nodes) {
     if (n.removed) continue;
     if (n.text !== undefined) { out += entityDecode(n.text); continue; }
-    if (n.tag && n.tag.toLowerCase() === 'br') { out += '\\n'; continue; }
-    if (n.tag && BLOCK.test(n.tag)) { out += fragmentText(n.children) + '\\n'; continue; }
     out += fragmentText(n.children);
   }
   return out;
@@ -272,6 +270,8 @@ function parse(html) {
     const el = {
       tag, children: [], removed: false, parent: stack[stack.length - 1],
       remove() { this.removed = true; },
+      replaceWith(text) { this.text = text; this.children = []; },
+      append(text) { this.children.push({text}); },
     };
     stack[stack.length - 1].children.push(el);
     if (!/^(br|img|hr|input|meta|link|col|embed|source|track|wbr)$/i.test(tag)) stack.push(el);
@@ -285,6 +285,7 @@ const document = {
         set innerHTML(v) { this._root = parse(v); },
         content: {
           _tpl: null,
+          get textContent() { return fragmentText(this._tpl._root.children); },
           querySelectorAll(sel) {
             const names = sel.split(',').map((s) => s.trim().toLowerCase());
             const out = [];
@@ -325,7 +326,7 @@ def test_email_html_to_plain_text_drops_payload_nodes_before_extraction():
     body = _extract_function("_emailHtmlToPlainText", _DOCUMENT_JS)
     assert "createElement('template')" in body
     assert "querySelectorAll('script,style,iframe,object,embed')" in body
-    assert "probe.appendChild(tpl.content)" in body
+    assert "createElement('div')" not in body
 
     script = (
         _EMAIL_TEXT_DOM

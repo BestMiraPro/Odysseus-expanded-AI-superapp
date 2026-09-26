@@ -221,7 +221,7 @@ def _friendly_email_auth_error(protocol: str, host: str, error: object) -> str:
             "does not support Microsoft OAuth/Graph mail yet, so Outlook "
             "accounts cannot be added with this password form."
         )
-    return raw[:200]
+    return "Mail authentication or connection failed. Check the account settings."
 
 
 def _strip_think(text: str) -> str:

@@ -1018,8 +1018,8 @@ def setup_calendar_routes(upload_handler=None) -> APIRouter:
         from src.caldav_sync import validate_caldav_url
         try:
             url = validate_caldav_url(url)
-        except ValueError as e:
-            return {"ok": False, "error": str(e)}
+        except ValueError:
+            return {"ok": False, "error": "Invalid CalDAV URL"}
         import httpx
         propfind_body = (
             '<?xml version="1.0" encoding="UTF-8"?>\n'

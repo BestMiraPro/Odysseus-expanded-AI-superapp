@@ -2274,9 +2274,8 @@ def setup_email_routes():
             return {"emails": [], "total": 0, "folder": folder, "offset": offset}
         except Exception as e:
             conn_ok = False
-            logger.error(f"Failed to list emails: {e}")
-            detail = str(e).strip()
-            return {"emails": [], "total": 0, "error": f"Mail operation failed: {detail[:180]}" if detail else "Mail operation failed"}
+            logger.error("Failed to list emails error_type=%s", type(e).__name__)
+            return {"emails": [], "total": 0, "error": "Mail operation failed"}
         finally:
             if conn:
                 _pooled_release(account_id, conn, ok=conn_ok, owner=owner)
@@ -2687,7 +2686,7 @@ def setup_email_routes():
             }
         except ValueError as e:
             logger.warning("unsubscribe execute failed error_type=%s uid=%s", type(e).__name__, uid)
-            return {"success": False, "error": str(e)}
+            return {"success": False, "error": "Mail operation failed"}
         except Exception as e:
             logger.error("unsubscribe execute failed error_type=%s uid=%s", type(e).__name__, uid)
             return {"success": False, "error": "Mail operation failed"}
@@ -4548,7 +4547,7 @@ def setup_email_routes():
             cfg = _resolve_send_config(req.account_id, owner=owner)
         except Exception as e:
             logger.warning("No SMTP-capable account resolved error_type=%s", type(e).__name__)
-            return {"success": False, "error": str(e) or "No SMTP-capable email account configured"}
+            return {"success": False, "error": "No SMTP-capable email account configured"}
 
         # Use 'mixed' if we have attachments, 'alternative' otherwise
         has_attachments = bool(req.attachments)
@@ -4722,8 +4721,8 @@ def setup_email_routes():
                 _cleanup_compose_uploads(_atts)
                 return delivery_result
             except Exception as e:
-                logger.error(f"Failed to send email to {_to_label}: {e}")
-                return {"success": False, "error": str(e) or "Failed to send email"}
+                logger.error("Failed to send email error_type=%s", type(e).__name__)
+                return {"success": False, "error": "Failed to send email"}
 
         if req.wait_for_delivery:
             result = await asyncio.to_thread(_deliver)
@@ -4782,7 +4781,8 @@ def setup_email_routes():
                     imap.append(drafts_folder, "\\Draft", None, msg.as_bytes())
                 return None
             except Exception as e:
-                return str(e)
+                logger.warning("Failed to save draft error_type=%s", type(e).__name__)
+                return "Failed to save draft"
 
         err = await asyncio.to_thread(_do_append)
         if err:
@@ -4843,7 +4843,8 @@ def setup_email_routes():
                             continue
                     return out, None
             except Exception as e:
-                return [], str(e)
+                logger.warning("Failed to gather mail samples error_type=%s", type(e).__name__)
+                return [], "Failed to gather mail samples"
 
         try:
             samples, err = await asyncio.to_thread(_gather_samples)

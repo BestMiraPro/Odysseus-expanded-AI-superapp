@@ -723,10 +723,8 @@ class OmnigentManager:
         try:
             with urllib.request.urlopen(f"{url}/v1/sessions", timeout=5) as resp:
                 payload = resp.read().decode("utf-8")
-        except urllib.error.URLError as exc:
-            return {"sessions": [], "running": True, "url": url, "error": str(exc)}
-        except Exception as exc:
-            return {"sessions": [], "running": True, "url": url, "error": str(exc)}
+        except Exception:
+            return {"sessions": [], "running": True, "url": url, "error": "Could not load Omnigent sessions"}
 
         try:
             data = json.loads(payload)

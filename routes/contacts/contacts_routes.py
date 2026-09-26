@@ -481,8 +481,8 @@ def _import_vcards(text: str) -> Dict:
     try:
         base_url = _carddav_base_url(cfg)
     except ValueError as e:
-        logger.warning("CardDAV import URL rejected: %s", e)
-        return {"imported": 0, "failed": 0, "total": 0, "error": str(e)}
+        logger.warning("CardDAV import URL rejected error_type=%s", type(e).__name__)
+        return {"imported": 0, "failed": 0, "total": 0, "error": "Invalid CardDAV URL"}
     auth = (cfg["username"], cfg["password"]) if cfg["username"] else None
     # Split into individual cards. re.split drops the BEGIN line, so we
     # re-add it. Normalize CRLF.

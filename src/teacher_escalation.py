@@ -583,11 +583,11 @@ async def run_teacher_inline(
         from src.ai_interaction import _resolve_model
         teacher_url, teacher_model, teacher_headers = await asyncio.to_thread(_resolve_model, teacher_spec, owner=owner)
     except Exception as e:
-        logger.warning(f"teacher endpoint not resolvable ({teacher_spec!r}): {e}")
+        logger.warning("teacher endpoint not resolvable error_type=%s", type(e).__name__)
         yield (
             'data: ' + json.dumps({
                 "type": "escalation_failed",
-                "reason": f"teacher endpoint not resolvable: {e}",
+                "reason": "Teacher endpoint is unavailable. Check the teacher model settings.",
             }) + '\n\n'
         )
         return
