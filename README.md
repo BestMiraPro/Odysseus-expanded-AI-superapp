@@ -49,6 +49,23 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+Or let a script do it: it clones on a fresh machine, fast-forwards an existing clone
+to `main` (and refuses if you have uncommitted changes), rebuilds, waits for the app to
+answer, and prints the first-run admin password. Your `data/` is kept.
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/BestMiraPro/Odysseus-expanded-AI-superapp/main/deploy-main.ps1 | iex
+```
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/BestMiraPro/Odysseus-expanded-AI-superapp/main/deploy-main.sh | bash
+```
+
+Run it again any time to update. From a clone, `./deploy-main.ps1` / `./deploy-main.sh`
+does the same in that folder.
+
 The first build takes a while (it bakes in Omnigent, the Claude Code and Codex CLIs,
 and the image-model wheels). When it finishes:
 
