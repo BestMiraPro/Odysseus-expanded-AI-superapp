@@ -2518,6 +2518,24 @@
             </div>
             <div id="adm-backupMsg" style="margin-top:6px;"></div>
           </div>
+          <div class="admin-card">
+            <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>Memory Transfer</h2>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Copy memories and skills straight from another Odysseus machine. <b>On the old machine</b>, press <i>Create Transfer Token</i> and copy the token. <b>On this machine</b>, enter the old machine's address and that token, then <i>Pull Memories</i>. Existing memories are kept and duplicates skipped, so pulling again is safe. Use HTTPS or a trusted network (LAN, Tailscale) — the token travels with the request; revoke it here when you are done.</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+              <button class="admin-btn-add" id="adm-transferTokenBtn">Create Transfer Token</button>
+            </div>
+            <div id="adm-transferTokenMsg" style="margin-bottom:8px;word-break:break-all;"></div>
+            <div id="adm-transferTokenList" style="margin-bottom:8px;"></div>
+            <div style="display:flex;flex-direction:column;gap:6px;max-width:460px;">
+              <input type="text" id="adm-transferUrl" placeholder="http://192.168.1.20:7000" autocomplete="off" spellcheck="false">
+              <input type="password" id="adm-transferToken" placeholder="ody_… (memory:read)" autocomplete="off">
+              <label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="adm-transferSkills" checked> Include skills</label>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;">
+              <button class="admin-btn-add" id="adm-transferPullBtn">Pull Memories</button>
+            </div>
+            <div id="adm-transferMsg" style="margin-top:6px;white-space:pre-line;"></div>
+          </div>
           <div class="admin-card admin-danger-card">
             <h2 style="color:#e55;"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.75"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>Danger Zone</h2>
             <div class="admin-toggle-sub" style="margin-bottom:8px">Irreversible. Each wipe targets one category — pick exactly what you want gone.</div>

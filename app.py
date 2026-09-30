@@ -860,6 +860,10 @@ app.include_router(setup_prefs_routes())
 from routes.backup_routes import setup_backup_routes
 app.include_router(setup_backup_routes(memory_manager, preset_manager, skills_manager))
 
+# Memory transfer (pull memories + skills directly from another machine)
+from routes.memory_transfer_routes import setup_memory_transfer_routes
+app.include_router(setup_memory_transfer_routes(memory_manager, skills_manager, memory_vector=memory_vector))
+
 from routes.font_routes import setup_font_routes
 app.include_router(setup_font_routes())
 

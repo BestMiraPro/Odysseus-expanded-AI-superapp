@@ -2948,6 +2948,111 @@ function initBackup() {
   });
 }
 
+// Pull memories + skills from another Odysseus machine. Previews first (a
+// dry run on the server), so the confirm shows real counts before anything
+// is written.
+function initMemoryTransfer() {
+  const btn = el('adm-transferPullBtn');
+  if (!btn) return;
+  // Source side: mint a read-only memory token for the other machine to use.
+  // These tokens carry no agent-name prefix, so Integrations does not list
+  // them; this card lists and revokes its own.
+  const TRANSFER_TOKEN_NAME = 'Memory transfer';
+  const listEl = el('adm-transferTokenList');
+  async function loadTransferTokens() {
+    try {
+      const res = await fetch('/api/tokens', { credentials: 'same-origin' });
+      const tokens = res.ok ? await res.json() : [];
+      const mine = (Array.isArray(tokens) ? tokens : []).filter(t => t.name === TRANSFER_TOKEN_NAME);
+      listEl.textContent = '';
+      for (const t of mine) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:4px;font-size:12px;';
+        const label = document.createElement('span');
+        label.textContent = `${t.token_prefix || 'token'}… (memory:read)`;
+        const del = document.createElement('button');
+        del.className = 'admin-btn-delete';
+        del.textContent = 'Revoke';
+        del.addEventListener('click', async () => {
+          del.disabled = true;
+          await fetch(`/api/tokens/${encodeURIComponent(t.id)}`, { method: 'DELETE', credentials: 'same-origin' }).catch(() => {});
+          loadTransferTokens();
+        });
+        row.append(label, del);
+        listEl.appendChild(row);
+      }
+    } catch (_) {}
+  }
+  loadTransferTokens();
+  const tokBtn = el('adm-transferTokenBtn');
+  tokBtn.addEventListener('click', async () => {
+    const out = el('adm-transferTokenMsg');
+    tokBtn.disabled = true; out.textContent = ''; out.className = '';
+    try {
+      const fd = new FormData();
+      fd.append('name', TRANSFER_TOKEN_NAME);
+      fd.append('scopes', 'memory:read');
+      const res = await fetch('/api/tokens', { method: 'POST', body: fd, credentials: 'same-origin' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.token) throw new Error(data.detail || `HTTP ${res.status}`);
+      out.textContent = `Token (shown once, read-only memory access): ${data.token}`;
+      out.className = 'admin-success';
+      try { await navigator.clipboard.writeText(data.token); out.textContent += '  — copied'; } catch (_) {}
+      loadTransferTokens();
+    } catch (e) {
+      out.textContent = 'Could not create token: ' + e.message;
+      out.className = 'admin-error';
+    } finally {
+      tokBtn.disabled = false;
+    }
+  });
+  btn.addEventListener('click', async () => {
+    const msg = el('adm-transferMsg');
+    const payload = {
+      source_url: el('adm-transferUrl').value.trim(),
+      token: el('adm-transferToken').value.trim(),
+      include_skills: el('adm-transferSkills').checked,
+    };
+    if (!payload.source_url || !payload.token) {
+      msg.textContent = 'Enter the source address and its API token.';
+      msg.className = 'admin-error';
+      return;
+    }
+    btn.disabled = true; btn.textContent = 'Connecting...'; msg.textContent = ''; msg.className = '';
+    try {
+      const preview = await postBackupJson('/api/memory-transfer/pull', { ...payload, dry_run: true });
+      if (!preview.ok) {
+        msg.textContent = preview.detail || preview.message || 'Transfer failed';
+        msg.className = 'admin-error';
+        return;
+      }
+      const what = payload.include_skills
+        ? `${preview.memories} memories and ${preview.skills} skills`
+        : `${preview.memories} memories`;
+      const when = preview.exported_at ? ` (exported ${preview.exported_at})` : '';
+      if (!window.confirm(`The source has ${what}${when}.\n\nMerge them into this machine? Duplicates are skipped.`)) {
+        msg.textContent = 'Transfer cancelled — nothing was changed.';
+        return;
+      }
+      btn.textContent = 'Pulling...';
+      const result = await postBackupJson('/api/memory-transfer/pull', payload);
+      if (result.ok) {
+        msg.textContent = describeImportResult(result);
+        msg.className = 'admin-success';
+        el('adm-transferToken').value = '';
+      } else {
+        msg.textContent = result.detail || result.message || 'Transfer failed';
+        msg.className = 'admin-error';
+      }
+    } catch (e) {
+      msg.textContent = 'Transfer failed: ' + e.message;
+      msg.className = 'admin-error';
+    } finally {
+      btn.disabled = false; btn.textContent = 'Pull Memories';
+    }
+  });
+}
+
 /* ── Danger Zone ── */
 function initDangerZone() {
   // Per-category Danger Zone wipes. Each button declares its target
@@ -3211,7 +3316,7 @@ function initAll() {
   modalEl = el('settings-modal');
   const inits = [
     initSignupToggle, initShareDefaultsToggle, initAddUser, initEndpointForm, initMcpForm,
-    initCalDAV, initBackup, initDangerZone, initTokenForm, initLogsView,
+    initCalDAV, initBackup, initMemoryTransfer, initDangerZone, initTokenForm, initLogsView,
     () => settingsModule.initIntegrations()
   ];
   for (const fn of inits) {

@@ -147,6 +147,33 @@ It runs agent crews with a mix of workers:
 Pin the version with `OMNIGENT_VERSION` in the Dockerfile, and move the bridged port with
 `OMNIGENT_UI_PORT` in `.env` if 6868 is taken.
 
+## Moving memory to another machine
+
+Memories and skills can be pulled straight from one Odysseus install into another —
+no export file to carry across.
+
+1. **On the machine that has the memories:** Settings → System → **Memory Transfer** →
+   **Create Transfer Token**. Copy the `ody_…` token (read-only memory access, shown once).
+2. **On the new machine:** same card. Enter the old machine's address
+   (e.g. `http://192.168.1.20:7000`) and the token, then **Pull Memories**. It shows
+   the counts and asks before writing anything.
+
+Pulled rows are merged, not replaced: anything you already have is skipped, so pulling
+again later only brings over what is new. Everything lands under the user doing the
+pull. The token is sent with the request, so use HTTPS or a network you trust (home LAN,
+Tailscale), and revoke the token on the source (same card) once you are done.
+
+The same thing over the API:
+
+```bash
+curl -X POST http://localhost:7000/api/memory-transfer/pull \
+  -H 'Content-Type: application/json' -b cookies.txt \
+  -d '{"source_url": "http://192.168.1.20:7000", "token": "ody_…", "include_skills": true}'
+```
+
+To move *everything* (chats, documents, settings), use `scripts/odysseus-backup snapshot`
+on the old machine and `restore` on the new one instead.
+
 ## Upstream features
 
 Everything from [odysseus-dev/odysseus](https://github.com/odysseus-dev/odysseus):
