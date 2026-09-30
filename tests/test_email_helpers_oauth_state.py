@@ -19,15 +19,19 @@ import json
 
 import pytest
 
-import src.secret_storage as _secret_storage
 from routes.email_helpers import make_oauth_state, verify_oauth_state
+
+# Both helpers import _load_or_create_key from sys.modules at call time.
+# Other tests reload or evict src.secret_storage, so patch by dotted path
+# (resolved when the patch is applied) rather than through a module object
+# captured at import, which may no longer be the one the helpers see.
+_KEY_LOADER = "src.secret_storage._load_or_create_key"
 
 
 @pytest.fixture(autouse=True)
 def _fixed_app_key(monkeypatch):
-    # Both helpers resolve _load_or_create_key at call time, so a fixed key
-    # keeps every test hermetic: no data/.app_key is created or read.
-    monkeypatch.setattr(_secret_storage, "_load_or_create_key", lambda: b"k" * 32)
+    # A fixed key keeps every test hermetic: no data/.app_key is created or read.
+    monkeypatch.setattr(_KEY_LOADER, lambda: b"k" * 32)
 
 
 def test_state_round_trips_account_owner_and_nonce():
@@ -74,7 +78,7 @@ def test_tampered_payload_is_rejected_before_parsing():
 
 def test_wrong_signing_key_is_rejected(monkeypatch):
     state = make_oauth_state("acct-1", "alice")  # signed with b"k"*32
-    monkeypatch.setattr(_secret_storage, "_load_or_create_key", lambda: b"j" * 32)
+    monkeypatch.setattr(_KEY_LOADER, lambda: b"j" * 32)
     assert verify_oauth_state(state) is None
 
 

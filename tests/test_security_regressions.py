@@ -273,12 +273,14 @@ def test_outlook_imap_authenticate_failed_is_actionable():
     assert "Outlook/Office 365" in msg
 
 
-def test_generic_auth_error_still_passes_through_truncated():
+def test_generic_auth_error_returns_fixed_guidance():
+    # The raw transport error used to pass through (truncated to 200 chars).
+    # It no longer reaches the client at all (CodeQL #107).
     normalize = _import_friendly_email_auth_error()
     msg = normalize("IMAP", "imap.example.com", "bad credentials " + ("x" * 300))
 
-    assert msg.startswith("bad credentials")
-    assert len(msg) == 200
+    assert msg == "Mail authentication or connection failed. Check the account settings."
+    assert "bad credentials" not in msg
 
 
 # ── compose-upload path traversal block ─────────────────────────

@@ -9,7 +9,9 @@ def _source(path):
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def test_html_code_runner_detaches_opener_before_document_write():
+def test_html_code_runner_detaches_opener_before_rendering_code():
+    # The runner no longer document.write()s the code; it builds a sandboxed
+    # preview frame in the popup. The opener must still be cut first.
     src = _source("static/js/codeRunner.js")
     match = re.search(
         r"export function runHTML\(code, panel\) \{(?P<body>.*?)showOutput\(panel, 'Opened in new window'",
@@ -20,7 +22,8 @@ def test_html_code_runner_detaches_opener_before_document_write():
     assert match
     body = match.group("body")
     assert "win.opener = null" in body
-    assert body.index("win.opener = null") < body.index("win.document.write(code)")
+    assert "win.document.write" not in body
+    assert body.index("win.opener = null") < body.index("buildIsolatedPreviewFrame(win.document, code)")
 
 
 def test_compare_print_popup_detaches_opener_before_document_write():

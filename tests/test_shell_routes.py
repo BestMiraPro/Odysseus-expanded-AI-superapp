@@ -79,7 +79,8 @@ async def test_generate_pty_reports_explicit_unsupported_error(monkeypatch):
     assert events == [
         {
             "stream": "stderr",
-            "data": "PTY streaming is not supported on this platform: No module named 'termios'",
+            # Fixed text only: the import error stays server-side (CodeQL #131).
+            "data": "PTY streaming is not supported on this platform",
             "error": shell_routes.PTY_UNSUPPORTED_ERROR,
         },
         {"exit_code": -1, "error": shell_routes.PTY_UNSUPPORTED_ERROR},

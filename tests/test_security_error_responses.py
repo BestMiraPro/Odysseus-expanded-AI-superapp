@@ -1142,6 +1142,10 @@ class TestCookbookModelRoutes:
         cr, router = _cookbook_router(monkeypatch, tmp_path)
         monkeypatch.setattr(cr, "require_admin", lambda request: None)
         monkeypatch.setattr(cr, "_binary_available", lambda binary, remote, *a, **k: _yes())
+        # The fixed launch-failure message lives on the local Windows path,
+        # where find_bash() is called. On POSIX the route launches a real tmux
+        # session instead, so pin the Windows path rather than start one.
+        monkeypatch.setattr(cr, "IS_WINDOWS", True)
         return cr, router
 
     def test_download_launch_failure_is_fixed(self, monkeypatch, caplog, tmp_path):
