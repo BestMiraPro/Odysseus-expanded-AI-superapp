@@ -3055,15 +3055,102 @@ function initMemoryTransfer() {
   });
 }
 
+// Study bundle: a .zip carried between machines on a USB stick or a cloud
+// drive, for when the old machine must not accept network connections.
+function initStudyBundle() {
+  const dlBtn = el('adm-studyBundleBtn');
+  if (!dlBtn) return;
+  const msg = el('adm-studyBundleMsg');
+  const say = (text, cls) => { msg.textContent = text; msg.className = cls || ''; };
+
+  dlBtn.addEventListener('click', async () => {
+    dlBtn.disabled = true; dlBtn.textContent = 'Preparing...'; say('');
+    try {
+      const res = await fetch('/api/study-transfer/bundle', { credentials: 'same-origin' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const match = (res.headers.get('Content-Disposition') || '').match(/filename="?([^";]+)"?/);
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = match ? match[1] : 'odysseus-study.zip';
+      a.click();
+      URL.revokeObjectURL(a.href);
+      const mb = (blob.size / (1024 * 1024)).toFixed(1);
+      say(`Bundle downloaded (${mb} MB). Copy it to the other machine and use Import Study Bundle there.`, 'admin-success');
+    } catch (e) {
+      say('Could not create the bundle: ' + e.message, 'admin-error');
+    } finally {
+      dlBtn.disabled = false; dlBtn.textContent = 'Download Study Bundle';
+    }
+  });
+
+  const importBtn = el('adm-studyImportBtn');
+  const fileInput = el('adm-studyImportFile');
+  importBtn.addEventListener('click', () => { fileInput.value = ''; fileInput.click(); });
+  const post = async (file, dryRun) => {
+    const fd = new FormData();
+    fd.append('bundle', file);
+    fd.append('dry_run', dryRun ? 'true' : 'false');
+    const res = await fetch('/api/study-transfer/import', { method: 'POST', body: fd, credentials: 'same-origin' });
+    const body = await res.json().catch(() => null);
+    if (!body) return { ok: false, detail: `Server returned ${res.status}` };
+    if (!res.ok) return { ok: false, detail: body.detail || `HTTP ${res.status}` };
+    return body;
+  };
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    importBtn.disabled = true; importBtn.textContent = 'Reading...'; say('');
+    try {
+      const preview = await post(file, true);
+      if (!preview.ok) { say(preview.detail || 'Import failed', 'admin-error'); return; }
+      const lines = describeStudySections(preview.sections || []);
+      if (!lines) { say('That bundle has no Study data.'); return; }
+      const when = preview.exported_at ? ` (exported ${preview.exported_at})` : '';
+      const files = preview.files ? `\n  • ${preview.files} material file(s)` : '';
+      if (!window.confirm(`Study bundle${when}:\n${lines}${files}\n\nImport the new items? Nothing here is overwritten.`)) {
+        say('Import cancelled — nothing was changed.');
+        return;
+      }
+      importBtn.textContent = 'Importing...';
+      const result = await post(file, false);
+      if (!result.ok) { say(result.detail || 'Import failed', 'admin-error'); return; }
+      const report = describeStudyResult(result);
+      say(report.text, report.cls);
+    } catch (e) {
+      say('Import failed: ' + e.message, 'admin-error');
+    } finally {
+      importBtn.disabled = false; importBtn.textContent = 'Import Study Bundle';
+    }
+  });
+}
+
+function describeStudySections(sections) {
+  return sections
+    .filter(s => s.added || s.skipped)
+    .map(s => `  • ${s.name}: ${s.added} new${s.skipped ? `, ${s.skipped} already here` : ''}`)
+    .join('\n');
+}
+
+function describeStudyResult(result) {
+  const added = (result.sections || []).filter(s => s.added).map(s => `${s.name}: ${s.added}`).join(', ');
+  let text = `Study copied — ${added || 'nothing new'}. Files: ${result.files_added || 0}, figures: ${result.figures_added || 0}.`;
+  if ((result.failed || []).length) {
+    text += `\n${result.failed.length} file(s) did not copy (import or pull again to retry):\n` +
+      result.failed.map(f => `  • ${f.material || 'material'}: ${f.reason}`).join('\n');
+    return { text, cls: 'admin-error' };
+  }
+  return { text, cls: 'admin-success' };
+}
+
 // Pull the whole Study app from another machine. Dry run first so the
 // confirm shows what is new here before anything is written.
 function initStudyTransfer() {
   const btn = el('adm-transferStudyBtn');
   if (!btn) return;
-  const describe = (sections) => sections
-    .filter(s => s.added || s.skipped)
-    .map(s => `  • ${s.name}: ${s.added} new${s.skipped ? `, ${s.skipped} already here` : ''}`)
-    .join('\n');
   btn.addEventListener('click', async () => {
     const msg = el('adm-transferMsg');
     const payload = {
@@ -3083,7 +3170,7 @@ function initStudyTransfer() {
         msg.className = 'admin-error';
         return;
       }
-      const lines = describe(preview.sections || []);
+      const lines = describeStudySections(preview.sections || []);
       if (!lines) {
         msg.textContent = 'The source has no Study data for this token.';
         return;
@@ -3101,16 +3188,9 @@ function initStudyTransfer() {
         msg.className = 'admin-error';
         return;
       }
-      const added = (result.sections || []).filter(s => s.added).map(s => `${s.name}: ${s.added}`).join(', ');
-      let text = `Study copied — ${added || 'nothing new'}. Files: ${result.files_added || 0}, figures: ${result.figures_added || 0}.`;
-      if ((result.failed || []).length) {
-        text += `\n${result.failed.length} file(s) did not copy (pull again to retry):\n` +
-          result.failed.map(f => `  • ${f.material || 'material'}: ${f.reason}`).join('\n');
-        msg.className = 'admin-error';
-      } else {
-        msg.className = 'admin-success';
-      }
-      msg.textContent = text;
+      const report = describeStudyResult(result);
+      msg.textContent = report.text;
+      msg.className = report.cls;
     } catch (e) {
       msg.textContent = 'Study transfer failed: ' + e.message;
       msg.className = 'admin-error';
@@ -3383,7 +3463,7 @@ function initAll() {
   modalEl = el('settings-modal');
   const inits = [
     initSignupToggle, initShareDefaultsToggle, initAddUser, initEndpointForm, initMcpForm,
-    initCalDAV, initBackup, initMemoryTransfer, initStudyTransfer, initDangerZone, initTokenForm, initLogsView,
+    initCalDAV, initBackup, initMemoryTransfer, initStudyBundle, initStudyTransfer, initDangerZone, initTokenForm, initLogsView,
     () => settingsModule.initIntegrations()
   ];
   for (const fn of inits) {

@@ -231,3 +231,144 @@ def test_pull_requires_ody_token(tmp_path, monkeypatch):
     client, _ = _pull_setup(tmp_path, monkeypatch, src, dst)
     r = client.post("/api/study-transfer/pull", json={"source_url": "h", "token": "secret"})
     assert r.status_code == 400
+
+
+# ── bundle (file) transfer: no network between the machines ──────────────
+
+import io
+import zipfile
+
+
+def _bundle_setup(tmp_path, monkeypatch, src):
+    """Write a bundle from the source DB as the source machine would."""
+    pdf = tmp_path / "aaaa.pdf"
+    pdf.write_bytes(b"%PDF-1.4 problem set")
+    figs = tmp_path / "srcfigs"
+    (figs / "m1").mkdir(parents=True)
+    (figs / "m1" / "0.jpg").write_bytes(b"\xff\xd8figure\xff\xd9")
+    import routes.study._common as sc
+    monkeypatch.setattr(sc, "_resolve_uploaded_file", lambda fid: str(pdf) if fid == "aaaa.pdf" else (_ for _ in ()).throw(HTTPException(404)))
+    monkeypatch.setattr(st, "SessionLocal", src)
+    monkeypatch.setattr(st, "_figures_dir", lambda mid: str(figs / mid))
+    out = tmp_path / "bundle.zip"
+    counts = st.write_bundle("dinis", str(out))
+    return out, counts
+
+
+def _import_client(tmp_path, monkeypatch, dst, user="admin"):
+    uploads = _Uploads()
+    import routes.study._common as sc
+    monkeypatch.setattr(sc, "_resolve_uploaded_file", lambda fid: fid if fid in uploads.ids else (_ for _ in ()).throw(HTTPException(404)))
+    monkeypatch.setattr(st, "SessionLocal", dst)
+    # Real figure-path logic, rooted in a temp uploads dir.
+    import src.constants as constants
+    monkeypatch.setattr(constants, "UPLOAD_DIR", str(tmp_path / "dstuploads"))
+    monkeypatch.setattr(st, "_figures_dir", st.__dict__["_real_figures_dir"])
+    monkeypatch.setattr(st, "require_admin", lambda request: None)
+    monkeypatch.setattr(st, "get_current_user", lambda request: user)
+    app = FastAPI()
+    app.include_router(st.setup_study_transfer_routes(upload_handler=uploads))
+    return TestClient(app), uploads
+
+
+def test_bundle_round_trip(tmp_path, monkeypatch):
+    src, dst = _db(tmp_path, "src.db"), _db(tmp_path, "dst.db")
+    _seed_source(src)
+    bundle, counts = _bundle_setup(tmp_path, monkeypatch, src)
+    assert counts == {"files": 1, "figures": 1, "missing": 0}
+    with zipfile.ZipFile(bundle) as zf:
+        assert sorted(zf.namelist()) == ["figures/m1/0.jpg", "files/m1", "study.json"]
+        manifest = json.loads(zf.read("study.json"))
+    assert [d["id"] for d in manifest["tables"]["decks"]] == ["d1"]  # owner-filtered
+
+    client, uploads = _import_client(tmp_path, monkeypatch, dst)
+    data = bundle.read_bytes()
+    preview = client.post("/api/study-transfer/import", data={"dry_run": "true"},
+                          files={"bundle": ("odysseus-study.zip", data, "application/zip")}).json()
+    assert preview["dry_run"] and preview["files"] == 1
+    s = dst()
+    assert s.query(StudyDeck).count() == 0
+    s.close()
+
+    out = client.post("/api/study-transfer/import",
+                      files={"bundle": ("odysseus-study.zip", data, "application/zip")}).json()
+    added = {x["name"]: x["added"] for x in out["sections"]}
+    assert added["subjects"] == 1 and added["flashcards"] == 1 and added["card reviews"] == 1
+    assert out["files_added"] == 1 and out["figures_added"] == 1 and out["failed"] == []
+    assert uploads.saved == [("PS1.pdf", b"%PDF-1.4 problem set", "admin")]
+    assert (tmp_path / "dstuploads" / ".study_figures" / "m1" / "0.jpg").read_bytes() == b"\xff\xd8figure\xff\xd9"
+    s = dst()
+    card = s.query(StudyCard).one()
+    assert card.owner == "admin" and card.stability == "4.2" and card.due == datetime(2026, 10, 9, 8, 0)
+    assert s.query(StudyMaterial).one().file_id == "bbbb.pdf"
+    s.close()
+
+    again = client.post("/api/study-transfer/import",
+                        files={"bundle": ("odysseus-study.zip", data, "application/zip")}).json()
+    assert sum(x["added"] for x in again["sections"]) == 0 and again["files_added"] == 0
+
+
+def test_bundle_download_route_is_owner_scoped(tmp_path, monkeypatch):
+    src = _db(tmp_path, "src.db")
+    _seed_source(src)
+    _bundle_setup(tmp_path, monkeypatch, src)
+    r = _source_app(src, monkeypatch, ["study:read"], owner="bob").get("/api/study-transfer/bundle")
+    assert r.status_code == 200 and r.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        manifest = json.loads(zf.read("study.json"))
+    assert [d["id"] for d in manifest["tables"]["decks"]] == ["d2"]
+    assert "files/m1" not in zf.namelist()
+    r = _source_app(src, monkeypatch, ["memory:read"]).get("/api/study-transfer/bundle")
+    assert r.status_code == 403
+
+
+def _zip(members):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, data in members.items():
+            zf.writestr(name, data)
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("data,needle", [
+    (b"not a zip at all", "not a Study bundle"),
+    (_zip({"other.json": "{}"}), "no study.json"),
+    (_zip({"study.json": "{nope"}), "not valid JSON"),
+    (_zip({"study.json": json.dumps({"kind": "odysseus-memory-transfer"})}), "not a Study bundle"),
+])
+def test_bad_bundles_are_rejected_and_write_nothing(tmp_path, monkeypatch, data, needle):
+    dst = _db(tmp_path, "dst.db")
+    client, _ = _import_client(tmp_path, monkeypatch, dst)
+    r = client.post("/api/study-transfer/import", files={"bundle": ("x.zip", data, "application/zip")})
+    assert r.status_code == 400 and needle in r.json()["detail"]
+    s = dst()
+    assert s.query(StudyDeck).count() == 0
+    s.close()
+
+
+def test_crafted_member_names_are_never_used_as_paths(tmp_path, monkeypatch):
+    # A zip carrying traversal names alongside a manifest whose material id
+    # is itself a traversal: the importer only opens names it builds from
+    # ids (basename'd), and figures land under the figures root.
+    manifest = {"kind": st.TRANSFER_KIND, "tables": {
+        "decks": [{"id": "d9", "name": "D"}],
+        "materials": [{"id": "../../evil", "deck_id": "d9", "name": "x", "file_id": "f.pdf"}],
+    }, "files": [{"material_id": "../../evil", "has_file": True, "figures": [0]}]}
+    data = _zip({"study.json": json.dumps(manifest),
+                 "../../evil.txt": "pwned", "files/evil": "%PDF", "figures/evil/0.jpg": "img"})
+    work = tmp_path / "work"
+    work.mkdir()
+    dst = _db(work, "dst.db")
+    client, _ = _import_client(work, monkeypatch, dst)
+    client.post("/api/study-transfer/import", files={"bundle": ("x.zip", data, "application/zip")})
+    root = work / "dstuploads" / ".study_figures"
+    written = [p for p in tmp_path.rglob("*") if p.is_file() and p.suffix in (".jpg", ".txt")]
+    assert written == [root / "evil" / "0.jpg"]
+
+
+def test_oversized_member_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(st, "MAX_BUNDLE_MEMBER_BYTES", 10)
+    zf = zipfile.ZipFile(io.BytesIO(_zip({"study.json": json.dumps({"kind": st.TRANSFER_KIND, "pad": "x" * 50})})))
+    with pytest.raises(HTTPException) as e:
+        st._read_member(zf, "study.json")
+    assert "too large" in e.value.detail

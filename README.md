@@ -166,35 +166,40 @@ Pin the version with `OMNIGENT_VERSION` in the Dockerfile, and move the bridged 
 
 ## Moving to another machine
 
-Your Study app, memories and skills can be pulled straight from one Odysseus install
-into another, with no export file to carry across. Study means everything: subjects,
-flashcards with their scheduling state, practice questions, materials and their PDFs and
-figures, exams and plans, focus sessions, the full review and attempt history, fitted
-FSRS weights and Study chats.
+Your whole Study app moves between Odysseus installs: subjects, flashcards with their
+scheduling state, practice questions, materials and their PDFs and figures, exams and
+plans, focus sessions, the full review and attempt history, fitted FSRS weights and
+Study chats. Both machines need this version, so update the old one first (the deploy
+script above keeps its data).
 
-Both machines need this version, so update the old one first (the deploy script above
-keeps its data).
+Everything lives in **Settings → System → Transfer From Another Machine**.
 
-1. **On the old machine:** Settings → System → **Transfer From Another Machine** →
-   **Create Transfer Token**. Copy the `ody_…` token (read-only memory and Study access,
-   shown once).
-2. **On the new machine:** same card. Enter the old machine's address
-   (e.g. `http://192.168.1.20:7000`) and the token, then **Pull Study Data** and/or
-   **Pull Memories**. Each shows what is new and asks before writing anything.
+### With a file (no network between the machines)
 
-Nothing on the new machine is overwritten: anything already there is skipped, so pulling
-again later only brings over what is new, and retries any PDF that failed to copy.
-Everything lands under the user doing the pull. The token is sent with each request, so
-use HTTPS or a network you trust (home LAN, Tailscale), and revoke the token on the
-source (same card) once you are done.
+1. **On the old machine:** **Download Study Bundle**. You get one `.zip`.
+2. Carry it over on a USB stick or your own cloud drive.
+3. **On the new machine:** **Import Study Bundle** and pick the file. It shows what is
+   new and asks before writing anything.
 
-The same thing over the API (`/api/memory-transfer/pull` takes the same body):
+Neither machine accepts a connection from the other, so this is the way on a shared or
+public network. The bundle holds your study data unencrypted, so delete it once it is
+imported. Memories, skills and settings go the same way with **Data Backup → Export
+Data / Import Data** on the same page.
 
-```bash
-curl -X POST http://localhost:7000/api/study-transfer/pull \
-  -H 'Content-Type: application/json' -b cookies.txt \
-  -d '{"source_url": "http://192.168.1.20:7000", "token": "ody_…"}'
-```
+### Over the network (optional)
+
+Only when the old machine is reachable from the new one on a network you trust (home
+LAN, Tailscale). On the old machine press **Create Transfer Token**; on the new one enter
+the old machine's address (e.g. `http://192.168.1.20:7000`) and the token, then **Pull
+Study Data** and/or **Pull Memories**. The token is sent with each request; revoke it on
+the source once you are done.
+
+### Either way
+
+Nothing on the new machine is overwritten: anything already there is skipped, so
+importing again later only brings over what is new and retries any PDF that failed to
+copy. Everything lands under the user doing the import. If the database part fails it is
+rolled back whole.
 
 To move *everything* (chats, documents, email, settings too) onto a fresh machine, use
 `scripts/odysseus-backup snapshot` on the old one and `restore` on the new one instead.

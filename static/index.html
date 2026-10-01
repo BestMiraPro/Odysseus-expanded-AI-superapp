@@ -2520,7 +2520,17 @@
           </div>
           <div class="admin-card">
             <h2><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:5px;opacity:0.6"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>Transfer From Another Machine</h2>
-            <div class="admin-toggle-sub" style="margin-bottom:8px">Copy your Study app (subjects, cards, questions, materials and their PDFs, exams, review history, Study chats) and your memories and skills straight from another Odysseus machine. <b>On the old machine</b>, press <i>Create Transfer Token</i> and copy the token. <b>On this machine</b>, enter the old machine's address and that token, then pull. Nothing here is overwritten and anything already present is skipped, so pulling again is safe. Use HTTPS or a trusted network (LAN, Tailscale) — the token travels with the request; revoke it here when you are done.</div>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Move your Study app (subjects, flashcards with their schedule, practice questions, materials and their PDFs, exams and plans, review history, Study chats) to another Odysseus machine. Nothing on the receiving machine is overwritten and anything already there is skipped, so importing again is safe.</div>
+            <div class="admin-toggle-label" style="margin-bottom:4px">With a file (no network needed)</div>
+            <div class="admin-toggle-sub" style="margin-bottom:8px"><b>On the old machine</b>, press <i>Download Study Bundle</i> and copy the .zip to a USB stick or your own cloud drive. <b>On this machine</b>, press <i>Import Study Bundle</i> and pick that file. Neither machine has to be reachable by the other. The bundle holds your study data in plain form, so delete it once imported.</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+              <button class="admin-btn-add" id="adm-studyBundleBtn">Download Study Bundle</button>
+              <button class="admin-btn-add" id="adm-studyImportBtn">Import Study Bundle</button>
+              <input type="file" id="adm-studyImportFile" accept=".zip,application/zip" style="display:none;">
+            </div>
+            <div id="adm-studyBundleMsg" style="margin-bottom:12px;white-space:pre-line;"></div>
+            <div class="admin-toggle-label" style="margin-bottom:4px">Over the network (optional)</div>
+            <div class="admin-toggle-sub" style="margin-bottom:8px">Only when the old machine is reachable from this one on a network you trust (home LAN, Tailscale). It also moves memories and skills. <b>On the old machine</b>, press <i>Create Transfer Token</i>; <b>here</b>, enter its address and the token, then pull. The token travels with the request; revoke it when you are done.</div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
               <button class="admin-btn-add" id="adm-transferTokenBtn">Create Transfer Token</button>
             </div>
