@@ -3090,10 +3090,11 @@ function initStudyBundle() {
   const importBtn = el('adm-studyImportBtn');
   const fileInput = el('adm-studyImportFile');
   importBtn.addEventListener('click', () => { fileInput.value = ''; fileInput.click(); });
-  const post = async (file, dryRun) => {
+  const post = async (file, dryRun, owner) => {
     const fd = new FormData();
     fd.append('bundle', file);
     fd.append('dry_run', dryRun ? 'true' : 'false');
+    if (owner) fd.append('source_owner', owner);
     const res = await fetch('/api/study-transfer/import', { method: 'POST', body: fd, credentials: 'same-origin' });
     const body = await res.json().catch(() => null);
     if (!body) return { ok: false, detail: `Server returned ${res.status}` };
@@ -3105,18 +3106,27 @@ function initStudyBundle() {
     if (!file) return;
     importBtn.disabled = true; importBtn.textContent = 'Reading...'; say('');
     try {
-      const preview = await post(file, true);
+      let owner = null;
+      let preview = await post(file, true);
+      if (!preview.ok && preview.needs_owner) {
+        // A zipped data folder holding several users' Study data.
+        const list = (preview.owners || []).map(o => `${o.user} (${o.items} items)`).join(', ');
+        owner = (window.prompt(`That database has Study data for several users: ${list}.\nWhose do you want to import?`, (preview.owners[0] || {}).user || '') || '').trim();
+        if (!owner) { say('Import cancelled — nothing was changed.'); return; }
+        preview = await post(file, true, owner);
+      }
       if (!preview.ok) { say(preview.detail || 'Import failed', 'admin-error'); return; }
       const lines = describeStudySections(preview.sections || []);
       if (!lines) { say('That bundle has no Study data.'); return; }
-      const when = preview.exported_at ? ` (exported ${preview.exported_at})` : '';
+      const when = preview.exported_at ? ` (exported ${preview.exported_at})`
+        : (preview.from_data_folder ? ` (read from the copied data folder${preview.source_owner ? `, user ${preview.source_owner}` : ''})` : '');
       const files = preview.files ? `\n  • ${preview.files} material file(s)` : '';
-      if (!window.confirm(`Study bundle${when}:\n${lines}${files}\n\nImport the new items? Nothing here is overwritten.`)) {
+      if (!window.confirm(`Study data${when}:\n${lines}${files}\n\nImport the new items? Nothing here is overwritten.`)) {
         say('Import cancelled — nothing was changed.');
         return;
       }
       importBtn.textContent = 'Importing...';
-      const result = await post(file, false);
+      const result = await post(file, false, owner);
       if (!result.ok) { say(result.detail || 'Import failed', 'admin-error'); return; }
       const report = describeStudyResult(result);
       say(report.text, report.cls);

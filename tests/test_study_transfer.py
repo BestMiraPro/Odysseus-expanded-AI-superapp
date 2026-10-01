@@ -331,8 +331,8 @@ def _zip(members):
 
 
 @pytest.mark.parametrize("data,needle", [
-    (b"not a zip at all", "not a Study bundle"),
-    (_zip({"other.json": "{}"}), "no study.json"),
+    (b"not a zip at all", "not a Study bundle or a zipped data folder"),
+    (_zip({"other.json": "{}"}), "neither a Study bundle"),
     (_zip({"study.json": "{nope"}), "not valid JSON"),
     (_zip({"study.json": json.dumps({"kind": "odysseus-memory-transfer"})}), "not a Study bundle"),
 ])
@@ -372,3 +372,102 @@ def test_oversized_member_is_refused(tmp_path, monkeypatch):
     with pytest.raises(HTTPException) as e:
         st._read_member(zf, "study.json")
     assert "too large" in e.value.detail
+
+
+# ── zipped data folder: the old machine needs no update at all ───────────
+
+import sqlite3
+
+
+def _old_db(path, owners=("dinis",), wal=False):
+    """An app.db from an older build: Study tables missing newer columns."""
+    conn = sqlite3.connect(path)
+    if wal:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+    conn.executescript("""
+        CREATE TABLE study_decks (id TEXT PRIMARY KEY, owner TEXT, name TEXT NOT NULL,
+            description TEXT, archived BOOLEAN, created_at DATETIME, updated_at DATETIME);
+        CREATE TABLE study_cards (id TEXT PRIMARY KEY, owner TEXT, deck_id TEXT, front TEXT NOT NULL,
+            back TEXT NOT NULL, suspended BOOLEAN, state TEXT, stability TEXT, difficulty TEXT,
+            due DATETIME, reps INTEGER, created_at DATETIME, updated_at DATETIME);
+        CREATE TABLE study_materials (id TEXT PRIMARY KEY, owner TEXT, deck_id TEXT, name TEXT NOT NULL,
+            kind TEXT, file_id TEXT, content TEXT, created_at DATETIME, updated_at DATETIME);
+    """)
+    for i, owner in enumerate(owners):
+        conn.execute("INSERT INTO study_decks VALUES (?,?,?,?,?,?,?)",
+                     (f"d{i}", owner, f"Deck {i}", None, 0, "2026-09-01 10:00:00.000000", "2026-09-01 10:00:00.000000"))
+        conn.execute("INSERT INTO study_cards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                     (f"c{i}", owner, f"d{i}", "F", "B", 0, "review", "7.5", "4.0",
+                      "2026-10-03 09:00:00", 5, "2026-09-01 10:00:00", "2026-09-01 10:00:00"))
+    conn.execute("INSERT INTO study_materials VALUES (?,?,?,?,?,?,?,?,?)",
+                 ("m0", owners[0], "d0", "Notes", "pdf", "abc.pdf", "text", "2026-09-01 10:00:00", "2026-09-01 10:00:00"))
+    conn.commit()
+    return conn
+
+
+def _data_zip(tmp_path, owners=("dinis",), wal=False, prefix="data/"):
+    db = tmp_path / "app.db"
+    conn = _old_db(db, owners, wal)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for suffix in ("", "-wal", "-shm"):
+            if (tmp_path / f"app.db{suffix}").exists():
+                zf.write(tmp_path / f"app.db{suffix}", f"{prefix}app.db{suffix}")
+        zf.writestr(f"{prefix}uploads/2026/09/01/abc.pdf", b"%PDF old")
+        zf.writestr(f"{prefix}uploads/.study_figures/m0/2.jpg", b"fig")
+        zf.writestr(f"{prefix}uploads/uploads.json", '{"x": {"path": "C:\\\\Users\\\\old\\\\data\\\\uploads\\\\abc.pdf"}}')
+    conn.close()
+    return buf.getvalue()
+
+
+@pytest.mark.parametrize("prefix", ["data/", "", "Odysseus/data/"])
+def test_zipped_data_folder_from_an_older_build(tmp_path, monkeypatch, prefix):
+    data = _data_zip(tmp_path, prefix=prefix)
+    work = tmp_path / "work"
+    work.mkdir()
+    dst = _db(work, "dst.db")
+    client, uploads = _import_client(work, monkeypatch, dst)
+    out = client.post("/api/study-transfer/import", files={"bundle": ("data.zip", data, "application/zip")}).json()
+    assert out["ok"] and out["from_data_folder"] and out["source_owner"] == "dinis"
+    added = {x["name"]: x["added"] for x in out["sections"]}
+    assert added["subjects"] == 1 and added["flashcards"] == 1 and added["materials"] == 1
+    assert out["files_added"] == 1 and out["figures_added"] == 1
+    assert uploads.saved == [("Notes.pdf", b"%PDF old", "admin")]
+    s = dst()
+    card = s.query(StudyCard).one()
+    # Columns the old build lacked get defaults; the ones it had survive.
+    assert card.owner == "admin" and card.stability == "7.5" and card.due == datetime(2026, 10, 3, 9, 0)
+    assert card.lapses == 0 and card.deep_explanation is None and card.suspended is False
+    s.close()
+
+
+def test_uncheckpointed_wal_changes_are_read(tmp_path, monkeypatch):
+    data = _data_zip(tmp_path, wal=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        assert "data/app.db-wal" in zf.namelist()
+    work = tmp_path / "work"
+    work.mkdir()
+    dst = _db(work, "dst.db")
+    client, _ = _import_client(work, monkeypatch, dst)
+    out = client.post("/api/study-transfer/import", files={"bundle": ("data.zip", data, "application/zip")}).json()
+    assert {x["name"]: x["added"] for x in out["sections"]}["flashcards"] == 1
+
+
+def test_several_users_must_be_picked(tmp_path, monkeypatch):
+    data = _data_zip(tmp_path, owners=("dinis", "guest"))
+    work = tmp_path / "work"
+    work.mkdir()
+    dst = _db(work, "dst.db")
+    client, _ = _import_client(work, monkeypatch, dst)
+    out = client.post("/api/study-transfer/import", data={"dry_run": "true"},
+                      files={"bundle": ("data.zip", data, "application/zip")}).json()
+    assert out["needs_owner"] and {o["user"] for o in out["owners"]} == {"dinis", "guest"}
+    out = client.post("/api/study-transfer/import", data={"source_owner": "guest"},
+                      files={"bundle": ("data.zip", data, "application/zip")}).json()
+    s = dst()
+    assert [d.id for d in s.query(StudyDeck).all()] == ["d1"]
+    s.close()
+    r = client.post("/api/study-transfer/import", data={"source_owner": "nobody"},
+                    files={"bundle": ("data.zip", data, "application/zip")})
+    assert r.status_code == 400

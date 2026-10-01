@@ -169,8 +169,7 @@ Pin the version with `OMNIGENT_VERSION` in the Dockerfile, and move the bridged 
 Your whole Study app moves between Odysseus installs: subjects, flashcards with their
 scheduling state, practice questions, materials and their PDFs and figures, exams and
 plans, focus sessions, the full review and attempt history, fitted FSRS weights and
-Study chats. Both machines need this version, so update the old one first (the deploy
-script above keeps its data).
+Study chats. Only the new machine needs this version (see the next paragraph).
 
 Everything lives in **Settings → System → Transfer From Another Machine**.
 
@@ -180,6 +179,13 @@ Everything lives in **Settings → System → Transfer From Another Machine**.
 2. Carry it over on a USB stick or your own cloud drive.
 3. **On the new machine:** **Import Study Bundle** and pick the file. It shows what is
    new and asks before writing anything.
+
+**Old machine on an older version?** It does not need updating. Stop Odysseus there, zip
+its whole `data` folder (Windows: right-click → *Send to → Compressed (zipped) folder*;
+Mac: right-click → *Compress*) and import that zip with the same button. The importer
+reads the Study tables straight out of the copied `app.db` (older schemas are fine) and
+finds the PDFs and figures under `uploads/`. If that database holds several users' Study
+data, it asks whose to import.
 
 Neither machine accepts a connection from the other, so this is the way on a shared or
 public network. The bundle holds your study data unencrypted, so delete it once it is

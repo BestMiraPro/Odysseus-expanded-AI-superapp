@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import zipfile
 from datetime import date, datetime
@@ -47,7 +48,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
-from sqlalchemy import DateTime
+from sqlalchemy import Boolean, DateTime
 
 from core.database import (
     SessionLocal,
@@ -145,7 +146,9 @@ def _dict_to_row(model, row: Dict[str, Any], owner) -> Dict[str, Any]:
         if col.key not in row:
             continue
         value = row[col.key]
-        if value is not None and isinstance(col.type, DateTime):
+        if value is not None and isinstance(col.type, Boolean):
+            value = bool(value)
+        elif value is not None and isinstance(col.type, DateTime):
             if not isinstance(value, str):
                 raise HTTPException(400, f"Bad {model.__tablename__}.{col.key} value")
             try:
@@ -328,25 +331,147 @@ def _read_member(zf: zipfile.ZipFile, name: str) -> bytes:
     return data
 
 
-def open_bundle(fileobj) -> tuple:
-    """Open an uploaded bundle and return (zipfile, payload)."""
+class _BundleNames:
+    """Where a material's file and figures sit inside the uploaded zip."""
+
+    def file(self, material_id: str) -> Optional[str]:
+        return _bundle_file_name(material_id)
+
+    def figure(self, material_id: str, idx: int) -> Optional[str]:
+        return _bundle_figure_name(material_id, idx)
+
+
+class _DataFolderNames(_BundleNames):
+    """A zip of an Odysseus ``data`` folder: files are found by their upload
+    id anywhere under uploads/, figures under uploads/.study_figures/."""
+
+    def __init__(self, zf: zipfile.ZipFile, prefix: str, file_ids: Dict[str, str]):
+        uploads = f"{prefix}uploads/"
+        by_base = {}
+        self._figures = set()
+        for name in zf.namelist():
+            if not name.startswith(uploads) or name.endswith("/"):
+                continue
+            if "/.study_figures/" in name:
+                self._figures.add(name)
+            else:
+                by_base.setdefault(name.rsplit("/", 1)[-1], name)
+        self._files = {mid: by_base.get(os.path.basename(fid)) for mid, fid in file_ids.items() if fid}
+        self._fig_root = f"{uploads}.study_figures/"
+
+    def file(self, material_id):
+        return self._files.get(material_id)
+
+    def figure(self, material_id, idx):
+        name = f"{self._fig_root}{os.path.basename(material_id)}/{int(idx)}.jpg"
+        return name if name in self._figures else None
+
+    def figures_for(self, material_id) -> List[int]:
+        root = f"{self._fig_root}{os.path.basename(material_id)}/"
+        out = []
+        for name in self._figures:
+            if name.startswith(root) and (m := _FIGURE_RE.match(name[len(root):])):
+                out.append(int(m.group(1)))
+        return sorted(out)
+
+
+def _data_folder_prefix(zf: zipfile.ZipFile) -> Optional[str]:
+    """The folder inside the zip that holds app.db ('' or 'data/' or
+    'Odysseus/data/'...), shallowest first; None when there is none."""
+    hits = [n for n in zf.namelist() if n.rsplit("/", 1)[-1] == "app.db"]
+    if not hits:
+        return None
+    best = min(hits, key=lambda n: n.count("/"))
+    return best[: -len("app.db")]
+
+
+def _payload_from_data_folder(zf: zipfile.ZipFile, prefix: str, source_owner: Optional[str]):
+    """Read the Study tables straight out of a copied app.db.
+
+    Plain SQLite, ``SELECT *``: a database from an older build simply lacks
+    some columns, and the import gives those their defaults. The -wal file is
+    copied alongside when present, so changes not yet checkpointed are read.
+    """
+    with tempfile.TemporaryDirectory(prefix="odysseus-import-") as tmp:
+        db_path = os.path.join(tmp, "app.db")
+        for suffix in ("", "-wal", "-shm"):
+            name = f"{prefix}app.db{suffix}"
+            if name in zf.namelist():
+                with open(db_path + suffix, "wb") as out:
+                    out.write(_read_member(zf, name))
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            raw = {}
+            for name, model in TABLES:
+                table = model.__tablename__
+                raw[name] = [dict(r) for r in conn.execute(f'SELECT * FROM "{table}"')] if table in have else []
+            conn.close()
+        except sqlite3.DatabaseError:
+            raise HTTPException(400, "The app.db in that zip could not be read. Stop Odysseus on the old PC before copying it, and include app.db-wal if there is one.")
+
+    # Pick whose Study app this is. One named owner: that one. Several: the
+    # caller must say (the preview lists them). None at all: an auth-off
+    # install, where every row is ownerless.
+    counts: Dict[Any, int] = {}
+    for row in raw["decks"] + raw["cards"] + raw["questions"]:
+        counts[row.get("owner")] = counts.get(row.get("owner"), 0) + 1
+    named = sorted((o for o in counts if o), key=lambda o: -counts[o])
+    if source_owner:
+        if source_owner not in counts:
+            raise HTTPException(400, f"No Study data for user {source_owner!r} in that database")
+        owner = source_owner
+    elif len(named) > 1:
+        return None, [{"user": o, "items": counts[o]} for o in named]
+    else:
+        owner = named[0] if named else None
+    tables = {name: [r for r in rows if r.get("owner") == owner] for name, rows in raw.items()}
+
+    names = _DataFolderNames(zf, prefix, {m["id"]: m.get("file_id") for m in tables["materials"]})
+    files = []
+    for m in tables["materials"]:
+        entry = {"material_id": m["id"], "has_file": bool(names.file(m["id"])),
+                 "figures": names.figures_for(m["id"])}
+        if entry["has_file"] or entry["figures"]:
+            files.append(entry)
+    payload = {"kind": TRANSFER_KIND, "version": TRANSFER_VERSION,
+               "exported_at": None, "tables": tables, "files": files,
+               "from_data_folder": True, "source_owner": owner}
+    return (payload, names), None
+
+
+def open_bundle(fileobj, source_owner: Optional[str] = None) -> tuple:
+    """Open an uploaded zip: a Study bundle, or a zip of an Odysseus data
+    folder (app.db + uploads/). Returns (zipfile, payload, names, owners);
+    ``owners`` is set, and the payload None, when a data folder holds
+    several users' Study data and the caller has to pick one."""
     try:
         zf = zipfile.ZipFile(fileobj)
     except zipfile.BadZipFile:
-        raise HTTPException(400, "That file is not a Study bundle (expected the .zip from Download Study Bundle)")
+        raise HTTPException(400, "That file is not a Study bundle or a zipped data folder")
     total = sum(i.file_size for i in zf.infolist())
     if total > MAX_BUNDLE_BYTES:
-        raise HTTPException(400, "Bundle is larger than the import limit")
-    raw = _read_member(zf, BUNDLE_MANIFEST) if BUNDLE_MANIFEST in zf.namelist() else None
-    if raw is None:
-        raise HTTPException(400, "That file is not a Study bundle (no study.json inside)")
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        raise HTTPException(400, "The bundle's study.json is not valid JSON")
-    if not isinstance(payload, dict) or payload.get("kind") != TRANSFER_KIND:
-        raise HTTPException(400, "That file is not a Study bundle")
-    return zf, payload
+        raise HTTPException(400, "That zip is larger than the import limit")
+
+    if BUNDLE_MANIFEST in zf.namelist():
+        raw = _read_member(zf, BUNDLE_MANIFEST)
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            raise HTTPException(400, "The bundle's study.json is not valid JSON")
+        if not isinstance(payload, dict) or payload.get("kind") != TRANSFER_KIND:
+            raise HTTPException(400, "That file is not a Study bundle")
+        return zf, payload, _BundleNames(), None
+
+    prefix = _data_folder_prefix(zf)
+    if prefix is None:
+        raise HTTPException(400, "That zip has neither a Study bundle's study.json nor an Odysseus app.db")
+    result, owners = _payload_from_data_folder(zf, prefix, source_owner)
+    if owners:
+        return zf, None, None, owners
+    payload, names = result
+    return zf, payload, names, None
 
 
 def setup_study_transfer_routes(upload_handler=None) -> APIRouter:
@@ -476,6 +601,8 @@ def setup_study_transfer_routes(upload_handler=None) -> APIRouter:
                     "sections": sections,
                     "files": sum(1 for f in files
                                  if f.get("has_file") and f.get("material_id") in wanted),
+                    "from_data_folder": bool(payload.get("from_data_folder")),
+                    "source_owner": payload.get("source_owner"),
                 }
             # One transaction for every table: all of it lands or none of it.
             for name, model in TABLES:
@@ -539,20 +666,36 @@ def setup_study_transfer_routes(upload_handler=None) -> APIRouter:
 
     @router.post("/import")
     async def import_bundle(request: Request, bundle: UploadFile = File(...),
-                            dry_run: bool = Form(False)):
-        """Merge a bundle made by Download Study Bundle on another machine."""
+                            dry_run: bool = Form(False),
+                            source_owner: Optional[str] = Form(None)):
+        """Merge a Study bundle, or a zipped data folder from another machine."""
         require_admin(request)
         user = get_current_user(request)
-        zf, payload = await asyncio.to_thread(open_bundle, bundle.file)
+        zf, payload, names, owners = await asyncio.to_thread(
+            open_bundle, bundle.file, (source_owner or "").strip() or None)
         try:
+            if owners:
+                return {"ok": False, "needs_owner": True, "owners": owners,
+                        "detail": "That database has Study data for several users; pick whose to import."}
+
             async def get_file(mid):
-                return await asyncio.to_thread(_read_member, zf, _bundle_file_name(mid))
+                name = names.file(mid)
+                if not name:
+                    raise HTTPException(404, "file not in the zip")
+                return await asyncio.to_thread(_read_member, zf, name)
 
             async def get_figure(mid, idx):
-                return await asyncio.to_thread(_read_member, zf, _bundle_figure_name(mid, idx))
+                name = names.figure(mid, idx)
+                if not name:
+                    raise HTTPException(404, "figure not in the zip")
+                return await asyncio.to_thread(_read_member, zf, name)
 
-            return await _apply(payload, user, get_file, get_figure, dry_run,
-                                bundle.filename or "bundle")
+            result = await _apply(payload, user, get_file, get_figure, dry_run,
+                                  bundle.filename or "bundle")
+            if payload.get("from_data_folder"):
+                result["from_data_folder"] = True
+                result["source_owner"] = payload.get("source_owner")
+            return result
         finally:
             zf.close()
 
