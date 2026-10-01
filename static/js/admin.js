@@ -2957,19 +2957,21 @@ function initMemoryTransfer() {
   // Source side: mint a read-only memory token for the other machine to use.
   // These tokens carry no agent-name prefix, so Integrations does not list
   // them; this card lists and revokes its own.
-  const TRANSFER_TOKEN_NAME = 'Memory transfer';
+  const TRANSFER_TOKEN_NAME = 'Machine transfer';
+  // Tokens made before Study transfer existed carry the old name.
+  const TRANSFER_TOKEN_NAMES = [TRANSFER_TOKEN_NAME, 'Memory transfer'];
   const listEl = el('adm-transferTokenList');
   async function loadTransferTokens() {
     try {
       const res = await fetch('/api/tokens', { credentials: 'same-origin' });
       const tokens = res.ok ? await res.json() : [];
-      const mine = (Array.isArray(tokens) ? tokens : []).filter(t => t.name === TRANSFER_TOKEN_NAME);
+      const mine = (Array.isArray(tokens) ? tokens : []).filter(t => TRANSFER_TOKEN_NAMES.includes(t.name));
       listEl.textContent = '';
       for (const t of mine) {
         const row = document.createElement('div');
         row.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:4px;font-size:12px;';
         const label = document.createElement('span');
-        label.textContent = `${t.token_prefix || 'token'}… (memory:read)`;
+        label.textContent = `${t.token_prefix || 'token'}… (${(t.scopes || []).join(', ') || 'memory:read'})`;
         const del = document.createElement('button');
         del.className = 'admin-btn-delete';
         del.textContent = 'Revoke';
@@ -2991,11 +2993,11 @@ function initMemoryTransfer() {
     try {
       const fd = new FormData();
       fd.append('name', TRANSFER_TOKEN_NAME);
-      fd.append('scopes', 'memory:read');
+      fd.append('scopes', 'memory:read,study:read');
       const res = await fetch('/api/tokens', { method: 'POST', body: fd, credentials: 'same-origin' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.token) throw new Error(data.detail || `HTTP ${res.status}`);
-      out.textContent = `Token (shown once, read-only memory access): ${data.token}`;
+      out.textContent = `Token (shown once, read-only memory and Study access): ${data.token}`;
       out.className = 'admin-success';
       try { await navigator.clipboard.writeText(data.token); out.textContent += '  — copied'; } catch (_) {}
       loadTransferTokens();
@@ -3049,6 +3051,71 @@ function initMemoryTransfer() {
       msg.className = 'admin-error';
     } finally {
       btn.disabled = false; btn.textContent = 'Pull Memories';
+    }
+  });
+}
+
+// Pull the whole Study app from another machine. Dry run first so the
+// confirm shows what is new here before anything is written.
+function initStudyTransfer() {
+  const btn = el('adm-transferStudyBtn');
+  if (!btn) return;
+  const describe = (sections) => sections
+    .filter(s => s.added || s.skipped)
+    .map(s => `  • ${s.name}: ${s.added} new${s.skipped ? `, ${s.skipped} already here` : ''}`)
+    .join('\n');
+  btn.addEventListener('click', async () => {
+    const msg = el('adm-transferMsg');
+    const payload = {
+      source_url: el('adm-transferUrl').value.trim(),
+      token: el('adm-transferToken').value.trim(),
+    };
+    if (!payload.source_url || !payload.token) {
+      msg.textContent = 'Enter the source address and its transfer token.';
+      msg.className = 'admin-error';
+      return;
+    }
+    btn.disabled = true; btn.textContent = 'Connecting...'; msg.textContent = ''; msg.className = '';
+    try {
+      const preview = await postBackupJson('/api/study-transfer/pull', { ...payload, dry_run: true });
+      if (!preview.ok) {
+        msg.textContent = preview.detail || preview.message || 'Study transfer failed';
+        msg.className = 'admin-error';
+        return;
+      }
+      const lines = describe(preview.sections || []);
+      if (!lines) {
+        msg.textContent = 'The source has no Study data for this token.';
+        return;
+      }
+      const when = preview.exported_at ? ` (exported ${preview.exported_at})` : '';
+      const files = preview.files ? `\n  • ${preview.files} material file(s) to copy` : '';
+      if (!window.confirm(`Study data on the source${when}:\n${lines}${files}\n\nCopy the new items to this machine? Nothing here is overwritten.`)) {
+        msg.textContent = 'Study transfer cancelled — nothing was changed.';
+        return;
+      }
+      btn.textContent = 'Copying... (large libraries take a while)';
+      const result = await postBackupJson('/api/study-transfer/pull', payload);
+      if (!result.ok) {
+        msg.textContent = result.detail || result.message || 'Study transfer failed';
+        msg.className = 'admin-error';
+        return;
+      }
+      const added = (result.sections || []).filter(s => s.added).map(s => `${s.name}: ${s.added}`).join(', ');
+      let text = `Study copied — ${added || 'nothing new'}. Files: ${result.files_added || 0}, figures: ${result.figures_added || 0}.`;
+      if ((result.failed || []).length) {
+        text += `\n${result.failed.length} file(s) did not copy (pull again to retry):\n` +
+          result.failed.map(f => `  • ${f.material || 'material'}: ${f.reason}`).join('\n');
+        msg.className = 'admin-error';
+      } else {
+        msg.className = 'admin-success';
+      }
+      msg.textContent = text;
+    } catch (e) {
+      msg.textContent = 'Study transfer failed: ' + e.message;
+      msg.className = 'admin-error';
+    } finally {
+      btn.disabled = false; btn.textContent = 'Pull Study Data';
     }
   });
 }
@@ -3316,7 +3383,7 @@ function initAll() {
   modalEl = el('settings-modal');
   const inits = [
     initSignupToggle, initShareDefaultsToggle, initAddUser, initEndpointForm, initMcpForm,
-    initCalDAV, initBackup, initMemoryTransfer, initDangerZone, initTokenForm, initLogsView,
+    initCalDAV, initBackup, initMemoryTransfer, initStudyTransfer, initDangerZone, initTokenForm, initLogsView,
     () => settingsModule.initIntegrations()
   ];
   for (const fn of inits) {

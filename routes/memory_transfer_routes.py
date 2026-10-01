@@ -20,6 +20,7 @@ import asyncio
 import copy
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -61,8 +62,14 @@ def _export_owner(request: Request):
     return get_current_user(request)
 
 
-def _source_export_url(raw: Any) -> str:
-    """Normalise what the user typed into the export URL on the source."""
+# Any transfer endpoint the user might paste is trimmed back to the base
+# address, so "http://h:7000/api/study-transfer/export" works as well as
+# "http://h:7000".
+_KNOWN_SUFFIX = re.compile(r"/api/[a-z-]+-transfer/[a-z-]+$")
+
+
+def source_base_url(raw: Any) -> str:
+    """Normalise what the user typed into the source's base address."""
     if not isinstance(raw, str) or not raw.strip():
         raise HTTPException(400, "Source URL is required")
     url = raw.strip().rstrip("/")
@@ -75,10 +82,12 @@ def _source_export_url(raw: Any) -> str:
         raise HTTPException(400, "Put the API token in the token field, not in the URL")
     if parsed.query or parsed.fragment:
         raise HTTPException(400, "Source URL must not carry a query string or fragment")
-    path = parsed.path.rstrip("/")
-    if not path.endswith(EXPORT_PATH):
-        path = path + EXPORT_PATH
+    path = _KNOWN_SUFFIX.sub("", parsed.path.rstrip("/"))
     return f"{parsed.scheme}://{parsed.netloc}{path}"
+
+
+def _source_export_url(raw: Any) -> str:
+    return source_base_url(raw) + EXPORT_PATH
 
 
 def _reown(rows: list, user) -> list:
@@ -100,16 +109,17 @@ def _reown(rows: list, user) -> list:
     return out
 
 
-async def _fetch_export(url: str, token: str, include_skills: bool) -> dict:
-    """GET the source's export and return the parsed payload.
+async def fetch_from_source(url: str, token: str, *, params=None,
+                            max_bytes: int = MAX_TRANSFER_BYTES,
+                            scope: str = "memory:read") -> bytes:
+    """GET ``url`` on the source machine with the transfer token.
 
     Redirects are not followed: the token is only meant for the host the user
     typed. The source's response body is never echoed back, so this cannot be
-    used to read arbitrary internal pages — only a well-formed transfer
-    payload is ever accepted.
+    used to read arbitrary internal pages; callers only accept a well-formed
+    transfer payload or the file they asked for.
     """
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    params = {"include_skills": "1" if include_skills else "0"}
+    headers = {"Authorization": f"Bearer {token}"}
     try:
         async with httpx.AsyncClient(timeout=FETCH_TIMEOUT, follow_redirects=False) as client:
             async with client.stream("GET", url, headers=headers, params=params) as resp:
@@ -117,12 +127,12 @@ async def _fetch_export(url: str, token: str, include_skills: bool) -> dict:
                     raise HTTPException(
                         502,
                         f"Source rejected the token (HTTP {resp.status_code}). "
-                        "It needs the memory:read scope.",
+                        f"It needs the {scope} scope.",
                     )
                 if resp.status_code == 404:
                     raise HTTPException(
                         502,
-                        "Source has no memory-transfer endpoint (HTTP 404). "
+                        "Source does not have this transfer endpoint (HTTP 404). "
                         "Update Odysseus on the source machine.",
                     )
                 if 300 <= resp.status_code < 400:
@@ -137,28 +147,39 @@ async def _fetch_export(url: str, token: str, include_skills: bool) -> dict:
                 size = 0
                 async for chunk in resp.aiter_bytes():
                     size += len(chunk)
-                    if size > MAX_TRANSFER_BYTES:
-                        raise HTTPException(502, "Source export is larger than the 64 MB limit")
+                    if size > max_bytes:
+                        raise HTTPException(
+                            502, f"Source response is larger than the {max_bytes // (1024 * 1024)} MB limit")
                     chunks.append(chunk)
     except HTTPException:
         raise
     except httpx.TimeoutException:
         raise HTTPException(504, "Timed out reaching the source machine")
     except httpx.HTTPError as e:
-        logger.info("Memory transfer fetch failed: %s", type(e).__name__)
+        logger.info("Transfer fetch failed: %s", type(e).__name__)
         raise HTTPException(
             502,
             "Could not reach the source machine. Check the address, that "
             "Odysseus is running there, and that its port is reachable from here.",
         )
+    return b"".join(chunks)
 
+
+def parse_transfer_payload(raw: bytes, kind: str) -> dict:
     try:
-        payload = json.loads(b"".join(chunks))
+        payload = json.loads(raw)
     except ValueError:
         raise HTTPException(502, "Source did not return JSON — is that an Odysseus address?")
-    if not isinstance(payload, dict) or payload.get("kind") != TRANSFER_KIND:
-        raise HTTPException(502, "Source did not return a memory-transfer payload")
+    if not isinstance(payload, dict) or payload.get("kind") != kind:
+        raise HTTPException(502, "Source did not return the expected transfer payload")
     return payload
+
+
+async def _fetch_export(url: str, token: str, include_skills: bool) -> dict:
+    """GET the source's memory export and return the parsed payload."""
+    raw = await fetch_from_source(
+        url, token, params={"include_skills": "1" if include_skills else "0"})
+    return parse_transfer_payload(raw, TRANSFER_KIND)
 
 
 def _index_memories(memory_vector, rows) -> None:

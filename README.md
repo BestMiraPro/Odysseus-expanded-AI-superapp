@@ -164,32 +164,40 @@ It runs agent crews with a mix of workers:
 Pin the version with `OMNIGENT_VERSION` in the Dockerfile, and move the bridged port with
 `OMNIGENT_UI_PORT` in `.env` if 6868 is taken.
 
-## Moving memory to another machine
+## Moving to another machine
 
-Memories and skills can be pulled straight from one Odysseus install into another —
-no export file to carry across.
+Your Study app, memories and skills can be pulled straight from one Odysseus install
+into another, with no export file to carry across. Study means everything: subjects,
+flashcards with their scheduling state, practice questions, materials and their PDFs and
+figures, exams and plans, focus sessions, the full review and attempt history, fitted
+FSRS weights and Study chats.
 
-1. **On the machine that has the memories:** Settings → System → **Memory Transfer** →
-   **Create Transfer Token**. Copy the `ody_…` token (read-only memory access, shown once).
+Both machines need this version, so update the old one first (the deploy script above
+keeps its data).
+
+1. **On the old machine:** Settings → System → **Transfer From Another Machine** →
+   **Create Transfer Token**. Copy the `ody_…` token (read-only memory and Study access,
+   shown once).
 2. **On the new machine:** same card. Enter the old machine's address
-   (e.g. `http://192.168.1.20:7000`) and the token, then **Pull Memories**. It shows
-   the counts and asks before writing anything.
+   (e.g. `http://192.168.1.20:7000`) and the token, then **Pull Study Data** and/or
+   **Pull Memories**. Each shows what is new and asks before writing anything.
 
-Pulled rows are merged, not replaced: anything you already have is skipped, so pulling
-again later only brings over what is new. Everything lands under the user doing the
-pull. The token is sent with the request, so use HTTPS or a network you trust (home LAN,
-Tailscale), and revoke the token on the source (same card) once you are done.
+Nothing on the new machine is overwritten: anything already there is skipped, so pulling
+again later only brings over what is new, and retries any PDF that failed to copy.
+Everything lands under the user doing the pull. The token is sent with each request, so
+use HTTPS or a network you trust (home LAN, Tailscale), and revoke the token on the
+source (same card) once you are done.
 
-The same thing over the API:
+The same thing over the API (`/api/memory-transfer/pull` takes the same body):
 
 ```bash
-curl -X POST http://localhost:7000/api/memory-transfer/pull \
+curl -X POST http://localhost:7000/api/study-transfer/pull \
   -H 'Content-Type: application/json' -b cookies.txt \
-  -d '{"source_url": "http://192.168.1.20:7000", "token": "ody_…", "include_skills": true}'
+  -d '{"source_url": "http://192.168.1.20:7000", "token": "ody_…"}'
 ```
 
-To move *everything* (chats, documents, settings), use `scripts/odysseus-backup snapshot`
-on the old machine and `restore` on the new one instead.
+To move *everything* (chats, documents, email, settings too) onto a fresh machine, use
+`scripts/odysseus-backup snapshot` on the old one and `restore` on the new one instead.
 
 ## Upstream features
 

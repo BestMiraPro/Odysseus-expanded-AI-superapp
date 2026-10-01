@@ -25,6 +25,8 @@ ALLOWED_SCOPES = {
     "calendar:write",
     "memory:read",
     "memory:write",
+    # Read-only: the Study export for moving Study data to another machine.
+    "study:read",
     "cookbook:read",
     "cookbook:launch",
 }

@@ -864,6 +864,10 @@ app.include_router(setup_backup_routes(memory_manager, preset_manager, skills_ma
 from routes.memory_transfer_routes import setup_memory_transfer_routes
 app.include_router(setup_memory_transfer_routes(memory_manager, skills_manager, memory_vector=memory_vector))
 
+# Study transfer (pull a whole Study app from another machine)
+from routes.study_transfer_routes import setup_study_transfer_routes
+app.include_router(setup_study_transfer_routes(upload_handler=upload_handler))
+
 from routes.font_routes import setup_font_routes
 app.include_router(setup_font_routes())
 
