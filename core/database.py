@@ -611,6 +611,36 @@ class Comparison(TimestampMixin, Base):
     )
 
 
+class CouncilSession(TimestampMixin, Base):
+    """An AI Council thread: several models answer, review each other, and a
+    chairman model synthesizes. ``config`` is the last member/chairman setup
+    used, so reopening the thread restores it."""
+    __tablename__ = "council_sessions"
+
+    id = Column(String, primary_key=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    title = Column(String, nullable=False, default="New council")
+    config = Column(Text, nullable=True)             # JSON {members, chairman, mode}
+
+
+class CouncilTurn(TimestampMixin, Base):
+    """One question put to the council and everything each stage produced."""
+    __tablename__ = "council_turns"
+
+    id = Column(String, primary_key=True, index=True)
+    session_id = Column(String, nullable=False, index=True)
+    owner = Column(String, nullable=True, index=True)
+    question = Column(Text, nullable=False)
+    config = Column(Text, nullable=True)             # JSON snapshot used for this turn
+    status = Column(String, nullable=False, default="running")  # running|done|error|cancelled
+    opinions = Column(Text, nullable=True)           # JSON [{member, text, error, ms}]
+    reviews = Column(Text, nullable=True)            # JSON [{member, text, ranking, error}]
+    ranking = Column(Text, nullable=True)            # JSON aggregate [{member, label, avg_rank, first_votes}]
+    labels = Column(Text, nullable=True)             # JSON {"A": member_index, ...}
+    final = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+
+
 class Signature(TimestampMixin, Base):
     """User-saved visual signatures (image stamps).
 

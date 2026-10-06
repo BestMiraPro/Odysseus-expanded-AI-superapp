@@ -27,6 +27,7 @@ export const UI_VIS_MAP = {
   'tool-memory':         '#tool-memory-btn, #rail-memory',
   'tool-notes':          '#tool-notes-btn, #rail-notes',
   'tool-omnigent':       '#tool-omnigent-btn, #rail-omnigent',
+  'tool-council':        '#tool-council-btn, #rail-council',
   // Study has no rail entry — the button alone.
   'tool-study':          '#tool-study-btn',
   'tool-tasks':          '#tool-tasks-btn, #rail-tasks',

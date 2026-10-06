@@ -685,7 +685,7 @@ def _safe_build_headers(api_key: Optional[str], base_url: str) -> dict:
 
 
 def _is_discovery_only_provider(provider: str) -> bool:
-    return provider == "chatgpt-subscription"
+    return provider in ("chatgpt-subscription", "claude-subscription")
 
 
 def _resolve_probe_key(ep) -> Optional[str]:
@@ -968,6 +968,10 @@ def _probe_endpoint(base_url: str, api_key: str = None, timeout: int = 5) -> Lis
         if api_key:
             return fetch_available_models(api_key, timeout=timeout)
         return []
+    if provider == "claude-subscription":
+        # The CLI has no model-list command; the curated list is the catalog.
+        from src.claude_subscription import default_models
+        return default_models()
     if _is_google_api_base(base):
         try:
             models = _probe_google_models(base, api_key, timeout=timeout)
@@ -1071,6 +1075,12 @@ def _ping_endpoint(base_url: str, api_key: str = None, timeout: float = 1.5) -> 
     """Reachability probe that does not require installed/listed models."""
     from src.endpoint_resolver import resolve_url
     base = resolve_url(_normalize_base(base_url))
+    if _safe_detect_provider(base) == "claude-subscription":
+        # Nothing to dial: "reachable" means the Claude Code CLI is installed.
+        from src.claude_subscription import find_cli
+        if find_cli():
+            return {"reachable": True}
+        return {"reachable": False, "error": "Claude Code CLI not installed"}
     headers = _safe_build_headers(api_key, base)
 
     # Ollama exposes /v1/models (OpenAI-compatible) AND native /api/version,

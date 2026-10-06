@@ -782,6 +782,13 @@ app.include_router(setup_copilot_routes())
 from routes.chatgpt_subscription_routes import setup_chatgpt_subscription_routes
 app.include_router(setup_chatgpt_subscription_routes())
 
+# Claude Subscription (Claude Code CLI) + the AI Council page that convenes
+# subscription and API models together.
+from routes.claude_subscription_routes import setup_claude_subscription_routes
+app.include_router(setup_claude_subscription_routes())
+from routes.council_routes import setup_council_routes
+app.include_router(setup_council_routes())
+
 # Omnigent agent bridge
 from routes.omnigent_routes import setup_omnigent_routes
 app.include_router(setup_omnigent_routes())
@@ -984,6 +991,10 @@ async def serve_tasks(request: Request):
 
 @app.get("/library")
 async def serve_library(request: Request):
+    return await serve_index(request)
+
+@app.get("/council")
+async def serve_council(request: Request):
     return await serve_index(request)
 
 @app.get("/backgrounds")

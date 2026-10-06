@@ -1023,6 +1023,9 @@ def _detect_provider(url: str) -> str:
     from src.chatgpt_subscription import is_chatgpt_subscription_base
     if is_chatgpt_subscription_base(url):
         return "chatgpt-subscription"
+    from src.claude_subscription import is_claude_subscription_base
+    if is_claude_subscription_base(url):
+        return "claude-subscription"
     from src.copilot import is_copilot_base
     if is_copilot_base(url):
         return "copilot"
@@ -1158,6 +1161,8 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "groq.com"): return "Groq"
     from src.chatgpt_subscription import is_chatgpt_subscription_base
     if is_chatgpt_subscription_base(url): return "ChatGPT Subscription"
+    from src.claude_subscription import is_claude_subscription_base
+    if is_claude_subscription_base(url): return "Claude Subscription"
     from src.copilot import is_copilot_base
     if is_copilot_base(url): return "GitHub Copilot"
     if _host_match(url, "cerebras.ai"):
@@ -2018,6 +2023,16 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         logger.debug(f"Returning cached response for key: {cache_key}")
         return cached_response
 
+    if provider == "claude-subscription":
+        # Served by the local Claude Code CLI, not an HTTP endpoint.
+        from src.claude_subscription import ClaudeSubscriptionError, run_chat_sync
+        try:
+            response = run_chat_sync(url, model, messages_copy, timeout=timeout)
+        except ClaudeSubscriptionError as exc:
+            raise HTTPException(exc.status, str(exc))
+        _set_cached_response(cache_key, response)
+        return response
+
     if provider == "anthropic":
         target_url = _normalize_anthropic_url(url)
         h = _build_anthropic_headers(headers)
@@ -2321,10 +2336,11 @@ async def llm_call_async(
             return cached_response, (_get_cached_response_model(cache_key) or model)
         return cached_response
 
-    if provider == "chatgpt-subscription":
+    if provider in ("chatgpt-subscription", "claude-subscription"):
         # ChatGPT/Codex requires streamed Responses requests even for callers
-        # that want a plain string (auto-title, memory extraction, etc.).
-        # Reuse stream_llm's validated Codex SSE path and collect deltas.
+        # that want a plain string (auto-title, memory extraction, etc.), and
+        # Claude Subscription only exists as the CLI stream. Reuse stream_llm's
+        # validated SSE path for both and collect the deltas.
         parts: List[str] = []
         actual_model = model
         async for chunk in stream_llm(
@@ -2365,7 +2381,7 @@ async def llm_call_async(
                     continue
                 if event_is_error or data.get("error") or (data.get("status") and data.get("text")):
                     status = int(data.get("status") or 502)
-                    text = data.get("text") or data.get("error") or "ChatGPT Subscription request failed"
+                    text = data.get("text") or data.get("error") or f"{_provider_label(url)} request failed"
                     error_type = (
                         _FallbackIneligibleHTTPException
                         if data.get("fallback_eligible") is False
@@ -2600,6 +2616,8 @@ def _stream_target_url(url: str) -> str:
         return _normalize_ollama_url(url)
     if provider == "chatgpt-subscription":
         return _normalize_chatgpt_subscription_url(url)
+    if provider == "claude-subscription":
+        return url
     return _normalize_openai_chat_url(url)
 
 
@@ -2608,6 +2626,14 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground"):
+    if _detect_provider(url) == "claude-subscription":
+        # The Claude Code CLI streams the subscription reply; tools stay off
+        # (the endpoint is provisioned with supports_tools=False).
+        from src.claude_subscription import stream_chat as _claude_stream_chat
+        note_model_activity(url, model)
+        async for chunk in _claude_stream_chat(url, model, _sanitize_llm_messages(messages), timeout=timeout):
+            yield chunk
+        return
     target_url = _stream_target_url(url)
     async with _local_model_slot(target_url, model, workload):
         async for chunk in _stream_llm_inner(

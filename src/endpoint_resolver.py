@@ -154,7 +154,13 @@ def resolve_endpoint_runtime(ep, owner: Optional[str] = None) -> Tuple[str, Opti
     api_key = getattr(ep, "api_key", None)
     auth_id = getattr(ep, "provider_auth_id", None)
     if auth_id:
-        from src.chatgpt_subscription import resolve_runtime_credentials
+        from src.claude_subscription import is_claude_subscription_base
+
+        if is_claude_subscription_base(base):
+            # The Claude Code CLI reads its token itself; no bearer here.
+            from src.claude_subscription import resolve_runtime_credentials
+        else:
+            from src.chatgpt_subscription import resolve_runtime_credentials
 
         creds = resolve_runtime_credentials(auth_id, owner=owner)
         base = normalize_base(creds.get("base_url") or base)
@@ -170,6 +176,10 @@ def _resolve_tailscale_host(hostname: str) -> Optional[str]:
     """Try to resolve a hostname via 'tailscale status' if DNS fails."""
     if hostname in _tailscale_cache:
         return _tailscale_cache[hostname]
+    if hostname.lower().rstrip(".").endswith(".invalid"):
+        # RFC 2606 reserved TLD: used for sentinel endpoints (Claude
+        # Subscription) that are never dialled, so skip DNS and Tailscale.
+        return None
 
     # First check if normal DNS works
     try:
@@ -278,6 +288,8 @@ def build_chat_url(base: str) -> str:
         return _append_endpoint_path(_ollama_api_root(base), "/chat")
     if provider == "chatgpt-subscription":
         return _append_endpoint_path(base, "/responses")
+    if provider == "claude-subscription":
+        return base
     if _pathless_host(base, "api.openai.com"):
         base = _append_endpoint_path(base, "/v1")
     return _append_endpoint_path(base, "/chat/completions")
@@ -300,7 +312,7 @@ def build_models_url(base: str) -> Optional[str]:
         return _append_endpoint_path(_anthropic_api_root(base), "/v1/models")
     if provider == "ollama":
         return _append_endpoint_path(_ollama_api_root(base), "/tags")
-    if provider == "chatgpt-subscription":
+    if provider in ("chatgpt-subscription", "claude-subscription"):
         return None
     # Generic OpenAI-compatible fallback: local model servers with no explicit
     # path conventionally expose `/v1/models` (LM Studio, llama.cpp, vLLM).
@@ -330,6 +342,8 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
     if provider == "chatgpt-subscription":
         from src.chatgpt_subscription import chatgpt_headers
         return chatgpt_headers(api_key)
+    if provider == "claude-subscription":
+        return headers
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if provider == "openrouter":

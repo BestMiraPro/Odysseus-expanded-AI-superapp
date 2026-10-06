@@ -36,6 +36,7 @@ import studyModule from './js/study.js';
 import adminModule from './js/admin.js?v=20260716openrouter3';
 import settingsModule from './js/settings.js?v=20260815approvalsave1';
 import omnigentModule from './js/omnigent.js';
+import councilModule from './js/council.js';
 // Eagerly bind unified minimize/restore behavior across all tool modals.
 import './js/modalManager.js?v=20260723compareicon2';
 // Desktop window tiling — drag a modal near an edge/corner to snap.
@@ -63,6 +64,7 @@ window.uiModule = uiModule;
 window.adminModule = adminModule;
 window.cookbookModule = cookbookModule;
 window.omnigentModule = omnigentModule;
+window.councilModule = councilModule;
 
 function _isMobileChatInput() {
   return window.innerWidth <= 768;
@@ -1111,6 +1113,12 @@ function initializeEventListeners() {
     });
   }
 
+  // Council tool button
+  const toolCouncilBtn = el('tool-council-btn');
+  if (toolCouncilBtn) {
+    toolCouncilBtn.addEventListener('click', () => councilModule.togglePanel());
+  }
+
   // Study tool button
   const toolStudyBtn = el('tool-study-btn');
   if (toolStudyBtn) {
@@ -1250,6 +1258,7 @@ function initializeEventListeners() {
     '/gallery':  () => document.getElementById('tool-gallery-btn')?.click(),
     '/tasks':    () => document.getElementById('tool-tasks-btn')?.click(),
     '/omnigent': () => document.getElementById('tool-omnigent-btn')?.click(),
+    '/council':  () => document.getElementById('tool-council-btn')?.click(),
     '/library':  () => sessionModule && sessionModule.openLibrary && sessionModule.openLibrary(),
   };
   const _opener = _routeOpen[urlPath];
@@ -3769,6 +3778,7 @@ function startOdysseusApp() {
     'rail-research':  'tool-research-btn',
     'rail-cookbook':   'tool-cookbook-btn',
     'rail-omnigent': 'tool-omnigent-btn',
+    'rail-council':  'tool-council-btn',
     'rail-archive':   'tool-library-btn',
     'rail-gallery':   'tool-gallery-btn',
     'rail-tasks':     'tool-tasks-btn',

@@ -149,6 +149,32 @@ from your notes rather than from the internet.
 Which model Study uses is shown in the panel header (`Model: …`); click it to change it,
 or set it in Settings → Services → Study Model.
 
+## AI Council
+
+**Council** in the left rail, or **Tools → Council** (also `/council`). Put one question to
+several models at once:
+
+1. **Opinions** — every seated model answers on its own, streamed side by side.
+2. **Peer review** (Full mode) — each model ranks the others' answers without knowing who
+   wrote them; a model's vote on its own answer is not counted.
+3. **Synthesis** — the chairman model writes one answer from the answers, reviews and ranking.
+
+Seats can be any model in Odysseus: API endpoints, local models, and your **Claude** and
+**ChatGPT** subscriptions. Both subscriptions connect from the Council page (or Settings →
+Models) and then work everywhere else in Odysseus too — chat, Study, research.
+
+- **ChatGPT** — OpenAI account sign-in with a device code, the same flow as
+  Settings → Models → ChatGPT Subscription.
+- **Claude** — runs through the official Claude Code CLI on the Odysseus host
+  (`npm install -g @anthropic-ai/claude-code`). Either run `claude setup-token` and paste
+  the token, or use the Claude login already on that machine (`claude auth login`).
+  Anthropic only allows subscription sign-ins inside Claude Code itself, so Odysseus drives
+  the CLI rather than calling the API with your subscription token. Text only: no tools or
+  images on these seats.
+
+Runs live on the server: closing the page does not stop a council, and reopening the thread
+shows the saved result. Follow-up questions in the same thread see the earlier answers.
+
 ## Omnigent
 
 **Omnigent** in the left rail, or **Tools → Omnigent**. Its own web UI is bridged to

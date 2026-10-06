@@ -107,6 +107,7 @@ export function providerLogo(modelId) {
 const _ENDPOINT_LABELS = [
   [/(^|\.)githubcopilot\.com$/i, "GitHub Copilot"],
   [/(^|\.)chatgpt\.com$/i, "ChatGPT Subscription"],
+  [/(^|\.)claude-subscription\.invalid$/i, "Claude Subscription"],
   [/(^|\.)openrouter\.ai$/i, "OpenRouter"],
   [/(^|\.)anthropic\.com$/i, "Anthropic"],
   [/(^|\.)openai\.com$/i, "OpenAI"],
