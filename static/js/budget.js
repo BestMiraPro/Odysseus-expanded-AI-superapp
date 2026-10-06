@@ -29,6 +29,7 @@ function tokens(n) {
 
 const SOURCE_LABELS = {
   chat: 'Chat', agent: 'Agent', delegation: 'Delegations', teacher: 'Teacher', council: 'Council',
+  research: 'Research', study: 'Study',
 };
 
 async function getJSON(url, opts) {
@@ -200,10 +201,11 @@ export async function renderPanel(root = document.getElementById('budget-panel-b
     ${breakdownTable(s.by_model, 'Model', r => `${esc(r.name)}${r.endpoint_name ? ` <span style="opacity:.6">· ${esc(r.endpoint_name)}</span>` : ''}`)}
     ${recentHtml(s.recent)}
     <div class="budget-note">Counted: chat, agent rounds (scheduled tasks included, and stopped turns up to where
-      they stopped), agent delegations and Council turns on metered models, priced from your declared costs or
-      OpenRouter's public price list. Rows marked ≈ were estimated from text length because the provider reported no
-      token counts. Requests running at the same moment can overshoot the cap by about one turn. Not counted yet:
-      background work (chat titles, memory, research, Study) and Omnigent. Months follow UTC.</div>`;
+      they stopped), agent delegations, Council turns, research jobs and Study (cards, questions, grading, the Study
+      tutor) on metered models, priced from your declared costs or OpenRouter's public price list. Rows marked ≈ were
+      estimated from text length because the provider reported no token counts. Requests running at the same moment
+      can overshoot the cap by about one turn. Not counted yet: chat titles, memory extraction and Omnigent. Months
+      follow UTC.</div>`;
   const form = root.querySelector('#budget-form');
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();

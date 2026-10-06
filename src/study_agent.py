@@ -1445,6 +1445,7 @@ async def _run_practice_turn(owner, thread, user_text: str,
     fixed status messages and one atomic, approved reply. Excluded tools are
     rejected at dispatch even if the model writes their names; a practice
     thread cannot gain code tools or drop its policy here."""
+    from src import budget as _budget
     from src.llm_core import stream_llm
     from src.study_practice_coach import (
         STATUS_CHECKING,
@@ -1489,10 +1490,10 @@ async def _run_practice_turn(owner, thread, user_text: str,
             native_calls: List[Dict] = []
             stream_error: Optional[str] = None
             try:
-                async for chunk in stream_llm(
+                async for chunk in _budget.metered_stream(stream_llm(
                         url, model, messages, temperature=0.3,
                         max_tokens=REPLY_MAX_TOKENS, headers=headers,
-                        timeout=600, tools=schemas or None):
+                        timeout=600, tools=schemas or None), owner, "study", getattr(thread, "id", None)):
                     for event, payload in _iter_sse_events(chunk):
                         if event == "error":
                             stream_error = (payload or {}).get("text") or \
@@ -1593,6 +1594,7 @@ async def run_study_agent(owner, thread_id: str, user_text: str, *, deck_id: Opt
     run protected (409), and a protected turn can only run on a thread bound
     to the same question — internal callers get the same guarantee as HTTP.
     """
+    from src import budget as _budget
     from src.llm_core import stream_llm
     from src.tool_security import owner_is_admin_or_single_user
 
@@ -1645,9 +1647,11 @@ async def run_study_agent(owner, thread_id: str, user_text: str, *, deck_id: Opt
         native_calls: List[Dict] = []
         stream_error: Optional[str] = None
         try:
-            async for chunk in stream_llm(url, model, messages, temperature=0.2,
-                                          max_tokens=REPLY_MAX_TOKENS, headers=headers,
-                                          timeout=600, tools=schemas or None):
+            async for chunk in _budget.metered_stream(
+                    stream_llm(url, model, messages, temperature=0.2,
+                               max_tokens=REPLY_MAX_TOKENS, headers=headers,
+                               timeout=600, tools=schemas or None),
+                    owner, "study", thread_id):
                 for event, payload in _iter_sse_events(chunk):
                     if event == "error":
                         stream_error = (payload or {}).get("text") or (payload or {}).get("error") or "model error"

@@ -812,9 +812,12 @@ def setup_chat_routes(
         if use_research and not research_blocked_by_policy:
             try:
                 _r_ep, _r_model, _r_headers = _resolve_research_endpoint(sess)
-                research_ctx = await research_handler.call_research_service(
-                    message, _r_ep, _r_model, llm_headers=_r_headers
-                )
+                from src import budget as _budget
+
+                with _budget.metering(owner, "research", session):
+                    research_ctx = await research_handler.call_research_service(
+                        message, _r_ep, _r_model, llm_headers=_r_headers
+                    )
                 research_message = untrusted_context_message("research context", research_ctx)
                 ctx.messages.insert(len(ctx.preface), research_message)
                 if foreground_policy.enabled:
@@ -1689,9 +1692,12 @@ def setup_chat_routes(
                             logger.info(f"Continuing research for session {session} with {len(_src_urls)} prior URLs")
 
                     # Synthesize conversation into a focused research query
-                    _research_query = await research_handler.synthesize_query(
-                        sess, message, _r_ep, _r_model, _r_headers,
-                    )
+                    from src import budget as _budget
+
+                    with _budget.metering(_user, "research", session):
+                        _research_query = await research_handler.synthesize_query(
+                            sess, message, _r_ep, _r_model, _r_headers,
+                        )
                     logger.info(f"Research query: {_research_query[:120]}")
 
                     research_handler.start_research(

@@ -400,7 +400,15 @@ class ResearchHandler:
                     entry["result"] = str(e)
                     entry["status"] = "error"
 
-        task = asyncio.create_task(_run())
+        async def _metered_run():
+            # Every model call of the job is billed to its owner as "research"
+            # (and refused once a blocking monthly budget cap is reached).
+            from src import budget as _budget
+
+            with _budget.metering(owner or None, "research", session_id):
+                await _run()
+
+        task = asyncio.create_task(_metered_run())
         entry["task"] = task
         return {"session_id": session_id, "status": "running", "query": query}
 

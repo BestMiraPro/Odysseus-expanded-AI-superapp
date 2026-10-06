@@ -30,6 +30,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
+
+from src import budget as _budget
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
@@ -568,6 +570,7 @@ async def _repair_llm_json(url: str, model: str, headers, broken: str, err: str,
     return parse_llm_json(_strip_think_safe(raw))
 
 
+@_budget.metered("study")
 async def _llm_json(owner: Optional[str], system: str, user: str, *,
                     temperature: float = 0.4, max_tokens: int = 3000,
                     timeout: int = 90, thinking_off: bool = False):
@@ -618,6 +621,7 @@ async def _llm_json(owner: Optional[str], system: str, user: str, *,
              "in the top bar).")
 
 
+@_budget.metered("study")
 async def _llm_text(owner: Optional[str], system: str, user: str, *,
                     temperature: float = 0.3, max_tokens: int = 4000,
                     timeout: int = 120) -> str:
@@ -1429,6 +1433,7 @@ def _vision_candidates(owner) -> List:
     return out
 
 
+@_budget.metered("study")
 async def _llm_json_vision(owner, system: str, instruction: str,
                            image_urls: List[str], *, temperature: float = 0.2,
                            max_tokens: int = EXTRACTION_MAX_TOKENS,
@@ -1887,6 +1892,7 @@ _public = [n for n in dir(_sys.modules[__name__]) if not n.startswith("__")]
 __all__ = _public
 
 
+@_budget.metered("study")
 async def _llm_text_vision(owner, system: str, instruction: str, image_urls: List[str], *,
                            temperature: float = 0.1, max_tokens: int = EXTRACTION_MAX_TOKENS,
                            timeout: int = 300) -> str:

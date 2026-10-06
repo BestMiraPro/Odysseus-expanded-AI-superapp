@@ -21,6 +21,8 @@ and counted as "unpriced" rather than guessed.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import threading
 import time
@@ -276,25 +278,34 @@ def _endpoints(endpoint_ids: Iterable[str]) -> Dict[str, Tuple[str, str, Optiona
         db.close()
 
 
-def endpoint_kind_for_url(url: str) -> Optional[str]:
-    """The saved endpoint_kind of the endpoint serving ``url`` (a base or chat URL)."""
+def endpoint_for_url(url: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """(endpoint_kind, name, id) of the saved endpoint serving ``url`` (a base or chat URL)."""
     from core.database import ModelEndpoint
 
     norm = (url or "").rstrip("/")
     if not norm:
-        return None
+        return None, None, None
     try:
         db = _session()
         try:
+            best = None
             for ep in db.query(ModelEndpoint).all():
                 base = (ep.base_url or "").rstrip("/")
                 if base and (norm == base or norm.startswith(base + "/")):
-                    return getattr(ep, "endpoint_kind", None)
+                    if best is None or len(base) > len((best.base_url or "").rstrip("/")):
+                        best = ep
+            if best is not None:
+                return getattr(best, "endpoint_kind", None), best.name or None, best.id
         finally:
             db.close()
     except Exception as exc:
-        logger.debug("budget: endpoint kind lookup failed: %s", exc)
-    return None
+        logger.debug("budget: endpoint lookup failed: %s", exc)
+    return None, None, None
+
+
+def endpoint_kind_for_url(url: str) -> Optional[str]:
+    """The saved endpoint_kind of the endpoint serving ``url`` (a base or chat URL)."""
+    return endpoint_for_url(url)[0]
 
 
 def record_bucket(owner: Optional[str], session_id: Optional[str], bucket: Dict[str, Any], *,
@@ -577,3 +588,133 @@ def estimate_call(price: Price, input_tokens: int, output_tokens: int) -> Option
 
 def text_tokens(text: str) -> int:
     return estimate_tokens([{"role": "user", "content": text or ""}])
+
+
+# ---------------------------------------------------------------------------
+# Metering scopes: research, Study and other work that calls llm_core directly
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class MeterScope:
+    owner: Optional[str]
+    source: str
+    session_id: Optional[str] = None
+
+
+_SCOPE: "contextvars.ContextVar[Optional[MeterScope]]" = contextvars.ContextVar("odysseus_budget_scope",
+                                                                               default=None)
+
+
+def current_scope() -> Optional[MeterScope]:
+    return _SCOPE.get()
+
+
+@contextlib.contextmanager
+def metering(owner: Optional[str], source: str, session_id: Optional[str] = None):
+    """Bill every llm_core call made inside this block to ``owner`` as ``source``.
+
+    ``llm_call_async`` and ``stream_llm`` record their usage (provider-reported,
+    else estimated) and refuse metered calls once a blocking cap is reached.
+    Chat, agent rounds, Council and delegations bill themselves and run
+    outside any scope, so nothing is counted twice.
+    """
+    previous = _SCOPE.get()
+    token = _SCOPE.set(MeterScope(owner or None, source, session_id))
+    try:
+        yield
+    finally:
+        try:
+            _SCOPE.reset(token)
+        except ValueError:          # finalised in another context (async generator cleanup)
+            _SCOPE.set(previous)
+
+
+def metered(source: str):
+    """Decorator for ``async def fn(owner, ...)``: run it inside :func:`metering`."""
+    import functools
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        async def wrapper(owner, *args, **kwargs):
+            with metering(owner, source):
+                return await fn(owner, *args, **kwargs)
+        return wrapper
+    return decorate
+
+
+async def metered_stream(agen, owner: Optional[str], source: str, session_id: Optional[str] = None):
+    """Iterate a ``stream_llm`` generator inside a metering scope.
+
+    The scope is active only while a chunk is being awaited, never while the
+    caller (often itself a generator) is suspended, so it cannot leak into
+    unrelated calls made by the consumer.
+    """
+    try:
+        while True:
+            with metering(owner, source, session_id):
+                try:
+                    chunk = await agen.__anext__()
+                except StopAsyncIteration:
+                    return
+            yield chunk
+    finally:
+        await agen.aclose()
+
+
+def scope_block_reason(scope: Optional[MeterScope], url: str, model: str) -> Optional[str]:
+    """Why a scoped metered call must not start (cap reached, block mode)."""
+    if scope is None:
+        return None
+    return chat_block_reason(scope.owner, url, model)
+
+
+def usage_from_response(provider: str, data: Any) -> Optional[Dict[str, int]]:
+    """Token usage from a non-streaming provider response, or None."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        if provider == "ollama":
+            tin, tout = int(data.get("prompt_eval_count") or 0), int(data.get("eval_count") or 0)
+            return {"input_tokens": tin, "output_tokens": tout} if (tin or tout) else None
+        usage = data.get("usage")
+        if not isinstance(usage, dict):
+            return None
+        if provider == "anthropic":
+            read = int(usage.get("cache_read_input_tokens") or 0)
+            write = int(usage.get("cache_creation_input_tokens") or 0)
+            out = {"input_tokens": int(usage.get("input_tokens") or 0) + read + write,
+                   "output_tokens": int(usage.get("output_tokens") or 0)}
+            if read:
+                out["cache_read_input_tokens"] = read
+            if write:
+                out["cache_creation_input_tokens"] = write
+            return out
+        tin = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        tout = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        return {"input_tokens": tin, "output_tokens": tout} if (tin or tout) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def record_scoped(scope: Optional[MeterScope], url: str, model: str, usage: Optional[Dict[str, Any]],
+                  messages: Optional[List[Dict[str, Any]]] = None, text: str = "") -> Optional[float]:
+    """Bill one scoped call: provider usage when given, else an estimate."""
+    if scope is None:
+        return None
+    try:
+        kind, name, endpoint_id = endpoint_for_url(url)
+        price = price_for(url, model, kind)
+        if not price.metered:
+            return None
+        estimated = not usage
+        if estimated:
+            if not text and not messages:
+                return None
+            usage = {"input_tokens": estimate_tokens(messages or []),
+                     "output_tokens": text_tokens(text) if text else 0}
+        return record(scope.owner, source=scope.source, model=model, usage=usage, price=price,
+                      endpoint_id=endpoint_id, endpoint_name=name, session_id=scope.session_id,
+                      estimated=estimated)
+    except Exception as exc:
+        logger.warning("budget: %s call not recorded: %s", getattr(scope, "source", "?"), exc)
+        return None

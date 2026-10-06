@@ -2551,6 +2551,16 @@ async def llm_call_async(
         raise HTTPException(503, "The model endpoint is unreachable (temporary "
                                  "cooldown). Try again shortly.")
 
+    # Budget metering scope (research, Study, ...): refuse a metered call
+    # once a blocking cap is reached, and bill the call after it returns.
+    _meter = _budget_scope()
+    if _meter is not None:
+        from src import budget as _budget
+
+        _cap_reason = await asyncio.to_thread(_budget.scope_block_reason, _meter, url, model)
+        if _cap_reason:
+            raise HTTPException(402, _cap_reason)
+
     call_timeout = _call_timeout(timeout)
     attempt = 0
     while attempt < max_retries:
@@ -2608,6 +2618,11 @@ async def llm_call_async(
                             response = text_part or _openai_message_text(msg)
                     else:
                         response = _openai_message_text(msg)
+                if _meter is not None:
+                    await asyncio.to_thread(
+                        _budget.record_scoped, _meter, url, actual_model,
+                        _budget.usage_from_response(provider, data), messages_copy, response or "",
+                    )
                 _set_cached_response(
                     cache_key,
                     response,
@@ -2728,7 +2743,63 @@ def _stream_target_url(url: str) -> str:
     return _normalize_openai_chat_url(url)
 
 
-async def stream_llm(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
+def _budget_scope():
+    """The active budget metering scope (research, Study, ...), if any."""
+    try:
+        from src import budget as _budget
+
+        return _budget.current_scope()
+    except Exception:
+        return None
+
+
+async def stream_llm(url: str, model: str, messages: List[Dict], *args, **kwargs):
+    """Stream one model call (see ``_stream_llm_unmetered``).
+
+    Inside a budget metering scope the call is billed to the scope's owner
+    when it ends (provider usage, else an estimate), and a metered call is
+    refused with a 402 error event once a blocking monthly cap is reached.
+    """
+    meter = _budget_scope()
+    inner = _stream_llm_unmetered(url, model, messages, *args, **kwargs)
+    if meter is None:
+        try:
+            async for chunk in inner:
+                yield chunk
+        finally:
+            await inner.aclose()
+        return
+    from src import budget as _budget
+
+    reason = await asyncio.to_thread(_budget.scope_block_reason, meter, url, model)
+    if reason:
+        await inner.aclose()
+        yield f"event: error\ndata: {json.dumps({'error': reason, 'status': 402, 'fallback_eligible': True})}\n\n"
+        return
+    usage = None
+    parts: List[str] = []
+    try:
+        async for chunk in inner:
+            if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
+                try:
+                    payload = json.loads(chunk[6:])
+                except (ValueError, TypeError):
+                    payload = None
+                if isinstance(payload, dict):
+                    if payload.get("type") == "usage" and isinstance(payload.get("data"), dict):
+                        usage = payload["data"]
+                    elif isinstance(payload.get("delta"), str):
+                        parts.append(payload["delta"])
+            yield chunk
+    finally:
+        await inner.aclose()
+        try:
+            await asyncio.to_thread(_budget.record_scoped, meter, url, model, usage, messages, "".join(parts))
+        except Exception as exc:
+            logger.debug("budget: stream not recorded: %s", exc)
+
+
+async def _stream_llm_unmetered(url: str, model: str, messages: List[Dict], temperature: float = LLMConfig.DEFAULT_TEMPERATURE,
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
