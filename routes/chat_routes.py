@@ -1921,6 +1921,7 @@ def setup_chat_routes(
                 _actual_route = _requested_route
                 _actual_candidate_index = 0
                 _chat_terminal_saved = False
+                _chat_billed = False  # spend for this turn is on the budget ledger
                 def _commit_chat_compaction(candidate_index: int) -> bool:
                     return apply_compaction_state(
                         sess,
@@ -2149,7 +2150,8 @@ def setup_chat_routes(
                                     character_name=ctx.preset.character_name,
                                     incognito=incognito,
                                 )
-                                accumulate_token_usage(session, _terminal_metrics)
+                                accumulate_token_usage(session, _terminal_metrics, owner=_user)
+                                _chat_billed = True
                                 _chat_terminal_saved = True
                                 _stream_set(session, status="error")
                                 if _saved_id:
@@ -2221,6 +2223,7 @@ def setup_chat_routes(
                                 )
                                 if _saved_id:
                                     yield f'data: {json.dumps({"type": "message_saved", "id": _saved_id})}\n\n'
+                                _chat_billed = True
                                 run_post_response_tasks(
                                     sess, session_manager, session, message, full_response,
                                     _metrics_to_save, ctx.uprefs, memory_manager, memory_vector, webhook_manager,
@@ -2251,6 +2254,24 @@ def setup_chat_routes(
                         )
                         sess.add_message(ChatMessage("assistant", _stopped_content, metadata=_stopped_md))
                         session_manager.save_sessions()
+                    if full_response and not _chat_billed:
+                        # Stopped mid-reply: the provider still charged for the
+                        # prompt and what it wrote, so bill an estimate.
+                        try:
+                            _stop_requests = _chat_request_state["requests"].get(_actual_candidate_index, messages)
+                            _stop_metrics = {
+                                "input_tokens": estimate_tokens(_stop_requests),
+                                "output_tokens": max(len(full_response) // 4, 1),
+                                "model": _actual_model or _answered_by or _requested_model,
+                                "endpoint_id": _actual_route.get("endpoint_id"),
+                                "endpoint_label": _actual_route.get("endpoint_label"),
+                                "usage_source": "estimated",
+                            }
+                            if isinstance(_actual_route.get("endpoint_cost_tracked"), bool):
+                                _stop_metrics["endpoint_cost_tracked"] = _actual_route["endpoint_cost_tracked"]
+                            accumulate_token_usage(session, _stop_metrics, owner=_user)
+                        except Exception as _bill_err:
+                            logger.warning("budget: stopped chat turn not billed: %s", _bill_err)
                     raise
                 finally:
                     _active_streams.pop(session, None)
@@ -2407,6 +2428,8 @@ def setup_chat_routes(
                                     yield f'data: {json.dumps(data)}\n\n'
                                 elif data.get("type") == "agent_terminal":
                                     terminal_metadata = dict(data.get("data") or {})
+                                    # The agent loop bills its own rounds.
+                                    terminal_metadata["spend_recorded"] = True
                                     last_metrics = terminal_metadata
                                     failure = terminal_metadata.get("failure") or {}
                                     failure_status = _normalize_http_status(
@@ -2441,7 +2464,7 @@ def setup_chat_routes(
                                             incognito=incognito,
                                         )
                                         _terminal_saved = True
-                                        accumulate_token_usage(session, terminal_metadata)
+                                        accumulate_token_usage(session, terminal_metadata, owner=_user)
                                         _stream_set(session, status="error")
                                         if _saved_id:
                                             yield f'data: {json.dumps({"type": "message_saved", "id": _saved_id})}\n\n'
@@ -2476,6 +2499,8 @@ def setup_chat_routes(
                             if full_response or _has_tool_events:
                                 _response_to_save = full_response or "Done."
                                 _metrics_to_save = dict(last_metrics or {})
+                                # The agent loop bills each round itself.
+                                _metrics_to_save["spend_recorded"] = True
                                 if thinking_response.strip() and not _metrics_to_save.get("thinking"):
                                     _metrics_to_save["thinking"] = thinking_response.strip()
                                 _saved_id = save_assistant_response(

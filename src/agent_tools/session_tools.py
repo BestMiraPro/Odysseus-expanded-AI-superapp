@@ -200,11 +200,20 @@ async def send_to_session(content: str, session_id: Optional[str] = None, owner:
         context = sess.get_context_messages()
         context.append({"role": "user", "content": message})
 
+        # Same budget guardrails as chat_with_model.
+        from src.agent_tools.model_interaction_tools import _budget_guard, _record_delegation
+
+        price, _estimate, refusal = await asyncio.to_thread(
+            _budget_guard, owner, sess.endpoint_url, sess.model, context, f"Messaging {sess.model}")
+        if refusal:
+            return refusal
         response = await llm_call_async(
             sess.endpoint_url, sess.model, context,
             headers=sess.headers,
             timeout=AI_CHAT_TIMEOUT,
         )
+        await asyncio.to_thread(_record_delegation, owner, target_sid, price, sess.model,
+                                context, response or "", "delegation")
 
         # Save both messages to session
         sess.add_message(ChatMessage("user", message))

@@ -2758,6 +2758,17 @@ async def _run_verifier_subagent(
     return [r.strip() for r in reasons.split(";") if r.strip()]
 
 
+def _budget_block_reason(owner: Optional[str], endpoint_url: str, model: str) -> Optional[str]:
+    """Why the monthly budget cap stops a metered model call now (None = go)."""
+    try:
+        from src import budget
+
+        return budget.chat_block_reason(owner, endpoint_url or "", model or "")
+    except Exception as exc:
+        logger.debug("[budget] cap check skipped: %s", exc)
+        return None
+
+
 def _empty_response_fallback(
     full_response: str,
     round_reasoning: str,
@@ -2841,7 +2852,32 @@ def _detect_runaway_call(call_freq, threshold=15):
     return sig.split(":", 1)[0] if sig else None
 
 
-async def stream_agent_loop(
+async def stream_agent_loop(*args, **kwargs) -> AsyncGenerator[str, None]:
+    """Streaming agent loop (see ``_stream_agent_loop_body`` for the events).
+
+    Thin wrapper that keeps the budget ledger honest when a run is stopped:
+    every finished model call is billed by the body as it ends, and a call
+    cut off by Stop (task cancelled or stream closed) is billed here from its
+    prompt and whatever it had produced.
+    """
+    billing: Dict[str, Any] = {}
+    body = _stream_agent_loop_body(*args, _billing=billing, **kwargs)
+    try:
+        async for chunk in body:
+            yield chunk
+    except (GeneratorExit, asyncio.CancelledError):
+        finalize = billing.get("finalize_round")
+        if finalize is not None:
+            try:
+                finalize(include_empty=False)
+            except Exception as exc:
+                logger.debug("[budget] stopped round not billed: %s", exc)
+        raise
+    finally:
+        await body.aclose()
+
+
+async def _stream_agent_loop_body(
     endpoint_url: str,
     model: str,
     messages: List[Dict],
@@ -2874,6 +2910,7 @@ async def stream_agent_loop(
     _is_teacher_run: bool = False,
     history_session=None,
     defer_context_shaping: bool = False,
+    _billing: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
 
@@ -2899,6 +2936,19 @@ async def stream_agent_loop(
             exact_approval and exact_approval.allow_remaining_actions
         ),
     )
+    _spend_source = "teacher" if _is_teacher_run else "agent"
+
+    def _bill_usage(bucket: dict) -> None:
+        """Bill one finished model call to the budget ledger right away, so a
+        stopped turn is still billed and later checks in this turn see it."""
+        try:
+            from src import budget as _budget
+
+            _budget.record_bucket(owner, session_id, bucket, source=_spend_source,
+                                  base_url=endpoint_url or "")
+        except Exception as exc:
+            logger.debug("[budget] round not billed: %s", exc)
+
     mcp_mgr = get_mcp_manager()
     prep_timings: Dict[str, float] = {}
     disabled_tools = set(disabled_tools or [])
@@ -3052,6 +3102,26 @@ async def stream_agent_loop(
                 },
             }
 
+        def _finalize_direct(*, include_empty: bool = False):
+            """Bill a direct reply cut off by Stop (called by the wrapper)."""
+            if not (direct_has_real_usage or direct_response.strip() or direct_reasoning.strip()):
+                return
+            _bill_usage(_usage_bucket(
+                round_num=1,
+                model=direct_actual_model,
+                endpoint_id=direct_actual_endpoint_id,
+                endpoint_label=direct_actual_endpoint_label,
+                endpoint_cost_tracked=direct_actual_endpoint_cost_tracked,
+                input_tokens=(real_input_tokens if direct_has_real_usage
+                              else estimate_tokens(direct_actual_messages)),
+                output_tokens=(real_output_tokens if direct_has_real_usage
+                               else max(len(direct_response + direct_reasoning) // 4, 0)),
+                usage_source="real" if direct_has_real_usage else "estimated",
+            ))
+
+        if _billing is not None:
+            _billing["finalize_round"] = _finalize_direct
+
         def _direct_terminal_event(terminal_status, failure_message):
             """Build truthful partial-history metadata for direct-path failure."""
             if not (direct_response.strip() or direct_reasoning.strip()):
@@ -3074,6 +3144,9 @@ async def stream_agent_loop(
                 ),
                 usage_source="real" if direct_has_real_usage else "estimated",
             )
+            _bill_usage(direct_usage)
+            if _billing is not None:
+                _billing.pop("finalize_round", None)
             failure_note = f"[Agent stopped: {failure_message}]"
             terminal_round = (
                 f"{direct_response.strip()}\n\n{failure_note}"
@@ -3250,6 +3323,9 @@ async def stream_agent_loop(
             ),
             usage_source="real" if direct_has_real_usage else "estimated",
         )
+        _bill_usage(direct_usage)
+        if _billing is not None:
+            _billing.pop("finalize_round", None)
         metrics = {
             "model": direct_actual_model,
             "requested_model": model,
@@ -4193,6 +4269,16 @@ async def stream_agent_loop(
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
 
+        # Monthly budget cap: earlier rounds of this turn are already on the
+        # ledger, so a long metered turn stops once it crosses the cap.
+        _cap_reason = await asyncio.to_thread(_budget_block_reason, owner, endpoint_url, model)
+        if _cap_reason:
+            logger.info("[agent] budget cap reached before round %s", round_num)
+            _cap_note = ("\n\n" if full_response.strip() else "") + f"[Stopped: {_cap_reason}]"
+            full_response += _cap_note
+            yield f'data: {json.dumps({"delta": _cap_note})}\n\n'
+            break
+
         _active_route_state = {
             "messages": messages,
             "mcp_schemas": mcp_schemas,
@@ -4341,7 +4427,7 @@ async def stream_agent_loop(
                     0,
                 )
                 usage_source = "estimated"
-            usage_buckets.append(_usage_bucket(
+            _bucket = _usage_bucket(
                 round_num=round_num,
                 model=_round_actual_model,
                 endpoint_id=_round_actual_endpoint_id,
@@ -4352,7 +4438,13 @@ async def stream_agent_loop(
                 usage_source=usage_source,
                 cache_read_input_tokens=_round_real_cache_read,
                 cache_creation_input_tokens=_round_real_cache_write,
-            ))
+            )
+            usage_buckets.append(_bucket)
+            _bill_usage(_bucket)
+
+        if _billing is not None:
+            # The wrapper bills this round if the run is stopped mid-call.
+            _billing["finalize_round"] = _finalize_round_usage
         logger.info(
             "[agent-timing] round_start round=%s model=%s endpoint=%s prompt_tokens=%s tools=%s native_tools=%s timeout=%s",
             round_num,
@@ -4792,7 +4884,7 @@ async def stream_agent_loop(
                     )
                     _raw_text = _raw or ""
                     _synth = _strip_think_blocks(strip_tool_blocks(_raw_text)).strip()
-                    usage_buckets.append(_usage_bucket(
+                    _grace_bucket = _usage_bucket(
                         round_num=round_num,
                         model=model,
                         endpoint_id=_round_actual_endpoint_id,
@@ -4801,7 +4893,9 @@ async def stream_agent_loop(
                         input_tokens=estimate_tokens(_synth_messages),
                         output_tokens=max(len(_raw_text) // 4, 0),
                         usage_source="estimated",
-                    ))
+                    )
+                    usage_buckets.append(_grace_bucket)
+                    _bill_usage(_grace_bucket)
                 except Exception as _e:
                     logger.warning(f"[agent] grace synthesis failed: {_e}")
                 if _synth:
@@ -5857,7 +5951,17 @@ async def stream_agent_loop(
     # gets a turn (with its own tool calls forwarded to the user) and
     # a skill is saved ONLY if the teacher actually succeeds. Skipped
     # when we ARE the teacher to avoid recursion.
-    if not _is_teacher_run and not guide_only and not _awaiting_user:
+    # No escalation to a (usually metered) teacher once the budget cap stops
+    # metered calls; its own rounds would be refused anyway.
+    _teacher_blocked = False
+    if not _is_teacher_run:
+        try:
+            from src import budget as _budget
+
+            _teacher_blocked = bool(await asyncio.to_thread(_budget.cap_block_reason, owner))
+        except Exception:
+            _teacher_blocked = False
+    if not _is_teacher_run and not guide_only and not _awaiting_user and not _teacher_blocked:
         try:
             from src.teacher_escalation import run_teacher_inline
             async for evt in run_teacher_inline(

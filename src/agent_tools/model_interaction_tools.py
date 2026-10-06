@@ -94,13 +94,18 @@ def _budget_guard(owner: Optional[str], url: str, model: str, messages: list, wh
     """
     from src import budget
 
-    price = budget.price_for(url, model)
-    if not price.metered:
-        return price, None, None
-    tokens_in = budget.estimate_tokens(messages)
-    tokens_out = budget.EXPECTED_OUTPUT_TOKENS["delegation"]
-    estimate = price.cost(tokens_in, tokens_out)
-    decision = budget.check(owner, estimate, what=what)
+    try:
+        price = budget.price_for(url, model, budget.endpoint_kind_for_url(url))
+        if not price.metered:
+            return price, None, None
+        tokens_in = budget.estimate_tokens(messages)
+        tokens_out = budget.EXPECTED_OUTPUT_TOKENS["delegation"]
+        estimate = price.cost(tokens_in, tokens_out)
+        decision = budget.check(owner, estimate, what=what)
+    except Exception as exc:
+        # Guardrails fail open: a broken budget store must not stop delegation.
+        logger.warning("budget guard skipped: %s", exc)
+        return None, None, None
     if decision.allowed and not decision.confirm:
         return price, estimate, None
     limit = decision.settings.get("action_limit_usd") or None

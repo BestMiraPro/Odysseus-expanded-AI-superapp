@@ -875,6 +875,8 @@ async function loadEstimate(key) {
     S.estimate = data;
   } catch {
     if (seq !== _estSeq) return;
+    // Remember the failed key too, so a stale seat doesn't refetch on every render.
+    _estKey = key;
     S.estimate = null;
   }
   renderEstimate();

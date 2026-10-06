@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 
 WARN_FRACTION = 0.8
 CAP_ACTIONS = ("block", "warn")
-DEFAULTS: Dict[str, Any] = {"monthly_cap_usd": 0.0, "cap_action": "block", "action_limit_usd": 0.5}
+# The default single-action limit is high enough for ordinary delegations
+# (tens of thousands of tokens to a flagship model) and still stops a runaway.
+DEFAULTS: Dict[str, Any] = {"monthly_cap_usd": 0.0, "cap_action": "block", "action_limit_usd": 1.0}
 MAX_USD = 1_000_000.0
 
 # Typical reply lengths (tokens) used when an estimate has to guess the output
@@ -106,14 +108,18 @@ class Price:
                          usage.get("cache_creation_input_tokens") or 0)
 
 
-_PRICE_CACHE: Dict[Tuple[str, str], Tuple[float, Price]] = {}
+_PRICE_CACHE: Dict[Tuple[str, str, str], Tuple[float, Price]] = {}
 _PRICE_TTL = 300.0
 _PRICE_LOCK = threading.Lock()
 
 
-def price_for(base_url: str, model: str) -> Price:
-    """Billing and list price of ``model`` served from ``base_url``."""
-    key = (base_url or "", model or "")
+def price_for(base_url: str, model: str, endpoint_kind: Optional[str] = None) -> Price:
+    """Billing and list price of ``model`` served from ``base_url``.
+
+    ``endpoint_kind`` is the endpoint's saved kind ("local", "api", ...); an
+    explicit "local" makes it free whatever the host looks like.
+    """
+    key = (base_url or "", model or "", (endpoint_kind or "").lower())
     now = time.monotonic()
     with _PRICE_LOCK:
         hit = _PRICE_CACHE.get(key)
@@ -122,7 +128,8 @@ def price_for(base_url: str, model: str) -> Price:
     try:
         from src import model_roster
 
-        kind, provider = model_roster.classify_endpoint(SimpleNamespace(base_url=base_url or ""))
+        kind, provider = model_roster.classify_endpoint(
+            SimpleNamespace(base_url=base_url or "", endpoint_kind=endpoint_kind))
         (entry,) = model_roster.build_entries([("", "", model or "", kind, provider)])
         price = Price(entry.billing, entry.input_per_mtok, entry.output_per_mtok, entry.price_source)
     except Exception as exc:
@@ -254,8 +261,8 @@ def record(
         return None
 
 
-def _endpoint_base_urls(endpoint_ids: Iterable[str]) -> Dict[str, Tuple[str, str]]:
-    """{endpoint_id: (base_url, name)} for pricing saved chat routes."""
+def _endpoints(endpoint_ids: Iterable[str]) -> Dict[str, Tuple[str, str, Optional[str]]]:
+    """{endpoint_id: (base_url, name, endpoint_kind)} for pricing saved routes."""
     ids = [i for i in {*endpoint_ids} if i]
     if not ids:
         return {}
@@ -263,44 +270,80 @@ def _endpoint_base_urls(endpoint_ids: Iterable[str]) -> Dict[str, Tuple[str, str
 
     db = _session()
     try:
-        return {ep.id: (ep.base_url or "", ep.name or "")
+        return {ep.id: (ep.base_url or "", ep.name or "", getattr(ep, "endpoint_kind", None))
                 for ep in db.query(ModelEndpoint).filter(ModelEndpoint.id.in_(ids)).all()}
     finally:
         db.close()
 
 
+def endpoint_kind_for_url(url: str) -> Optional[str]:
+    """The saved endpoint_kind of the endpoint serving ``url`` (a base or chat URL)."""
+    from core.database import ModelEndpoint
+
+    norm = (url or "").rstrip("/")
+    if not norm:
+        return None
+    try:
+        db = _session()
+        try:
+            for ep in db.query(ModelEndpoint).all():
+                base = (ep.base_url or "").rstrip("/")
+                if base and (norm == base or norm.startswith(base + "/")):
+                    return getattr(ep, "endpoint_kind", None)
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.debug("budget: endpoint kind lookup failed: %s", exc)
+    return None
+
+
+def record_bucket(owner: Optional[str], session_id: Optional[str], bucket: Dict[str, Any], *,
+                  source: str = "agent", base_url: str = "") -> Optional[float]:
+    """Bill one agent model call (a usage bucket) as soon as it ends.
+
+    The agent loop calls this per round, so a turn that is stopped midway is
+    still billed and checks later in the same turn see the spend.
+    """
+    try:
+        if not isinstance(bucket, dict) or bucket.get("endpoint_cost_tracked") is False:
+            return None
+        endpoint_id = bucket.get("endpoint_id") or None
+        url, name, kind = _endpoints([endpoint_id or ""]).get(endpoint_id or "", (base_url, "", None))
+        model = bucket.get("model") or ""
+        return record(owner, source=source, model=model, usage=bucket,
+                      price=price_for(url, model, kind), endpoint_id=endpoint_id,
+                      endpoint_name=bucket.get("endpoint_label") or name or None, session_id=session_id,
+                      estimated=bucket.get("usage_source") == "estimated")
+    except Exception as exc:
+        logger.warning("budget: agent round not recorded: %s", exc)
+        return None
+
+
 def record_turn(owner: Optional[str], session_id: Optional[str], metrics: Dict[str, Any], *,
                 base_url: str = "") -> float:
-    """Bill one saved chat turn from its metrics; returns the priced total.
+    """Bill one saved plain-chat turn from its metrics; returns its cost.
 
-    Agent turns carry ``usage_buckets`` (one per model round, each with the
-    model and endpoint that actually answered); plain chat carries a single
-    usage. Routes the resolver marked as not cost-tracked are skipped.
+    Agent turns (metrics with ``usage_buckets``) are skipped: the agent loop
+    bills each round as it ends (:func:`record_bucket`), which also covers
+    stopped turns and inline teacher runs.
     """
-    if not isinstance(metrics, dict):
+    if not isinstance(metrics, dict) or metrics.get("usage_buckets") or metrics.get("spend_recorded"):
         return 0.0
-    buckets = metrics.get("usage_buckets")
-    agent = isinstance(buckets, list) and bool(buckets)
-    items = [b for b in buckets if isinstance(b, dict)] if agent else [metrics]
-    source = "teacher" if metrics.get("teacher") else ("agent" if agent else "chat")
+    if metrics.get("endpoint_cost_tracked") is False:
+        return 0.0
+    model = metrics.get("model") or ""
+    endpoint_id = metrics.get("endpoint_id") or None
     try:
-        endpoints = _endpoint_base_urls(
-            (item.get("endpoint_id") or metrics.get("endpoint_id") or "") for item in items)
+        url, name, kind = _endpoints([endpoint_id or ""]).get(endpoint_id or "", (base_url, "", None))
+        if kind is None:
+            kind = endpoint_kind_for_url(url)
     except Exception as exc:
         logger.debug("budget: endpoint lookup failed: %s", exc)
-        endpoints = {}
-    total = 0.0
-    for item in items:
-        if item.get("endpoint_cost_tracked") is False:
-            continue
-        model = item.get("model") or metrics.get("model") or ""
-        endpoint_id = item.get("endpoint_id") or metrics.get("endpoint_id") or None
-        url, name = endpoints.get(endpoint_id or "", (base_url, ""))
-        cost = record(owner, source=source, model=model, usage=item, base_url=url,
-                      endpoint_id=endpoint_id, endpoint_name=item.get("endpoint_label") or name or None,
-                      session_id=session_id, estimated=item.get("usage_source") == "estimated")
-        total += cost or 0.0
-    return round(total, 6)
+        url, name, kind = base_url, "", None
+    cost = record(owner, source="chat", model=model, usage=metrics, price=price_for(url, model, kind),
+                  endpoint_id=endpoint_id, endpoint_name=metrics.get("endpoint_label") or name or None,
+                  session_id=session_id, estimated=metrics.get("usage_source") == "estimated")
+    return round(cost or 0.0, 6)
 
 
 def month_window(now: Optional[datetime] = None) -> Tuple[datetime, datetime]:
@@ -453,7 +496,8 @@ def check(owner: Optional[str], estimate_usd: Optional[float], *, metered: bool 
         settings = get_settings(owner)
         if not metered:
             return Decision(settings=settings)
-        spent = month_spend(owner)
+        # Without a cap the month total only feeds a display: skip the SUM.
+        spent = month_spend(owner) if settings["monthly_cap_usd"] > 0 else 0.0
     except Exception as exc:
         # A broken budget store must not stop every model call: fail open.
         logger.warning("budget: check skipped, store unavailable: %s", exc)
@@ -482,10 +526,29 @@ def check(owner: Optional[str], estimate_usd: Optional[float], *, metered: bool 
     return decision
 
 
-def chat_block_reason(owner: Optional[str], base_url: str, model: str) -> Optional[str]:
-    """Why a metered chat request must not start (cap reached in block mode)."""
+def cap_block_reason(owner: Optional[str]) -> Optional[str]:
+    """Why metered calls are refused right now, whatever the model (cap reached, block mode)."""
     try:
-        price = price_for(base_url, model)
+        settings = get_settings(owner)
+        if settings["monthly_cap_usd"] <= 0 or settings["cap_action"] != "block":
+            return None
+        decision = check(owner, None, what="This call")
+        return None if decision.allowed else decision.reason
+    except Exception as exc:
+        logger.warning("budget: cap check failed: %s", exc)
+        return None
+
+
+def chat_block_reason(owner: Optional[str], base_url: str, model: str,
+                      endpoint_kind: Optional[str] = None) -> Optional[str]:
+    """Why a metered model call must not start (cap reached in block mode)."""
+    try:
+        settings = get_settings(owner)
+        if settings["monthly_cap_usd"] <= 0 or settings["cap_action"] != "block":
+            return None          # the common case: one small query, no pricing
+        if endpoint_kind is None:
+            endpoint_kind = endpoint_kind_for_url(base_url)
+        price = price_for(base_url, model, endpoint_kind)
         if not price.metered:
             return None
         decision = check(owner, None, what="This message")

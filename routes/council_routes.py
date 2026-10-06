@@ -360,8 +360,13 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
         except council.CouncilError as exc:
             raise HTTPException(exc.status, str(exc))
         history = _history(db, owner, row.id)
-        _budget_gate(owner, _estimate(db, owner, members, chairman, mode, question, history),
-                     body.budget_confirmed)
+        try:
+            estimate = _estimate(db, owner, members, chairman, mode, question, history)
+        except Exception as exc:
+            # No estimate: still enforce a reached cap, but never fail the ask.
+            logger.warning("council: estimate failed error_type=%s", type(exc).__name__)
+            estimate = {"total_usd": None, "metered": any(m.billing == "metered" for m in [*members, chairman])}
+        _budget_gate(owner, estimate, body.budget_confirmed)
         config = {
             "members": [{"endpoint_id": s.endpoint_id, "model": s.model} for s in body.members],
             "chairman": {"endpoint_id": body.chairman.endpoint_id, "model": body.chairman.model},
@@ -451,7 +456,7 @@ def setup_council_routes() -> APIRouter:
     async def estimate(request: Request, body: EstimateRequest):
         owner = _owner(request)
         if not body.members:
-            return {"estimate": None, "budget": budget.status(owner)}
+            return {"estimate": None, "budget": await asyncio.to_thread(budget.status, owner)}
         return await asyncio.to_thread(_estimate_for, owner, body)
 
     @router.get("/sessions")

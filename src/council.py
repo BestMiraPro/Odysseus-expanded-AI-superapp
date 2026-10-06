@@ -541,16 +541,25 @@ def observed_output_tokens(turns: List[Dict[str, Any]]) -> Dict[str, int]:
     left out so the caller falls back to defaults.
     """
     sums = {"opinions": [0, 0], "review": [0, 0], "synthesis": [0, 0]}
+
+    def _out(usage) -> int:
+        try:
+            return int((usage or {}).get("output_tokens") or 0) if isinstance(usage, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
     for turn in turns:
+        if not isinstance(turn, dict):
+            continue
         member_out = 0
-        for stage, calls in (("opinions", turn.get("opinions") or []), ("review", turn.get("reviews") or [])):
-            for call in calls:
-                out = int(((call or {}).get("usage") or {}).get("output_tokens") or 0)
+        for stage, calls in (("opinions", turn.get("opinions")), ("review", turn.get("reviews"))):
+            for call in calls if isinstance(calls, list) else []:
+                out = _out(call.get("usage")) if isinstance(call, dict) else 0
                 if out > 0:
                     sums[stage][0] += out
                     sums[stage][1] += 1
                     member_out += out
-        total_out = int((turn.get("usage") or {}).get("output_tokens") or 0)
+        total_out = _out(turn.get("usage"))
         if total_out > member_out:
             sums["synthesis"][0] += total_out - member_out
             sums["synthesis"][1] += 1

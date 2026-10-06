@@ -34,7 +34,7 @@ def db(monkeypatch):
 @pytest.fixture
 def prices(monkeypatch):
     """Price by model name: 'paid-*' metered, 'local-*' free, 'plan-*' flat, else unpriced."""
-    def fake(base_url, model):
+    def fake(base_url, model, endpoint_kind=None):
         if model.startswith("paid"):
             return PRICED
         if model.startswith("local"):
@@ -117,7 +117,7 @@ def test_month_spend_is_per_owner_and_per_calendar_month(db):
 def test_settings_validate_and_persist(db):
     assert budget.get_settings("alice") == budget.DEFAULTS
     saved = budget.save_settings("alice", {"monthly_cap_usd": 20, "cap_action": "warn"})
-    assert saved == {"monthly_cap_usd": 20.0, "cap_action": "warn", "action_limit_usd": 0.5}
+    assert saved == {"monthly_cap_usd": 20.0, "cap_action": "warn", "action_limit_usd": 1.0}
     assert budget.get_settings("alice")["cap_action"] == "warn"
     assert budget.get_settings("bob") == budget.DEFAULTS
     for bad in ({"monthly_cap_usd": -1}, {"action_limit_usd": float("nan")}, {"cap_action": "explode"},
@@ -177,35 +177,39 @@ def test_summary_breaks_down_by_source_and_model(db):
 
 # --- chat turns ------------------------------------------------------------
 
-def test_record_turn_bills_agent_buckets_and_skips_untracked_routes(db, prices):
+def test_record_bucket_bills_one_agent_round(db, prices):
     s = db()
     s.add(ModelEndpoint(id="ep1", name="Paid API", base_url="https://api.example.com/v1", owner="alice",
                         is_enabled=True, model_type="llm"))
     s.commit()
     s.close()
-    metrics = {"model": "paid-a", "input_tokens": 3000, "output_tokens": 300, "usage_buckets": [
-        {"round": 1, "model": "paid-a", "endpoint_id": "ep1", "input_tokens": 1000, "output_tokens": 100,
-         "usage_source": "real"},
-        {"round": 2, "model": "paid-b", "endpoint_id": "ep1", "input_tokens": 2000, "output_tokens": 200,
-         "usage_source": "estimated"},
-        {"round": 3, "model": "paid-c", "endpoint_id": "ep1", "input_tokens": 5000, "output_tokens": 5000,
-         "endpoint_cost_tracked": False},
-    ]}
-    total = budget.record_turn("alice", "sess1", metrics)
-    assert total == pytest.approx((1000 * 2 + 100 * 8 + 2000 * 2 + 200 * 8) / 1e6)
+    real = {"round": 1, "model": "paid-a", "endpoint_id": "ep1", "input_tokens": 1000, "output_tokens": 100,
+            "usage_source": "real"}
+    est = {"round": 2, "model": "paid-b", "endpoint_id": "ep1", "input_tokens": 2000, "output_tokens": 200,
+           "usage_source": "estimated"}
+    untracked = {"round": 3, "model": "paid-c", "endpoint_id": "ep1", "input_tokens": 5000,
+                 "output_tokens": 5000, "endpoint_cost_tracked": False}
+    assert budget.record_bucket("alice", "s1", real) == (1000 * 2 + 100 * 8) / 1e6
+    budget.record_bucket("alice", "s1", est, source="teacher")
+    assert budget.record_bucket("alice", "s1", untracked) is None
     s = db()
     rows = s.query(SpendEntry).order_by(SpendEntry.id).all()
     s.close()
     assert [(r.source, r.model, r.estimated, r.endpoint_name) for r in rows] == [
-        ("agent", "paid-a", False, "Paid API"), ("agent", "paid-b", True, "Paid API")]
+        ("agent", "paid-a", False, "Paid API"), ("teacher", "paid-b", True, "Paid API")]
 
 
-def test_record_turn_plain_chat_and_teacher(db, prices):
+def test_record_turn_bills_plain_chat_only(db, prices):
     budget.record_turn("alice", "s", {"model": "paid-a", "input_tokens": 1000, "output_tokens": 0})
-    budget.record_turn("alice", "s", {"model": "paid-a", "input_tokens": 1000, "output_tokens": 0, "teacher": True})
     budget.record_turn("alice", "s", {"model": "local-a", "input_tokens": 1000, "output_tokens": 10})
+    # Agent turns are billed round by round by the agent loop, never again here.
+    budget.record_turn("alice", "s", {"model": "paid-a", "input_tokens": 9000, "output_tokens": 9000,
+                                      "usage_buckets": [{"model": "paid-a", "input_tokens": 9000}]})
+    # An agent turn stopped by the cap before any model call has no buckets.
+    budget.record_turn("alice", "s", {"model": "paid-a", "input_tokens": 5000, "output_tokens": 0,
+                                      "usage_source": "estimated", "spend_recorded": True})
     s = db()
-    assert [r.source for r in s.query(SpendEntry).order_by(SpendEntry.id)] == ["chat", "teacher"]
+    assert [(r.source, r.input_tokens) for r in s.query(SpendEntry).order_by(SpendEntry.id)] == [("chat", 1000)]
     s.close()
 
 
@@ -426,3 +430,120 @@ def test_budget_routes(db, prices):
     out = c.put("/api/budget/settings", json={"monthly_cap_usd": 5, "action_limit_usd": 0}).json()
     assert out["monthly_cap_usd"] == 5 and out["action_limit_usd"] == 0 and "by_model" in out
     assert c.put("/api/budget/settings", json={"cap_action": "nope"}).status_code == 400
+
+
+# --- review regressions ----------------------------------------------------
+
+def test_self_hosted_endpoints_are_free_and_never_blocked(db, monkeypatch):
+    budget.clear_price_cache()
+    monkeypatch.setattr("src.omnigent_catalog.load_declared", lambda: {})
+    # Docker service / LAN shortnames and an explicit "local" kind are free.
+    assert budget.price_for("http://ollama:11434/v1", "qwen3:8b").billing == "local"
+    assert budget.price_for("http://gpu-box:8000/v1", "llama-70b").billing == "local"
+    assert budget.price_for("https://models.mylab.org/v1", "llama-70b", "local").billing == "local"
+    assert budget.price_for("https://api.example.com/v1", "x").billing == "metered"
+    budget.save_settings("alice", {"monthly_cap_usd": 1})
+    _spend(db, "alice", 5.0)
+    assert budget.chat_block_reason("alice", "http://ollama:11434/v1", "qwen3:8b") is None
+    s = db()
+    s.add(ModelEndpoint(id="lab", name="Lab", base_url="https://models.mylab.org/v1", owner="alice",
+                        is_enabled=True, model_type="llm", endpoint_kind="local"))
+    s.commit()
+    s.close()
+    assert budget.endpoint_kind_for_url("https://models.mylab.org/v1/chat/completions") == "local"
+    assert budget.chat_block_reason("alice", "https://models.mylab.org/v1/chat/completions", "llama-70b") is None
+    assert budget.chat_block_reason("alice", "https://api.example.com/v1", "x") is not None
+
+
+def test_no_cap_skips_the_month_total(db, monkeypatch):
+    calls = []
+    monkeypatch.setattr(budget, "month_spend", lambda owner, now=None: calls.append(owner) or 0.0)
+    assert budget.chat_block_reason("alice", "https://api.example.com/v1", "x") is None
+    assert budget.check("alice", 0.2).allowed is True
+    assert calls == []
+
+
+def test_stopped_agent_round_is_billed_by_the_wrapper(monkeypatch):
+    from src import agent_loop
+
+    billed = []
+
+    async def fake_body(*args, _billing=None, **kwargs):
+        def finalize(*, include_empty=True):
+            billed.append(include_empty)
+        _billing["finalize_round"] = finalize
+        yield 'data: {"delta": "partial"}\n\n'
+        yield 'data: {"delta": "more"}\n\n'
+
+    monkeypatch.setattr(agent_loop, "_stream_agent_loop_body", fake_body)
+
+    async def consume_then_stop():
+        gen = agent_loop.stream_agent_loop("http://x", "m", [])
+        first = await gen.__anext__()
+        await gen.aclose()            # what Stop / a closed stream does
+        return first
+
+    assert asyncio.run(consume_then_stop()).startswith("data:")
+    assert billed == [False]
+
+    billed.clear()
+
+    async def consume_all():
+        return [c async for c in agent_loop.stream_agent_loop("http://x", "m", [])]
+
+    assert len(asyncio.run(consume_all())) == 2
+    assert billed == []               # a finished run bills inside the body, not here
+
+
+def test_pipeline_and_send_to_session_respect_the_limit(db, prices, monkeypatch):
+    from src import ai_interaction, llm_core
+
+    budget.save_settings(None, {"action_limit_usd": 0.0001})
+    monkeypatch.setattr(ai_interaction, "_resolve_model", lambda spec, owner=None: ("https://api.x.com/v1", "paid-big", {}))
+    monkeypatch.setattr("src.model_roster.roster", lambda owner: [])
+    called = []
+
+    async def fake_call(*a, **k):
+        called.append(1)
+        return "x"
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_call)
+    monkeypatch.setattr(ai_interaction, "llm_call_async", fake_call, raising=False)
+    out = asyncio.run(ai_interaction.do_pipeline(json.dumps({"steps": [
+        {"model": "paid-big", "instruction": "summarise"}]}), owner=None))
+    assert out.get("budget_blocked") is True and not called
+
+    from src.agent_tools import session_tools
+
+    class _Sess:
+        name, owner, endpoint_url, model, headers = "t", None, "https://api.x.com/v1", "paid-big", {}
+
+        def get_context_messages(self):
+            return [{"role": "user", "content": "hello " * 50}]
+
+    class _Mgr:
+        def get_session(self, sid):
+            return _Sess()
+    monkeypatch.setattr(session_tools, "get_session_manager", lambda: _Mgr())
+    monkeypatch.setattr(session_tools, "llm_call_async", fake_call, raising=False)
+    out = asyncio.run(session_tools.send_to_session("s2\nhi there", owner=None))
+    assert out.get("budget_blocked") is True and not called
+
+
+def test_accumulate_uses_the_request_owner(db, prices, monkeypatch):
+    import routes.chat_helpers as ch
+
+    monkeypatch.setattr(ch, "SessionLocal", db)
+    s = db()
+    s.add(dbmod.Session(id="s9", name="t", endpoint_url="https://api.example.com/v1", model="paid-a", owner="alice"))
+    s.commit()
+    s.close()
+    # Auth turned off after the session was created: the cap is checked for
+    # owner None, so the spend must land there too.
+    ch.accumulate_token_usage("s9", {"model": "paid-a", "input_tokens": 1000, "output_tokens": 500}, owner=None)
+    assert budget.month_spend(None) == 0.006 and budget.month_spend("alice") == 0.0
+
+
+def test_observed_lengths_ignore_malformed_history():
+    turns = [{"opinions": "not a list", "reviews": None, "usage": "?"}, None,
+             {"opinions": [None, {"usage": {"output_tokens": "x"}}], "usage": {"output_tokens": 5}}]
+    assert council.observed_output_tokens(turns) == {}

@@ -237,6 +237,16 @@ blocked.
 
 Costs use the same prices as the model pickers. A model with no known price is listed as unpriced rather
 than guessed. Rows marked ≈ were estimated from text length because the provider reported no token counts.
+
+What counts:
+- Chat, and agent rounds (scheduled agent tasks included).
+- Agent delegations (`chat_with_model`, `ask_teacher`, `pipeline`, `send_to_session`).
+- Council turns.
+
+Each agent round is billed when it ends, so a turn you stop is still counted, and a long agent turn stops
+at the cap. The default single-action limit is $1. Requests running at the same moment can each pass the
+check before the others are recorded, so the cap can be overshot by about one turn's cost.
+
 Background work (chat titles, memory, research, Study) and Omnigent are not counted yet.
 
 ## Moving to another machine

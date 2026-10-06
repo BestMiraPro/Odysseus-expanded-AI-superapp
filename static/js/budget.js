@@ -199,17 +199,22 @@ export async function renderPanel(root = document.getElementById('budget-panel-b
     <div class="budget-h3">By model</div>
     ${breakdownTable(s.by_model, 'Model', r => `${esc(r.name)}${r.endpoint_name ? ` <span style="opacity:.6">· ${esc(r.endpoint_name)}</span>` : ''}`)}
     ${recentHtml(s.recent)}
-    <div class="budget-note">Counted: chat, agent rounds, agent delegations and Council turns on metered models,
-      priced from your declared costs or OpenRouter's public price list. Rows marked ≈ were estimated from text length
-      because the provider reported no token counts. Not counted yet: background work (chat titles, memory, research,
-      Study) and Omnigent. Months follow UTC.</div>`;
+    <div class="budget-note">Counted: chat, agent rounds (scheduled tasks included, and stopped turns up to where
+      they stopped), agent delegations and Council turns on metered models, priced from your declared costs or
+      OpenRouter's public price list. Rows marked ≈ were estimated from text length because the provider reported no
+      token counts. Requests running at the same moment can overshoot the cap by about one turn. Not counted yet:
+      background work (chat titles, memory, research, Study) and Omnigent. Months follow UTC.</div>`;
   const form = root.querySelector('#budget-form');
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     const status = root.querySelector('#budget-save-status');
     const btn = root.querySelector('#budget-save');
+    // A number field holding text it cannot parse ("1,000", "50$") reads as
+    // "" — that must be an error, not a silently removed cap.
     const num = id => {
-      const raw = root.querySelector(id).value.trim();
+      const input = root.querySelector(id);
+      if (input.validity && input.validity.badInput) return NaN;
+      const raw = input.value.trim();
       return raw === '' ? 0 : Number(raw);
     };
     const patch = {
@@ -218,7 +223,7 @@ export async function renderPanel(root = document.getElementById('budget-panel-b
       action_limit_usd: num('#budget-limit'),
     };
     if ([patch.monthly_cap_usd, patch.action_limit_usd].some(v => !Number.isFinite(v) || v < 0)) {
-      status.textContent = 'Amounts must be zero or more.';
+      status.textContent = 'Amounts must be plain numbers, zero or more (e.g. 25 or 0.5).';
       status.classList.add('error');
       return;
     }

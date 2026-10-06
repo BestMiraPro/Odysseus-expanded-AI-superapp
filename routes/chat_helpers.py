@@ -841,20 +841,30 @@ async def build_chat_context(
     )
 
 
-def accumulate_token_usage(session_id: str, metrics: dict):
-    """Add input/output token counts to the session's running totals."""
+_SESSION_OWNER = object()
+
+
+def accumulate_token_usage(session_id: str, metrics: dict, owner=_SESSION_OWNER):
+    """Add input/output token counts to the session's running totals.
+
+    Also bills a plain-chat turn to the budget ledger. ``owner`` is the
+    requesting user (the identity the budget cap is checked against); it
+    falls back to the session's stored owner for older callers.
+    """
     in_t = metrics.get("input_tokens", 0)
     out_t = metrics.get("output_tokens", 0)
     if not (in_t or out_t):
         return
     db = SessionLocal()
-    owner = base_url = None
+    base_url = None
     found = False
     try:
         db_s = db.query(DBSession).filter(DBSession.id == session_id).first()
         if db_s:
             found = True
-            owner, base_url = db_s.owner, db_s.endpoint_url
+            base_url = db_s.endpoint_url
+            if owner is _SESSION_OWNER:
+                owner = db_s.owner
             db_s.total_input_tokens = (db_s.total_input_tokens or 0) + in_t
             db_s.total_output_tokens = (db_s.total_output_tokens or 0) + out_t
             db.commit()
@@ -867,7 +877,7 @@ def accumulate_token_usage(session_id: str, metrics: dict):
         try:
             from src import budget
 
-            budget.record_turn(owner, session_id, metrics, base_url=base_url or "")
+            budget.record_turn(owner or None, session_id, metrics, base_url=base_url or "")
         except Exception as exc:
             logger.warning("budget: turn not recorded: %s", exc)
 
@@ -1277,7 +1287,7 @@ def run_post_response_tasks(
 
     # Token accumulation
     if last_metrics:
-        accumulate_token_usage(session_id, last_metrics)
+        accumulate_token_usage(session_id, last_metrics, owner=owner)
 
     # Webhook
     if webhook_manager and not compare_mode:

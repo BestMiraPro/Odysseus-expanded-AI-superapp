@@ -429,6 +429,11 @@ def _is_local_host(host: str) -> bool:
     host = (host or "").lower().rstrip(".")
     if host in {"localhost", "host.docker.internal"} or host.endswith(".local"):
         return True
+    # A dotless name is a Docker/Compose service or LAN shortname ("ollama",
+    # "gpu-box"); public APIs always use a fully qualified name. Mirrors
+    # endpoint_resolver.endpoint_cost_tracked and the chat cost display.
+    if host and "." not in host and ":" not in host:
+        return True
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
@@ -447,6 +452,12 @@ def classify_endpoint(ep) -> Tuple[str, str]:
         provider = "openai"
     if provider in SUBSCRIPTION_PROVIDERS:
         return "subscription", provider
+    # An explicit endpoint kind set in Settings wins over host heuristics.
+    declared_kind = str(getattr(ep, "endpoint_kind", "") or "").strip().lower()
+    if declared_kind == "local":
+        return "local", provider
+    if declared_kind in ("api", "proxy"):
+        return "api", provider
     try:
         host = urlparse(base).hostname or ""
     except Exception:

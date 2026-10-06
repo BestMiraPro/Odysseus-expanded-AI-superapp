@@ -675,7 +675,7 @@ class BudgetSetting(TimestampMixin, Base):
     owner_key = Column(String, primary_key=True)
     monthly_cap_usd = Column(Float, nullable=False, default=0.0)
     cap_action = Column(String, nullable=False, default="block")     # block | warn
-    action_limit_usd = Column(Float, nullable=False, default=0.5)
+    action_limit_usd = Column(Float, nullable=False, default=1.0)
 
 
 class Signature(TimestampMixin, Base):

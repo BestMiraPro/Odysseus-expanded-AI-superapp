@@ -330,9 +330,20 @@ async def do_pipeline(content: str, session_id: Optional[str] = None, owner: Opt
                 {"role": "user", "content": user_content},
             ]
 
+            # Same budget guardrails as chat_with_model, step by step.
+            from src.agent_tools.model_interaction_tools import _budget_guard, _record_delegation
+
+            price, _estimate, refusal = await asyncio.to_thread(
+                _budget_guard, owner, url, model, messages, f"Pipeline step {i + 1} ({model})")
+            if refusal:
+                if step_outputs:
+                    refusal["completed_steps"] = step_outputs
+                return refusal
             response = await llm_call_async(
                 url, model, messages, headers=headers, timeout=AI_CHAT_TIMEOUT
             )
+            await asyncio.to_thread(_record_delegation, owner, session_id, price, model,
+                                    messages, response or "", "delegation")
 
             step_outputs.append({
                 "step": i + 1,
