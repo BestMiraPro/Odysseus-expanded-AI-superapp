@@ -498,14 +498,27 @@ def register(router: APIRouter) -> None:
         except Exception as e:
             _optimize_status[user] = {"status": "error", "message": str(e)}
 
+    def _run_optimize_then_release(lock, user: str, snapshots: list, reviews: list):
+        try:
+            _run_optimize(user, snapshots, reviews)
+        finally:
+            lock.release()
+
     @router.post("/optimize")
     def optimize_weights(request: Request):
         """Trigger per-user FSRS weight fitting (A6).
 
         Phase 4.3: runs asynchronously in a background thread so the request
         returns immediately with a task_id. Poll /optimize/status for results.
+        One fit per user at a time: a call while one is running starts
+        nothing and reports the running one (``already_running``).
         """
         user = _owner(request)
+        lock = _optimize_lock(user)
+        if not lock.acquire(blocking=False):
+            running = _optimize_status.get(user) or {}
+            return {"status": "running", "reviews": running.get("reviews", 0),
+                    "already_running": True}
         db = _common.SessionLocal()
         try:
             # ----- load this user's review history -----
@@ -537,12 +550,14 @@ def register(router: APIRouter) -> None:
             # Run in background thread (Phase 4.3)
             _optimize_status[user] = {"status": "running", "reviews": len(reviews)}
             t = threading.Thread(
-                target=_run_optimize, args=(user, snapshots, reviews), daemon=True,
+                target=_run_optimize_then_release,
+                args=(lock, user, snapshots, reviews), daemon=True,
             )
             t.start()
             return {"status": "running", "reviews": len(reviews)}
         except Exception:
             db.close()
+            lock.release()
             raise
 
     @router.get("/optimize/status")
@@ -550,4 +565,30 @@ def register(router: APIRouter) -> None:
         """Poll the status of a background FSRS optimization (Phase 4.3)."""
         user = _owner(request)
         return _optimize_status.get(user, {"status": "never_run"})
+
+    @router.post("/optimize/reset")
+    def reset_optimized_weights(request: Request):
+        """Drop the user's fitted FSRS weights, so scheduling goes back to the
+        defaults (fsrs.DEFAULT_W). Refused while a fit is running, which would
+        otherwise write its weights straight back."""
+        user = _owner(request)
+        lock = _optimize_lock(user)
+        if not lock.acquire(blocking=False):
+            raise HTTPException(409, "An optimization is running. Try again "
+                                     "when it has finished.")
+        try:
+            db = _common.SessionLocal()
+            try:
+                removed = 0
+                for row in db.query(StudyUserParams).filter(
+                        StudyUserParams.owner == user).all():
+                    db.delete(row)
+                    removed += 1
+                db.commit()
+            finally:
+                db.close()
+            _optimize_status[user] = {"status": "reset"}
+            return {"status": "reset", "removed": removed}
+        finally:
+            lock.release()
 

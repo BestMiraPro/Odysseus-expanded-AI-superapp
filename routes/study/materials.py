@@ -35,6 +35,7 @@ def create_material_record(user, deck_id: str, *, name=None, text=None,
         deck = study_service.get_deck(db, deck_id, user)
         page_count = None
         if file_id:
+            _common._require_upload_owner(file_id, user)
             kind = "pdf" if file_id.lower().endswith(".pdf") else "file"
             name = (name or file_id).strip()
             try:
@@ -109,15 +110,18 @@ async def run_extraction(user, material_id: str, *, mode: str = "extract",
 
     # Vision by default whenever the original PDF is on disk and a vision-
     # capable model is configured; an explicit ``vision`` flag forces a path.
+    vision_available = bool(pdf_path) and bool(
+        await asyncio.to_thread(_common._vision_candidates, user))
     use_vision = should_use_vision(
         has_pdf=bool(pdf_path),
-        vision_available=bool(pdf_path) and bool(_common._vision_candidates(user)),
+        vision_available=vision_available,
         explicit=vision)
     # Thin text layer (formula images / scans): go vision-first instead of
-    # wasting a text pass on cover-page scraps.
+    # wasting a text pass on cover-page scraps - when there is a vision model
+    # to go to; without one the text pass is the only pass that can work.
     page_info = None
     auto_vision = False
-    if pdf_path and not use_vision:
+    if pdf_path and vision_available and not use_vision:
         try:
             from src.study_vision import pdf_page_count, text_layer_is_thin
             auto_vision = text_layer_is_thin(len(content), pdf_page_count(pdf_path))
@@ -445,7 +449,9 @@ async def run_transcribe_material(user, material_id: str) -> Dict:
         db.close()
     pdf_path = _common._resolve_uploaded_file(file_id)
     try:
-        urls = pages_to_data_urls(render_pdf_pages(pdf_path))
+        # Rasterizing every page is seconds of CPU: keep it off the event loop.
+        urls = await asyncio.to_thread(
+            lambda: pages_to_data_urls(render_pdf_pages(pdf_path)))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 

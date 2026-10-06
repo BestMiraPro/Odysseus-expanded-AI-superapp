@@ -22,7 +22,11 @@ def register(router: APIRouter) -> None:
                          *( [StudyDeck.owner == user] if user is not None else [] )
                      ).all())
             queue: List[Dict] = []
+            # The rating-button labels must preview what review_card will
+            # schedule: the deck's retention and the user's fitted weights.
+            user_w = _cached_w(db, user)
             for deck in decks:
+                retention = _flt(deck.retention, 0.9)
                 base = db.query(StudyCard).filter(
                     StudyCard.deck_id == deck.id,
                     StudyCard.suspended == False)  # noqa: E712
@@ -38,7 +42,8 @@ def register(router: APIRouter) -> None:
                 new = base.filter(StudyCard.state == "new") \
                     .order_by(StudyCard.created_at.asc()).limit(cap).all() if cap else []
                 for c in learning + review + new:
-                    queue.append(_card_to_dict(c, with_preview=True))
+                    queue.append(_card_to_dict(c, with_preview=True,
+                                               retention=retention, w=user_w))
             # Default: already-seen cards (learning/review) sink behind new ones.
             # The per-user `study_order` pref = "review" restores the classic
             # spaced-repetition order (due reviews first, then new).

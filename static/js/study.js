@@ -740,6 +740,12 @@ a.study-btn { display: inline-flex; align-items: center; text-decoration: none; 
 .study-cardrow .front, .study-cardrow .back { overflow: hidden; display: -webkit-box;
   -webkit-line-clamp: 3; -webkit-box-orient: vertical; white-space: pre-wrap; }
 .study-cardrow.suspended { opacity: 0.45; }
+.study-card-edit { display: flex; flex-direction: column; gap: 4px; padding: 8px 10px;
+  border: 1px solid var(--accent, #5b8abf); border-radius: 8px; margin-bottom: 6px; }
+.study-qe-opts { border: 1px solid var(--border); border-radius: 7px; padding: 6px 8px; margin: 2px 0; }
+.study-qe-opt { display: flex; gap: 6px; align-items: flex-start; margin-bottom: 4px; }
+.study-qe-opt .study-textarea { min-height: 34px; flex: 1; }
+.study-qe-opt input[type="radio"] { margin-top: 10px; }
 .study-state { font-size: 9.5px; text-transform: uppercase; opacity: 0.55; white-space: nowrap; }
 .study-topic-row { display: grid; grid-template-columns: 1fr 110px 110px 30px; gap: 6px; margin-bottom: 6px; }
 .study-subtle { font-size: 11.5px; opacity: 0.6; }
@@ -2302,6 +2308,7 @@ function renderQuestionList() {
       <span class="study-state">${esc(q.topic || '')}${q.topic ? ' · ' : ''}${esc(q.difficulty)}
         · ${esc(q.state)}${q.state !== 'new' ? ` · due ${fmtDue(q.due)}` : ''}${q.lapses ? ` · ${q.lapses}✗` : ''}</span>
       ${_originalQuestionButton(q, true)}
+      <button class="study-btn small" data-qedit="${q.id}" title="Edit" aria-label="Edit question">✎</button>
       <button class="study-btn small" data-qsusp="${q.id}" title="${q.suspended ? 'Unsuspend' : 'Suspend'}">${q.suspended ? '▶' : '⏸'}</button>
       <button class="study-btn small danger" data-qdel="${q.id}" title="Delete">✕</button>
     </div>`).join('')
@@ -2316,10 +2323,15 @@ function renderQuestionList() {
   _enrichRendered(wrap);
   wrap.onclick = async (e) => {
     if (e.target.closest('#study-q-more')) { s.qLimit = (s.qLimit || 40) + 40; renderQuestionList(); return; }
+    const editBtn = e.target.closest('[data-qedit]');
     const su = e.target.closest('[data-qsusp]')?.dataset.qsusp;
     const delBtn = e.target.closest('[data-qdel]');
     try {
-      if (su) {
+      if (editBtn) {
+        const q = s.questions.find(x => x.id === editBtn.dataset.qedit);
+        const row = editBtn.closest('.study-cardrow');
+        if (q && row) _openQuestionEditor(row, q);
+      } else if (su) {
         const q = s.questions.find(x => x.id === su);
         await jput(`/api/study/questions/${su}`, { suspended: !q.suspended });
         q.suspended = !q.suspended;   // local update — avoids a full subject reload + re-render
@@ -2347,6 +2359,117 @@ function renderQuestionList() {
       }
     } catch (err) { toast(err.message, true); }
   };
+}
+
+// Inline editor for one bank question: the prompt and reference answer of any
+// question, plus the options and the correct one for an MCQ. It sends only the
+// fields that changed: the server drops a question's cached explanation
+// whenever options or reference arrive, so an untouched field must not ride
+// along.
+function _openQuestionEditor(row, q) {
+  const mcq = q.qtype === 'mcq';
+  const draft = {
+    options: mcq ? [...(q.options || [])] : [],
+    correct: Number.isInteger(q.correct_index) ? q.correct_index : -1,
+  };
+  while (mcq && draft.options.length < 2) draft.options.push('');
+  const uid = esc(q.id);
+  const form = document.createElement('div');
+  form.className = 'study-card-edit';
+  form.setAttribute('role', 'group');
+  form.setAttribute('aria-label', 'Edit question');
+  form.innerHTML = `
+    <label class="study-subtle" for="study-qe-q-${uid}">Question</label>
+    <textarea class="study-textarea" id="study-qe-q-${uid}" data-qe-question style="min-height:70px;"></textarea>
+    ${mcq ? `<fieldset class="study-qe-opts">
+      <legend class="study-subtle">Options (select the correct one)</legend>
+      <div data-qe-opts></div>
+      <button type="button" class="study-btn small" data-qe-optadd>Add option</button>
+    </fieldset>` : ''}
+    <label class="study-subtle" for="study-qe-ref-${uid}">${mcq
+      ? 'Reference answer / worked solution (optional)' : 'Reference answer (answers are graded against it)'}</label>
+    <textarea class="study-textarea" id="study-qe-ref-${uid}" data-qe-reference style="min-height:70px;"></textarea>
+    <div class="study-form-row" style="margin-top:6px;">
+      <button class="study-btn primary" data-ed-save>Save</button>
+      <button class="study-btn" data-ed-cancel>Cancel</button>
+    </div>`;
+  const qEl = form.querySelector('[data-qe-question]');
+  const refEl = form.querySelector('[data-qe-reference]');
+  qEl.value = q.question || '';
+  refEl.value = q.reference || '';
+  const optsBox = form.querySelector('[data-qe-opts]');
+  const renderOpts = () => {
+    if (!optsBox) return;
+    optsBox.innerHTML = draft.options.map((o, i) => `
+      <div class="study-qe-opt">
+        <input type="radio" name="study-qe-correct-${uid}" data-qe-correct="${i}"
+          ${i === draft.correct ? 'checked' : ''} aria-label="Option ${i + 1} is correct">
+        <textarea class="study-textarea" rows="1" data-qe-opt="${i}" aria-label="Option ${i + 1}">${esc(o)}</textarea>
+        <button type="button" class="study-btn small" data-qe-optdel="${i}"
+          title="Remove option" aria-label="Remove option ${i + 1}">✕</button>
+      </div>`).join('');
+  };
+  renderOpts();
+  form.addEventListener('input', (e) => {
+    const i = e.target.dataset?.qeOpt;
+    if (i !== undefined) draft.options[+i] = e.target.value;
+  });
+  form.addEventListener('change', (e) => {
+    const i = e.target.dataset?.qeCorrect;
+    if (i !== undefined && e.target.checked) draft.correct = +i;
+  });
+  form.addEventListener('click', (e) => {
+    if (e.target.closest('[data-qe-optadd]')) {
+      draft.options.push('');
+      renderOpts();
+      optsBox?.querySelector(`[data-qe-opt="${draft.options.length - 1}"]`)?.focus();
+      return;
+    }
+    const del = e.target.closest('[data-qe-optdel]');
+    if (!del) return;
+    const i = +del.dataset.qeOptdel;
+    draft.options.splice(i, 1);
+    if (draft.correct === i) draft.correct = -1;
+    else if (draft.correct > i) draft.correct -= 1;
+    renderOpts();
+  });
+  const close = () => {
+    renderQuestionList();
+    _focusRowEditButton('#study-q-list', 'data-qedit', q.id);
+  };
+  _mountRowEditor(row, form, {
+    focusSel: '[data-qe-question]',
+    onCancel: close,
+    onSave: async () => {
+      const patch = {};
+      const question = qEl.value.trim();
+      if (!question) { toast('The question cannot be empty', true); return; }
+      if (question !== (q.question || '').trim()) patch.question = question;
+      const reference = refEl.value.trim();
+      if (reference !== (q.reference || '').trim()) patch.reference = reference;
+      if (mcq) {
+        // Drop blank options before numbering, so correct_index names the
+        // option that was ticked instead of shifting past a gap.
+        const kept = draft.options.map((t, i) => ({ t: t.trim(), i })).filter(o => o.t);
+        if (kept.length < 2) { toast('A multiple-choice question needs at least 2 options', true); return; }
+        const ci = kept.findIndex(o => o.i === draft.correct);
+        if (ci < 0) { toast('Select the correct option', true); return; }
+        const options = kept.map(o => o.t);
+        if (JSON.stringify(options) !== JSON.stringify(q.options || [])) {
+          patch.options = options;
+          patch.correct_index = ci;
+        } else if (ci !== q.correct_index) {
+          patch.correct_index = ci;
+        }
+      }
+      if (Object.keys(patch).length) {
+        const updated = await jput(`/api/study/questions/${encodeURIComponent(q.id)}`, patch);
+        const cur = S.subject?.questions.find(x => x.id === q.id);
+        if (cur && updated) Object.assign(cur, updated);
+      }
+      close();
+    },
+  });
 }
 
 // Bank maintenance for one subject. These passes used to be reachable only
@@ -2525,33 +2648,18 @@ function renderCardList() {
       <button class="study-btn small danger" data-delc="${c.id}" title="Delete">✕</button>
     </div>`).join('');
   wrap.onclick = async (e) => {
-    const editId = e.target.closest('[data-edit]')?.dataset.edit;
+    const editBtn = e.target.closest('[data-edit]');
+    const editId = editBtn?.dataset.edit;
     const suspId = e.target.closest('[data-susp]')?.dataset.susp;
     const delId = e.target.closest('[data-delc]')?.dataset.delc;
     try {
       if (editId) {
+        // Inline edit form (Phase 4.2: replaces native prompt()). It used to
+        // look the row up through an undeclared `el` and a `.study-row`
+        // class these rows never had, so the button threw and did nothing.
         const c = s.cards.find(x => x.id === editId);
-        // Inline edit form (Phase 4.2: replaces native prompt())
-        const wrap2 = el.querySelector(`[data-edit="${editId}"]`)?.closest('.study-row');
-        if (wrap2) {
-          wrap2.outerHTML = `<div class="study-card-edit" role="dialog" aria-label="Edit card">
-            <input class="study-input" id="study-edit-front" value="${esc(c.front)}" placeholder="Front" style="width:100%;margin-bottom:6px;" aria-label="Card front">
-            <textarea class="study-textarea" id="study-edit-back" style="min-height:80px;margin-bottom:6px;" aria-label="Card back">${esc(c.back)}</textarea>
-            <div class="study-form-row">
-              <button class="study-btn primary" id="study-edit-save" data-id="${editId}">Save</button>
-              <button class="study-btn" id="study-edit-cancel">Cancel</button>
-            </div>
-          </div>`;
-          el.querySelector('#study-edit-save')?.addEventListener('click', async () => {
-            const front = el.querySelector('#study-edit-front').value.trim();
-            const back = el.querySelector('#study-edit-back').value.trim();
-            if (!front) return toast('Front cannot be empty', true);
-            await jput(`/api/study/cards/${editId}`, { front, back });
-            reloadSubject();
-          });
-          el.querySelector('#study-edit-cancel')?.addEventListener('click', () => reloadSubject());
-          el.querySelector('#study-edit-front')?.focus();
-        }
+        const row = editBtn.closest('.study-cardrow');
+        if (c && row) _openCardEditor(row, c);
       } else if (suspId) {
         const c = s.cards.find(x => x.id === suspId);
         await jput(`/api/study/cards/${suspId}`, { suspended: !c.suspended });
@@ -2564,6 +2672,79 @@ function renderCardList() {
       }
     } catch (err) { toast(err.message, true); }
   };
+}
+
+// Shared plumbing for the inline row editors (cards and bank questions): the
+// form takes the row's place, Escape or Cancel puts the row back, and focus
+// returns to the row's edit button either way. Escape is stopped here so the
+// pane-level handler does not read it as "close Study".
+function _mountRowEditor(row, form, { onSave, onCancel, focusSel }) {
+  row.replaceWith(form);
+  const cancel = () => onCancel();
+  form.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopPropagation();
+    cancel();
+  });
+  form.querySelector('[data-ed-cancel]')?.addEventListener('click', cancel);
+  const saveBtn = form.querySelector('[data-ed-save]');
+  saveBtn?.addEventListener('click', async () => {
+    if (saveBtn.disabled) return;
+    saveBtn.disabled = true;
+    try { await onSave(); }
+    catch (err) { toast(err.message, true); }
+    finally { saveBtn.disabled = false; }
+  });
+  form.querySelector(focusSel)?.focus();
+}
+
+function _focusRowEditButton(listSel, attr, id) {
+  const btns = body()?.querySelector(listSel)?.querySelectorAll(`[${attr}]`) || [];
+  Array.from(btns).find(b => b.getAttribute(attr) === id)?.focus();
+}
+
+function _openCardEditor(row, c) {
+  const form = document.createElement('div');
+  form.className = 'study-card-edit';
+  form.setAttribute('role', 'group');
+  form.setAttribute('aria-label', 'Edit card');
+  const fid = `study-edit-front-${esc(c.id)}`;
+  const bid = `study-edit-back-${esc(c.id)}`;
+  // Values are assigned below, not interpolated: fronts can span lines, which
+  // an <input value=...> would have flattened on save.
+  form.innerHTML = `
+    <label class="study-subtle" for="${fid}">Front</label>
+    <textarea class="study-textarea" id="${fid}" data-ed-front style="min-height:50px;"></textarea>
+    <label class="study-subtle" for="${bid}">Back</label>
+    <textarea class="study-textarea" id="${bid}" data-ed-back style="min-height:80px;"></textarea>
+    <div class="study-form-row" style="margin-top:6px;">
+      <button class="study-btn primary" data-ed-save>Save</button>
+      <button class="study-btn" data-ed-cancel>Cancel</button>
+    </div>`;
+  const frontEl = form.querySelector('[data-ed-front]');
+  const backEl = form.querySelector('[data-ed-back]');
+  frontEl.value = c.front || '';
+  backEl.value = c.back || '';
+  const close = () => {
+    renderCardList();
+    _focusRowEditButton('#study-card-list', 'data-edit', c.id);
+  };
+  _mountRowEditor(row, form, {
+    focusSel: '[data-ed-front]',
+    onCancel: close,
+    onSave: async () => {
+      const front = frontEl.value.trim();
+      const back = backEl.value.trim();
+      // The server keeps the old text for an empty side, which would look
+      // like a save that silently did nothing.
+      if (!front || !back) { toast('Front and back are both required', true); return; }
+      const updated = await jput(`/api/study/cards/${encodeURIComponent(c.id)}`, { front, back });
+      const cur = S.subject?.cards.find(x => x.id === c.id);
+      if (cur) Object.assign(cur, updated || { front, back });
+      close();
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------

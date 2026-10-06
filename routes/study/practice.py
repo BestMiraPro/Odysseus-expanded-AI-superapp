@@ -123,13 +123,18 @@ def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
 
         interleaved = _round_robin(new_rows, _key)[:limit]
 
-        # Ordering mode (per-user pref `study_order`): the default sinks
-        # answered questions behind unseen ones; "review" puts due reviews
-        # first. A mock is a fixed paper, so it keeps its drawn order.
-        if mock or _common._read_pref(user, "study_order") == "review":
-            queue = due + interleaved
-        else:
-            queue = interleaved + due
+        # Selection: due questions (review and relearning) claim the session's
+        # slots first and new ones fill what is left, still interleaved.
+        # `interleaved` alone can be `limit` long, so putting it first made
+        # `queue[:limit]` drop every due question for as long as unseen ones
+        # remained - the schedule never came round.
+        queue = due + interleaved
+
+        # Ordering mode (per-user pref `study_order`) then decides only the
+        # order *within* the session: the default shows the unseen questions
+        # first and answered ones last; "review" puts due reviews first. A
+        # mock is a fixed paper, so it keeps its drawn order.
+        new_first = not mock and _common._read_pref(user, "study_order") != "review"
 
         weak_area_weights = None
         if adaptive:
@@ -154,6 +159,10 @@ def practice_queue_payload(user, *, deck_id=None, material_id=None, topics=None,
                 })
         else:
             rows = queue[:limit]
+            if new_first:
+                due_ids = {r.id for r in due}
+                rows = ([r for r in rows if r.id not in due_ids]
+                        + [r for r in rows if r.id in due_ids])
 
         pretest_ids = set()
         if mode == "pretest":
@@ -287,6 +296,12 @@ def register(router: APIRouter) -> None:
                 if body.correct_index != row.correct_index:
                     row.correct_index = body.correct_index
                     changed.add("correct_index")
+            if "options" in changed and not _mcq_answer_in_range(row):
+                # Fewer options can leave the stored answer pointing past the
+                # end, and an MCQ whose answer is not an option can never be
+                # answered right. Nothing is committed on this path.
+                raise HTTPException(400, "correct_index is out of range for the "
+                                         "new options; send the correct_index too")
             if body.reference is not None:
                 if body.reference != row.reference:
                     row.reference = body.reference
@@ -338,9 +353,11 @@ def register(router: APIRouter) -> None:
                        mode: Optional[str] = None, adaptive: bool = False,
                        chapter: Optional[str] = None,
                        theme: Optional[str] = None):
-        """Due questions first (spaced retrieval), then new ones interleaved
-        across subject and topic. Optional scope: one subject, one material,
-        and/or a comma-separated topic list. ``mock=true`` draws a fixed-size
+        """Due questions (spaced retrieval, including relearning) are picked
+        first, then new ones interleaved across subject and topic fill the
+        session; the ``study_order`` pref orders the picked questions (new
+        first by default, due first with "review"). Optional scope: one
+        subject, one material, and/or a comma-separated topic list. ``mock=true`` draws a fixed-size
         paper regardless of the schedule (timed mock exams); ``mode=pretest``
         lifts one unseen question per topic ahead of the rest."""
         return practice_queue_payload(
@@ -359,9 +376,10 @@ def register(router: APIRouter) -> None:
         first result and ignores the retry's payload, and omitting the key
         records every request as a new attempt. See ``review_card`` for the
         reasoning.
+
+        Only AI-graded answers (open, or an MCQ in typed-recall mode) count
+        against the AI rate limit; a picked MCQ option is checked locally.
         """
-        if not _ai_limiter.check(request.client.host):
-            raise HTTPException(429, "Too many requests — try again later")
         user = _owner(request)
         db = _common.SessionLocal()
         try:
@@ -396,6 +414,10 @@ def register(router: APIRouter) -> None:
                     }
         finally:
             db.close()
+        ai_graded = qtype != "mcq" or bool(body.typed_recall)
+        if ai_graded and not _ai_limiter.check(request.client.host):
+            raise HTTPException(429, "Too many requests — try again later")
+
         async def _grade_open_answer(answer_text: str, ref_block: str) -> tuple:
             """Reuse the existing open-answer AI grading path (Phase 2.5)."""
             if not answer_text:
@@ -486,7 +508,9 @@ def register(router: APIRouter) -> None:
                 "last_review": row.last_review,
                 "reps": row.reps or 0,
                 "lapses": row.lapses or 0,
-            }, rating, w=(user_w if user_w is not None else _common.fsrs.DEFAULT_W))
+            }, rating,
+                desired_retention=_deck_retention(db, row.deck_id, user),
+                w=(user_w if user_w is not None else _common.fsrs.DEFAULT_W))
             row.state = result["state"]
             row.stability = str(result["stability"])
             row.fsrs_difficulty = str(result["difficulty"])

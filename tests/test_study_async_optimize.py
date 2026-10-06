@@ -10,6 +10,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -69,6 +70,11 @@ class _Session:
 
     def add(self, row):
         self.rows.setdefault(type(row), []).append(row)
+
+    def delete(self, row):
+        table = self.rows.setdefault(type(row), [])
+        if row in table:
+            table.remove(row)
 
     def commit(self):
         self.commits += 1
@@ -131,3 +137,73 @@ def test_optimize_status_never_run(study_client):
     res = client.get("/api/study/optimize/status")
     assert res.status_code == 200
     assert res.json()["status"] == "never_run"
+
+
+@pytest.fixture
+def blocking_fit(monkeypatch):
+    """fit_w that holds until released, counting how many fits started."""
+    from src import fsrs_optimizer
+    release = threading.Event()
+    started = []
+
+    def fit(snapshots, reviews, seed=42):
+        started.append(1)
+        release.wait(5)
+        return None
+
+    monkeypatch.setattr(fsrs_optimizer, "fit_w", fit)
+    yield release, started
+    release.set()
+
+
+def _wait_idle(client, timeout=5.0):
+    """Until the worker has released the user's lock (the status turns
+    terminal a moment before that)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if not study_routes._optimize_lock(OWNER).locked():
+            return
+        time.sleep(0.02)
+    raise AssertionError("optimization never finished")
+
+
+def test_concurrent_optimize_runs_one_fit(study_client, blocking_fit):
+    """A second /optimize while one is running must not start a parallel fit
+    that races the first to write the user's weights."""
+    client, _session = study_client
+    release, started = blocking_fit
+    first = client.post("/api/study/optimize").json()
+    second = client.post("/api/study/optimize").json()
+    assert first["status"] == "running" and not first.get("already_running")
+    assert second == {"status": "running", "reviews": 0, "already_running": True}
+    release.set()
+    _wait_idle(client)
+    assert len(started) == 1
+
+    # The lock is released when the fit ends: the next request runs again.
+    third = client.post("/api/study/optimize").json()
+    assert not third.get("already_running")
+    _wait_idle(client)
+    assert len(started) == 2
+
+
+def test_reset_restores_default_weights(study_client):
+    client, session = study_client
+    session.rows[StudyUserParams].append(StudyUserParams(
+        id="p1", owner=OWNER, w_json=json.dumps([1.0] * 17), review_count=500))
+    res = client.post("/api/study/optimize/reset")
+    assert res.status_code == 200
+    assert res.json() == {"status": "reset", "removed": 1}
+    assert session.rows[StudyUserParams] == []
+    assert client.get("/api/study/optimize/status").json()["status"] == "reset"
+
+
+def test_reset_is_refused_while_a_fit_runs(study_client, blocking_fit):
+    """Otherwise the running fit would write its weights straight back."""
+    client, _session = study_client
+    release, _started = blocking_fit
+    client.post("/api/study/optimize")
+    assert client.post("/api/study/optimize/reset").status_code == 409
+    release.set()
+    _wait_idle(client)
+    assert client.post("/api/study/optimize/reset").status_code == 200

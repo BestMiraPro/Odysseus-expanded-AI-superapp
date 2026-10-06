@@ -4,8 +4,8 @@ ACs exercised:
 1. Gate: <400 reviews => fit_w returns None.
 2. Determinism: same inputs => identical w.
 3. Owner-scope: data built from a single user's rows.
-4. Exclude interval_days==0 learning-step rows from loss (gate works on
-   effective training rows after excluding zeros).
+4. Train on memory tests only - reviews of a card in the review state after
+   a real gap - and count lapses among them (gate works on those rows).
 5. Warm-start fallback: schedule() behavior-identical when no w supplied.
 """
 
@@ -18,6 +18,7 @@ import pytest
 from src import fsrs
 from src.fsrs import schedule
 from src.fsrs_optimizer import fit_w, MIN_REVIEWS
+from src import fsrs_optimizer
 
 NOW = datetime(2026, 6, 11, 12, 0, tzinfo=timezone.utc)
 
@@ -155,3 +156,71 @@ def test_fitted_w_valid_length_and_finite():
     assert w is not None
     assert len(w) == 17
     assert all(math.isfinite(v) and v > 0 for v in w)
+
+
+# --- 6. Lapses are training data ---
+
+def _history(card_id: str, outcomes):
+    """A card that graduates, then is reviewed every 5 days with the given
+    outcomes (True = recalled). Each lapse is followed by a relearning step
+    10 minutes later, recorded as the scheduler would: Again in review grants
+    0 days, which is why the old interval_days > 0 mask dropped every lapse."""
+    t = NOW - timedelta(days=5 * (len(outcomes) + 2))
+    rows = [{"id": f"{card_id}-0", "card_id": card_id, "rating": 3, "interval_days": 4,
+             "state_before": "new", "reviewed_at": t.isoformat()}]
+    for i, ok in enumerate(outcomes, start=1):
+        t += timedelta(days=5)
+        rows.append({"id": f"{card_id}-{i}", "card_id": card_id,
+                     "rating": 3 if ok else 1, "interval_days": 5 if ok else 0,
+                     "state_before": "review", "reviewed_at": t.isoformat()})
+        if not ok:
+            rows.append({"id": f"{card_id}-{i}r", "card_id": card_id, "rating": 3,
+                         "interval_days": 2, "state_before": "relearning",
+                         "reviewed_at": (t + timedelta(minutes=10)).isoformat()})
+    return rows
+
+
+def test_training_rows_include_lapses():
+    """Observed recall must reflect the failures. Under the old mask every
+    training row read as a success (observed == 1), inflating stability."""
+    import numpy as np
+    outcomes = [True, False, True, False]
+    grouped, _ = fsrs_optimizer._parse_reviews([], _history("c1", outcomes))
+    s_pre, elapsed, observed = fsrs_optimizer._training_rows(
+        grouped, np.array(fsrs.DEFAULT_W))
+    # One row per review-state memory test; the graduation step and the
+    # same-day relearning steps are not memory tests.
+    assert list(observed) == [1.0, 0.0, 1.0, 0.0]
+    assert all(e >= 4.9 for e in elapsed), "a relearning step leaked into training"
+    assert all(s > 0 for s in s_pre)
+
+
+def test_gate_counts_memory_tests_including_lapses():
+    """The gate counts exactly the memory tests - lapses included, the
+    graduation and relearning steps not."""
+    outcomes = [i % 4 == 0 for i in range(MIN_REVIEWS)]   # 75% lapses
+    rows = _history("c1", outcomes)
+    assert len(rows) > MIN_REVIEWS
+    grouped, _ = fsrs_optimizer._parse_reviews([], rows)
+    assert fsrs_optimizer._count_trainable(grouped) == MIN_REVIEWS
+    grouped, _ = fsrs_optimizer._parse_reviews([], _history("c1", outcomes[:-1]))
+    assert fit_w([], [r for revs in grouped.values() for r in revs]) is None
+
+
+def test_frequent_lapses_lower_the_loss_of_weaker_memory():
+    """The loss now sees lapses, so a history with many of them prefers
+    parameters that predict lower recall than the defaults do. With the old
+    all-success rows, longer stability would always have looked better."""
+    import numpy as np
+    histories = []
+    for c in range(40):
+        histories += _history(f"c{c}", [(c + i) % 2 == 0 for i in range(6)])
+    grouped, _ = fsrs_optimizer._parse_reviews([], histories)
+    base = np.array(fsrs.DEFAULT_W)
+    weaker = base.copy()
+    weaker[8] -= 1.0       # slower stability growth after a recall
+    stronger = base.copy()
+    stronger[8] += 1.0
+    assert fsrs_optimizer._loss_for_w(grouped, weaker) < \
+        fsrs_optimizer._loss_for_w(grouped, base) < \
+        fsrs_optimizer._loss_for_w(grouped, stronger)

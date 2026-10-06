@@ -348,7 +348,13 @@ def _card_fsrs_dict(card: StudyCard) -> Dict:
     }
 
 
-def _card_to_dict(card: StudyCard, with_preview: bool = False) -> Dict:
+def _card_to_dict(card: StudyCard, with_preview: bool = False, *,
+                  retention: Optional[float] = None,
+                  w: Optional[List[float]] = None) -> Dict:
+    """Serialize a card. ``with_preview`` adds the per-rating next-due labels;
+    pass the deck's ``retention`` and the user's fitted ``w`` - the ones
+    review_card schedules with - or the labels promise intervals the review
+    will not grant."""
     out = {
         "id": card.id,
         "deck_id": card.deck_id,
@@ -367,8 +373,11 @@ def _card_to_dict(card: StudyCard, with_preview: bool = False) -> Dict:
         "lapses": card.lapses or 0,
     }
     if with_preview:
-        out["preview"] = {str(k): v for k, v in
-                          fsrs.preview_intervals(_card_fsrs_dict(card)).items()}
+        out["preview"] = {str(k): v for k, v in fsrs.preview_intervals(
+            _card_fsrs_dict(card),
+            desired_retention=(retention if retention is not None
+                               else fsrs.DEFAULT_RETENTION),
+            w=(w if w is not None else fsrs.DEFAULT_W)).items()}
     return out
 
 
@@ -394,6 +403,16 @@ def _exam_to_dict(exam: StudyExam) -> Dict:
         "deck_id": exam.deck_id,
         "archived": bool(exam.archived),
     }
+
+
+def _carried_done_blocks(old_done_json: Optional[str], plan: Dict) -> str:
+    """done_blocks JSON for a regenerated plan: completed blocks that still
+    exist in the new plan keep their tick (see migrate_done_blocks). Shared
+    by the regenerate route and the Study agent's generate_plan."""
+    old_done = json.loads(old_done_json) if old_done_json else []
+    if not isinstance(old_done, list):
+        return json.dumps([])
+    return json.dumps(migrate_done_blocks(old_done, plan))
 
 
 def _focus_to_dict(s: StudyFocusSession) -> Dict:
@@ -1115,7 +1134,9 @@ async def _build_figures_section(owner, material_id: str, file_id: str,
     from src.study_vision import extract_pdf_figures, figure_data_url
 
     try:
-        figs = extract_pdf_figures(pdf_path, _study_figures_dir(material_id))
+        # pypdf + Pillow over every page: CPU/disk work, off the event loop.
+        figs = await asyncio.to_thread(
+            extract_pdf_figures, pdf_path, _study_figures_dir(material_id))
     except Exception as e:
         logger.warning("study notes: figure extraction failed error_type=%s",
                        type(e).__name__)
@@ -1127,7 +1148,8 @@ async def _build_figures_section(owner, material_id: str, file_id: str,
     keep: set = set()
     value = None
     try:
-        urls = [figure_data_url(f["path"]) for f in figs]
+        urls = await asyncio.to_thread(
+            lambda: [figure_data_url(f["path"]) for f in figs])
         value = await _llm_json_vision(
             owner, FIGURE_CAPTION_SYSTEM,
             f"Caption these {len(urls)} figures, in order.", urls,
@@ -1196,6 +1218,14 @@ def _question_to_dict(q: StudyQuestion, with_answer: bool = True,
         out["explanation"] = q.explanation
         out["answer_provenance"] = normalize_answer_provenance(q.answer_provenance)
     return out
+
+
+def _mcq_answer_in_range(row) -> bool:
+    """False when an MCQ's stored correct_index no longer names an option."""
+    if row.qtype != "mcq" or row.correct_index is None:
+        return True
+    opts = json.loads(row.options) if row.options else []
+    return 0 <= row.correct_index < len(opts)
 
 
 def _question_original_link(q: StudyQuestion,
@@ -1285,6 +1315,35 @@ def _resolve_uploaded_file(file_id: str) -> str:
     raise HTTPException(404, "Uploaded file not found")
 
 
+def _require_upload_owner(file_id: str, owner: Optional[str]) -> None:
+    """404 unless ``owner`` uploaded ``file_id`` - the check
+    routes/upload_routes.download_file makes before serving an upload. Upload
+    ids are not secrets (they end up in links and exports), so without this a
+    user could attach - and then read, transcribe and export - someone
+    else's file by naming its id. With auth off (owner None) there is only
+    one user and nothing to check."""
+    if owner is None:
+        return
+    import os
+    from src.constants import UPLOAD_DIR
+    safe = os.path.basename(file_id or "")
+    info = None
+    # Same index the upload routes use; its .bak twin covers a torn write.
+    for name in ("uploads.json", "uploads.json.bak"):
+        try:
+            with open(os.path.join(UPLOAD_DIR, name), encoding="utf-8") as fh:
+                index = json.load(fh)
+        except Exception:
+            continue
+        if isinstance(index, dict):
+            info = index.get(safe) if isinstance(index.get(safe), dict) else next(
+                (v for v in index.values()
+                 if isinstance(v, dict) and v.get("id") == safe), None)
+        break
+    if not info or info.get("owner") != owner:
+        raise HTTPException(404, "Uploaded file not found")
+
+
 def _extract_file_text(file_id: str, owner) -> str:
     """Resolve an uploaded file and extract its text for question extraction."""
     import os
@@ -1324,26 +1383,36 @@ def _extract_file_text(file_id: str, owner) -> str:
 
 
 def _vision_candidates(owner) -> List:
-    """(url, model, headers) candidates for image calls: the user's study
-    model first (they may have picked a VLM), then the configured/auto
-    vision model, then the vision fallback chain."""
-    cands = []
-    try:
-        from src.endpoint_resolver import resolve_endpoint
-        url, model, headers = resolve_endpoint("study", owner=owner or None)
-        if url and model:
-            cands.append((url, model, headers))
-    except Exception:
-        pass
+    """(url, model, headers) candidates for image calls, vision-capable only:
+    a dedicated vision model configured in Settings -> Vision first, then the
+    user's Study model when it can read images (they may have picked a VLM),
+    then the auto-detected vision model, then the vision fallback chain.
+
+    The Study model is often text-only. Offered unconditionally it was tried
+    first on every page batch, failing each time before the fallback, and it
+    made vision look available on setups that have no vision model at all.
+    Blocking (settings, endpoint probes): call it via asyncio.to_thread from
+    async code."""
+    dedicated, study, auto = [], [], []
     try:
         from src.document_processor import _load_vl_settings, _resolve_vl_model
         settings = _load_vl_settings()
-        url, model, headers = _resolve_vl_model(settings.get("vision_model", ""), owner=owner)
+        configured = (settings.get("vision_model") or "").strip()
+        url, model, headers = _resolve_vl_model(configured, owner=owner)
         if url and model:
-            cands.append((url, model, headers))
+            (dedicated if configured else auto).append((url, model, headers))
     except Exception as e:
         logger.debug("study vision: vl model resolution failed error_type=%s",
                      type(e).__name__)
+    try:
+        from src.chat_helpers import model_supports_vision
+        from src.endpoint_resolver import resolve_endpoint
+        url, model, headers = resolve_endpoint("study", owner=owner or None)
+        if url and model and model_supports_vision(model, url):
+            study.append((url, model, headers))
+    except Exception:
+        pass
+    cands = dedicated + study + auto
     try:
         from src.endpoint_resolver import resolve_vision_fallback_candidates
         cands.extend(c for c in resolve_vision_fallback_candidates(owner=owner)
@@ -1367,7 +1436,7 @@ async def _llm_json_vision(owner, system: str, instruction: str,
     """One-shot vision call returning parsed JSON; iterates model candidates."""
     from src.llm_core import llm_call_async
 
-    candidates = _vision_candidates(owner)
+    candidates = await asyncio.to_thread(_vision_candidates, owner)
     if not candidates:
         raise HTTPException(503, "No vision-capable model available. Pick a vision "
                                  "model in the Study model selector, or configure "
@@ -1536,13 +1605,15 @@ async def _extract_questions_vision(owner, mode: str, types: List[str],
     from src.study_vision import render_pdf_pages, pages_to_data_urls
 
     try:
-        page_urls = pages_to_data_urls(render_pdf_pages(pdf_path))
+        # Rasterizing every page is seconds of CPU: keep it off the event loop.
+        page_urls = await asyncio.to_thread(
+            lambda: pages_to_data_urls(render_pdf_pages(pdf_path)))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
     # render_pdf_pages caps at MAX_PAGES; say so rather than silently reading
     # only the front of a long exam.
     from src.study_vision import MAX_PAGES, pdf_page_count
-    total_pages = pdf_page_count(pdf_path) or len(page_urls)
+    total_pages = (await asyncio.to_thread(pdf_page_count, pdf_path)) or len(page_urls)
     page_info = {"pages": len(page_urls), "total_pages": total_pages,
                  "truncated": total_pages > len(page_urls)}
     if page_info["truncated"]:
@@ -1715,6 +1786,18 @@ Use the learner's language for feedback and followup. Write any mathematics as L
 # Module-level so the status endpoint and tests can access it.
 _optimize_locks: Dict[str, threading.Lock] = {}
 _optimize_status: Dict[str, Dict] = {}
+_optimize_locks_guard = threading.Lock()
+
+
+def _optimize_lock(user: Optional[str]) -> threading.Lock:
+    """The per-user lock held for the whole of one optimization run (request
+    through background thread), so concurrent /optimize calls cannot start
+    parallel fits that race to write the user's weights."""
+    with _optimize_locks_guard:
+        lock = _optimize_locks.get(user)
+        if lock is None:
+            lock = _optimize_locks[user] = threading.Lock()
+        return lock
 
 
 
@@ -1743,6 +1826,19 @@ def _cached_w(db, user: Optional[str]) -> Optional[List[float]]:
         except Exception:
             pass
     return None
+
+
+def _deck_retention(db, deck_id: Optional[str], user: Optional[str]) -> float:
+    """The deck's desired retention (what review_card schedules cards with),
+    for scheduling that deck's practice questions the same way."""
+    deck = None
+    if deck_id:
+        q = db.query(StudyDeck).filter(StudyDeck.id == deck_id)
+        if user is not None:
+            q = q.filter(StudyDeck.owner == user)
+        deck = q.first()
+    return _flt(deck.retention, fsrs.DEFAULT_RETENTION) if deck is not None \
+        else fsrs.DEFAULT_RETENTION
 
 
 def _new_introduced_today(db, user, deck_id: str) -> int:
@@ -1797,7 +1893,7 @@ async def _llm_text_vision(owner, system: str, instruction: str, image_urls: Lis
     """One-shot vision call returning plain text; iterates model candidates."""
     from src.llm_core import llm_call_async
 
-    candidates = _vision_candidates(owner)
+    candidates = await asyncio.to_thread(_vision_candidates, owner)
     if not candidates:
         raise HTTPException(503, "No vision-capable model available. Pick a vision "
                                  "model in the Study model selector, or configure "

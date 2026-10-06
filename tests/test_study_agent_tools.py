@@ -145,7 +145,11 @@ def test_add_questions_validates_and_dedupes(db):
     assert res["ok"] and res["result"]["topic"] == "Demand" and res["result"]["difficulty"] == "hard"
 
     assert run("set_question_suspended", "alice", {"question_id": mcq["id"], "suspended": True})["result"]["suspended"]
-    assert run("delete_question", "alice", {"question_id": mcq["id"]})["ok"]
+    # Destructive: refused until the user's go-ahead arrives as confirm=true.
+    res = run("delete_question", "alice", {"question_id": mcq["id"]})
+    assert not res["ok"] and "confirm" in res["error"].lower()
+    assert run("list_questions", "alice", {"deck_id": did})["result"]["total"] == 2
+    assert run("delete_question", "alice", {"question_id": mcq["id"], "confirm": True})["ok"]
     assert run("list_questions", "alice", {"deck_id": did})["result"]["total"] == 1
 
 
@@ -172,7 +176,40 @@ def test_cards_roundtrip(db):
     assert res["result"]["created"] == 1
     cards = run("list_cards", "alice", {"deck_id": did})["result"]["cards"]
     assert len(cards) == 1
-    assert run("delete_card", "alice", {"card_id": cards[0]["id"]})["ok"]
+    res = run("delete_card", "alice", {"card_id": cards[0]["id"]})
+    assert not res["ok"] and "confirm" in res["error"].lower()
+    assert len(run("list_cards", "alice", {"deck_id": did})["result"]["cards"]) == 1
+    assert run("delete_card", "alice", {"card_id": cards[0]["id"], "confirm": True})["ok"]
+    assert run("list_cards", "alice", {"deck_id": did})["result"]["cards"] == []
+
+
+def test_every_destructive_study_tool_requires_confirm(db):
+    """Enforced at dispatch, so a destructive tool cannot skip it by
+    forgetting to call _confirmed() in its handler (delete_question and
+    delete_card did). The schema advertises the argument too."""
+    from src import study_agent as sa
+    destructive = [t for t in sa.TOOLS.values() if t.destructive and not t.code]
+    assert {t.name for t in destructive} >= {"delete_subject", "remove_material",
+                                             "delete_question", "delete_card"}
+    for spec in destructive:
+        assert "confirm" in spec.required, spec.name
+        res = run(spec.name, "alice", {"deck_id": "x", "material_id": "x",
+                                      "question_id": "x", "card_id": "x"})
+        assert not res["ok"] and "confirm" in res["error"].lower(), spec.name
+
+
+def test_update_question_rejects_options_that_orphan_the_answer(db):
+    did = _subject()
+    run("add_questions", "alice", {"deck_id": did, "questions": [
+        {"type": "mcq", "question": "Which?", "options": ["a", "b", "c"], "answer": "c"}]})
+    qid = run("list_questions", "alice", {"deck_id": did})["result"]["questions"][0]["id"]
+    res = run("update_question", "alice", {"question_id": qid, "options": ["a", "b"]})
+    assert not res["ok"] and "correct_index" in res["error"]
+    full = run("get_question", "alice", {"question_id": qid})["result"]
+    assert full["options"] == ["a", "b", "c"] and full["correct_index"] == 2
+    res = run("update_question", "alice", {"question_id": qid, "options": ["a", "b"],
+                                           "correct_index": 1})
+    assert res["ok"] and res["result"]["correct_index"] == 1
 
 
 def test_exam_with_linked_subject_and_plan(db):
@@ -187,6 +224,29 @@ def test_exam_with_linked_subject_and_plan(db):
     exams = run("list_exams", "alice")["result"]["exams"]
     assert exams[0]["deck_id"] == did and exams[0]["has_plan"]
     assert not run("create_exam", "alice", {"title": "x", "exam_date": "15/01/2099", "topics": []})["ok"]
+
+
+def test_regenerating_a_plan_keeps_completed_blocks(db):
+    """The agent used to reset done_blocks to [] on regenerate, wiping the
+    learner's ticks; the HTTP route keeps those that still exist."""
+    from core.database import StudyExam
+    eid = run("create_exam", "alice", {"title": "Midterm", "exam_date": "2099-01-15",
+                                       "topics": [{"name": "Demand", "importance": 5, "mastery": 2}]}
+              )["result"]["id"]
+    assert run("generate_plan", "alice", {"exam_id": eid})["ok"]
+    s = db()
+    exam = s.query(StudyExam).filter(StudyExam.id == eid).first()
+    first_day = json.loads(exam.plan)["days"][0]["date"]
+    kept, gone = f"{first_day}:0", "1999-01-01:0"
+    exam.done_blocks = json.dumps([kept, gone])
+    s.commit()
+    s.close()
+
+    assert run("generate_plan", "alice", {"exam_id": eid})["ok"]
+    s = db()
+    done = json.loads(s.query(StudyExam).filter(StudyExam.id == eid).first().done_blocks)
+    s.close()
+    assert done == [kept], "completed blocks were wiped (or a vanished block kept)"
 
 
 def test_study_stats_on_empty_db(db):

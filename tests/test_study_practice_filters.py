@@ -113,6 +113,60 @@ def test_queue_owner_isolation(db):
         practice_queue_payload("bob", deck_id="d1")
 
 
+def _seed_backlog(SessionLocal, n_new=8):
+    """More unseen questions than one session holds, plus one overdue review
+    and one relearning (just-failed) question."""
+    from datetime import timedelta
+    from core.database import StudyDeck, StudyQuestion
+    from routes.study_routes import _utcnow_naive
+    s = SessionLocal()
+    s.add(StudyDeck(id="d1", owner="alice", name="Micro", new_per_day=15, retention="0.9"))
+    now = _utcnow_naive()
+    for i in range(n_new):
+        s.add(StudyQuestion(id=f"new{i}", owner="alice", deck_id="d1", qtype="open",
+                            question=f"New {i}", reference="r", topic=f"T{i % 3}",
+                            difficulty="medium", state="new", due=now))
+    s.add(StudyQuestion(id="due-review", owner="alice", deck_id="d1", qtype="open",
+                        question="Overdue", reference="r", topic="T0", difficulty="medium",
+                        state="review", due=now - timedelta(days=3)))
+    s.add(StudyQuestion(id="due-relearn", owner="alice", deck_id="d1", qtype="open",
+                        question="Lapsed", reference="r", topic="T1", difficulty="medium",
+                        state="relearning", due=now - timedelta(minutes=1)))
+    s.commit()
+    s.close()
+
+
+@pytest.mark.parametrize("order", ["", "review"])
+def test_due_questions_are_never_starved_by_new_ones(db, monkeypatch, order):
+    """With at least `limit` unseen questions the old default queue was all
+    new: `interleaved + due` sliced to `limit` dropped every due and
+    relearning question, so the schedule never came round. Due ones now
+    claim slots first, under either ordering preference."""
+    from routes.study import practice as prac
+    _seed_backlog(db)
+    monkeypatch.setattr(prac._common, "_read_pref", lambda u, k: order)
+    res = prac.practice_queue_payload("alice", deck_id="d1", limit=5)
+    ids = [q["id"] for q in res["queue"]]
+    assert len(ids) == 5
+    assert {"due-review", "due-relearn"} <= set(ids)
+    assert res["due"] == 2
+    # New questions fill the rest, still interleaved across topics.
+    new_topics = [q["topic"] for q in res["queue"] if q["id"].startswith("new")]
+    assert len(new_topics) == 3 and len(set(new_topics)) == 3
+    if order == "review":
+        assert set(ids[:2]) == {"due-review", "due-relearn"}
+    else:
+        # The default still shows unseen questions first within the session.
+        assert set(ids[-2:]) == {"due-review", "due-relearn"}
+
+
+def test_due_backlog_larger_than_session_fills_it(db):
+    from routes.study_routes import practice_queue_payload
+    _seed_backlog(db)
+    res = practice_queue_payload("alice", deck_id="d1", limit=2)
+    assert {q["id"] for q in res["queue"]} == {"due-review", "due-relearn"}
+
+
 # ---------------------------------------------------------------- live counts
 
 def test_material_counts_are_live(db):

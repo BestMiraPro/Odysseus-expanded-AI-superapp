@@ -595,6 +595,9 @@ async def _update_question(owner, args):
                 row.correct_index = ci
                 changed.add("correct_index")
                 row.explanation = None
+        if "options" in changed and not sr._mcq_answer_in_range(row):
+            raise HTTPException(400, "correct_index is out of range for the new "
+                                     "options; pass correct_index too")
         if args.get("reference") is not None:
             new_ref = str(args["reference"])
             if new_ref != row.reference:
@@ -616,8 +619,9 @@ async def _update_question(owner, args):
         db.close()
 
 
-@tool("delete_question", "Delete one question (and its attempt history).",
-      {"question_id": _s("Question id")}, ["question_id"], destructive=True)
+@tool("delete_question", "Delete one question (and its attempt history). Destructive: needs confirm=true after the user agreed.",
+      {"question_id": _s("Question id"), "confirm": _b("Must be true")},
+      ["question_id", "confirm"], destructive=True)
 async def _delete_question(owner, args):
     _require(args, "question_id")
     db = SessionLocal()
@@ -695,7 +699,9 @@ async def _add_cards(owner, args):
         db.close()
 
 
-@tool("delete_card", "Delete one flashcard.", {"card_id": _s("Card id")}, ["card_id"], destructive=True)
+@tool("delete_card", "Delete one flashcard. Destructive: needs confirm=true after the user agreed.",
+      {"card_id": _s("Card id"), "confirm": _b("Must be true")}, ["card_id", "confirm"],
+      destructive=True)
 async def _delete_card(owner, args):
     _require(args, "card_id")
     db = SessionLocal()
@@ -773,7 +779,9 @@ async def _generate_plan(owner, args):
         except ValueError as e:
             raise HTTPException(400, str(e))
         exam.plan = json.dumps(plan)
-        exam.done_blocks = json.dumps([])
+        # Keep the ticks on completed blocks that survive the regeneration,
+        # exactly as the regenerate route does.
+        exam.done_blocks = sr._carried_done_blocks(exam.done_blocks, plan)
         db.commit()
         meta = plan.get("meta", {})
         return {"ok": True, "days": len(plan.get("days", [])), "meta": meta}
@@ -1301,6 +1309,11 @@ async def dispatch_tool(name: str, owner, args: Dict, *, allow_code: bool = Fals
         if not owner_is_admin_or_single_user(owner):
             return {"ok": False, "error": "code tools require an admin user"}
     try:
+        if spec.destructive and not spec.code:
+            # Enforced here, not left to each handler: a destructive study
+            # tool that forgot to call _confirmed() deleted unasked. Code
+            # tools have their own gate (allow_code + admin) above.
+            _confirmed(args or {})
         result = await spec.handler(owner, args or {})
     except HTTPException as e:
         return {"ok": False, "error": str(e.detail)}

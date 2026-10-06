@@ -143,11 +143,7 @@ def register(router: APIRouter) -> None:
             exam.plan = json.dumps(plan)
 
             # --- done_blocks preservation on regen ---
-            old_done = json.loads(exam.done_blocks) if exam.done_blocks else []
-            if isinstance(old_done, list):
-                exam.done_blocks = json.dumps(migrate_done_blocks(old_done, plan))
-            else:
-                exam.done_blocks = json.dumps([])
+            exam.done_blocks = _carried_done_blocks(exam.done_blocks, plan)
             db.commit()
             return _exam_to_dict(exam)
         finally:

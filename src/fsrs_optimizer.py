@@ -9,9 +9,15 @@ state so that pre-review stability/difficulty are consistent with the
 candidate parameters.
 
 Key design choices:
-- Gate: >= 400 trainable reviews (interval_days > 0) before fitting.
-- Exclude interval_days == 0 rows from loss: they are fixed learning-step
-  delays, not a stability signal.
+- Training rows are memory tests: reviews of a card that was in the
+  "review" state, after a real gap (elapsed days since the previous review
+  > 0). The observed outcome is whether that review succeeded (rating !=
+  Again), so lapses count. Learning/relearning steps are fixed same-day
+  re-drills, not a stability signal, and are excluded.
+  (Selecting rows by the interval a review *granted* was wrong: Again always
+  grants 0 days, so every lapse was dropped and every row read as a success,
+  which pushed stability up.)
+- Gate: >= 400 trainable reviews before fitting.
 - Deterministic: inputs sorted by (card_id, reviewed_at, id); RNG seeded.
 - Owner-scoped: only caller-passed rows feed the loss.
 - No per-row gradient — loss is binned MSE over predicted vs observed recall.
@@ -70,6 +76,28 @@ def _parse_reviews(card_snapshots: List[Dict], reviews: List[Dict]):
     return grouped, snapshots
 
 
+def _is_memory_test(state_before: str, elapsed_days: float) -> bool:
+    """A review that tests recall after a real gap: the card was in the
+    review state and time passed since its previous review."""
+    return state_before == "review" and elapsed_days > 0
+
+
+def _count_trainable(grouped: Dict[str, List[Dict]]) -> int:
+    """Training rows per _is_memory_test, from the recorded history alone
+    (elapsed days do not depend on w)."""
+    n = 0
+    for revs in grouped.values():
+        prev = None
+        for r in revs:
+            ra = _ensure_aware(r.get("reviewed_at"))
+            elapsed = ((ra - prev).total_seconds() / 86400.0
+                       if prev is not None and ra is not None else 0.0)
+            if _is_memory_test(r.get("state_before") or "new", elapsed):
+                n += 1
+            prev = ra
+    return n
+
+
 def _simulate_card(reviews: List[Dict], w: np.ndarray):
     """Simulate a single card's history with a given w.
 
@@ -119,39 +147,45 @@ def _simulate_card(reviews: List[Dict], w: np.ndarray):
     return s_pre, d_pre, elapsed, ratings, ivals, states
 
 
-def _loss_for_w(grouped: Dict, w: np.ndarray) -> float:
-    """Binned MSE loss over all trainable rows (interval_days > 0)."""
-    FACTOR = fsrs.FACTOR
-    DECAY = fsrs.DECAY
-
-    # Aggregate all rows into flat arrays
+def _training_rows(grouped: Dict, w: np.ndarray):
+    """(pre-review S, elapsed days, observed recall) for every memory test
+    (see _is_memory_test), simulated under ``w``; None when there are none.
+    ``observed`` is 1.0 for a successful review and 0.0 for Again."""
     all_s = []
-    all_d = []
     all_elapsed = []
     all_rating = []
-    all_ival = []
 
     for cid, reviews in grouped.items():
         if not reviews:
             continue
-        s_pre, d_pre, elapsed, rating, ivals, _states = _simulate_card(reviews, w)
-        mask = ivals > 0
+        s_pre, _d_pre, elapsed, rating, _ivals, states = _simulate_card(reviews, w)
+        in_review = np.array([st == "review" for st in states], dtype=bool)
+        # s_pre > 0 drops a history that starts mid-review (no simulated
+        # memory state to predict from).
+        mask = in_review & (elapsed > 0) & (s_pre > 0)
         if not np.any(mask):
             continue
         all_s.append(s_pre[mask])
-        all_d.append(d_pre[mask])
         all_elapsed.append(elapsed[mask])
         all_rating.append(rating[mask])
-        all_ival.append(ivals[mask])
 
     if not all_s:
-        return 1e9
-
-    s_pre = np.concatenate(all_s)
-    d_pre = np.concatenate(all_d)
-    elapsed = np.concatenate(all_elapsed)
+        return None
     rating = np.concatenate(all_rating)
-    ivals = np.concatenate(all_ival)
+    observed = (rating != fsrs.AGAIN).astype(np.float64)
+    return np.concatenate(all_s), np.concatenate(all_elapsed), observed
+
+
+def _loss_for_w(grouped: Dict, w: np.ndarray) -> float:
+    """Binned MSE between predicted and observed recall over memory tests,
+    binned by (log) elapsed days."""
+    FACTOR = fsrs.FACTOR
+    DECAY = fsrs.DECAY
+
+    rows = _training_rows(grouped, w)
+    if rows is None:
+        return 1e9
+    s_pre, elapsed, observed = rows
     n = len(s_pre)
 
     # Predicted R
@@ -162,12 +196,10 @@ def _loss_for_w(grouped: Dict, w: np.ndarray) -> float:
         else:
             r_pred[i] = (1.0 + FACTOR * elapsed[i] / s_pre[i]) ** DECAY
 
-    observed = (rating != fsrs.AGAIN).astype(np.float64)
-
     log_min, log_max = math.log(1.0), math.log(730.0)
     bidx = np.empty(n, dtype=np.int32)
     for i in range(n):
-        ld = math.log(max(1.0, float(ivals[i])))
+        ld = math.log(max(1.0, float(elapsed[i])))
         b = int((ld - log_min) / (log_max - log_min) * (BINS - 1))
         b = max(0, min(BINS - 1, b))
         bidx[i] = b
@@ -198,16 +230,11 @@ def fit_w(card_snapshots: List[Dict], reviews: List[Dict],
           seed: int = SEED) -> Optional[List[float]]:
     """Fit per-user FSRS weights.
 
-    Returns a list of 17 floats or None if the gate (< MIN_REVIEWS trainable
-    rows with interval_days>0) isn't met.
+    Returns a list of 17 floats or None if the gate (< MIN_REVIEWS memory
+    tests, see _is_memory_test) isn't met.
     """
     grouped, _snapshots = _parse_reviews(card_snapshots, reviews)
-    # Quick gate: count trainable rows
-    trainable = sum(
-        1 for revs in grouped.values()
-        for r in revs if int(r.get("interval_days") or 0) > 0
-    )
-    if trainable < MIN_REVIEWS:
+    if _count_trainable(grouped) < MIN_REVIEWS:
         return None
 
     rng = np.random.default_rng(seed)
