@@ -356,7 +356,26 @@ def build_headers(api_key: Optional[str], base: str) -> Dict[str, str]:
         headers.setdefault("X-OpenRouter-Title", "Odysseus")
     if _is_kimi_code_url(base):
         headers.setdefault("User-Agent", KIMI_CODE_USER_AGENT)
+    if _host_match(base, "inference.wandb.ai"):
+        project = wandb_project()
+        if project:
+            headers.setdefault("OpenAI-Project", project)
     return headers
+
+
+def wandb_project() -> Optional[str]:
+    """W&B Inference bills and tracks calls against an "entity/project".
+
+    Read from the standard W&B variables: WANDB_PROJECT as "entity/project",
+    or WANDB_ENTITY + WANDB_PROJECT.
+    """
+    import os
+
+    project = (os.getenv("WANDB_PROJECT") or "").strip()
+    entity = (os.getenv("WANDB_ENTITY") or "").strip()
+    if project and "/" not in project and entity:
+        project = f"{entity}/{project}"
+    return project or None
 
 
 def resolve_endpoint(

@@ -197,3 +197,17 @@ def test_research_job_runs_inside_a_research_scope(monkeypatch):
     asyncio.run(go())
     assert seen["scope"] is not None
     assert (seen["scope"].owner, seen["scope"].source, seen["scope"].session_id) == ("erin", "research", "sess-r")
+
+
+def test_wandb_inference_gets_its_project_header(monkeypatch):
+    from src.endpoint_resolver import build_headers
+
+    monkeypatch.delenv("WANDB_PROJECT", raising=False)
+    monkeypatch.delenv("WANDB_ENTITY", raising=False)
+    assert build_headers("k", "https://api.inference.wandb.ai/v1") == {"Authorization": "Bearer k"}
+    monkeypatch.setenv("WANDB_ENTITY", "team")
+    monkeypatch.setenv("WANDB_PROJECT", "proj")
+    assert build_headers("k", "https://api.inference.wandb.ai/v1")["OpenAI-Project"] == "team/proj"
+    monkeypatch.setenv("WANDB_PROJECT", "other/proj2")
+    assert build_headers("k", "https://api.inference.wandb.ai/v1")["OpenAI-Project"] == "other/proj2"
+    assert "OpenAI-Project" not in build_headers("k", "https://api.openai.com/v1")

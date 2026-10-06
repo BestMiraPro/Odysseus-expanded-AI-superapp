@@ -12,6 +12,9 @@ Spends a few US cents at most (one short reply per path).
 Provider (first one configured wins):
   ANTHROPIC_API_KEY             Anthropic API (default model claude-haiku-4-5-20251001)
   GEMINI_API_KEY                Google Gemini, OpenAI-compatible API (default gemini-2.5-flash)
+  WANDB_API_KEY                 W&B Inference, OpenAI-compatible API (default meta-llama/Llama-3.1-8B-Instruct);
+                                set WANDB_ENTITY + WANDB_PROJECT (or WANDB_PROJECT="entity/project") if
+                                your account needs the OpenAI-Project header
   ODYSSEUS_LIVE_BASE_URL +      any OpenAI-compatible API (needs ODYSSEUS_LIVE_MODEL and
   ODYSSEUS_LIVE_API_KEY         ODYSSEUS_LIVE_PRICE_IN / _OUT)
 Optional overrides:
@@ -42,6 +45,9 @@ PROVIDERS = {
                   "model": "claude-haiku-4-5-20251001", "price": (1.0, 5.0)},
     "gemini": {"env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
                "model": "gemini-2.5-flash", "price": (0.30, 2.50)},
+    # W&B's published price for Llama 3.1 8B at the time of writing; override if it changed.
+    "wandb": {"env": "WANDB_API_KEY", "base_url": "https://api.inference.wandb.ai/v1",
+              "model": "meta-llama/Llama-3.1-8B-Instruct", "price": (0.22, 0.22)},
 }
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -66,6 +72,45 @@ def pick_provider() -> dict:
     if base and key and model and p_in and p_out:
         return {"name": "custom", "base_url": base, "key": key, "model": model, "price": (float(p_in), float(p_out))}
     sys.exit("No provider configured: set ANTHROPIC_API_KEY or GEMINI_API_KEY (see the docstring).")
+
+
+def provider_headers(provider: dict) -> dict:
+    if provider["name"] == "anthropic":
+        return {"x-api-key": provider["key"], "anthropic-version": "2023-06-01"}
+    headers = {"Authorization": f"Bearer {provider['key']}"}
+    if provider["name"] == "wandb":
+        project = (os.getenv("WANDB_PROJECT") or "").strip()
+        entity = (os.getenv("WANDB_ENTITY") or "").strip()
+        if project and "/" not in project and entity:
+            project = f"{entity}/{project}"
+        if project:
+            headers["OpenAI-Project"] = project
+    return headers
+
+
+def preflight(provider: dict) -> None:
+    """Fail fast, before any spend: blocked host, bad key, or unknown model."""
+    from urllib.parse import urlparse
+
+    host = urlparse(provider["base_url"]).hostname
+    try:
+        r = httpx.get(provider["base_url"].rstrip("/") + "/models", headers=provider_headers(provider), timeout=20)
+    except httpx.HTTPError as exc:
+        sys.exit(f"Cannot reach {host} ({type(exc).__name__}: {exc}). If this runs in a sandbox, its network "
+                 f"policy must allow {host}.")
+    if r.status_code in (401, 403):
+        sys.exit(f"{host} rejected the key (HTTP {r.status_code}): {r.text[:300]}")
+    if r.status_code >= 400:
+        print(f"  note: {host}/models answered HTTP {r.status_code}; continuing", flush=True)
+        return
+    try:
+        ids = [m.get("id") for m in r.json().get("data", []) if isinstance(m, dict)]
+    except ValueError:
+        ids = []
+    if ids and provider["model"] not in ids and f"models/{provider['model']}" not in ids:
+        sys.exit(f"{provider['model']} is not offered by {host}. Set ODYSSEUS_LIVE_MODEL (and its prices) to one of: "
+                 + ", ".join(sorted(ids)[:40]))
+    print(f"  preflight ok: {host} reachable, key accepted, {provider['model']} available", flush=True)
 
 
 def free_port() -> int:
@@ -107,16 +152,17 @@ class Odysseus:
             settings[f"{role}_endpoint_id"] = ep_id
             settings[f"{role}_model"] = p["model"]
         (self.data / "settings.json").write_text(json.dumps(settings))
+        # The key travels in the environment, never on a command line (visible in `ps`).
         code = (
-            "import json, core.database as d\n"
+            "import json, os, core.database as d\n"
             "s = d.SessionLocal()\n"
             f"s.add(d.ModelEndpoint(id={ep_id!r}, name='Live provider', base_url={p['base_url']!r}, owner=None,"
-            f" is_enabled=True, model_type='llm', endpoint_kind='api', api_key={p['key']!r},"
+            " is_enabled=True, model_type='llm', endpoint_kind='api', api_key=os.environ['LIVE_SEED_KEY'],"
             f" cached_models=json.dumps([{p['model']!r}])))\n"
             "s.commit()\n"
         )
-        subprocess.run([sys.executable, "-c", code], cwd=REPO, env=self.env, check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run([sys.executable, "-c", code], cwd=REPO, env={**self.env, "LIVE_SEED_KEY": p["key"]},
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return ep_id
 
     def start(self) -> None:
@@ -176,6 +222,7 @@ def run() -> int:
     provider = pick_provider()
     print(f"Provider: {provider['name']}  model: {provider['model']}  "
           f"price: ${provider['price'][0]}/${provider['price'][1]} per 1M in/out")
+    preflight(provider)
     app = Odysseus(provider)
     ep_id = app.seed()
     app.start()
