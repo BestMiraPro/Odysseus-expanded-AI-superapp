@@ -24,7 +24,10 @@ def test_model_listing_and_image_fallback_are_owner_scoped():
     image_body = _source(ai_interaction.do_generate_image)
 
     assert "owner: Optional[str] = None" in list_body
-    assert "owner_filter(query, ModelEndpoint, owner)" in list_body
+    # list_models reads the shared model roster, which owner-filters endpoints.
+    assert "model_roster.roster, owner" in list_body
+    from src import model_roster
+    assert "owner_filter(q, ModelEndpoint, owner)" in _source(model_roster.visible_endpoints)
     # _resolve_model is offloaded to a worker thread (#4589) but stays owner-scoped.
     assert "asyncio.to_thread(_resolve_model, candidate, owner=owner)" in image_body
     assert "owner_filter(_img_q, ModelEndpoint, owner)" in image_body

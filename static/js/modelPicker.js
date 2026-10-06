@@ -194,6 +194,40 @@ export function initModelPicker(deps) {
   _initModelPickerDropdown();
 }
 
+// Recommendation + price per model from /api/models/roster: "★" marks the
+// newest model of its family, the chip is the metered price band (or plan /
+// free). Fetched lazily and at most every two minutes; the picker renders
+// without it and re-renders once it arrives.
+const _rosterMeta = new Map();
+let _rosterAt = 0;
+let _rosterInflight = null;
+
+function _loadRosterMeta() {
+  if (_rosterInflight) return _rosterInflight;
+  if (Date.now() - _rosterAt < 120000) return Promise.resolve(false);
+  _rosterInflight = fetch('/api/models/roster', { credentials: 'same-origin' })
+    .then(r => (r.ok ? r.json() : null))
+    .then(data => {
+      if (!data || !Array.isArray(data.models)) return false;
+      _rosterMeta.clear();
+      const bare = new Map();
+      for (const m of data.models) {
+        _rosterMeta.set(`${m.endpoint_id}::${m.model}`, m);
+        bare.set(m.model, bare.has(m.model) ? null : m);
+      }
+      for (const [mid, m] of bare) if (m && !_rosterMeta.has(mid)) _rosterMeta.set(mid, m);
+      _rosterAt = Date.now();
+      return true;
+    })
+    .catch(() => false)
+    .finally(() => { _rosterInflight = null; });
+  return _rosterInflight;
+}
+
+function _rosterFor(m) {
+  return _rosterMeta.get(`${m.endpointId}::${m.mid}`) || _rosterMeta.get(m.mid) || null;
+}
+
 function _initModelPickerDropdown() {
   const wrap = document.getElementById('model-picker-wrap');
   const btn = document.getElementById('model-picker-btn');
@@ -491,6 +525,30 @@ function _initModelPickerDropdown() {
       // hover so the suffix/variant tag is still discoverable (#1982).
       nameSpan.title = m.display;
       row.appendChild(nameSpan);
+      const meta = _rosterFor(m);
+      if (meta && meta.recommended) {
+        const star = document.createElement('span');
+        star.className = 'mp-rec-star';
+        star.textContent = '★';
+        star.title = 'Recommended: the newest model of its family';
+        star.setAttribute('aria-label', 'Recommended');
+        star.style.cssText = 'color:#e0b03c;font-size:10px;margin-left:4px;flex-shrink:0;';
+        row.appendChild(star);
+      }
+      if (meta) {
+        const text = meta.billing === 'subscription' ? 'plan' : meta.billing === 'local' ? 'free' : (meta.cost_band || '');
+        if (text && text !== '?') {
+          const chip = document.createElement('span');
+          chip.className = 'mp-cost-chip';
+          chip.textContent = text;
+          chip.title = meta.cost_label || '';
+          chip.style.cssText = 'font-size:9.5px;opacity:0.6;margin-left:4px;padding:0 4px;border-radius:4px;'
+            + 'background:color-mix(in srgb, var(--fg) 8%, transparent);flex-shrink:0;';
+          row.appendChild(chip);
+        }
+        row.title = [row.title, `${meta.tier || ''}${(meta.traits || []).length ? ' · ' + meta.traits.join(', ') : ''}`, meta.cost_label]
+          .filter(Boolean).join('\n');
+      }
       // Offline state is already conveyed by the row's reduced opacity —
       // a redundant "offline" pill on top of that just added clutter.
       // (Class kept on `row` so the opacity rule still applies; the text
@@ -580,6 +638,17 @@ function _initModelPickerDropdown() {
       if (recentModels.length) {
         _addSection('Recent');
         recentModels.forEach(m => { shown.add(_pickerModelKey(m)); _addRow(m); });
+      }
+    }
+
+    // Large catalogs: surface the newest model of each family up top.
+    if (all.length > BROWSE_ALL_LIMIT && _rosterMeta.size) {
+      const recommended = all
+        .filter(m => !shown.has(_pickerModelKey(m)) && !m.stale && _rosterFor(m)?.recommended)
+        .slice(0, 8);
+      if (recommended.length) {
+        _addSection('Recommended');
+        recommended.forEach(m => { shown.add(_pickerModelKey(m)); _addRow(m); });
       }
     }
 
@@ -788,6 +857,9 @@ async function _pick(m) {
       } else {
         _renderLoading('Loading models…');
       }
+      _loadRosterMeta().then((changed) => {
+        if (changed && !menu.classList.contains('hidden') && _hasModelCache()) _populate(search.value || '');
+      });
       if (window.modelsModule && window.modelsModule.refreshModels) {
         // Force the cheap /api/models cache refresh when the picker opens.
         // This does not wait on provider probes; the backend returns cached

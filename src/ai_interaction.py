@@ -79,8 +79,12 @@ def _resolve_model(spec: str, owner: Optional[str] = None, model_type: Optional[
     """Resolve a model specifier to (endpoint_url, model_id, headers).
 
     Accepts:
+      "endpoint_id::model_id"   — an exact roster key (from list_models)
       "model_name"              — searches all configured endpoints
       "model_name@endpoint_name" — looks up specific endpoint by display name
+
+    Exact matches on any endpoint win over partial ones, and the endpoints'
+    known model lists are checked before any live /models probe.
 
     Raises ValueError if model not found.
     """
@@ -91,7 +95,12 @@ def _resolve_model(spec: str, owner: Optional[str] = None, model_type: Optional[
 
     spec = spec.strip()
     target_endpoint_name = None
+    target_endpoint_id = None
 
+    if "::" in spec:
+        target_endpoint_id, _, spec = spec.partition("::")
+        target_endpoint_id = target_endpoint_id.strip()
+        spec = spec.strip()
     if "@" in spec:
         model_name, target_endpoint_name = spec.rsplit("@", 1)
         model_name = model_name.strip()
@@ -124,14 +133,33 @@ def _resolve_model(spec: str, owner: Optional[str] = None, model_type: Optional[
             query = query.filter(ModelEndpoint.model_type == model_type)
         if target_endpoint_name:
             query = query.filter(ModelEndpoint.name.ilike(f"%{target_endpoint_name}%"))
+        if target_endpoint_id:
+            query = query.filter(ModelEndpoint.id == target_endpoint_id)
         if owner:
             query = owner_filter(query, ModelEndpoint, owner)
         endpoints = query.all()
 
         if not endpoints:
             raise ValueError("No enabled endpoints found" +
-                             (f" matching '{target_endpoint_name}'" if target_endpoint_name else ""))
+                             (f" matching '{target_endpoint_name or target_endpoint_id}'"
+                              if (target_endpoint_name or target_endpoint_id) else ""))
 
+        # Fast exact pass over each endpoint's known models (cached + pinned):
+        # no network, and it finds models the hardcoded provider lists do not
+        # know yet (new Claude releases, subscription endpoints).
+        wanted = model_name.lower()
+        for ep in endpoints:
+            known = _json_list(getattr(ep, "cached_models", None)) + _json_list(getattr(ep, "pinned_models", None))
+            hit = next((mid for mid in known if mid.lower() == wanted), None)
+            if not hit:
+                continue
+            try:
+                base, api_key = resolve_endpoint_runtime(ep, owner=owner)
+            except Exception:
+                continue
+            return build_chat_url(base), hit, build_headers(api_key, base)
+
+        partial_hits: list[Tuple[str, str, Dict]] = []
         for ep in endpoints:
             try:
                 base, api_key = resolve_endpoint_runtime(ep, owner=owner)
@@ -141,14 +169,15 @@ def _resolve_model(spec: str, owner: Optional[str] = None, model_type: Optional[
             headers = build_headers(api_key, base)
 
             if provider == "anthropic":
-                # Anthropic: match against hardcoded model list
-                matched = None
-                for am in ANTHROPIC_MODELS:
-                    if model_name.lower() in am.lower() or am.lower() in model_name.lower():
-                        matched = am
-                        break
-                if matched:
-                    return build_chat_url(base), matched, headers
+                # Anthropic: exact id from the provider list, else remember a
+                # partial match and only use it if no endpoint matches exactly.
+                exact = next((am for am in ANTHROPIC_MODELS if am.lower() == wanted), None)
+                if exact:
+                    return build_chat_url(base), exact, headers
+                partial = next((am for am in ANTHROPIC_MODELS
+                                if wanted in am.lower() or am.lower() in wanted), None)
+                if partial:
+                    partial_hits.append((build_chat_url(base), partial, headers))
             else:
                 # OpenAI-compatible and native Ollama: probe the provider's model list.
                 endpoint_reachable = False
@@ -188,18 +217,23 @@ def _resolve_model(spec: str, owner: Optional[str] = None, model_type: Optional[
                     if mid.lower() == model_name.lower():
                         return build_chat_url(base), mid, headers
 
-                # Partial match
+                # Partial match: kept until every endpoint had its exact chance.
+                partial_here = False
                 for mid in model_ids:
                     if model_name.lower() in mid.lower() or mid.lower() in model_name.lower():
-                        return build_chat_url(base), mid, headers
+                        partial_hits.append((build_chat_url(base), mid, headers))
+                        partial_here = True
+                        break
 
                 # Last resort for local image endpoints: if the requested model
                 # name is clearly an image model, use the endpoint's first known
                 # image model id. This prevents a harmless alias mismatch from
                 # blocking image generation.
-                if model_type == "image" and _image_like(model_name) and model_ids:
+                if model_type == "image" and _image_like(model_name) and model_ids and not partial_here:
                     return build_chat_url(base), model_ids[0], headers
 
+        if partial_hits:
+            return partial_hits[0]
         raise ValueError(f"Model '{spec}' not found on any configured endpoint")
     finally:
         db.close()

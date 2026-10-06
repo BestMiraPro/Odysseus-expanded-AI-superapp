@@ -335,12 +335,13 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "chat_with_model",
-            "description": "Send a message to another AI model and get its response. Use for getting a second opinion, delegating subtasks, or AI-to-AI communication.",
+            "description": "Delegate a subtask to, or get a second opinion from, ANY other configured model (subscription, API or local) and get its answer. Call list_models first to see which models are recommended, what they cost and what they are good at; pick the cheapest one that can do the job, and a different vendor than yourself for an independent opinion.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "model": {"type": "string", "description": "Model name (e.g. 'qwen3-32b') or model@endpoint_name"},
-                    "message": {"type": "string", "description": "The message to send to the model"}
+                    "model": {"type": "string", "description": "Exact [key] from list_models (endpoint_id::model), or a model name, or model@endpoint_name"},
+                    "message": {"type": "string", "description": "The full task or question for that model, with all the context it needs (it cannot see this conversation)"},
+                    "instructions": {"type": "string", "description": "Optional system prompt for the delegate: its role, constraints and the output format you want back"}
                 },
                 "required": ["model", "message"]
             }
@@ -455,7 +456,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_models",
-            "description": "List all available AI models across configured endpoints. Optionally filter by keyword.",
+            "description": "List every model you can delegate to with chat_with_model: RECOMMENDED (newest of its family), subscription/api/local, tier (fast/balanced/flagship), strengths, context window and price per 1M tokens. Optionally filter by keyword (e.g. 'code', 'fast', 'local', 'claude').",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1484,7 +1485,11 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     elif tool_type == "search_chats":
         content = args.get("query", "")
     elif tool_type == "chat_with_model":
-        content = args.get("model", "") + "\n" + args.get("message", "")
+        if args.get("instructions"):
+            # Carries the delegate's system prompt; chat_with_model reads either form.
+            content = json.dumps({k: args.get(k, "") for k in ("model", "message", "instructions")})
+        else:
+            content = args.get("model", "") + "\n" + args.get("message", "")
     elif tool_type == "create_session":
         content = args.get("name", "Untitled") + "\n" + args.get("model", "")
     elif tool_type == "list_sessions":

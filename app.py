@@ -788,6 +788,8 @@ from routes.claude_subscription_routes import setup_claude_subscription_routes
 app.include_router(setup_claude_subscription_routes())
 from routes.council_routes import setup_council_routes
 app.include_router(setup_council_routes())
+from routes.model_roster_routes import setup_model_roster_routes
+app.include_router(setup_model_roster_routes())
 
 # Omnigent agent bridge
 from routes.omnigent_routes import setup_omnigent_routes

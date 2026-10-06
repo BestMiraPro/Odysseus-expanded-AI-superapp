@@ -27,47 +27,102 @@ _TEACHER_SYSTEM_PROMPT = (
 )
 
 
-async def chat_with_model(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
-    """Send a message to a specific model and return its response.
+def _parse_delegate_content(content: str) -> tuple[str, str, str]:
+    """(model_spec, message, instructions) from the tool content.
 
-    Content format:
-      Line 1: model_name (or model_name@endpoint_name)
-      Line 2+: the message to send
+    Plain form: line 1 = model, rest = message. Native calls that carry
+    ``instructions`` arrive as a JSON object instead.
+    """
+    import json
+
+    text = (content or "").strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            return (str(data.get("model") or "").strip(), str(data.get("message") or "").strip(),
+                    str(data.get("instructions") or "").strip())
+    lines = text.split("\n", 1)
+    return (lines[0].strip() if lines else "", lines[1].strip() if len(lines) > 1 else "", "")
+
+
+def _roster_entry_for(model_id: str, owner: Optional[str]):
+    try:
+        from src import model_roster
+
+        return next((e for e in model_roster.roster(owner) if e.model == model_id), None)
+    except Exception:
+        return None
+
+
+async def chat_with_model(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
+    """Delegate to (or consult) another configured model and return its answer.
+
+    Content: line 1 = model (a roster key ``endpoint_id::model`` from
+    list_models, a model name, or ``model@endpoint``); line 2+ = the message.
+    Native calls may also pass ``instructions``: a system prompt for the
+    delegate (its role, constraints, output format).
     """
     from src.ai_interaction import _resolve_model, AI_CHAT_TIMEOUT
     from src.llm_core import llm_call_async
 
-    lines = content.strip().split("\n", 1)
-    if not lines or not lines[0].strip():
-        return {"error": "First line must be the model name"}
-
-    model_spec = lines[0].strip()
-    message = lines[1].strip() if len(lines) > 1 else ""
+    model_spec, message, instructions = _parse_delegate_content(content)
+    if not model_spec:
+        return {"error": "First line must be the model name (see list_models for exact keys)"}
     if not message:
         return {"error": "No message provided (line 2+ is the message)"}
 
     try:
         url, model, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=owner)
     except ValueError as e:
-        return {"error": str(e)}
+        return {"error": f"{e}. Call list_models to see the exact keys."}
 
+    messages = [{"role": "user", "content": message}]
+    if instructions:
+        messages.insert(0, {"role": "system", "content": instructions[:8000]})
     try:
         response = await llm_call_async(
             url, model,
-            [{"role": "user", "content": message}],
+            messages,
             headers=headers,
             timeout=AI_CHAT_TIMEOUT,
         )
         # Truncate very long responses
         if len(response) > 10000:
             response = response[:10000] + "\n... (truncated)"
-        return {"model": model, "response": response}
+        result = {"model": model, "response": response}
+        entry = await asyncio.to_thread(_roster_entry_for, model, owner)
+        if entry is not None:
+            result["cost"] = entry.cost_label()
+            result["tier"] = entry.tier
+        return result
     except Exception as e:
         logger.error(f"chat_with_model failed: {e}")
         return {
             "error": f"Failed to get response from {model_spec}: {e}",
             "untrusted_content": True,
         }
+
+
+def _auto_teacher(owner: Optional[str]) -> str:
+    """A recommended flagship model from the roster, for ask_teacher 'auto'."""
+    try:
+        from src import model_roster
+
+        entries = model_roster.roster(owner)
+    except Exception:
+        return ""
+    for pick in (
+        lambda e: e.recommended and e.tier == "flagship",
+        lambda e: e.recommended,
+        lambda e: e.tier == "flagship",
+    ):
+        hit = next((e for e in entries if pick(e)), None)
+        if hit:
+            return hit.key
+    return ""
 
 
 async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
@@ -89,9 +144,9 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
         return {"error": "No problem description provided"}
 
     if model_spec.lower() in ("auto", ""):
-        model_spec = get_setting("teacher_model", "")
+        model_spec = get_setting("teacher_model", "") or await asyncio.to_thread(_auto_teacher, owner)
         if not model_spec:
-            return {"error": "No teacher model configured. Specify a model name or set teacher_model in settings."}
+            return {"error": "No teacher model available. Specify a model (see list_models) or set teacher_model in settings."}
 
     try:
         url, model, headers = await asyncio.to_thread(_resolve_model, model_spec, owner=owner)
@@ -120,80 +175,33 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
 
 
 async def list_models(content: str, session_id: Optional[str] = None, owner: Optional[str] = None) -> Dict:
-    """List all available models across configured endpoints.
+    """Every model this user can delegate to: recommended, kind, tier, cost.
 
-    Content = optional filter keyword.
+    Content = optional filter keyword (matches model, endpoint, kind, tier or
+    strength, e.g. "code", "fast", "local", "claude").
     """
-    import json
-    import httpx
-    from src.database import SessionLocal, ModelEndpoint
-    from src.llm_core import _detect_provider, ANTHROPIC_MODELS
-    from src.auth_helpers import owner_filter
-    from src.endpoint_resolver import resolve_endpoint_runtime, build_headers, build_models_url
+    from src import model_roster
 
     keyword = content.strip().lower() if content.strip() else None
-
-    db = SessionLocal()
     try:
-        query = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
-        if owner:
-            query = owner_filter(query, ModelEndpoint, owner)
-        endpoints = query.all()
-        if not endpoints:
-            return {"results": "No enabled model endpoints configured."}
-
-        result_lines = []
-        total_models = 0
-
-        for ep in endpoints:
-            try:
-                base, api_key = resolve_endpoint_runtime(ep, owner=owner)
-            except Exception:
-                continue
-            provider = _detect_provider(base)
-            headers = build_headers(api_key, base)
-
-            model_ids = []
-            if provider == "anthropic":
-                model_ids = list(ANTHROPIC_MODELS)
-            else:
-                try:
-                    models_url = build_models_url(base)
-                    if models_url:
-                        r = httpx.get(models_url, headers=headers, timeout=5)
-                        r.raise_for_status()
-                        data = r.json()
-                        model_ids = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
-                        if not model_ids:
-                            model_ids = [
-                                m.get("name") or m.get("model")
-                                for m in (data.get("models") or [])
-                                if m.get("name") or m.get("model")
-                            ]
-                    else:
-                        model_ids = json.loads(ep.cached_models or "[]")
-                except Exception:
-                    model_ids = ["(endpoint offline)"]
-
-            if keyword:
-                model_ids = [m for m in model_ids if keyword in m.lower() or keyword in (ep.name or "").lower()]
-
-            if model_ids:
-                result_lines.append(f"\n**{ep.name or base}** ({provider}):")
-                for mid in model_ids:
-                    result_lines.append(f"  - `{mid}`")
-                    total_models += 1
-
-        if not result_lines:
-            return {"results": "No models found" + (f" matching '{keyword}'" if keyword else "") + "."}
-
-        header = f"Available models ({total_models} total):"
-        return {"results": header + "\n".join(result_lines)}
+        # Owner-scoped: roster() lists only endpoints visible to this owner.
+        entries = await asyncio.to_thread(model_roster.roster, owner)
     except Exception as e:
         logger.error(f"list_models failed: {e}")
-        return {"error": str(e)}
-    finally:
-        db.close()
+        return {"error": "Could not list models."}
+    if keyword:
+        def _hay(e) -> str:
+            return " ".join([e.model, e.endpoint_name, e.kind, e.tier, *e.traits,
+                             "recommended" if e.recommended else ""]).lower()
+        entries = [e for e in entries if keyword in _hay(e)]
+    if not entries:
+        if not keyword:
+            return {"results": "No enabled model endpoints configured."}
+        return {"results": f"No models found matching '{keyword}'."}
+    header = (f"Available models ({len(entries)}). Pass the [key] as `model` to chat_with_model "
+              "to delegate a subtask or get a second opinion.")
+    return {"results": header + "\n" + model_roster.roster_lines(entries, limit=80)
+            + "\n\n" + model_roster.ROUTING_GUIDANCE}
 
 
 # ---------------------------------------------------------------------------
