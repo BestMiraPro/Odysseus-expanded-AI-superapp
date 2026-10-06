@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
 import sqlite3
 import tarfile
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -34,17 +36,6 @@ _DEFAULT_MODEL_PREFS = ("glm-5", "glm", "qwen3", "deepseek", "llama")
 # endpoint flooding the picker and the orchestrator's spawn roster.
 _MAX_WORKERS = 40
 
-# Curated "best option" gateway models that get their own crew entry. The
-# broad `crew`/`crew-codex` can still delegate to every API model.
-# Qwen 27B explicitly requested as a dedicated crew (cheap, good for 27B tier).
-# Qwen 3.8 27B is the current target — ensure exact match variants rank first.
-_BEST_API_MODEL_HINTS = (
-    "glm-5", "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4",
-    "kimi-k2", "qwen3-coder", "qwen3-235b",
-    "qwen3.8-27b", "qwen3-8-27b", "3.8-27b", "qwen3-27b", "qwen2.5-27b",
-    "qwen-27b", "27b", "minimax-m2", "nemotron-3-ultra",
-)
-_MAX_API_CREWS = 12
 _LEGACY_AGENT_REPOINTS = "generated_agent_repoints.json"
 _KNOWN_STALE_SESSION_AGENT_NAMES = {
     "deepseek-v3-1",
@@ -80,20 +71,6 @@ def _pick_default_model(ids: list[str]) -> str | None:
             if pref in mid.lower():
                 return mid
     return ids[0] if ids else None
-
-
-def _pick_best_api_models(ids: list[str], limit: int = _MAX_API_CREWS) -> list[str]:
-    chosen: list[str] = []
-    for hint in _BEST_API_MODEL_HINTS:
-        for mid in ids:
-            if hint in mid.lower() and mid not in chosen:
-                chosen.append(mid)
-    for mid in ids:
-        if len(chosen) >= limit:
-            break
-        if mid not in chosen:
-            chosen.append(mid)
-    return chosen[:limit]
 
 
 def _model_slug(model_id: str) -> str:
@@ -249,11 +226,11 @@ def _cli_worker_spec(w: dict) -> dict:
     }
 
 
-def _api_worker_spec(slug: str, mid: str, creds: tuple[str, str] | None) -> dict:
+def _api_worker_spec(slug: str, mid: str, creds: tuple[str, str] | None, endpoint_name: str = "API") -> dict:
     return {
         "spec_version": 1,
         "name": slug,
-        "description": f"{mid} worker (API model via the W&B gateway).",
+        "description": f"{mid} worker (via {endpoint_name}).",
         "executor": _executor_block(mid, creds),
         "os_env": _os_env_block(),
         "prompt": _WORKER_PROMPT.format(slug=slug, mid=mid) + _TOOL_PROTOCOL,
@@ -310,9 +287,12 @@ def _crew_config(
     slugs: list[str],
     primary_worker: str | None = None,
     lead_model: str | None = None,
+    prompt: str | None = None,
 ) -> dict:
     worker_list = ", ".join(slugs) if slugs else "none"
-    if lead_model:
+    if prompt is not None:
+        pass
+    elif lead_model:
         prompt = (
             f"You are `{name}`, the crew lead running directly on `{lead_model}`. "
             "That selected model is your own executor; do not delegate the first task just to prove "
@@ -328,7 +308,7 @@ def _crew_config(
         )
     else:
         prompt = _CREW_PROMPT.format(workers=worker_list) + _TOOL_PROTOCOL
-    if primary_worker and not lead_model:
+    if primary_worker and not lead_model and prompt is None:
         prompt = (
             f"This crew is anchored on `{primary_worker}`. On the first turn, immediately delegate "
             f"the user's substantive task to `{primary_worker}` with sys_session_send. Do not emit "
@@ -371,127 +351,305 @@ def _crew_config(
     }
 
 
-def _generate_crew(model_creds: dict[str, tuple[str, str]], default_model: str | None) -> int:
-    """Write generated crew variants and their nested workers."""
-    raw_ids = [mid for mid in model_creds if mid]
-    # Rank rather than truncate: provider cache order is arbitrary and would
-    # fill the roster with deprecated/unmeasured models while the best ones
-    # went unused. Catalog ranking prefers measured benchmarks, then scale.
+# ---------------------------------------------------------------------------
+# The universal crew
+# ---------------------------------------------------------------------------
+#
+# One crew, `crew`, replaces the old per-model variants (crew-claude,
+# crew-codex, crew-<model>). Its orchestrator is whatever model the user picks
+# in the Omnigent panel, and every other connected model is on its roster as a
+# sub-agent, described with what it costs and whether it is the newest of its
+# family, so the orchestrator can choose the right worker for each task.
+
+_CREW_NAME = "crew"
+_CREW_SETTINGS_FILE = "omnigent-crew.json"
+_GENERATED_MANIFEST = ".odysseus-generated.json"
+_DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
+_REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
+# Descriptions the previous generator wrote; a crew-* dir carrying one of them
+# is ours to retire even before a manifest existed.
+_LEGACY_GENERATED_MARKERS = (
+    "-brained crew", "Claude-brained", "Codex-brained", "API-model workers",
+)
+_NATIVE_WORKER_LINES = {
+    "claude-code": (
+        "Claude Code CLI, a full coding agent on the Claude subscription logged in inside "
+        "Omnigent (`claude login`). Best for implementation, refactors, debugging and tests. "
+        "Flat-rate: uses plan limits, no per-token charge."
+    ),
+    "codex": (
+        "Codex CLI, a full coding agent on the ChatGPT subscription logged in inside Omnigent "
+        "(`codex login`). Best for implementation and test-heavy work. Flat-rate: uses plan "
+        "limits, no per-token charge."
+    ),
+}
+
+
+def _crew_settings_path() -> Path:
+    return Path(DATA_DIR) / _CREW_SETTINGS_FILE
+
+
+def load_crew_settings() -> dict:
+    """The user's crew choices, with defaults for anything unset."""
+    settings = {"orchestrator": "claude", "reasoning_effort": "high", "max_workers": _MAX_WORKERS}
+    try:
+        raw = json.loads(_crew_settings_path().read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            settings.update({k: v for k, v in raw.items() if k in settings})
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("omnigent crew settings unreadable error_type=%s", type(exc).__name__)
+    if settings["reasoning_effort"] not in _REASONING_EFFORTS:
+        settings["reasoning_effort"] = "high"
+    try:
+        settings["max_workers"] = max(1, min(_MAX_WORKERS, int(settings["max_workers"])))
+    except (TypeError, ValueError):
+        settings["max_workers"] = _MAX_WORKERS
+    return settings
+
+
+def save_crew_settings(settings: dict) -> None:
+    path = _crew_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2, sort_keys=True), encoding="utf-8")
+    _chmod_600(path)
+
+
+def parse_orchestrator_id(value: str | None) -> dict:
+    """``claude`` / ``claude::<model>`` / ``codex[::<model>]`` / ``api::<endpoint>::<model>``."""
+    value = (value or "claude").strip()
+    kind, _, rest = value.partition("::")
+    if kind in ("claude", "codex"):
+        return {"kind": kind, "model": rest or None, "endpoint_id": None}
+    if kind == "api" and "::" in rest:
+        endpoint_id, _, model = rest.partition("::")
+        if endpoint_id and model:
+            return {"kind": "api", "model": model, "endpoint_id": endpoint_id}
+    return {"kind": "claude", "model": None, "endpoint_id": None}
+
+
+def _manifest_path(agents_root: Path) -> Path:
+    return agents_root.parent / _GENERATED_MANIFEST
+
+
+def _read_manifest(agents_root: Path) -> dict:
+    try:
+        data = json.loads(_manifest_path(agents_root).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_manifest(agents_root: Path, data: dict) -> None:
+    path = _manifest_path(agents_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    _chmod_600(path)
+
+
+def _looks_generated(crew_dir: Path) -> bool:
+    if crew_dir.name in ("crew-claude", "crew-codex") or crew_dir.name.startswith("crew-api-"):
+        return True
+    try:
+        cfg = yaml.safe_load((crew_dir / "config.yaml").read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+    desc = str(cfg.get("description") or "") if isinstance(cfg, dict) else ""
+    return any(marker in desc for marker in _LEGACY_GENERATED_MARKERS)
+
+
+def _retire_generated_crews(agents_root: Path, manifest: dict) -> list[str]:
+    """Remove crews an earlier Odysseus generated; never a crew the user made."""
+    retired: list[str] = []
+    candidates = {name for name in manifest.get("agents") or [] if isinstance(name, str)}
+    candidates.update(p.name for p in agents_root.glob("crew-*") if p.is_dir())
+    for name in sorted(candidates):
+        if name == _CREW_NAME or "/" in name or name.startswith("."):
+            continue
+        crew_dir = agents_root / name
+        if not crew_dir.is_dir():
+            continue
+        if name in (manifest.get("agents") or []) or _looks_generated(crew_dir):
+            shutil.rmtree(crew_dir, ignore_errors=True)
+            retired.append(name)
+    shutil.rmtree(agents_root / _CREW_NAME, ignore_errors=True)
+    return retired
+
+
+def _rank_worker_models(ids: list[str], entries: dict, limit: int) -> list[str]:
+    """Recommended models first, then the catalog's measured/scale ranking."""
     try:
         declared = load_declared(path=str(Path(DATA_DIR) / "omnigent-model-costs.json"))
-        ids = select_workers(raw_ids, declared, limit=_MAX_WORKERS)
+        ranked = select_workers(ids, declared, limit=len(ids) or 1)
     except Exception:
-        ids = raw_ids[:_MAX_WORKERS]
-    if not ids:
-        return 0
+        ranked = list(ids)
+    order = {mid: i for i, mid in enumerate(ranked)}
+    kept = [mid for mid in ids if mid in order]
+    kept.sort(key=lambda mid: (not getattr(entries.get(mid), "recommended", False), order[mid]))
+    return kept[:limit]
+
+
+def _roster_entries(model_creds: dict, model_meta: dict | None) -> dict:
+    """model id -> RosterEntry (recommended, tier, cost) for the crew prompt."""
+    from src import model_roster
+
+    rows = []
+    for mid in model_creds:
+        meta = (model_meta or {}).get(mid) or {}
+        rows.append((meta.get("endpoint_id") or "api", meta.get("endpoint_name") or "API",
+                     mid, meta.get("kind") or "api", meta.get("provider") or "openai"))
+    try:
+        return {e.model: e for e in model_roster.build_entries(rows)}
+    except Exception as exc:
+        logger.warning("omnigent roster metadata failed error_type=%s", type(exc).__name__)
+        return {}
+
+
+def _worker_line(slug: str, mid: str, entry, endpoint_name: str) -> str:
+    if entry is None:
+        return f"- `{slug}`: {mid} via {endpoint_name}"
+    bits = []
+    if entry.recommended:
+        bits.append("RECOMMENDED")
+    bits.append(f"{entry.kind}, {entry.tier}")
+    if entry.traits:
+        bits.append("good at " + "/".join(entry.traits))
+    if entry.context_k:
+        bits.append(f"{entry.context_k}k context")
+    bits.append(entry.cost_label())
+    if entry.notes:
+        bits.append(str(entry.notes)[:120])
+    return f"- `{slug}`: {mid} via {endpoint_name} — " + "; ".join(bits)
+
+
+def _orchestrator_executor(orch: dict, model_creds: dict, effort: str) -> tuple[dict, dict | None, str, str | None]:
+    """(executor, llm block, human label, own model id) for the chosen orchestrator."""
+    if orch["kind"] == "api" and orch.get("model") in model_creds:
+        mid = orch["model"]
+        return _executor_block(mid, model_creds[mid]), None, f"{mid} (API)", mid
+    if orch["kind"] == "codex":
+        model = orch.get("model") or _DEFAULT_CODEX_MODEL
+        executor = {
+            "type": "omnigent",
+            "model": model,
+            "context_window": 1000000,
+            "config": {"harness": "codex-native", "yolo": True, "reasoning_effort": effort},
+        }
+        return executor, {"model": model, "reasoning_effort": effort}, f"Codex ({model})", None
+    # Claude Code login inside Omnigent (claude-sdk). With no model pinned the
+    # Claude provider picks its default; a pinned Claude id is passed through.
+    executor = {"type": "omnigent", "context_window": 1000000, "config": {"harness": "claude-sdk"}}
+    model = orch.get("model") if orch["kind"] == "claude" else None
+    if model:
+        executor["model"] = model
+    return executor, None, f"Claude ({model or 'default model'})", None
+
+
+def _universal_prompt(label: str, own_model: str | None, lines: list[str], worker_models: list[str]) -> str:
+    from src.model_roster import ROUTING_GUIDANCE
+
+    try:
+        declared = load_declared(path=str(Path(DATA_DIR) / "omnigent-model-costs.json"))
+        from src.omnigent_catalog import dispatch_guidance
+
+        guidance = dispatch_guidance(own_model, worker_models, declared)
+    except Exception:
+        guidance = ""
+    roster = "\n".join(lines) if lines else "- (no sub-agents connected: do the work yourself)"
+    return (
+        f"You are the crew orchestrator, running on {label}. You are a tech lead, not the doer: break "
+        "the goal into scoped tasks, give each to the best-suited sub-agent, then synthesize their "
+        "results. Every model the user has connected is on your roster; each sub-agent has its own "
+        "shell and file tools.\n\n"
+        "Your roster (RECOMMENDED = newest model of its family; cost is per 1M tokens):\n"
+        f"{roster}\n\n"
+        f"{ROUTING_GUIDANCE}\n\n"
+        f"{guidance}\n\n"
+        "If a worker errors, stalls, or returns nothing useful, RE-DISPATCH that task to a different "
+        "worker; never report failure without first retrying elsewhere.\n\n"
+        "Delegate each scoped task via sys_session_send. ALWAYS prefix the `title` with the worker's "
+        "model in square brackets, e.g. `[deepseek-v4-flash] summarise the logs`, and give a precise "
+        "task prompt stating exactly what to produce. Workers notify your inbox when done; collect "
+        "results with sys_read_inbox, never busy-poll. Once you have dispatched and have nothing to do "
+        "but wait, end the turn; you are woken when a worker finishes.\n\n"
+        "On your FIRST turn, orient briefly with your own tools (sys_os_shell: `ls`, read a key file) "
+        "and start delegating in that same turn."
+        + _TOOL_PROTOCOL
+    )
+
+
+def _generate_crew(
+    model_creds: dict[str, tuple[str, str]],
+    orchestrator: str | None = None,
+    *,
+    model_meta: dict | None = None,
+    settings: dict | None = None,
+) -> int:
+    """Write the universal crew; returns how many sub-agents it can delegate to.
+
+    ``model_creds`` maps each API/local model id to ``(base_url, api_key)``;
+    ``model_meta`` optionally maps it to ``{endpoint_id, endpoint_name, kind,
+    provider}`` for the roster. ``orchestrator`` overrides the saved setting.
+    """
+    settings = settings or load_crew_settings()
+    orch = parse_orchestrator_id(orchestrator or settings.get("orchestrator"))
+    effort = settings.get("reasoning_effort") or "high"
     agents_root = Path(DATA_DIR) / "omnigent-home" / ".omnigent" / "agents"
+    agents_root.mkdir(parents=True, exist_ok=True)
+    manifest = _read_manifest(agents_root)
+    retired = _retire_generated_crews(agents_root, manifest)
 
-    for pattern in ("crew", "crew-api-*", "crew-*"):
-        for stale in agents_root.glob(pattern):
-            if stale.is_dir():
-                shutil.rmtree(stale, ignore_errors=True)
+    entries = _roster_entries(model_creds, model_meta)
+    executor, llm_block, label, own_model = _orchestrator_executor(orch, model_creds, effort)
+    worker_ids = _rank_worker_models([m for m in model_creds if m and m != own_model],
+                                     entries, int(settings.get("max_workers") or _MAX_WORKERS))
 
-    api_slugs: list[str] = []
-    api_slug_by_model: dict[str, str] = {}
-    used: set[str] = set()
-    for mid in ids:
+    crew_dir = agents_root / _CREW_NAME
+    slugs: list[str] = []
+    lines: list[str] = []
+    used: set[str] = {w["slug"] for w in _CLI_WORKERS} | {_CREW_NAME}
+    for w in _CLI_WORKERS:
+        _write_worker(crew_dir / "agents", w["slug"], _cli_worker_spec(w))
+        slugs.append(w["slug"])
+        lines.append(f"- `{w['slug']}`: {_NATIVE_WORKER_LINES.get(w['slug'], w['label'])}")
+    for mid in worker_ids:
         slug = _model_slug(mid)
         while slug in used:
             slug += "-x"
         used.add(slug)
-        api_slugs.append(slug)
-        api_slug_by_model[mid] = slug
-    api_specs = {slug: _api_worker_spec(slug, mid, model_creds.get(mid)) for slug, mid in zip(api_slugs, ids)}
+        endpoint_name = ((model_meta or {}).get(mid) or {}).get("endpoint_name") or "API"
+        _write_worker(crew_dir / "agents", slug, _api_worker_spec(slug, mid, model_creds.get(mid), endpoint_name))
+        slugs.append(slug)
+        lines.append(_worker_line(slug, mid, entries.get(mid), endpoint_name))
 
-    crew_slugs = [w["slug"] for w in _CLI_WORKERS] + api_slugs
-
-    def write_full_roster_crew(name: str, description: str, executor: dict) -> None:
-        crew_dir = agents_root / name
-        for w in _CLI_WORKERS:
-            _write_worker(crew_dir / "agents", w["slug"], _cli_worker_spec(w))
-        for slug, spec in api_specs.items():
-            _write_worker(crew_dir / "agents", slug, spec)
-        _write_crew_file(crew_dir, _crew_config(
-            name,
-            description,
-            executor,
-            crew_slugs,
-        ))
-
-    claude_executor = {"type": "omnigent", "context_window": 1000000, "config": {"harness": "claude-sdk"}}
-    codex_executor = {
-        "type": "omnigent",
-        "model": "gpt-5.6-sol",
-        "context_window": 1000000,
-        "config": {
-            "harness": "codex-native",
-            "yolo": True,
-            "reasoning_effort": "xhigh",
-        },
-    }
-
-    write_full_roster_crew(
-        "crew",
-        "Claude-brained orchestrator that delegates to Claude Code, Codex, and your W&B API-model workers.",
-        claude_executor,
+    spec = _crew_config(
+        _CREW_NAME,
+        f"Universal crew: {label} orchestrates every connected model (Claude Code, Codex and "
+        f"{len(worker_ids)} API/local models).",
+        executor,
+        slugs,
+        prompt=_universal_prompt(label, own_model, lines, worker_ids),
     )
-    write_full_roster_crew(
-        "crew-claude",
-        "Claude-brained crew alias with Claude Code, Codex, and your W&B API-model workers.",
-        claude_executor,
-    )
-    written = 2
-
-    codex_dir = agents_root / "crew-codex"
-    for slug, spec in api_specs.items():
-        _write_worker(codex_dir / "agents", slug, spec)
-    codex_crew = _crew_config(
-        "crew-codex",
-        "Codex-brained crew that can use its own tools and delegate to your W&B API-model workers.",
-        codex_executor,
-        api_slugs,
-    )
-    # Canonical Omnigent LLM metadata. Keep the executor mirrors above for
-    # 0.10 compatibility, while the llm block is what session creation uses
-    # to persist Codex's requested reasoning effort.
-    codex_crew["llm"] = {
-        "model": "gpt-5.6-sol",
-        "reasoning_effort": "xhigh",
-    }
-    _write_crew_file(codex_dir, codex_crew)
-    written += 1
-
-    # Per-model crews: API-model-brained, no Codex/Claude sub-agents to avoid
-    # burning subscription usage. They run directly on their model and spawn
-    # only other API workers if needed (currently lean: no sub-agents, broad
-    # crews retain Codex/Claude for deep code work).
-    for mid in _pick_best_api_models(ids):
-        target_slug = api_slug_by_model[mid]
-        crew_name = f"crew-{target_slug}"
-        variant_dir = agents_root / crew_name
-        model_crew_slugs: list[str] = []
-        _write_crew_file(variant_dir, _crew_config(
-            crew_name,
-            f"{mid}-brained crew running directly on {mid} (no Codex/Claude fallback to save subscription usage).",
-            _executor_block(mid, model_creds.get(mid)),
-            model_crew_slugs,
-            lead_model=mid,
-        ))
-        written += 1
-
-    return written
+    if llm_block:
+        spec["llm"] = llm_block
+    _write_crew_file(crew_dir, spec)
+    _write_manifest(agents_root, {
+        "agents": [_CREW_NAME],
+        "retired": sorted(set(manifest.get("retired") or []) | set(retired)),
+        "providers": manifest.get("providers") or [],
+        "orchestrator": orch,
+    })
+    return len(slugs)
 
 
 def _generated_crew_dirs(agents_root: Path) -> list[Path]:
-    crew_dirs: list[Path] = []
-    broad = agents_root / "crew"
-    if (broad / "config.yaml").exists():
-        crew_dirs.append(broad)
-    crew_dirs.extend(sorted(
-        p for p in agents_root.glob("crew-*")
-        if p.is_dir() and (p / "config.yaml").exists()
-    ))
-    return crew_dirs
+    crew = agents_root / _CREW_NAME
+    return [crew] if (crew / "config.yaml").exists() else []
+
+
+def _retired_agent_names(agents_root: Path) -> set[str]:
+    return {n for n in (_read_manifest(agents_root).get("retired") or []) if isinstance(n, str)}
 
 
 def _generated_api_worker_slugs(crew_dirs: list[Path]) -> set[str]:
@@ -566,6 +724,9 @@ def _purge_generated_builtin_agent_rows() -> int:
     names: set[str] = {p.name for p in crew_dirs}
     names.update(p.name for p in agents_root.glob("crew-api-*") if (p / "config.yaml").exists())
     names.update(_generated_api_worker_slugs([*crew_dirs, *agents_root.glob("crew-api-*")]))
+    # Crews an earlier version generated (crew-claude, crew-<model>, ...): their
+    # built-in template rows would otherwise linger in Omnigent's picker.
+    names.update(_retired_agent_names(agents_root))
     if not names:
         return 0
     placeholders = ",".join("?" for _ in names)
@@ -625,6 +786,7 @@ def _refresh_generated_session_agent_rows() -> int:
     if not crew_names:
         return 0
     api_worker_slugs = _generated_api_worker_slugs(crew_dirs)
+    retired_names = _retired_agent_names(root / "agents")
     placeholders = ",".join("?" for _ in crew_names)
     repoint_path = root / _LEGACY_AGENT_REPOINTS
     total = 0
@@ -684,7 +846,9 @@ def _refresh_generated_session_agent_rows() -> int:
             except Exception:
                 repoints = {}
         for old_id_key, new_name in repoints.items():
-            row = fresh.get(str(new_name))
+            # A legacy crew-api-* chat points at its per-model crew; once that
+            # crew is retired it continues on the universal crew instead.
+            row = fresh.get(str(new_name)) or fresh.get(_CREW_NAME)
             if not row:
                 continue
             old_id_val = _key_to_agent_id(str(old_id_key))
@@ -725,6 +889,10 @@ def _refresh_generated_session_agent_rows() -> int:
                 generatedish = True
             if name in _KNOWN_STALE_SESSION_AGENT_NAMES:
                 target_names.append(f"crew-{name}")
+                generatedish = True
+            if name in retired_names:
+                # A conversation on a retired per-model crew continues on the
+                # universal crew rather than losing its agent.
                 generatedish = True
             if generatedish:
                 model_slug = _artifact_model_slug(root, stale["bundle_location"])
@@ -800,58 +968,87 @@ def _gateway_credentials_env(user: str | None) -> dict[str, str] | None:
         db.close()
 
 
-def _install_api_models(user: str | None) -> dict:
-    """Write every enabled Odysseus API endpoint into the bundled Omnigent as an
-    OpenAI-compatible ``gateway`` provider (so all their models are available and
-    marked API the moment the server boots).
+# Placeholder key for keyless local servers (Ollama, LM Studio, llama.cpp):
+# openai-agents refuses to start a worker with no key at all.
+_LOCAL_PLACEHOLDER_KEY = "not-needed"
 
-    Keys are written inline into a 0600 config file: Omnigent's ``env:`` refs
-    don't thread down to the harness that resolves the credential, so a file the
-    harness reads directly is the reliable path. Lives in the persisted
-    ``omnigent-home`` so it survives container recreates.
+
+def _crew_endpoints(user: str | None):
+    """Endpoints Omnigent can call as OpenAI-compatible gateways, with roster kind.
+
+    Subscription endpoints are left out: Claude and ChatGPT plans reach the
+    crew through the native Claude Code / Codex workers, and their Odysseus
+    endpoints are not plain OpenAI-compatible URLs.
     """
+    from src import model_roster
+
     db = SessionLocal()
     try:
         q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)  # noqa: E712
         if user:
             q = owner_filter(q, ModelEndpoint, user)
-        endpoints = [
-            ep for ep in q.all()
-            if (ep.model_type or "llm") == "llm" and ep.base_url and ep.api_key
-        ]
-        providers: dict[str, dict] = {}
-        default_model: str | None = None
-        model_count = 0
-        # Ordered {model_id: (base_url, api_key)} so each generated worker can
-        # bake its own endpoint's credentials inline (HOME-independent auth).
-        model_creds: dict[str, tuple[str, str]] = {}
-        used: set[str] = set()
-        for idx, ep in enumerate(endpoints):
-            slug = _provider_slug(ep.name or ep.base_url)
-            while slug in used:
-                slug += "-x"
-            used.add(slug)
-            ids = _endpoint_model_ids(ep)
-            model_count += len(ids)
-            ep_base = (ep.base_url or "").rstrip("/")
-            for mid in ids:
-                model_creds.setdefault(mid, (ep_base, ep.api_key))
-            pick = _pick_default_model(ids)
-            if default_model is None and pick:
-                default_model = pick
-            family = {"base_url": (ep.base_url or "").rstrip("/"), "api_key": ep.api_key, "wire_api": "chat"}
-            if pick:
-                family["models"] = {"default": pick}
-            block: dict = {"kind": "gateway", "openai": family}
-            if idx == 0:
-                block["default"] = ["openai"]
-            providers[slug] = block
+        out = []
+        for ep in q.all():
+            if (ep.model_type or "llm") != "llm" or not ep.base_url:
+                continue
+            kind, provider = model_roster.classify_endpoint(ep)
+            if kind == "subscription":
+                continue
+            if not ep.api_key and kind != "local":
+                continue
+            out.append((ep, kind, provider))
+        return out
     finally:
         db.close()
-    if not providers:
-        return {"endpoints": 0, "models": 0, "default_model": None}
+
+
+def _install_api_models(user: str | None) -> dict:
+    """Write the caller's API/local endpoints into the bundled Omnigent and
+    regenerate the universal crew.
+
+    Each endpoint becomes an OpenAI-compatible ``gateway`` provider in
+    ``config.yaml`` (0600). Providers the user set up themselves with
+    ``omnigent setup`` are kept; only the ones Odysseus wrote last time (listed
+    in the generated manifest, or pointing at one of the caller's endpoints)
+    are replaced.
+    """
+    from src.endpoint_resolver import _NON_CHAT_MODEL
+
+    providers: dict[str, dict] = {}
+    default_model: str | None = None
+    model_count = 0
+    model_creds: dict[str, tuple[str, str]] = {}
+    model_meta: dict[str, dict] = {}
+    our_bases: set[str] = set()
+    used: set[str] = set()
+    for ep, kind, provider in _crew_endpoints(user):
+        slug = "ody-" + _provider_slug(ep.name or ep.base_url)
+        while slug in used:
+            slug += "-x"
+        used.add(slug)
+        ids = [m for m in _endpoint_model_ids(ep) if not any(p in m.lower() for p in _NON_CHAT_MODEL)]
+        model_count += len(ids)
+        ep_base = (ep.base_url or "").rstrip("/")
+        our_bases.add(ep_base)
+        key = ep.api_key or _LOCAL_PLACEHOLDER_KEY
+        for mid in ids:
+            if mid not in model_creds:
+                model_creds[mid] = (ep_base, key)
+                model_meta[mid] = {"endpoint_id": ep.id, "endpoint_name": ep.name or ep_base,
+                                   "kind": kind, "provider": provider}
+        pick = _pick_default_model(ids)
+        if default_model is None and pick:
+            default_model = pick
+        family = {"base_url": ep_base, "api_key": key, "wire_api": "chat"}
+        if pick:
+            family["models"] = {"default": pick}
+        providers[slug] = {"kind": "gateway", "openai": family}
+
     cfg_dir = Path(DATA_DIR) / "omnigent-home" / ".omnigent"
     cfg_dir.mkdir(parents=True, exist_ok=True)
+    agents_root = cfg_dir / "agents"
+    manifest = _read_manifest(agents_root)
+    ours_before = set(manifest.get("providers") or [])
     cfg_path = cfg_dir / "config.yaml"
     cfg: dict = {}
     if cfg_path.exists():
@@ -859,16 +1056,29 @@ def _install_api_models(user: str | None) -> dict:
             cfg = yaml.safe_load(cfg_path.read_text()) or {}
         except Exception:
             cfg = {}
-    cfg["providers"] = providers
-    cfg["harness"] = "openai-agents"
-    if default_model:
+    kept: dict[str, dict] = {}
+    for name, block in (cfg.get("providers") or {}).items():
+        base = ""
+        if isinstance(block, dict) and isinstance(block.get("openai"), dict):
+            base = str(block["openai"].get("base_url") or "").rstrip("/")
+        if name in ours_before or name.startswith("ody-") or (base and base in our_bases):
+            continue
+        kept[name] = block
+    merged = {**kept, **providers}
+    if providers and not any(isinstance(b, dict) and b.get("default") for b in kept.values()):
+        first = next(iter(providers))
+        merged[first] = {**providers[first], "default": ["openai"]}
+    cfg["providers"] = merged
+    cfg.setdefault("harness", "openai-agents")
+    if default_model and not kept:
         cfg["model"] = default_model
     cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
-    try:
-        os.chmod(cfg_path, 0o600)
-    except Exception:
-        pass
-    workers = _generate_crew(model_creds, default_model)
+    _chmod_600(cfg_path)
+
+    workers = _generate_crew(model_creds, model_meta=model_meta)
+    manifest = _read_manifest(agents_root)
+    manifest["providers"] = sorted(providers)
+    _write_manifest(agents_root, manifest)
     try:
         purged_builtin_rows = _purge_generated_builtin_agent_rows()
     except Exception:
@@ -878,6 +1088,7 @@ def _install_api_models(user: str | None) -> dict:
         "models": model_count,
         "default_model": default_model,
         "workers": workers,
+        "orchestrator": load_crew_settings().get("orchestrator"),
         "purged_builtin_rows": purged_builtin_rows,
     }
 
@@ -944,6 +1155,81 @@ def _has_visible_model_endpoint(request: Request | None = None) -> bool:
         db.close()
 
 
+# Launch, start and orchestrator changes rewrite the same config files and
+# restart the same server; one at a time.
+_LAUNCH_LOCK = threading.Lock()
+
+
+def _option(id_: str, group: str, label: str, model: str | None, entry=None) -> dict:
+    data = {"id": id_, "group": group, "label": label, "model": model,
+            "recommended": False, "tier": None, "cost_label": None, "cost_band": None}
+    if entry is not None:
+        data.update({"recommended": entry.recommended, "tier": entry.tier,
+                     "cost_label": entry.cost_label(), "cost_band": entry.cost_band()})
+    return data
+
+
+def orchestrator_options(user: str | None) -> list[dict]:
+    """Every model that can lead the crew, recommended first within each group."""
+    from src import claude_subscription, model_roster
+
+    entries = model_roster.roster(user)
+    claude_models = [e for e in entries if e.provider == "claude-subscription"]
+    chatgpt_models = [e for e in entries if e.provider == "chatgpt-subscription"]
+    sub_note = "flat-rate; uses the login inside Omnigent"
+    options = [_option("claude", "Claude Code (subscription)", "Claude — default model", None)]
+    options[0]["cost_label"] = sub_note
+    if claude_models:
+        options += [_option(f"claude::{e.model}", "Claude Code (subscription)", f"Claude — {e.model}", e.model, e)
+                    for e in claude_models]
+    else:
+        options += [_option(f"claude::{m}", "Claude Code (subscription)", f"Claude — {m}", m)
+                    for m in claude_subscription.default_models()]
+    options.append(_option("codex", "Codex (subscription)", f"Codex — {_DEFAULT_CODEX_MODEL}", _DEFAULT_CODEX_MODEL))
+    options[-1]["cost_label"] = sub_note
+    options += [_option(f"codex::{e.model}", "Codex (subscription)", f"Codex — {e.model}", e.model, e)
+                for e in chatgpt_models if e.model != _DEFAULT_CODEX_MODEL]
+    usable = {ep.id for ep, _kind, _provider in _crew_endpoints(user)}
+    for e in entries:
+        if e.kind in ("api", "local") and e.endpoint_id in usable:
+            group = "API models" if e.kind == "api" else "Local models"
+            options.append(_option(f"api::{e.endpoint_id}::{e.model}", group,
+                                   f"{e.model} · {e.endpoint_name}", e.model, e))
+    for opt in options:
+        if opt["cost_label"] is None:
+            opt["cost_label"] = sub_note
+    return options
+
+
+def crew_preview(user: str | None) -> dict:
+    """The roster the crew will get with the current settings (no files written)."""
+    from src import model_roster
+
+    settings = load_crew_settings()
+    orch = parse_orchestrator_id(settings.get("orchestrator"))
+    entries = [e for e in model_roster.roster(user) if e.kind in ("api", "local")]
+    usable = {ep.id for ep, _kind, _provider in _crew_endpoints(user)}
+    workers = [
+        {"model": w["label"], "endpoint": "native CLI", "kind": "subscription", "recommended": False,
+         "tier": "flagship", "cost_label": "flat-rate (plan limits)", "native": True}
+        for w in _CLI_WORKERS
+    ]
+    seen = set()
+    for e in entries:
+        if e.endpoint_id not in usable or e.model in seen:
+            continue
+        if orch["kind"] == "api" and e.model == orch.get("model"):
+            continue
+        seen.add(e.model)
+        workers.append({"model": e.model, "endpoint": e.endpoint_name, "kind": e.kind,
+                        "recommended": e.recommended, "tier": e.tier, "traits": e.traits,
+                        "cost_label": e.cost_label(), "cost_band": e.cost_band(), "native": False})
+    native = workers[:len(_CLI_WORKERS)]
+    rest = sorted(workers[len(_CLI_WORKERS):], key=lambda w: (not w["recommended"], w["model"].lower()))
+    limit = int(settings.get("max_workers") or _MAX_WORKERS)
+    return {"workers": native + rest[:limit], "omitted": max(0, len(rest) - limit)}
+
+
 def setup_omnigent_routes(
     manager: OmnigentManager | None = None,
     native_manager: NativeOmnigentManager | None = None,
@@ -956,6 +1242,8 @@ def setup_omnigent_routes(
     def status(request: Request):
         data = manager.status()
         data["install"] = INSTALL_GUIDANCE
+        data["ui_port"] = int(os.environ.get("OMNIGENT_UI_PORT") or os.environ.get("OMNIGENT_BRIDGE_PORT") or 6868)
+        data["crew"] = {"name": _CREW_NAME, **load_crew_settings()}
         data["native"] = native_manager.status(model_ready=_has_visible_model_endpoint(request))
         return data
 
@@ -1052,8 +1340,19 @@ def setup_omnigent_routes(
         # Omnigent (as OpenAI-compatible gateway providers, marked API), then
         # boot its server (which serves Omnigent's own chat web UI). Degrades
         # gracefully when the Omnigent CLI isn't installed where Odysseus runs.
-        require_authenticated_request(request)
+        # Admin only: Omnigent's agents run unsandboxed with a shell on the
+        # Odysseus host, so launching it is the same trust level as the
+        # server start route below.
+        require_admin(request)
         user = get_current_user(request)
+        if not _LAUNCH_LOCK.acquire(blocking=False):
+            raise HTTPException(409, "Omnigent is already being launched. Try again in a moment.")
+        try:
+            return _launch_locked(user)
+        finally:
+            _LAUNCH_LOCK.release()
+
+    def _launch_locked(user):
         try:
             api = _install_api_models(user)
         except Exception as exc:
@@ -1084,5 +1383,76 @@ def setup_omnigent_routes(
         data["install"] = INSTALL_GUIDANCE
         data["api_models"] = api
         return data
+
+    @router.get("/orchestrator")
+    def get_orchestrator(request: Request):
+        require_admin(request)
+        user = get_current_user(request)
+        return {
+            "settings": load_crew_settings(),
+            "options": orchestrator_options(user),
+            "reasoning_efforts": list(_REASONING_EFFORTS),
+            "max_workers_limit": _MAX_WORKERS,
+            **crew_preview(user),
+        }
+
+    @router.post("/orchestrator")
+    async def set_orchestrator(request: Request):
+        """Choose who leads the crew; rewrites the crew and restarts a running server."""
+        require_admin(request)
+        user = get_current_user(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "Expected a JSON object")
+        settings = load_crew_settings()
+        if "orchestrator" in body:
+            choice = str(body.get("orchestrator") or "")
+            valid = {o["id"] for o in await asyncio.to_thread(orchestrator_options, user)}
+            if choice not in valid:
+                raise HTTPException(400, "That model is not available as an orchestrator.")
+            settings["orchestrator"] = choice
+        if "reasoning_effort" in body:
+            if body["reasoning_effort"] not in _REASONING_EFFORTS:
+                raise HTTPException(400, "Unknown reasoning effort")
+            settings["reasoning_effort"] = body["reasoning_effort"]
+        if "max_workers" in body:
+            try:
+                settings["max_workers"] = max(1, min(_MAX_WORKERS, int(body["max_workers"])))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "max_workers must be a number")
+        await asyncio.to_thread(save_crew_settings, settings)
+        restart = bool(body.get("apply", True))
+        if not restart:
+            return {"settings": settings, "restarted": False}
+        if not _LAUNCH_LOCK.acquire(blocking=False):
+            raise HTTPException(409, "Omnigent is already being launched. Try again in a moment.")
+        try:
+            running = await asyncio.to_thread(lambda: bool(manager.status().get("running")))
+            if running:
+                data = await asyncio.to_thread(_launch_locked, user)
+            else:
+                # Not running: just rewrite the crew so the next launch uses it.
+                api = await asyncio.to_thread(_install_api_models, user)
+                data = {"running": False, "api_models": api}
+        finally:
+            _LAUNCH_LOCK.release()
+        data["settings"] = settings
+        data["restarted"] = running
+        return data
+
+    @router.post("/server/restart")
+    def restart_server(request: Request):
+        """Re-sync models and restart (picks up new endpoints, keys and settings)."""
+        require_admin(request)
+        user = get_current_user(request)
+        if not _LAUNCH_LOCK.acquire(blocking=False):
+            raise HTTPException(409, "Omnigent is already being launched. Try again in a moment.")
+        try:
+            return _launch_locked(user)
+        finally:
+            _LAUNCH_LOCK.release()
 
     return router

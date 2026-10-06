@@ -180,15 +180,39 @@ shows the saved result. Follow-up questions in the same thread see the earlier a
 **Omnigent** in the left rail, or **Tools → Omnigent**. Its own web UI is bridged to
 **http://localhost:6868**.
 
-It runs agent crews with a mix of workers:
+It runs one **universal crew** (`crew`). You pick its **orchestrator** in the Omnigent panel:
+Claude Code, Codex, or any API or local model you configured. Every other model is on the
+crew's roster as a sub-agent:
 
-- **API models** — anything you configured above. No extra login.
+- **API and local models** — everything configured above, including keyless local servers
+  (Ollama, LM Studio). No extra login.
 - **Claude Code** and **Codex** — both CLIs are baked into the image so they can act as
   native sub-agents. Each needs a one-time interactive subscription login inside the
   container; the API-model workers need none.
 
-Pin the version with `OMNIGENT_VERSION` in the Dockerfile, and move the bridged port with
-`OMNIGENT_UI_PORT` in `.env` if 6868 is taken.
+The orchestrator's prompt lists each worker with its tier (fast / balanced / flagship), what
+it is good at, ★ **recommended** (the newest model of its family) and its price per million
+tokens, so it can send routine work to cheap fast models and hard work to flagships. The panel
+shows the same roster; **Apply** rewrites the crew and restarts a running server, **Re-sync
+models** picks up new endpoints and keys, and **Max API workers** caps the roster.
+
+Launching Omnigent is admin-only: its agents run unsandboxed with a shell where Odysseus runs.
+
+Pin the version with `OMNIGENT_VERSION` in the Dockerfile (currently 0.16.0), and move the
+bridged port with `OMNIGENT_UI_PORT` in `.env` if 6868 is taken.
+
+## Models: recommended, cost, and delegation
+
+Every model picker (chat, Council, Omnigent) marks the **★ recommended** model of each family
+and shows a price band (`$`–`$$$$` metered, `plan` for subscriptions, `free` for local).
+Prices come from your own `data/omnigent-model-costs.json` when you declare them, otherwise
+from OpenRouter's public model list (cached daily; set `ODYSSEUS_MODEL_PRICES=off` to never
+fetch it). An unmatched model says "price unknown" rather than guessing.
+
+In agent mode any chat model can use any other model as a sub-agent: `list_models` shows the
+roster with recommendations and prices, and `chat_with_model` delegates a subtask (optionally
+with its own instructions) to the model the agent picks. `ask_teacher auto` uses a
+recommended flagship when no teacher model is set.
 
 ## Moving to another machine
 

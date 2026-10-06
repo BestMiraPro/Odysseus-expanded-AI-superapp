@@ -11,6 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 
@@ -250,12 +251,13 @@ def test_agent_config_routes_are_removed():
     from routes.omnigent_routes import setup_omnigent_routes
 
     paths = {getattr(r, "path", "") for r in setup_omnigent_routes(_FakeManager()).routes}
-    for gone in ("/api/omnigent/agents", "/api/omnigent/orchestrator",
-                 "/api/omnigent/agents/compile", "/api/omnigent/model-options"):
+    for gone in ("/api/omnigent/agents", "/api/omnigent/agents/compile", "/api/omnigent/model-options"):
         assert gone not in paths, f"{gone} should be removed"
-    # the launcher endpoints stay
+    # the launcher endpoints stay, and the universal crew's orchestrator is choosable
     assert "/api/omnigent/launch" in paths
     assert "/api/omnigent/status" in paths
+    assert "/api/omnigent/orchestrator" in paths
+    assert "/api/omnigent/server/restart" in paths
 
 
 def test_install_helpers_shape_api_gateways():
@@ -298,8 +300,6 @@ def test_model_slug_for_worker_dirs():
     assert _model_slug("zai-org/GLM-5.2") == "glm-5-2"
     assert _model_slug("deepseek-ai/DeepSeek-V3.1") == "deepseek-v3-1"
     assert _model_slug("") == "model"
-    # no models -> no crew written, no crash
-    assert _generate_crew({}, None) == 0
 
 
 def test_executor_block_bakes_inline_api_key_auth():
@@ -324,418 +324,267 @@ def test_executor_block_bakes_inline_api_key_auth():
     assert "auth" not in _executor_block("x/y", ("https://x", ""))
 
 
-def test_pick_best_api_models_keeps_requested_crews():
-    from routes.omnigent_routes import _pick_best_api_models
-
-    picked = _pick_best_api_models([
-        "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        "deepseek-ai/DeepSeek-V4-Flash",
-        "zai-org/GLM-5.2",
-        "deepseek-ai/DeepSeek-V4-Pro",
-        "moonshotai/Kimi-K2.6",
-        "Qwen/Qwen3-Coder-480B-A35B-Instruct",
-    ])
-
-    assert picked[:4] == [
-        "zai-org/GLM-5.2",
-        "deepseek-ai/DeepSeek-V4-Flash",
-        "deepseek-ai/DeepSeek-V4-Pro",
-        "moonshotai/Kimi-K2.6",
-    ]
-    assert "Qwen/Qwen3-Coder-480B-A35B-Instruct" in picked
 
 
-def test_generate_crew_writes_broad_and_curated_crew_variants(tmp_path, monkeypatch):
+# ---------------------------------------------------------------------------
+# Universal crew
+# ---------------------------------------------------------------------------
+
+def _crew(tmp_path):
+    return yaml.safe_load((tmp_path / "omnigent-home" / ".omnigent" / "agents" / "crew" / "config.yaml")
+                          .read_text(encoding="utf-8"))
+
+
+def _isolate(monkeypatch, tmp_path):
     import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import _generate_crew
+    from src import model_roster
 
     monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
-    agents_root = tmp_path / "omnigent-home" / ".omnigent" / "agents"
-    stale_worker = agents_root / "crew" / "agents" / "stale-openai-worker"
-    stale_worker.mkdir(parents=True)
-    (stale_worker / "config.yaml").write_text("name: stale-openai-worker\n")
+    monkeypatch.setattr(model_roster.PRICES, "lookup", lambda model_id: None)
+    return omnigent_routes
 
-    models = {
-        "zai-org/GLM-5.2": ("https://api.inference.wandb.ai/v1", "wandb_key"),
-        "deepseek-ai/DeepSeek-V4-Flash": ("https://api.inference.wandb.ai/v1", "wandb_key"),
-        "deepseek-ai/DeepSeek-V4-Pro": ("https://api.inference.wandb.ai/v1", "wandb_key"),
-        "Qwen/Qwen3-Coder-480B-A35B-Instruct": ("https://api.inference.wandb.ai/v1", "wandb_key"),
-    }
 
-    written = _generate_crew(models, "zai-org/GLM-5.2")
-
-    assert written == 7
-    assert not stale_worker.exists()
-    assert not list(agents_root.glob("crew-api-*"))
-
-    crew = yaml.safe_load((agents_root / "crew" / "config.yaml").read_text(encoding="utf-8"))
+def test_universal_crew_with_no_api_models_still_has_native_workers(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    assert og._generate_crew({}, None) == 2
+    crew = _crew(tmp_path)
+    assert crew["name"] == "crew"
+    assert crew["tools"]["agents"] == ["claude-code", "codex"]
     assert crew["executor"]["config"]["harness"] == "claude-sdk"
-    assert {"claude-code", "codex", "glm-5-2", "deepseek-v4-flash", "deepseek-v4-pro"} <= set(
-        crew["tools"]["agents"]
-    )
-
-    crew_claude = yaml.safe_load((agents_root / "crew-claude" / "config.yaml").read_text(encoding="utf-8"))
-    assert crew_claude["executor"]["config"]["harness"] == "claude-sdk"
-
-    crew_codex = yaml.safe_load((agents_root / "crew-codex" / "config.yaml").read_text(encoding="utf-8"))
-    assert crew_codex["executor"]["config"]["harness"] == "codex-native"
-    assert crew_codex["executor"]["config"]["yolo"] is True
-    assert crew_codex["executor"]["model"] == "gpt-5.6-sol"
-    assert crew_codex["executor"]["config"]["reasoning_effort"] == "xhigh"
-    assert crew_codex["llm"] == {
-        "model": "gpt-5.6-sol",
-        "reasoning_effort": "xhigh",
-    }
-
-    glm_crew = yaml.safe_load((agents_root / "crew-glm-5-2" / "config.yaml").read_text(encoding="utf-8"))
-    assert glm_crew["executor"]["config"]["harness"] == "openai-agents"
-    assert glm_crew["executor"]["model"] == "zai-org/GLM-5.2"
-    assert glm_crew["executor"]["auth"]["api_key"] == "wandb_key"
-    assert glm_crew["executor"]["auth"]["base_url"] == "https://api.inference.wandb.ai/v1"
-    # Per-model crews are API-model-brained without Codex/Claude to save subscription usage
-    assert glm_crew["tools"]["agents"] == []
-    assert "running directly on `zai-org/GLM-5.2`" in glm_crew["prompt"]
-    assert "anchored on `glm-5-2`" not in glm_crew["prompt"]
-    assert not (agents_root / "crew-glm-5-2" / "agents" / "glm-5-2").exists()
-    # No Codex/Claude sub-agent should be written inside per-model crew
-    assert not (agents_root / "crew-glm-5-2" / "agents" / "codex").exists()
-    assert not (agents_root / "crew-glm-5-2" / "agents" / "claude-code").exists()
-
-    glm_worker = yaml.safe_load((agents_root / "crew" / "agents" / "glm-5-2" / "config.yaml").read_text(encoding="utf-8"))
-    assert glm_worker["executor"]["config"]["harness"] == "openai-agents"
-    assert glm_worker["executor"]["model"] == "zai-org/GLM-5.2"
-    assert glm_worker["executor"]["auth"]["api_key"] == "wandb_key"
-    assert glm_worker["executor"]["auth"]["base_url"] == "https://api.inference.wandb.ai/v1"
 
 
-def test_generate_crew_creates_qwen_27b_variant_without_codex_subagent(tmp_path, monkeypatch):
-    import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import _generate_crew
+def test_universal_crew_rosters_every_model_with_recommendation_and_cost(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    creds = {m: ("https://api.example/v1", "k") for m in ("glm-4.6", "zai-org/GLM-5.2", "deepseek-v4-flash")}
+    meta = {m: {"endpoint_id": "e1", "endpoint_name": "Gateway", "kind": "api", "provider": "openai"} for m in creds}
 
-    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
+    assert og._generate_crew(creds, None, model_meta=meta) == 5
+
+    crew = _crew(tmp_path)
+    assert crew["tools"]["agents"][:2] == ["claude-code", "codex"]
+    # recommended (newest of family) ranks ahead of the older GLM
+    assert crew["tools"]["agents"].index("glm-5-2") < crew["tools"]["agents"].index("glm-4-6")
+    prompt = crew["prompt"]
+    assert "`glm-5-2`: zai-org/GLM-5.2 via Gateway — RECOMMENDED" in prompt
+    assert "`glm-4-6`: glm-4.6 via Gateway — api" in prompt
+    assert "price unknown" in prompt
+    assert "Choosing a model" in prompt and "TOOL-CALL PROTOCOL" in prompt
+    worker = yaml.safe_load((tmp_path / "omnigent-home" / ".omnigent" / "agents" / "crew" / "agents" / "glm-5-2"
+                             / "config.yaml").read_text(encoding="utf-8"))
+    assert worker["executor"]["model"] == "zai-org/GLM-5.2"
+    assert worker["description"] == "zai-org/GLM-5.2 worker (via Gateway)."
+
+
+def test_api_orchestrator_leads_and_is_not_its_own_worker(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    creds = {"zai-org/GLM-5.2": ("https://api.example/v1", "k"), "deepseek-v4-flash": ("https://api.example/v1", "k")}
+
+    og._generate_crew(creds, "api::e1::zai-org/GLM-5.2")
+
+    crew = _crew(tmp_path)
+    assert crew["executor"]["model"] == "zai-org/GLM-5.2"
+    assert crew["executor"]["config"]["harness"] == "openai-agents"
+    assert "glm-5-2" not in crew["tools"]["agents"]
+    assert "deepseek-v4-flash" in crew["tools"]["agents"]
+    assert "running on zai-org/GLM-5.2 (API)" in crew["prompt"]
+
+
+def test_codex_orchestrator_uses_saved_reasoning_effort(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    og.save_crew_settings({"orchestrator": "codex::gpt-5.5", "reasoning_effort": "xhigh", "max_workers": 40})
+
+    og._generate_crew({})
+
+    crew = _crew(tmp_path)
+    assert crew["executor"]["model"] == "gpt-5.5"
+    assert crew["executor"]["config"] == {"harness": "codex-native", "yolo": True, "reasoning_effort": "xhigh"}
+    assert crew["llm"] == {"model": "gpt-5.5", "reasoning_effort": "xhigh"}
+
+
+def test_unknown_or_vanished_api_orchestrator_falls_back_to_claude(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    og._generate_crew({}, "api::gone::some-model")
+    assert _crew(tmp_path)["executor"]["config"]["harness"] == "claude-sdk"
+    assert og.parse_orchestrator_id("nonsense") == {"kind": "claude", "model": None, "endpoint_id": None}
+    assert og.parse_orchestrator_id("claude::claude-opus-5-5")["model"] == "claude-opus-5-5"
+
+
+def test_max_workers_caps_the_api_roster(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    og.save_crew_settings({"orchestrator": "claude", "reasoning_effort": "high", "max_workers": 1})
+    creds = {f"model-{i}": ("https://api.example/v1", "k") for i in range(5)}
+    assert og._generate_crew(creds) == 3          # claude-code + codex + 1 API worker
+
+
+def test_regeneration_retires_old_generated_crews_but_keeps_user_crews(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
     agents_root = tmp_path / "omnigent-home" / ".omnigent" / "agents"
+    for name, desc in (("crew-codex", "anything"),
+                       ("crew-glm-5-2", "zai-org/GLM-5.2-brained crew running directly on zai-org/GLM-5.2"),
+                       ("crew-research", "My own research crew")):
+        (agents_root / name).mkdir(parents=True)
+        (agents_root / name / "config.yaml").write_text(yaml.safe_dump({"name": name, "description": desc}))
 
-    models = {
-        "zai-org/GLM-5.2": ("https://api.inference.wandb.ai/v1", "k1"),
-        "Qwen/Qwen3-27B": ("https://api.inference.wandb.ai/v1", "k2"),
-        "Qwen/Qwen2.5-27B-Instruct": ("https://api.inference.wandb.ai/v1", "k3"),
-    }
+    og._generate_crew({})
 
-    written = _generate_crew(models, "Qwen/Qwen3-27B")
-
-    # Qwen 27B should get a dedicated crew via _BEST_API_MODEL_HINTS ("27b")
-    assert (agents_root / "crew-qwen3-27b" / "config.yaml").exists() or (agents_root / "crew-qwen2-5-27b-instruct" / "config.yaml").exists()
-    # Find the qwen crew that was created
-    qwen_crew_path = None
-    for p in agents_root.glob("crew-qwen*27b*"):
-        if (p / "config.yaml").exists():
-            qwen_crew_path = p
-            break
-    assert qwen_crew_path is not None, "Qwen 27B crew not created"
-    cfg = yaml.safe_load((qwen_crew_path / "config.yaml").read_text(encoding="utf-8"))
-    # Must run directly on Qwen model and have no Codex/Claude sub-agents
-    assert cfg["executor"]["model"] in ("Qwen/Qwen3-27B", "Qwen/Qwen2.5-27B-Instruct")
-    assert cfg["tools"]["agents"] == []
-    assert not (qwen_crew_path / "agents" / "codex").exists()
-    assert not (qwen_crew_path / "agents" / "claude-code").exists()
-    # Broad crews still retain Codex/Claude for deep work
-    crew = yaml.safe_load((agents_root / "crew" / "config.yaml").read_text(encoding="utf-8"))
-    assert "codex" in crew["tools"]["agents"]
-    assert "claude-code" in crew["tools"]["agents"]
+    assert not (agents_root / "crew-codex").exists()
+    assert not (agents_root / "crew-glm-5-2").exists()
+    assert (agents_root / "crew-research" / "config.yaml").exists()
+    assert og._retired_agent_names(agents_root) == {"crew-codex", "crew-glm-5-2"}
+    env = og._builtin_agent_env()
+    assert [Path(p).name for p in env["OMNIGENT_BUILTIN_AGENT_DIRS"].split(os.pathsep)] == ["crew"]
 
 
-def test_builtin_agent_env_registers_only_top_level_crews(tmp_path, monkeypatch):
-    import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import _builtin_agent_env, _generate_crew
-
-    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
-    _generate_crew(
-        {"zai-org/GLM-5.2": ("https://api.inference.wandb.ai/v1", "wandb_key")},
-        "zai-org/GLM-5.2",
-    )
-
-    env = _builtin_agent_env()
-    names = {Path(p).name for p in env["OMNIGENT_BUILTIN_AGENT_DIRS"].split(os.pathsep)}
-
-    assert {"crew", "crew-claude", "crew-codex", "crew-glm-5-2"} <= names
-    assert "glm-5-2" not in names
-    assert not any(name.startswith("crew-api-") for name in names)
-
-
-def test_purge_generated_builtin_agent_rows_removes_stale_crews_and_raw_workers(tmp_path, monkeypatch):
-    import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import _purge_generated_builtin_agent_rows
-
-    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
+def test_purge_removes_universal_retired_and_worker_template_rows(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    og._generate_crew({"zai-org/GLM-5.2": ("https://api.example/v1", "k")})
     root = tmp_path / "omnigent-home" / ".omnigent"
-    agents_root = root / "agents"
-    for agent_name in ("crew", "crew-glm-5-2", "crew-api-glm-5-2"):
-        agent_dir = agents_root / agent_name
-        agent_dir.mkdir(parents=True)
-        (agent_dir / "config.yaml").write_text(f"name: {agent_name}\n")
-    raw_worker = agents_root / "crew" / "agents" / "glm-5-2"
-    raw_worker.mkdir(parents=True)
-    (raw_worker / "config.yaml").write_text("name: glm-5-2\n")
-    cli_worker = agents_root / "crew" / "agents" / "codex"
-    cli_worker.mkdir(parents=True)
-    (cli_worker / "config.yaml").write_text("name: codex\n")
+    manifest = json.loads((root / ".odysseus-generated.json").read_text())
+    manifest["retired"] = ["crew-glm-5-2", "crew-codex"]
+    (root / ".odysseus-generated.json").write_text(json.dumps(manifest))
+    (root / "agents" / "crew-api-glm-5-2").mkdir(parents=True)
+    (root / "agents" / "crew-api-glm-5-2" / "config.yaml").write_text("name: crew-api-glm-5-2\n")
 
-    db_path = root / "chat.db"
-    with sqlite3.connect(db_path) as con:
-        con.execute("CREATE TABLE agents (id TEXT, name TEXT, session_id TEXT)")
-        con.executemany(
-            "INSERT INTO agents VALUES (?, ?, ?)",
-            [
-                ("fresh_crew", "crew", None),
-                ("legacy_api", "crew-api-glm-5-2", None),
-                ("fresh_glm_crew", "crew-glm-5-2", None),
-                ("raw_glm", "glm-5-2", None),
-                ("session_glm", "glm-5-2", "conv_keep"),
-                ("polly", "polly", None),
-                ("codex", "codex", None),
-            ],
-        )
-        con.commit()
-
-    purged = _purge_generated_builtin_agent_rows()
-
-    assert purged == 4
-    with sqlite3.connect(db_path) as con:
-        remaining = set(con.execute("SELECT name, session_id FROM agents").fetchall())
-    assert remaining == {("glm-5-2", "conv_keep"), ("polly", None), ("codex", None)}
-    repoints = json.loads((root / "generated_agent_repoints.json").read_text(encoding="utf-8"))
-    assert repoints == {"legacy_api": "crew-glm-5-2"}
-
-
-def test_refresh_generated_session_agent_rows_repoints_existing_chats(tmp_path, monkeypatch):
-    import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import _refresh_generated_session_agent_rows
-
-    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
-    root = tmp_path / "omnigent-home" / ".omnigent"
-    crew_dir = root / "agents" / "crew"
-    crew_dir.mkdir(parents=True)
-    (crew_dir / "config.yaml").write_text("name: crew\n")
-    deepseek_worker = crew_dir / "agents" / "deepseek-v3-1"
-    deepseek_worker.mkdir(parents=True)
-    (deepseek_worker / "config.yaml").write_text("name: deepseek-v3-1\n")
-    codex_dir = root / "agents" / "crew-codex"
-    codex_dir.mkdir(parents=True)
-    (codex_dir / "config.yaml").write_text("name: crew-codex\n")
-    agent_dir = root / "agents" / "crew-glm-5-2"
-    agent_dir.mkdir(parents=True)
-    (agent_dir / "config.yaml").write_text("name: crew-glm-5-2\n")
-    (root / "generated_agent_repoints.json").write_text(json.dumps({"legacy_api": "crew-glm-5-2"}))
-
-    old_openai_bundle = root / "artifacts" / "ag_openai" / "bundle"
-    old_openai_bundle.parent.mkdir(parents=True)
-    old_openai_config = (
-        "name: openai-agents\n"
-        "executor:\n"
-        "  model: zai-org/GLM-5.2\n"
-        "  config:\n"
-        "    harness: openai-agents\n"
-    ).encode()
-    with tarfile.open(old_openai_bundle, "w:gz") as tf:
-        info = tarfile.TarInfo("./config.yaml")
-        info.size = len(old_openai_config)
-        tf.addfile(info, BytesIO(old_openai_config))
-
-    db_path = root / "chat.db"
-    with sqlite3.connect(db_path) as con:
-        con.execute(
-            "CREATE TABLE agents (id TEXT, name TEXT, session_id TEXT, bundle_location TEXT, version INTEGER)"
-        )
-        con.execute("CREATE TABLE conversations (id TEXT, agent_id TEXT)")
-        con.executemany(
-            "INSERT INTO agents VALUES (?, ?, ?, ?, ?)",
-            [
-                ("fresh_codex", "crew-codex", None, "new_codex_bundle", 2),
-                ("fresh", "crew-glm-5-2", None, "new_bundle", 7),
-                ("session", "crew-glm-5-2", "conv_session", "old_bundle", 1),
-                ("raw_glm", "glm-5-2", "conv_raw_glm", "raw_bundle", 1),
-                ("legacy_session_api", "crew-api-glm-5-2", "conv_session_api", "old_api_bundle", 1),
-                ("old_openai", "openai-agents", "conv_openai", "ag_openai/bundle", 1),
-                ("raw_v3", "deepseek-v3-1", "conv_raw_v3", "old_v3_bundle", 1),
-            ],
-        )
-        con.executemany(
-            "INSERT INTO conversations VALUES (?, ?)",
-            [
-                ("conv_session", "session"),
-                ("conv_raw_glm", "raw_glm"),
-                ("conv_session_api", "legacy_session_api"),
-                ("conv_openai", "old_openai"),
-                ("conv_raw_v3", "raw_v3"),
-                ("conv_legacy", "legacy_api"),
-                ("conv_other", "other"),
-            ],
-        )
-        con.commit()
-
-    refreshed = _refresh_generated_session_agent_rows()
-
-    assert refreshed == 11
-    with sqlite3.connect(db_path) as con:
-        session_row = con.execute(
-            "SELECT bundle_location, version FROM agents WHERE id = 'session'"
-        ).fetchone()
-        conversations = dict(con.execute("SELECT id, agent_id FROM conversations").fetchall())
-        stale_agent_ids = {
-            row[0]
-            for row in con.execute(
-                "SELECT id FROM agents WHERE id IN "
-                "('raw_glm', 'legacy_session_api', 'old_openai', 'raw_v3')"
-            ).fetchall()
-        }
-    assert session_row == ("new_bundle", 7)
-    assert conversations["conv_session"] == "fresh"
-    assert conversations["conv_raw_glm"] == "fresh"
-    assert conversations["conv_session_api"] == "fresh"
-    assert conversations["conv_openai"] == "fresh"
-    assert conversations["conv_raw_v3"] == "fresh_codex"
-    assert conversations["conv_legacy"] == "fresh"
-    assert conversations["conv_other"] == "other"
-    assert stale_agent_ids == set()
-    assert not (root / "generated_agent_repoints.json").exists()
-
-
-def test_purge_generated_builtin_agent_rows_supports_kind_schema_and_blob_ids(tmp_path, monkeypatch):
-    import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import _purge_generated_builtin_agent_rows
-
-    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
-    root = tmp_path / "omnigent-home" / ".omnigent"
-    agents_root = root / "agents"
-    for agent_name in ("crew", "crew-glm-5-2", "crew-api-glm-5-2"):
-        agent_dir = agents_root / agent_name
-        agent_dir.mkdir(parents=True)
-        (agent_dir / "config.yaml").write_text(f"name: {agent_name}\n")
-    raw_worker = agents_root / "crew" / "agents" / "glm-5-2"
-    raw_worker.mkdir(parents=True)
-    (raw_worker / "config.yaml").write_text("name: glm-5-2\n")
-
-    legacy_id = bytes.fromhex("11" * 16)
-    db_path = root / "chat.db"
-    with sqlite3.connect(db_path) as con:
+    with sqlite3.connect(root / "chat.db") as con:
         con.execute("CREATE TABLE agents (id BLOB, name TEXT, kind INTEGER)")
-        con.executemany(
-            "INSERT INTO agents VALUES (?, ?, ?)",
-            [
-                (bytes.fromhex("01" * 16), "crew", 1),
-                (legacy_id, "crew-api-glm-5-2", 1),
-                (bytes.fromhex("02" * 16), "crew-glm-5-2", 1),
-                (bytes.fromhex("03" * 16), "glm-5-2", 1),
-                (bytes.fromhex("04" * 16), "glm-5-2", 2),
-                (bytes.fromhex("05" * 16), "polly", 1),
-                (bytes.fromhex("06" * 16), "codex", 1),
-            ],
-        )
-        con.commit()
+        legacy = bytes.fromhex("11" * 16)
+        con.executemany("INSERT INTO agents VALUES (?, ?, ?)", [
+            (bytes.fromhex("01" * 16), "crew", 1),
+            (bytes.fromhex("02" * 16), "crew-glm-5-2", 1),
+            (bytes.fromhex("03" * 16), "crew-codex", 1),
+            (legacy, "crew-api-glm-5-2", 1),
+            (bytes.fromhex("04" * 16), "glm-5-2", 1),
+            (bytes.fromhex("05" * 16), "glm-5-2", 2),
+            (bytes.fromhex("06" * 16), "polly", 1),
+            (bytes.fromhex("07" * 16), "codex", 1),
+        ])
 
-    purged = _purge_generated_builtin_agent_rows()
-
-    assert purged == 4
-    with sqlite3.connect(db_path) as con:
+    assert og._purge_generated_builtin_agent_rows() == 5
+    with sqlite3.connect(root / "chat.db") as con:
         remaining = set(con.execute("SELECT name, kind FROM agents").fetchall())
     assert remaining == {("glm-5-2", 2), ("polly", 1), ("codex", 1)}
-    repoints = json.loads((root / "generated_agent_repoints.json").read_text(encoding="utf-8"))
-    assert repoints == {f"hex:{legacy_id.hex()}": "crew-glm-5-2"}
 
 
-def test_refresh_generated_session_agent_rows_supports_kind_schema_and_blob_ids(tmp_path, monkeypatch):
-    import routes.omnigent_routes as omnigent_routes
-    from routes.omnigent_routes import _refresh_generated_session_agent_rows
-
-    monkeypatch.setattr(omnigent_routes, "DATA_DIR", str(tmp_path))
+def test_refresh_moves_chats_from_retired_crews_onto_the_universal_crew(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    og._generate_crew({"zai-org/GLM-5.2": ("https://api.example/v1", "k")})
     root = tmp_path / "omnigent-home" / ".omnigent"
-    crew_dir = root / "agents" / "crew"
-    crew_dir.mkdir(parents=True)
-    (crew_dir / "config.yaml").write_text("name: crew\n")
-    deepseek_worker = crew_dir / "agents" / "deepseek-v3-1"
-    deepseek_worker.mkdir(parents=True)
-    (deepseek_worker / "config.yaml").write_text("name: deepseek-v3-1\n")
-    codex_dir = root / "agents" / "crew-codex"
-    codex_dir.mkdir(parents=True)
-    (codex_dir / "config.yaml").write_text("name: crew-codex\n")
-    agent_dir = root / "agents" / "crew-glm-5-2"
-    agent_dir.mkdir(parents=True)
-    (agent_dir / "config.yaml").write_text("name: crew-glm-5-2\n")
+    manifest = json.loads((root / ".odysseus-generated.json").read_text())
+    manifest["retired"] = ["crew-glm-5-2", "crew-codex"]
+    (root / ".odysseus-generated.json").write_text(json.dumps(manifest))
+    (root / "generated_agent_repoints.json").write_text(json.dumps({"legacy": "crew-glm-5-2"}))
 
-    ids = {name: bytes([idx]) * 16 for idx, name in enumerate(
-        ("fresh_codex", "fresh", "session", "raw_glm", "legacy_session_api", "old_openai", "raw_v3", "legacy"),
-        start=1,
-    )}
-    (root / "generated_agent_repoints.json").write_text(json.dumps({
-        f"hex:{ids['legacy'].hex()}": "crew-glm-5-2",
+    with sqlite3.connect(root / "chat.db") as con:
+        con.execute("CREATE TABLE agents (id TEXT, name TEXT, session_id TEXT, bundle_location TEXT, version INTEGER)")
+        con.execute("CREATE TABLE conversations (id TEXT, agent_id TEXT)")
+        con.executemany("INSERT INTO agents VALUES (?, ?, ?, ?, ?)", [
+            ("fresh", "crew", None, "new_bundle", 3),
+            ("on_crew", "crew", "c1", "old_bundle", 1),
+            ("on_glm_crew", "crew-glm-5-2", "c2", "b", 1),
+            ("on_codex_crew", "crew-codex", "c3", "b", 1),
+            ("raw_worker", "glm-5-2", "c4", "b", 1),
+            ("mine", "my-agent", "c5", "b", 1),
+        ])
+        con.executemany("INSERT INTO conversations VALUES (?, ?)", [
+            ("conv1", "on_crew"), ("conv2", "on_glm_crew"), ("conv3", "on_codex_crew"),
+            ("conv4", "raw_worker"), ("conv5", "mine"), ("conv6", "legacy"),
+        ])
+
+    og._refresh_generated_session_agent_rows()
+
+    with sqlite3.connect(root / "chat.db") as con:
+        conv = dict(con.execute("SELECT id, agent_id FROM conversations").fetchall())
+        bundle = con.execute("SELECT bundle_location FROM agents WHERE id='on_crew'").fetchone()[0]
+    assert bundle == "new_bundle"
+    assert conv == {"conv1": "fresh", "conv2": "fresh", "conv3": "fresh", "conv4": "fresh",
+                    "conv5": "mine", "conv6": "fresh"}
+
+
+def test_install_keeps_user_providers_and_includes_keyless_local_endpoints(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    from types import SimpleNamespace as NS
+
+    cfg_dir = tmp_path / "omnigent-home" / ".omnigent"
+    cfg_dir.mkdir(parents=True)
+    (cfg_dir / "config.yaml").write_text(yaml.safe_dump({
+        "providers": {
+            "mine": {"kind": "gateway", "openai": {"base_url": "https://my.own/v1", "api_key": "x"},
+                     "default": ["openai"]},
+            "old-ours": {"kind": "gateway", "openai": {"base_url": "https://api.example/v1", "api_key": "old"}},
+        },
+        "harness": "claude-sdk",
     }))
+    eps = [
+        (NS(id="e1", name="Example", base_url="https://api.example/v1", api_key="new",
+            pinned_models=None, cached_models=json.dumps(["deepseek-v4-flash"])), "api", "openai"),
+        (NS(id="e2", name="Ollama", base_url="http://127.0.0.1:11434/v1", api_key=None,
+            pinned_models=None, cached_models=json.dumps(["qwen3:8b", "nomic-embed-text"])), "local", "ollama"),
+    ]
+    monkeypatch.setattr(og, "_crew_endpoints", lambda user: eps)
+    monkeypatch.setattr(og, "_purge_generated_builtin_agent_rows", lambda: 0)
 
-    old_openai_bundle = root / "artifacts" / "ag_openai" / "bundle"
-    old_openai_bundle.parent.mkdir(parents=True)
-    old_openai_config = (
-        "name: openai-agents\n"
-        "executor:\n"
-        "  model: zai-org/GLM-5.2\n"
-        "  config:\n"
-        "    harness: openai-agents\n"
-    ).encode()
-    with tarfile.open(old_openai_bundle, "w:gz") as tf:
-        info = tarfile.TarInfo("./config.yaml")
-        info.size = len(old_openai_config)
-        tf.addfile(info, BytesIO(old_openai_config))
+    out = og._install_api_models("alice")
 
-    db_path = root / "chat.db"
-    with sqlite3.connect(db_path) as con:
-        con.execute("CREATE TABLE agents (id BLOB, name TEXT, bundle_location TEXT, version INTEGER, kind INTEGER)")
-        con.execute("CREATE TABLE conversations (id TEXT, agent_id BLOB)")
-        con.executemany(
-            "INSERT INTO agents VALUES (?, ?, ?, ?, ?)",
-            [
-                (ids["fresh_codex"], "crew-codex", "new_codex_bundle", 2, 1),
-                (ids["fresh"], "crew-glm-5-2", "new_bundle", 7, 1),
-                (ids["session"], "crew-glm-5-2", "old_bundle", 1, 2),
-                (ids["raw_glm"], "glm-5-2", "raw_bundle", 1, 2),
-                (ids["legacy_session_api"], "crew-api-glm-5-2", "old_api_bundle", 1, 2),
-                (ids["old_openai"], "openai-agents", "ag_openai/bundle", 1, 2),
-                (ids["raw_v3"], "deepseek-v3-1", "old_v3_bundle", 1, 2),
-            ],
-        )
-        con.executemany(
-            "INSERT INTO conversations VALUES (?, ?)",
-            [
-                ("conv_session", ids["session"]),
-                ("conv_raw_glm", ids["raw_glm"]),
-                ("conv_session_api", ids["legacy_session_api"]),
-                ("conv_openai", ids["old_openai"]),
-                ("conv_raw_v3", ids["raw_v3"]),
-                ("conv_legacy", ids["legacy"]),
-                ("conv_other", bytes.fromhex("ff" * 16)),
-            ],
-        )
-        con.commit()
+    cfg = yaml.safe_load((cfg_dir / "config.yaml").read_text())
+    assert set(cfg["providers"]) == {"mine", "ody-example", "ody-ollama"}
+    assert cfg["providers"]["mine"]["default"] == ["openai"]       # the user's default stays
+    assert cfg["providers"]["ody-ollama"]["openai"]["api_key"] == "not-needed"
+    assert cfg["harness"] == "claude-sdk"                           # not overridden
+    assert out["models"] == 2                                       # embedding model skipped
+    crew = _crew(tmp_path)
+    assert "qwen3-8b" in crew["tools"]["agents"] and "deepseek-v4-flash" in crew["tools"]["agents"]
+    assert "free (local hardware)" in crew["prompt"]
 
-    refreshed = _refresh_generated_session_agent_rows()
 
-    assert refreshed == 11
-    with sqlite3.connect(db_path) as con:
-        session_row = con.execute(
-            "SELECT bundle_location, version FROM agents WHERE id = ?", (ids["session"],)
-        ).fetchone()
-        conversations = dict(con.execute("SELECT id, agent_id FROM conversations").fetchall())
-        stale_agent_ids = {
-            row[0]
-            for row in con.execute(
-                "SELECT id FROM agents WHERE id IN (?, ?, ?, ?)",
-                (ids["raw_glm"], ids["legacy_session_api"], ids["old_openai"], ids["raw_v3"]),
-            ).fetchall()
-        }
-    assert session_row == ("new_bundle", 7)
-    assert conversations["conv_session"] == ids["fresh"]
-    assert conversations["conv_raw_glm"] == ids["fresh"]
-    assert conversations["conv_session_api"] == ids["fresh"]
-    assert conversations["conv_openai"] == ids["fresh"]
-    assert conversations["conv_raw_v3"] == ids["fresh_codex"]
-    assert conversations["conv_legacy"] == ids["fresh"]
-    assert conversations["conv_other"] == bytes.fromhex("ff" * 16)
-    assert stale_agent_ids == set()
-    assert not (root / "generated_agent_repoints.json").exists()
+def test_launch_requires_admin(monkeypatch):
+    import routes.omnigent_routes as og
+    from fastapi import HTTPException
+
+    def deny(request):
+        raise HTTPException(403, "Admin only")
+
+    monkeypatch.setattr(og, "require_admin", deny)
+    launch = _handler(og.setup_omnigent_routes(_FakeManager()), "POST", "/api/omnigent/launch")
+    with pytest.raises(HTTPException) as exc:
+        launch(SimpleNamespace(state=SimpleNamespace(current_user="bob")))
+    assert exc.value.status_code == 403
+
+
+def test_orchestrator_route_validates_choice_and_saves(tmp_path, monkeypatch):
+    og = _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(og, "require_admin", lambda request: None)
+    monkeypatch.setattr(og, "orchestrator_options", lambda user: [{"id": "claude"}, {"id": "codex::gpt-5.5"}])
+    monkeypatch.setattr(og, "_install_api_models", lambda user: {"workers": 2})
+    router = og.setup_omnigent_routes(_FakeManager())
+    set_orch = _handler(router, "POST", "/api/omnigent/orchestrator")
+
+    class Req:
+        state = SimpleNamespace(current_user="admin")
+
+        def __init__(self, body):
+            self._body = body
+
+        async def json(self):
+            return self._body
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(set_orch(Req({"orchestrator": "api::x::not-offered"})))
+    assert exc.value.status_code == 400
+
+    out = asyncio.run(set_orch(Req({"orchestrator": "codex::gpt-5.5", "reasoning_effort": "xhigh"})))
+    assert out["restarted"] is False                       # server not running: files only
+    assert og.load_crew_settings()["orchestrator"] == "codex::gpt-5.5"
+    assert og.load_crew_settings()["reasoning_effort"] == "xhigh"
+
+
+def test_omnigent_env_drops_secrets_but_keeps_harness_logins():
+    from src.omnigent_manager import scrubbed_env
+
+    env = scrubbed_env({
+        "PATH": "/usr/bin", "HOME": "/root", "LANG": "C.UTF-8",
+        "SMTP_PASSWORD": "x", "GOOGLE_OAUTH_CLIENT_SECRET": "x", "DATABASE_URL": "postgres://u:p@h/db",
+        "OPENAI_API_KEY": "kept-for-gateway", "ANTHROPIC_API_KEY": "x", "ODYSSEUS_ADMIN_PASSWORD": "x",
+        "CLAUDE_CODE_OAUTH_TOKEN": "kept", "OMNIGENT_UI_PORT": "6868", "SOME_TOKEN": "x",
+    })
+    assert set(env) == {"PATH", "HOME", "LANG", "OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OMNIGENT_UI_PORT"}

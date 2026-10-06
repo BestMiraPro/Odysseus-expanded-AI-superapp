@@ -468,6 +468,33 @@ def _builtin_agent_route_candidates(command: str) -> list[Path]:
     )
 
 
+# Environment variables Omnigent never needs. Its agents run unsandboxed with a
+# shell, so anything left in the server's environment is one `printenv` away
+# from every crew member: mail passwords, OAuth secrets, Odysseus's own keys.
+_SECRET_ENV_RE = re.compile(
+    r"(PASSWORD|PASSWD|SECRET|TOKEN|PRIVATE|CREDENTIAL|COOKIE|_KEY$|_KEYS$|APIKEY|DATABASE_URL|DSN)",
+    re.IGNORECASE,
+)
+# Prefixes the harnesses read on purpose (Claude Code / Codex logins, Omnigent's
+# own settings, the gateway variables Odysseus injects).
+_ALLOWED_ENV_PREFIXES = ("CLAUDE_CODE_", "CODEX_", "OMNIGENT_", "HARNESS_", "OPENAI_", "UV_")
+
+
+def scrubbed_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """``os.environ`` minus secrets the Omnigent server and its agents never need."""
+    env = dict(os.environ if base is None else base)
+    for key in list(env):
+        if key.startswith(_ALLOWED_ENV_PREFIXES):
+            continue
+        if _SECRET_ENV_RE.search(key):
+            env.pop(key, None)
+    return env
+
+
+def _private_umask() -> None:  # pragma: no cover - runs in the child process
+    os.umask(0o077)
+
+
 @dataclass(slots=True)
 class OmnigentCommandResult:
     exit_code: int
@@ -515,7 +542,10 @@ class OmnigentManager:
                 Path("server") / "routes" / "_sessions" / "orchestration.py",
                 _patch_codex_session_route_source,
             ),
+            # <= 0.12 kept the forwarder at the package root; 0.13+ moved it
+            # under harnesses/. Whichever exists is patched.
             (Path("codex_native_forwarder.py"), _patch_codex_forwarder_source),
+            (Path("harnesses") / "codex_native" / "forwarder.py", _patch_codex_forwarder_source),
         )
         for relative_path, patcher in patches:
             for path in _omnigent_source_candidates(command, relative_path):
@@ -556,7 +586,7 @@ class OmnigentManager:
         timeout: float | None = None,
         env_extra: dict[str, str] | None = None,
     ) -> OmnigentCommandResult:
-        env = dict(os.environ)
+        env = scrubbed_env()
         try:
             self._home.mkdir(parents=True, exist_ok=True)
             env["HOME"] = str(self._home)
@@ -564,6 +594,12 @@ class OmnigentManager:
             pass
         if env_extra:
             env.update({k: str(v) for k, v in env_extra.items() if v})
+        extra: dict[str, Any] = {}
+        if os.name != "nt":
+            # Omnigent copies every agent bundle (inline API keys included)
+            # into its artifact store with default permissions; an owner-only
+            # umask keeps those copies, and the daemon's logs, private.
+            extra["preexec_fn"] = _private_umask
         proc = subprocess.run(
             args,
             capture_output=True,
@@ -571,6 +607,7 @@ class OmnigentManager:
             timeout=timeout or self.timeout,
             check=False,
             env=env,
+            **extra,
         )
         return OmnigentCommandResult(proc.returncode, proc.stdout or "", proc.stderr or "")
 
@@ -684,7 +721,13 @@ class OmnigentManager:
             raise RuntimeError("Omnigent CLI not found on PATH")
         self._patch_picker_metadata(command)
         self._patch_codex_native_runtime(command)
-        result = self._run([command, "server", "start"], timeout=30, env_extra=env_extra)
+        # 0.13+ spells it `server --background` (`server start` still works
+        # but warns it is deprecated); older installs only know `server start`.
+        args = [command, "server", "--background"]
+        result = self._run(args, timeout=30, env_extra=env_extra)
+        if result.exit_code != 0 and re.search(r"no such option|unrecognized|usage:", f"{result.stdout}\n{result.stderr}", re.I):
+            args = [command, "server", "start"]
+            result = self._run(args, timeout=30, env_extra=env_extra)
         # Learn the URL Omnigent actually bound (it prints e.g. "Started
         # background server at http://127.0.0.1:6767") so the probe matches.
         match = re.search(r"https?://127\.0\.0\.1:\d+", f"{result.stdout}\n{result.stderr}")
@@ -693,7 +736,7 @@ class OmnigentManager:
             self._sync_bridge(self._ui_url)
         status = self.status()
         status.update({
-            "last_command": "omnigent server start",
+            "last_command": " ".join(["omnigent", *args[1:]]),
             "stdout": result.stdout,
             "stderr": result.stderr,
             "exit_code": result.exit_code,

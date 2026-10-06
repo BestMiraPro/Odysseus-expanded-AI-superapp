@@ -100,12 +100,12 @@ ENV UV_TOOL_DIR=/opt/uv/tools \
 # Keep at or above whatever migrated the persisted chat DB
 # (data/omnigent-home/.omnigent/chat.db): Omnigent refuses to start against a
 # database newer than the binary, and alembic cannot walk revisions backwards.
-ARG OMNIGENT_VERSION=0.12.0
+ARG OMNIGENT_VERSION=0.16.0
 # uv is pinned like every other tool baked into the image: an unpinned installer
 # is the one dependency that can change the resolution of everything it then
 # installs, so "reproducible build" would stop being true the day uv shipped a
 # resolver change. Dependabot's pip ecosystem tracks this ARG.
-ARG UV_VERSION=0.12.11
+ARG UV_VERSION=0.12.23
 RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
     && uv tool install "omnigent==${OMNIGENT_VERSION}" \
     && chmod -R a+rX /opt/uv \
@@ -114,8 +114,10 @@ RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
 # Claude Code + Codex CLIs so their native harnesses are available as Omnigent
 # sub-agents alongside the API-model workers. Each still needs a one-time
 # interactive subscription login (the API/W&B workers need no login).
-ARG CLAUDE_CODE_VERSION=2.1.245
-ARG CODEX_VERSION=0.150.0
+ARG CLAUDE_CODE_VERSION=2.1.290
+# Omnigent 0.16's codex-native harness gates its remote-resume permission
+# guard on Codex >= 0.154, so the two pins move together.
+ARG CODEX_VERSION=0.160.1
 RUN npm install -g \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     "@openai/codex@${CODEX_VERSION}"
@@ -159,15 +161,15 @@ RUN python -c "from src.omnigent_manager import OmnigentManager; m=OmnigentManag
     && grep -R -q "ODYSSEUS_CODEX_REASONING_ARGV_PATCH" \
         /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/server/routes/_sessions/orchestration.py \
     && grep -R -q "ODYSSEUS_CODEX_MCP_ROTATION_PATCH" \
-        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/harnesses/codex_native/forwarder.py \
     && grep -R -q "ODYSSEUS_CODEX_STARTUP_THREAD_GUARD_PATCH" \
-        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/harnesses/codex_native/forwarder.py \
     && grep -R -q "ODYSSEUS_CODEX_ACTIVE_TURN_ROTATION_GUARD_PATCH" \
-        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/harnesses/codex_native/forwarder.py \
     && grep -R -q "ODYSSEUS_CODEX_ROTATION_FORCE_SETTLE_PATCH" \
-        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py \
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/harnesses/codex_native/forwarder.py \
     && grep -R -q "ODYSSEUS_CODEX_IDLE_RELEASE_PATCH" \
-        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/codex_native_forwarder.py
+        /opt/uv/tools/omnigent/lib/python*/site-packages/omnigent/harnesses/codex_native/forwarder.py
 
 # Turn-2 crash fix for API-model crews: openai-agents 0.17.7 treats assistant
 # string content as list of parts (iterates char-by-char). Patch at build time

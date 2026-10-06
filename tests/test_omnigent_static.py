@@ -42,8 +42,10 @@ def test_omnigent_module_is_a_launcher():
     assert "/api/omnigent/launch" in module
     assert "Launch Omnigent" in module
     assert "Open Omnigent" in module
-    # the agent-config window + goal-gated path are gone
-    assert "renderOrchestrator" not in module
+    # one universal crew: the orchestrator is chosen in a menu, every other
+    # model is its worker; the old per-agent config window stays gone
+    assert "/api/omnigent/orchestrator" in module
+    assert 'id="omnigent-orchestrator"' in module
     assert "renderAgents" not in module
     assert "omnigent-goal-input" not in module
     assert "/api/omnigent/runs" not in module
