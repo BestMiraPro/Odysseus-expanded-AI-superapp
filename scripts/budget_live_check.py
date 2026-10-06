@@ -128,6 +128,12 @@ def sse_events(text: str):
                 continue
 
 
+def last_metrics(text: str) -> dict:
+    """The turn's final metrics event (earlier ones can be partial)."""
+    found = [e["data"] for e in sse_events(text) if e.get("type") == "metrics" and isinstance(e.get("data"), dict)]
+    return found[-1] if found else {}
+
+
 class Odysseus:
     def __init__(self, provider: dict):
         self.provider = provider
@@ -237,7 +243,7 @@ def run() -> int:
         before = app.ledger()
         r = app.http.post("/api/chat_stream", data={"session": sid, "mode": "chat",
                                                     "message": "Reply with exactly: ok"})
-        metrics = next((e["data"] for e in sse_events(r.text) if e.get("type") == "metrics"), {})
+        metrics = last_metrics(r.text)
         if check("chat: provider reported usage", metrics.get("usage_source") != "estimated" and metrics.get("input_tokens"),
                  f"{metrics.get('input_tokens')}/{metrics.get('output_tokens')} tokens"):
             rows_match("chat", new_rows(app, before), [metrics], price, "chat")
@@ -246,7 +252,7 @@ def run() -> int:
         before = app.ledger()
         r = app.http.post("/api/chat_stream", data={"session": sid, "mode": "agent",
                                                     "message": "What is 17 times 23? Reply with just the number."})
-        metrics = next((e["data"] for e in sse_events(r.text) if e.get("type") == "metrics"), {})
+        metrics = last_metrics(r.text)
         buckets = metrics.get("usage_buckets") or []
         if check("agent: rounds reported", buckets, f"{len(buckets)} round(s)"):
             rows_match("agent", new_rows(app, before), buckets, price, "agent")

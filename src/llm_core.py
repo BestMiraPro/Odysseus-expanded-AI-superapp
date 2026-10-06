@@ -3338,6 +3338,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     _harmony_active = False       # sticky: gpt-oss harmony <|channel|> stream detected
     _actual_model = ""
     _actual_model_announced = False
+    # Some providers (W&B Inference, vLLM with continuous usage stats) attach
+    # CUMULATIVE usage to every chunk. Keep only the latest and emit it once at
+    # the end, the shape OpenAI itself sends: consumers that add usage events
+    # up (the agent loop) would otherwise count the prompt several times.
+    _pending_usage_event: Optional[str] = None
 
     def _emit_tool_calls():
         """Build the tool_calls event string if any were accumulated."""
@@ -3388,6 +3393,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                         tc_event = _emit_tool_calls()
                         if tc_event:
                             yield tc_event
+                        if _pending_usage_event:
+                            yield _pending_usage_event
                         yield "data: [DONE]\n\n"
                         return
 
@@ -3458,7 +3465,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                         _usage_data["model"] = _actual_model
                                         if not _same_model_identity(_actual_model, model):
                                             _usage_data["requested_model"] = model
-                                    yield f'data: {json.dumps({"type": "usage", "data": _usage_data})}\n\n'
+                                    _pending_usage_event = f'data: {json.dumps({"type": "usage", "data": _usage_data})}\n\n'
                                 elif "choices" in j:
                                     _c0 = (j["choices"] or [None])[0]
                                     if _c0 is None:
@@ -3621,6 +3628,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             tc_event = _emit_tool_calls()
             if tc_event:
                 yield tc_event
+            if _pending_usage_event:
+                yield _pending_usage_event
             yield "data: [DONE]\n\n"
 
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
