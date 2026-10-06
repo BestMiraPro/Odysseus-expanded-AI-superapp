@@ -49,6 +49,10 @@ def endpoint_cost_tracked(url: str, endpoint_kind: Optional[str] = None) -> bool
         path == "/backend-api/codex" or path.startswith("/backend-api/codex/")
     ):
         return False
+    # Flat-rate subscriptions, whatever endpoint_kind they were saved with:
+    # the Claude plan's reserved ``*.invalid`` sentinel host and Copilot.
+    if host.endswith(".invalid") or host == "githubcopilot.com" or host.endswith(".githubcopilot.com"):
+        return False
     kind = str(endpoint_kind or "auto").strip().lower()
     if kind == "local":
         return False

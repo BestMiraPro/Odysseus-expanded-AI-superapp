@@ -95,18 +95,18 @@ class Member:
             "billing": self.billing,
         }
 
+    @property
+    def price(self):
+        from src.budget import Price
+
+        return Price(self.billing, self.input_per_mtok, self.output_per_mtok)
+
     def cost_usd(self, usage: Optional[Dict[str, int]]) -> Optional[float]:
-        """Metered cost of one call, or None when free, flat-rate or unpriced."""
-        if not usage or self.billing != "metered" or self.input_per_mtok is None:
-            return None
-        out_price = self.output_per_mtok if self.output_per_mtok is not None else self.input_per_mtok
-        # Cached prompt tokens are part of input_tokens but bill differently:
-        # reads at ~0.1x input, 5-minute cache writes at 1.25x.
-        cache_read = int(usage.get("cache_read_input_tokens") or 0)
-        cache_write = int(usage.get("cache_creation_input_tokens") or 0)
-        fresh = max(int(usage.get("input_tokens") or 0) - cache_read - cache_write, 0)
-        input_cost = (fresh + 0.1 * cache_read + 1.25 * cache_write) * self.input_per_mtok
-        return round((input_cost + usage.get("output_tokens", 0) * out_price) / 1_000_000, 6)
+        """Metered cost of one call, or None when free, flat-rate or unpriced.
+
+        Cached prompt tokens (inside input_tokens) are priced at cache rates.
+        """
+        return self.price.usage_cost(usage)
 
 
 class CouncilError(RuntimeError):
@@ -333,8 +333,13 @@ async def run_member(
     thinking_sent = False
     error: Optional[str] = None
     usage: Optional[Dict[str, int]] = None
+    from src.budget import estimate_tokens
+
+    # Kept so a call whose provider reports no usage (or that is stopped
+    # midway) can still be billed from an estimate.
+    input_estimate = estimate_tokens(messages)
     if sink is not None:
-        sink.update({"text": "", "error": None, "ms": None, "pending": True})
+        sink.update({"text": "", "error": None, "ms": None, "pending": True, "input_estimate": input_estimate})
     try:
         async for chunk in stream_fn(member.url, member.model, messages, headers=member.headers,
                                      timeout=timeout, workload="foreground"):
@@ -385,7 +390,8 @@ async def run_member(
         error = "The model returned an empty answer."
     ms = int((time.monotonic() - started) * 1000)
     cost = member.cost_usd(usage)
-    outcome = {"text": text, "error": error, "ms": ms, "usage": usage, "cost_usd": cost}
+    outcome = {"text": text, "error": error, "ms": ms, "usage": usage, "cost_usd": cost,
+               "input_estimate": input_estimate}
     if sink is not None:
         sink.update(outcome)
         sink.pop("pending", None)
@@ -521,3 +527,126 @@ def usage_totals(result: Dict[str, Any]) -> Dict[str, Any]:
     return {"input_tokens": tokens_in, "output_tokens": tokens_out,
             "cost_usd": round(cost, 6) if priced else None, "priced_calls": priced,
             "unpriced_calls": unpriced}
+
+
+# ---------------------------------------------------------------------------
+# Budget
+# ---------------------------------------------------------------------------
+
+def observed_output_tokens(turns: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Average reply length per stage over earlier turns' recorded usage.
+
+    ``turns`` are saved results ({opinions, reviews, usage}); the chairman's
+    share is the turn total minus its members' calls. Stages with no data are
+    left out so the caller falls back to defaults.
+    """
+    sums = {"opinions": [0, 0], "review": [0, 0], "synthesis": [0, 0]}
+    for turn in turns:
+        member_out = 0
+        for stage, calls in (("opinions", turn.get("opinions") or []), ("review", turn.get("reviews") or [])):
+            for call in calls:
+                out = int(((call or {}).get("usage") or {}).get("output_tokens") or 0)
+                if out > 0:
+                    sums[stage][0] += out
+                    sums[stage][1] += 1
+                    member_out += out
+        total_out = int((turn.get("usage") or {}).get("output_tokens") or 0)
+        if total_out > member_out:
+            sums["synthesis"][0] += total_out - member_out
+            sums["synthesis"][1] += 1
+    return {stage: int(total / n) for stage, (total, n) in sums.items() if n >= 2}
+
+
+def estimate_turn(
+    members: List[Member],
+    chairman: Member,
+    mode: str,
+    question: str,
+    history: List[Dict[str, str]],
+    expected: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """What one council turn should cost before it runs.
+
+    Input sizes come from the real prompts; reply sizes are typical lengths
+    (``expected`` overrides them, e.g. with the user's own averages). Only
+    metered seats cost money; a metered seat with no known price is counted
+    in ``unpriced_calls`` instead of guessed.
+    """
+    from src import budget
+
+    exp = {**budget.EXPECTED_OUTPUT_TOKENS, **(expected or {})}
+    question = question or ""
+    n = len(members)
+    labels = assign_labels(list(range(n)), random.Random(0))
+    blank = {i: "" for i in range(n)}
+    names = {i: f"{m.model} via {m.endpoint_name}" for i, m in enumerate(members)}
+    answers_tokens = exp["opinions"] * n
+    plan: List[tuple] = []
+    opinion_in = budget.estimate_tokens(opinion_messages(question, history))
+    plan += [("opinions", i, m, opinion_in, exp["opinions"]) for i, m in enumerate(members)]
+    reviews_tokens = 0
+    if mode == MODE_FULL and n >= 2:
+        review_in = budget.estimate_tokens(review_messages(question, labels, blank)) + answers_tokens
+        plan += [("review", i, m, review_in, exp["review"]) for i, m in enumerate(members)]
+        reviews_tokens = exp["review"] * n
+    chair_in = (budget.estimate_tokens(chair_messages(question, history, labels, blank, names, [], []))
+                + answers_tokens + reviews_tokens)
+    plan.append(("synthesis", "chair", chairman, chair_in, exp["synthesis"]))
+
+    calls = []
+    total = 0.0
+    priced = unpriced = 0
+    metered = False
+    for stage, index, member, tokens_in, tokens_out in plan:
+        price = member.price
+        cost = price.cost(tokens_in, tokens_out)
+        if price.metered:
+            metered = True
+            if cost is None:
+                unpriced += 1
+            else:
+                priced += 1
+                total += cost
+        calls.append({"stage": stage, "member": index, "model": member.model, "billing": price.billing,
+                      "input_tokens": tokens_in, "output_tokens": tokens_out, "cost_usd": cost})
+    return {
+        "total_usd": round(total, 6) if priced else (None if unpriced else 0.0),
+        "metered": metered,
+        "priced_calls": priced,
+        "unpriced_calls": unpriced,
+        "calls": calls,
+        "expected_output_tokens": exp,
+    }
+
+
+def billable_calls(result: Dict[str, Any], members: List[Member], chairman: Member):
+    """(member, stage, usage, cost_usd, estimated) for every call that ran.
+
+    A call with provider-reported usage is billed as reported. One without
+    (a provider that sends no usage, or a call stopped midway) is billed from
+    its prompt estimate plus the text it produced, and flagged as estimated.
+    """
+    from src.budget import text_tokens
+
+    out = []
+    stages = [("opinions", c) for c in result.get("opinions") or []]
+    stages += [("review", c) for c in result.get("reviews") or []]
+    if isinstance(result.get("chair"), dict):
+        stages.append(("synthesis", result["chair"]))
+    for stage, call in stages:
+        if not isinstance(call, dict) or "input_estimate" not in call and not call.get("usage"):
+            continue
+        who = call.get("member")
+        member = chairman if who == "chair" else (members[who] if isinstance(who, int) and 0 <= who < len(members) else None)
+        if member is None:
+            continue
+        usage = call.get("usage")
+        if usage:
+            out.append((member, stage, usage, call.get("cost_usd"), False))
+            continue
+        text = call.get("text") or ""
+        if not text:
+            continue        # failed before producing anything: nothing billable
+        usage = {"input_tokens": int(call.get("input_estimate") or 0), "output_tokens": text_tokens(text)}
+        out.append((member, stage, usage, member.cost_usd(usage), True))
+    return out

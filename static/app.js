@@ -37,6 +37,7 @@ import adminModule from './js/admin.js?v=20260716openrouter3';
 import settingsModule from './js/settings.js?v=20260815approvalsave1';
 import omnigentModule from './js/omnigent.js';
 import councilModule from './js/council.js';
+import budgetModule from './js/budget.js';
 // Eagerly bind unified minimize/restore behavior across all tool modals.
 import './js/modalManager.js?v=20260723compareicon2';
 // Desktop window tiling — drag a modal near an edge/corner to snap.
@@ -65,6 +66,9 @@ window.adminModule = adminModule;
 window.cookbookModule = cookbookModule;
 window.omnigentModule = omnigentModule;
 window.councilModule = councilModule;
+window.budgetModule = budgetModule;
+// Other modules (calendar, budget) open a Settings tab through this handle.
+window.settingsModule = settingsModule;
 
 function _isMobileChatInput() {
   return window.innerWidth <= 768;
@@ -3700,6 +3704,9 @@ function startOdysseusApp() {
   tasksModule?.startNotificationPolling?.();
   if (window.__odysseusAppStarted) return;
   window.__odysseusAppStarted = true;
+  setTimeout(() => {
+    try { budgetModule.refreshBanner(); budgetModule.loadServerPrices(); } catch (_e) { /* optional */ }
+  }, 1500);
   const _bumpChatPriority = (ms = 10000) => {
     try {
       window.__odysseusChatBusyUntil = Math.max(window.__odysseusChatBusyUntil || 0, Date.now() + ms);

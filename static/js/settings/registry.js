@@ -70,6 +70,12 @@ export const SETTINGS_PANELS = Object.freeze([
     group: 'models',
     keywords: ['search', 'research', 'provider'],
   }),
+  definePanel({
+    id: 'budget',
+    label: 'Budget',
+    group: 'models',
+    keywords: ['budget', 'cost', 'spend', 'price', 'cap', 'limit', 'money'],
+  }),
 
   definePanel({
     id: 'integrations',

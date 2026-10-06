@@ -151,6 +151,7 @@ function onSettingsPanelActivated(tab) {
 
   // AI endpoints are intentionally refreshed only when entering the AI panel.
   if (tab === 'ai') refreshAiModelEndpoints();
+  if (tab === 'budget' && window.budgetModule) window.budgetModule.renderPanel();
 }
 
 function openAdminSettingsTab(tab) {

@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
-from src import council, model_roster
+from src import budget, council, model_roster
 from src.auth_helpers import get_current_user, owner_filter, require_user
 
 logger = logging.getLogger(__name__)
@@ -43,6 +43,17 @@ class AskRequest(BaseModel):
     members: List[Seat] = Field(..., max_length=council.MAX_MEMBERS)
     chairman: Seat
     mode: str = council.MODE_FULL
+    # Set when the person has seen the cost estimate and agreed to a turn
+    # above their single-action limit. It never overrides the monthly cap.
+    budget_confirmed: bool = False
+
+
+class EstimateRequest(BaseModel):
+    question: str = Field("", max_length=council.MAX_QUESTION_CHARS)
+    members: List[Seat] = Field(..., max_length=council.MAX_MEMBERS)
+    chairman: Seat
+    mode: str = council.MODE_FULL
+    session_id: Optional[str] = Field(None, max_length=64)
 
 
 class SessionPatch(BaseModel):
@@ -145,7 +156,12 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
     }
 
 
-def resolve_seat(db, owner: Optional[str], seat: Seat) -> council.Member:
+def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> council.Member:
+    """The seat's endpoint, model, pricing and (with ``runtime``) credentials.
+
+    ``runtime=False`` skips credential resolution, which can refresh an OAuth
+    token over the network: cost estimates only need billing and prices.
+    """
     from src.endpoint_resolver import build_chat_url, build_headers, resolve_endpoint_runtime
 
     model = (seat.model or "").strip()
@@ -161,6 +177,10 @@ def resolve_seat(db, owner: Optional[str], seat: Seat) -> council.Member:
     enabled = _chat_models(ep)
     if enabled and model not in enabled:
         raise council.CouncilError(f"{model} is not enabled on {ep.name}.")
+    if not runtime:
+        kind, provider = classify_endpoint(ep)
+        return council.Member(endpoint_id=ep.id, model=model, endpoint_name=ep.name or "", kind=kind,
+                              provider=provider, **_seat_pricing(ep, model, kind, provider))
     try:
         base, api_key = resolve_endpoint_runtime(ep, owner=owner)
     except Exception as exc:
@@ -287,6 +307,44 @@ def _history(db, owner: Optional[str], session_id: str) -> List[Dict[str, str]]:
     return [{"question": r.question, "final": r.final or ""} for r in rows]
 
 
+def _expected_outputs(db, owner: Optional[str]) -> Dict[str, int]:
+    """This user's typical reply lengths per stage, from their recent turns."""
+    rows = (db.query(CouncilTurn)
+            .filter(CouncilTurn.owner == owner, CouncilTurn.status == "done")
+            .order_by(CouncilTurn.created_at.desc()).limit(20).all())
+    turns = [{"opinions": _loads(r.opinions, []), "reviews": _loads(r.reviews, []),
+              "usage": _loads(r.usage, {})} for r in rows]
+    return council.observed_output_tokens(turns)
+
+
+def _estimate(db, owner: Optional[str], members, chairman, mode: str, question: str,
+              history: List[Dict[str, str]]) -> Dict[str, Any]:
+    return council.estimate_turn(members, chairman, mode, question, history,
+                                 expected=_expected_outputs(db, owner))
+
+
+def _budget_gate(owner: Optional[str], estimate: Dict[str, Any], confirmed: bool) -> None:
+    """Refuse a turn the monthly cap forbids; ask first above the action limit."""
+    decision = budget.check(owner, estimate.get("total_usd"), metered=estimate.get("metered", False),
+                            what="This council turn")
+    if not decision.allowed:
+        raise HTTPException(402, {"code": "budget_blocked", "message": decision.reason,
+                                  "estimate": estimate, "budget": decision.to_dict()})
+    if decision.confirm and not confirmed:
+        raise HTTPException(402, {"code": "budget_confirm", "message": decision.reason,
+                                  "estimate": estimate, "budget": decision.to_dict()})
+
+
+def _record_turn_spend(owner: Optional[str], session_id: str, members, chairman,
+                       result: Dict[str, Any]) -> None:
+    for member, stage, usage, cost, estimated in council.billable_calls(result, members, chairman):
+        if member.billing != "metered":
+            continue
+        budget.record(owner, source="council", model=member.model, usage=usage, price=member.price,
+                      endpoint_id=member.endpoint_id, endpoint_name=member.endpoint_name,
+                      session_id=session_id, cost_usd=cost, estimated=estimated)
+
+
 def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: str, body: AskRequest):
     """Validate the seats, record a running turn, and return what the run needs.
 
@@ -302,6 +360,8 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
         except council.CouncilError as exc:
             raise HTTPException(exc.status, str(exc))
         history = _history(db, owner, row.id)
+        _budget_gate(owner, _estimate(db, owner, members, chairman, mode, question, history),
+                     body.budget_confirmed)
         config = {
             "members": [{"endpoint_id": s.endpoint_id, "model": s.model} for s in body.members],
             "chairman": {"endpoint_id": body.chairman.endpoint_id, "model": body.chairman.model},
@@ -365,6 +425,34 @@ def setup_council_routes() -> APIRouter:
     def roster(request: Request):
         owner = _owner(request)
         return roster_payload(owner, _is_admin(request))
+
+    def _estimate_for(owner, body: EstimateRequest) -> Dict[str, Any]:
+        mode = body.mode if body.mode in council.MODES else council.MODE_FULL
+        db = SessionLocal()
+        try:
+            try:
+                members = [resolve_seat(db, owner, seat, runtime=False) for seat in body.members]
+                chairman = resolve_seat(db, owner, body.chairman, runtime=False)
+            except council.CouncilError as exc:
+                raise HTTPException(exc.status, str(exc))
+            history: List[Dict[str, str]] = []
+            if body.session_id:
+                row = _session_query(db, owner).filter(CouncilSession.id == body.session_id).first()
+                if row is not None:
+                    history = _history(db, owner, row.id)
+            estimate = _estimate(db, owner, members, chairman, mode, (body.question or "").strip(), history)
+        finally:
+            db.close()
+        decision = budget.check(owner, estimate.get("total_usd"), metered=estimate["metered"],
+                                what="This council turn")
+        return {"estimate": estimate, "budget": decision.to_dict()}
+
+    @router.post("/estimate")
+    async def estimate(request: Request, body: EstimateRequest):
+        owner = _owner(request)
+        if not body.members:
+            return {"estimate": None, "budget": budget.status(owner)}
+        return await asyncio.to_thread(_estimate_for, owner, body)
 
     @router.get("/sessions")
     def list_sessions(request: Request):
@@ -554,6 +642,12 @@ def setup_council_routes() -> APIRouter:
             finally:
                 _RUNNING.pop(turn_id, None)
                 _ACTIVE_SESSIONS.discard(session_id)
+                # Every call that ran is billed once, whether the turn
+                # finished, was stopped or failed.
+                try:
+                    await asyncio.to_thread(_record_turn_spend, owner, session_id, members, chairman, state)
+                except Exception as exc:
+                    logger.warning("council: spend not recorded error_type=%s", type(exc).__name__)
                 await stream.emit(None)
 
         task = asyncio.create_task(runner(), name=f"council-{turn_id}")

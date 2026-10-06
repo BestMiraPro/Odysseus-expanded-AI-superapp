@@ -790,6 +790,8 @@ from routes.council_routes import setup_council_routes
 app.include_router(setup_council_routes())
 from routes.model_roster_routes import setup_model_roster_routes
 app.include_router(setup_model_roster_routes())
+from routes.budget_routes import setup_budget_routes
+app.include_router(setup_budget_routes())
 
 # Omnigent agent bridge
 from routes.omnigent_routes import setup_omnigent_routes

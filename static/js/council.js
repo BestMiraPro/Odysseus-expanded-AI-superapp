@@ -18,6 +18,7 @@ import * as Modals from './modalManager.js';
 import { mdToHtml, renderMath } from './markdown.js';
 import { providerLogo } from './providers.js';
 import { formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
+import { money } from './budget.js';
 
 const PANE_ID = 'council-pane';
 const STORE_KEY = 'council:lastSession';
@@ -41,6 +42,7 @@ const S = {
   picker: false,
   connect: { claude: { busy: false, msg: '', err: false }, chatgpt: { busy: false, msg: '', err: false, code: '', url: '' } },
   pollTimer: null,
+  estimate: null,        // /api/council/estimate for the current seats
 };
 
 // ---------------------------------------------------------------------------
@@ -62,9 +64,11 @@ async function jfetch(path, opts = {}) {
   let data = null;
   try { data = await res.json(); } catch { /* empty */ }
   if (!res.ok) {
-    const msg = (data && (data.detail || data.error)) || `Request failed (${res.status})`;
+    const detail = data && (data.detail || data.error);
+    const msg = (detail && typeof detail === 'object' && detail.message) || detail || `Request failed (${res.status})`;
     const err = new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
     err.status = res.status;
+    err.detail = detail;
     throw err;
   }
   return data;
@@ -285,6 +289,12 @@ function injectStyles() {
 .council-composer textarea { flex: 1; resize: none; min-height: 40px; max-height: 200px; padding: 9px 11px; font: inherit;
   font-size: 13.5px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
 .council-composer .hint { font-size: 11px; opacity: 0.55; }
+.council-estimate { font-size: 11px; opacity: 0.8; font-variant-numeric: tabular-nums; }
+.council-estimate[hidden] { display: none; }
+.council-estimate.warn { color: #b58800; opacity: 1; }
+.council-estimate.over { color: #d64545; opacity: 1; }
+.council-estimate button { background: none; border: none; color: inherit; text-decoration: underline; cursor: pointer;
+  font: inherit; padding: 0; }
 .council-warn { font-size: 12px; padding: 7px 10px; border-radius: 8px;
   background: color-mix(in srgb, #e0a252 15%, transparent); }
 .council-side-toggle { display: none; }
@@ -344,6 +354,7 @@ export function openPanel() {
           <div style="flex:1;display:flex;flex-direction:column;gap:4px;">
             <textarea id="council-input" rows="2" placeholder="Ask the council…" aria-label="Question for the council"></textarea>
             <span class="hint" id="council-hint">Enter to convene · Shift+Enter for a new line</span>
+            <span class="council-estimate" id="council-estimate" role="status" aria-live="polite" hidden></span>
           </div>
           <button class="council-btn primary" id="council-send">Convene</button>
         </div>
@@ -370,6 +381,7 @@ export function openPanel() {
   input.addEventListener('input', () => {
     input.style.height = 'auto';
     input.style.height = `${Math.min(200, input.scrollHeight)}px`;
+    scheduleEstimate();
   });
   _pane.addEventListener('click', onPaneClick);
   _pane.addEventListener('change', onPaneChange);
@@ -817,6 +829,97 @@ function renderComposer() {
       : !ready ? 'A seat points at a model that is no longer available — remove or replace it.'
       : `${S.members.length} member${S.members.length === 1 ? '' : 's'} · ${S.mode === 'full' ? 'opinions → blind review → synthesis' : 'opinions → synthesis'} · Enter to convene`;
   }
+  scheduleEstimate();
+}
+
+// ---------------------------------------------------------------------------
+// cost estimate and budget
+// ---------------------------------------------------------------------------
+
+let _estTimer = null;
+let _estSeq = 0;
+let _estKey = '';
+
+function estimateKey() {
+  const q = $('#council-input')?.value || '';
+  const turns = (S.session?.turns || []).filter(t => t.status === 'done').length;
+  // Question length in ~200-char steps: typing doesn't refetch every keystroke.
+  return JSON.stringify([S.members, chairmanSeat(), S.mode, S.session?.id || '', turns, Math.ceil(q.length / 200)]);
+}
+
+function scheduleEstimate(force = false) {
+  clearTimeout(_estTimer);
+  const chair = chairmanSeat();
+  if (!S.members.length || !chair) {
+    _estKey = '';
+    S.estimate = null;
+    renderEstimate();
+    return;
+  }
+  const key = estimateKey();
+  if (!force && key === _estKey) return;
+  _estTimer = setTimeout(() => loadEstimate(key), 450);
+}
+
+async function loadEstimate(key) {
+  const chair = chairmanSeat();
+  if (!S.members.length || !chair) return;
+  const seq = ++_estSeq;
+  try {
+    const data = await jpost('/api/council/estimate', {
+      question: $('#council-input')?.value || '', members: S.members, chairman: chair,
+      mode: S.mode, session_id: S.session?.id || null,
+    });
+    if (seq !== _estSeq) return;
+    _estKey = key;
+    S.estimate = data;
+  } catch {
+    if (seq !== _estSeq) return;
+    S.estimate = null;
+  }
+  renderEstimate();
+}
+
+const STAGE_NAMES = { opinions: 'Opinion', review: 'Review', synthesis: 'Synthesis' };
+
+function estimateTitle(est) {
+  const lines = (est.calls || []).map(c => {
+    const cost = c.billing !== 'metered' ? (c.billing === 'local' ? 'free' : 'plan')
+      : c.cost_usd == null ? 'price unknown' : `≈${money(c.cost_usd)}`;
+    return `${STAGE_NAMES[c.stage] || c.stage} · ${c.model}: ~${fmtTokens(c.input_tokens)} in / ${fmtTokens(c.output_tokens)} out · ${cost}`;
+  });
+  lines.push('', 'Reply lengths use your recent council turns when there are enough, otherwise typical lengths.');
+  return lines.join('\n');
+}
+
+function renderEstimate() {
+  const el = $('#council-estimate');
+  if (!el) return;
+  const est = S.estimate?.estimate;
+  const b = S.estimate?.budget || {};
+  if (!est) { el.hidden = true; el.textContent = ''; return; }
+  const parts = [];
+  if (!est.metered) parts.push('No metered cost: plan and local seats only');
+  else if (est.total_usd == null) parts.push(`Cost unknown: ${est.unpriced_calls} unpriced call${est.unpriced_calls === 1 ? '' : 's'}`);
+  else {
+    parts.push(`≈ ${money(est.total_usd)} this turn`);
+    if (est.unpriced_calls) parts.push(`+ ${est.unpriced_calls} unpriced`);
+  }
+  if (b.monthly_cap_usd > 0) parts.push(`${money(b.spent_usd)} of ${money(b.monthly_cap_usd)} this month`);
+  el.classList.toggle('over', b.allowed === false);
+  el.classList.toggle('warn', b.allowed !== false && !!b.confirm);
+  if (b.allowed === false) parts.push('over budget');
+  else if (b.confirm) parts.push(`asks first (over your ${money(b.action_limit_usd)} limit)`);
+  el.textContent = parts.join(' · ');
+  if (est.metered) {
+    const link = document.createElement('button');
+    link.type = 'button';
+    link.textContent = 'Budget';
+    link.addEventListener('click', () => window.budgetModule?.openBudgetSettings());
+    el.append(' · ', link);
+  }
+  el.title = estimateTitle(est);
+  el.hidden = false;
 }
 
 function seatsOfTurn(turn) {
@@ -1185,16 +1288,37 @@ async function convene() {
   scrollToEnd();
 
   const sessionId = S.session.id;
+  const members = S.members.slice();
+  const mode = S.mode;
+  const send = (budgetConfirmed) => fetch(`/api/council/sessions/${encodeURIComponent(sessionId)}/ask`, {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, members, chairman: chair, mode, budget_confirmed: budgetConfirmed }),
+  });
   try {
-    const res = await fetch(`/api/council/sessions/${encodeURIComponent(sessionId)}/ask`, {
-      method: 'POST',
-      credentials: 'same-origin',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, members: S.members, chairman: chair, mode: S.mode }),
-    });
+    let res = await send(false);
+    if (res.status === 402) {
+      // Budget: a turn above the single-action limit asks first; the
+      // monthly cap (block mode) refuses outright.
+      let detail = null;
+      try { detail = (await res.json()).detail; } catch { /* not json */ }
+      if (detail?.code === 'budget_confirm' && window.confirm(`${detail.message}\n\nConvene the council anyway?`)) {
+        res = await send(true);
+      } else {
+        const err = new Error(detail?.code === 'budget_confirm'
+          ? 'Not convened. Your question is back in the box.'
+          : (detail?.message || 'Over budget'));
+        err.budget = true;
+        throw err;
+      }
+    }
     if (!res.ok || !res.body) {
       let msg = `Request failed (${res.status})`;
-      try { const d = await res.json(); msg = d.detail || d.error || msg; } catch { /* not json */ }
+      try {
+        const d = await res.json();
+        msg = (d.detail && typeof d.detail === 'object' && d.detail.message) || d.detail || d.error || msg;
+      } catch { /* not json */ }
       throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
     }
     const reader = res.body.getReader();
@@ -1219,12 +1343,19 @@ async function convene() {
     if (S.live && S.live.status === 'running' && !S.live.id.startsWith('live-')) {
       // Lost the stream but the run continues server-side; the poll picks it up.
     } else if (S.live) {
-      toast(e.message || 'Council failed');
+      if (e.budget && !e.message.startsWith('Not convened')) {
+        // A cap refusal is worth reading in full, so keep it on screen.
+        try { window.uiModule?.showError?.(e.message); } catch { toast(e.message); }
+      } else {
+        toast(e.message || 'Council failed');
+      }
       if (input && !input.value) input.value = question;
     }
   } finally {
     const wasLive = S.live;
     S.live = null;
+    scheduleEstimate(true);
+    window.budgetModule?.refreshBanner();
     if (_open && S.session?.id === sessionId) {
       try { S.session = await jget(`/api/council/sessions/${encodeURIComponent(sessionId)}`); } catch { /* keep */ }
       const idx = S.sessions.findIndex(s => s.id === sessionId);

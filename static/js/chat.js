@@ -2129,6 +2129,11 @@ import { loadPanel } from './panels.js';
           }
         }
         typewriterInto(holder.querySelector('.body'), errText);
+        if (res.status === 402 && window.budgetModule) {
+          // Monthly budget cap: offer the settings and show the banner.
+          window.budgetModule.decorateBudgetError(holder);
+          window.budgetModule.refreshBanner(true);
+        }
         enableResearchBtn();
         return;
       }
@@ -3479,6 +3484,7 @@ import { loadPanel } from './panels.js';
                 if (metrics && streamRunId) {
                   metrics._costRecordId = _metricsCostRecordId(streamRunId, json);
                 }
+                if (window.budgetModule) window.budgetModule.refreshBanner();
                 if (!_isBg && holder && metrics) {
                   applyModelMetricsState(metrics, holder, roundHolder, modelName);
                 }
@@ -3497,6 +3503,8 @@ import { loadPanel } from './panels.js';
                 }
 
               } else if (json.type === 'message_saved') {
+                // The turn's spend is on the ledger once it is saved.
+                if (window.budgetModule) window.budgetModule.refreshBanner();
                 // Wire the persisted DB id onto the just-streamed bubble so it
                 // can be edited/deleted immediately, without reloading the chat.
                 if (_isBg) continue;

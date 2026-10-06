@@ -219,6 +219,26 @@ Sending your chat to another model is network egress, so once untrusted text is 
 (MCP tool descriptions, a provider's model list, a web page) Odysseus asks before delegating.
 Choose **Allow for this chat session** once and later delegations in that chat run without asking.
 
+## Budget
+
+**Settings → Budget** shows what pay-per-token API models cost you this month. It breaks the total down by
+source (chat, agent, delegations, Council) and by model, and projects the month-end total.
+Subscription (Claude, ChatGPT, Copilot) and local models cost nothing per call. They are never counted or
+blocked.
+
+- **Monthly cap.** When metered spend reaches it, *Block* refuses new metered chats, Council turns and
+  delegations until the month ends (UTC). *Warn* lets them run and shows a banner. A banner appears above the chat from 80% of the cap.
+- **Ask before one action above $X.**
+  - A Council turn whose estimate is over this asks you first. The Council shows the estimate under the
+    question box as you type. The estimate starts from typical reply lengths, then learns your own after
+    a few turns.
+  - An agent delegation over the limit is refused and the agent is offered cheaper models, since an agent
+    cannot approve its own spend.
+
+Costs use the same prices as the model pickers. A model with no known price is listed as unpriced rather
+than guessed. Rows marked ≈ were estimated from text length because the provider reported no token counts.
+Background work (chat titles, memory, research, Study) and Omnigent are not counted yet.
+
 ## Moving to another machine
 
 Your whole Study app moves between Odysseus installs: subjects, flashcards with their

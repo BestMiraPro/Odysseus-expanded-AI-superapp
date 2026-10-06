@@ -184,6 +184,21 @@ def _allowed_models_for_request(request) -> Optional[frozenset[str]]:
     privs = auth_manager.get_privileges(user) or {}
     return _allowed_models_from_privileges(privs)
 
+def _enforce_budget_cap(user, sess) -> None:
+    """Refuse a metered chat once the user's monthly budget cap is reached.
+
+    Applies in single-user mode too. Subscription and local models are never
+    blocked. The 402 detail carries ``message`` for the chat error bubble and
+    ``code`` so the UI can offer the budget settings.
+    """
+    from src import budget
+
+    reason = budget.chat_block_reason(user or None, getattr(sess, "endpoint_url", "") or "",
+                                      getattr(sess, "model", "") or "")
+    if reason:
+        raise HTTPException(402, {"code": "budget_blocked", "message": reason})
+
+
 def _enforce_chat_privileges(request, sess) -> None:
     """Apply the per-user privilege gates (allowed_models + max_messages_per_day)
     that both /api/chat and /api/chat_stream must enforce BEFORE any LLM work.
@@ -198,6 +213,7 @@ def _enforce_chat_privileges(request, sess) -> None:
         user = effective_user(request)
     except Exception:
         user = None
+    _enforce_budget_cap(user, sess)
     if not user:
         return
     auth_manager = getattr(getattr(request.app, "state", None), "auth_manager", None)
@@ -832,9 +848,13 @@ def accumulate_token_usage(session_id: str, metrics: dict):
     if not (in_t or out_t):
         return
     db = SessionLocal()
+    owner = base_url = None
+    found = False
     try:
         db_s = db.query(DBSession).filter(DBSession.id == session_id).first()
         if db_s:
+            found = True
+            owner, base_url = db_s.owner, db_s.endpoint_url
             db_s.total_input_tokens = (db_s.total_input_tokens or 0) + in_t
             db_s.total_output_tokens = (db_s.total_output_tokens or 0) + out_t
             db.commit()
@@ -842,6 +862,14 @@ def accumulate_token_usage(session_id: str, metrics: dict):
         db.rollback()
     finally:
         db.close()
+    if found:
+        # Metered spend for the monthly budget (never raises).
+        try:
+            from src import budget
+
+            budget.record_turn(owner, session_id, metrics, base_url=base_url or "")
+        except Exception as exc:
+            logger.warning("budget: turn not recorded: %s", exc)
 
 
 def _normalize_thinking(text: str) -> str:

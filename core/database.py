@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urlparse
-from sqlalchemy import DDL, event, create_engine, Column, String, Text, Boolean, DateTime, Integer, ForeignKey, JSON, Index, func, inspect, text
+from sqlalchemy import DDL, event, create_engine, Column, String, Text, Boolean, DateTime, Float, Integer, ForeignKey, JSON, Index, func, inspect, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
@@ -640,6 +640,42 @@ class CouncilTurn(TimestampMixin, Base):
     final = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
     usage = Column(Text, nullable=True)              # JSON {input_tokens, output_tokens, cost_usd, ...}
+
+
+class SpendEntry(Base):
+    """One metered (pay-per-token) model call, for the monthly budget.
+
+    Subscription and local calls cost nothing per call and are not recorded.
+    ``cost_usd`` is NULL when the model has no known price; ``estimated`` marks
+    rows whose token counts were estimated because the provider reported none.
+    """
+    __tablename__ = "spend_entries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    owner = Column(String, nullable=True, index=True)
+    created_at = Column(DateTime, default=utcnow_naive, nullable=False, index=True)
+    source = Column(String, nullable=False, default="chat")   # chat|agent|delegation|council|...
+    session_id = Column(String, nullable=True)
+    endpoint_id = Column(String, nullable=True)
+    endpoint_name = Column(String, nullable=True)
+    model = Column(String, nullable=False)
+    input_tokens = Column(Integer, nullable=False, default=0)
+    output_tokens = Column(Integer, nullable=False, default=0)
+    cache_read_tokens = Column(Integer, nullable=False, default=0)
+    cache_write_tokens = Column(Integer, nullable=False, default=0)
+    cost_usd = Column(Float, nullable=True)
+    estimated = Column(Boolean, nullable=False, default=False)
+
+
+class BudgetSetting(TimestampMixin, Base):
+    """Per-user budget guardrails. ``owner_key`` is the username, or "" when
+    auth is off (single-user installs)."""
+    __tablename__ = "budget_settings"
+
+    owner_key = Column(String, primary_key=True)
+    monthly_cap_usd = Column(Float, nullable=False, default=0.0)
+    cap_action = Column(String, nullable=False, default="block")     # block | warn
+    action_limit_usd = Column(Float, nullable=False, default=0.5)
 
 
 class Signature(TimestampMixin, Base):

@@ -834,9 +834,17 @@ export function applyModelColor(roleEl, modelName) {
  */
 export function getModelCost(modelName, inputTokens, outputTokens, cache) {
   if (!modelName) return null;
+  // Prices the server bills with (Settings → Budget; loaded by budget.js): an
+  // operator-declared price wins, a public-catalog price only fills models
+  // the table above does not know.
+  const serverPrices = (typeof globalThis !== 'undefined' && globalThis.__odyServerPrices) || null;
+  const sp = serverPrices ? serverPrices[String(modelName).toLowerCase()] : null;
   const key = matchModelKey(modelName, Object.keys(MODEL_PRICING));
-  if (!key) return null;
-  const price = MODEL_PRICING[key];
+  let price = key ? MODEL_PRICING[key] : null;
+  if (sp && (sp.source === 'declared' || !price)) {
+    price = { input: sp.input, output: sp.output != null ? sp.output : sp.input };
+  }
+  if (!price) return null;
   const cacheRead = Math.max(Number(cache && cache.read) || 0, 0);
   const cacheWrite = Math.max(Number(cache && cache.write) || 0, 0);
   const uncached = Math.max(inputTokens - cacheRead - cacheWrite, 0);
@@ -885,7 +893,11 @@ export function isSubscriptionEndpoint(url) {
   try {
     const parsed = new URL(url);
     const path = parsed.pathname.replace(/\/+$/, '');
-    return parsed.hostname === 'chatgpt.com'
+    const host = parsed.hostname.toLowerCase();
+    // Flat-rate plans: the Claude subscription's reserved *.invalid sentinel
+    // host and GitHub Copilot (mirrors endpoint_cost_tracked on the server).
+    if (host.endsWith('.invalid') || host === 'githubcopilot.com' || host.endsWith('.githubcopilot.com')) return true;
+    return host === 'chatgpt.com'
       && (path === '/backend-api/codex' || path.startsWith('/backend-api/codex/'));
   } catch (_e) {
     return false;
