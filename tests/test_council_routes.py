@@ -233,7 +233,7 @@ def test_stop_cancels_a_running_council_and_keeps_finished_stages(db, monkeypatc
             if event["type"] == "turn":
                 turn_id = event["turn_id"]
             if event["type"] == "stage" and event["stage"] == "synthesis" and event["status"] == "start":
-                assert stop(sid, turn_id, request) == {"stopped": True}
+                assert await stop(sid, turn_id, request) == {"stopped": True}
             if event["type"] == "done":
                 break
         return sid, turn_id, events
@@ -244,5 +244,81 @@ def test_stop_cancels_a_running_council_and_keeps_finished_stages(db, monkeypatc
     assert turn["status"] == "cancelled"
     # Opinions and reviews finished before the stop, so they were kept.
     assert len(turn["opinions"]) == 2 and len(turn["reviews"]) == 2
+    assert all(not o.get("error") for o in turn["opinions"])
     assert turn["final"] == ""
-    assert not cr._RUNNING
+    assert not cr._RUNNING and not cr._ACTIVE_SESSIONS
+
+
+def _direct(router, request):
+    return (_handler(router, "POST", "/api/council/sessions"),
+            _handler(router, "POST", "/api/council/sessions/{session_id}/ask"),
+            _handler(router, "POST", "/api/council/sessions/{session_id}/turns/{turn_id}/stop"),
+            _handler(router, "GET", "/api/council/sessions/{session_id}"))
+
+
+def _request(user="alice"):
+    return SimpleNamespace(state=SimpleNamespace(current_user=user, api_token=False),
+                           app=SimpleNamespace(state=SimpleNamespace()), client=None)
+
+
+def test_second_ask_on_a_busy_council_is_refused(db, monkeypatch):
+    from fastapi import HTTPException
+
+    async def hang(url, model, messages, **kwargs):
+        await asyncio.Event().wait()
+        yield ""
+
+    monkeypatch.setattr("src.llm_core.stream_llm", hang)
+    create, ask, stop, _get = _direct(cr.setup_council_routes(), _request())
+    request = _request()
+
+    async def scenario():
+        sid = create(request, cr.SessionCreate())["id"]
+        first = await ask(sid, request, cr.AskRequest(question="one", **SEATS))
+        with pytest.raises(HTTPException) as exc:
+            await ask(sid, request, cr.AskRequest(question="two", **SEATS))
+        assert exc.value.status_code == 409
+        turn_id = None
+        async for raw in first.body_iterator:
+            turn_id = json.loads(raw[5:])["turn_id"]
+            break
+        assert await stop(sid, turn_id, request) == {"stopped": True}
+        async for raw in first.body_iterator:
+            if json.loads(raw[5:])["type"] == "done":
+                break
+        # Once stopped, the council takes questions again.
+        assert sid not in cr._ACTIVE_SESSIONS
+
+    asyncio.run(scenario())
+
+
+def test_stop_during_synthesis_keeps_the_partial_answer(db, monkeypatch):
+    async def chair_streams_then_hangs(url, model, messages, **kwargs):
+        if messages[0]["content"] == cr.council.CHAIR_SYSTEM:
+            yield 'data: {"delta": "The council leans towards"}\n\n'
+            await asyncio.Event().wait()
+        async for chunk in _fake_stream(url, model, messages, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", chair_streams_then_hangs)
+    create, ask, stop, get = _direct(cr.setup_council_routes(), _request())
+    request = _request()
+
+    async def scenario():
+        sid = create(request, cr.SessionCreate())["id"]
+        resp = await ask(sid, request, cr.AskRequest(question="q", **SEATS))
+        turn_id = None
+        async for raw in resp.body_iterator:
+            ev = json.loads(raw[5:])
+            turn_id = ev.get("turn_id", turn_id)
+            if ev["type"] == "delta" and ev["stage"] == "synthesis":
+                await stop(sid, turn_id, request)
+            if ev["type"] == "done":
+                break
+        return sid
+
+    sid = asyncio.run(scenario())
+    (turn,) = get(sid, request)["turns"]
+    assert turn["status"] == "cancelled"
+    assert turn["final"].startswith("The council leans towards")
+    assert "stopped before the chairman finished" in turn["final"]

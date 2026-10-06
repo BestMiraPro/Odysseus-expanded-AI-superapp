@@ -962,7 +962,15 @@ function initEndpointForm() {
     }, { capture: true });
   }
 
+  let _prevProviderValue = provider.value;
   provider.addEventListener('change', () => {
+    if (_prevProviderValue === 'claude-subscription' && provider.value !== 'claude-subscription') {
+      // A pasted `claude setup-token` value must never be submitted as some
+      // other provider's API key.
+      const keyInput = el('adm-epApiKey');
+      if (keyInput) keyInput.value = '';
+    }
+    _prevProviderValue = provider.value;
     if (_isDeviceAuthSelected() || _isClaudeSubscriptionSelected()) {
       _setApiFormForProvider();
       _renderPickerMenu();

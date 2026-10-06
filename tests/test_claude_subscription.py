@@ -428,3 +428,49 @@ def test_timeout_is_idle_not_total(monkeypatch, fake_cli):
     # ...while a CLI that goes silent is cut off and killed.
     (kind, payload), = _events(asyncio.run(run("HANG", 1)))
     assert kind == "error" and payload["status"] == 504
+
+
+def test_short_legacy_auth_ids_are_reissued_keeping_the_endpoint(monkeypatch):
+    Session = _mem_db(monkeypatch)
+    db = Session()
+    db.add(ProviderAuthSession(id="abc123def456", provider=cs.CLAUDE_SUBSCRIPTION_PROVIDER, owner="alice",
+                               label="Claude Subscription", base_url=cs.endpoint_base_url("abc123def456"),
+                               access_token=TOKEN, auth_mode="token"))
+    db.add(ModelEndpoint(id="ep-old", name="Claude Subscription", base_url=cs.endpoint_base_url("abc123def456"),
+                         owner="alice", provider_auth_id="abc123def456", model_type="llm"))
+    db.commit()
+    db.close()
+
+    res = cs.provision("alice", cs.AUTH_MODE_TOKEN, TOKEN)
+
+    assert res["id"] == "ep-old"                      # settings that point at it keep working
+    assert len(res["auth_id"]) == 32 and res["auth_id"] != "abc123def456"
+    assert res["base_url"] == cs.endpoint_base_url(res["auth_id"])
+    with pytest.raises(cs.ClaudeSubscriptionError):
+        cs.load_credentials("abc123def456")
+
+
+def test_shared_legacy_connection_resolves_for_a_signed_in_user(monkeypatch):
+    _mem_db(monkeypatch)
+    res = cs.provision(None, cs.AUTH_MODE_HOST, None)
+    assert cs.resolve_runtime_credentials(res["auth_id"], owner="alice")["base_url"] == res["base_url"]
+
+
+def test_cli_workdir_is_private_and_stable():
+    first = cs._workdir()
+    assert first == cs._workdir()
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(first).st_mode) == 0o700
+
+
+def test_llm_call_async_drops_thinking_deltas(monkeypatch):
+    from src import llm_core
+
+    async def fake_stream(url, model, messages, **kwargs):
+        yield 'data: {"delta": "let me think", "thinking": true}\n\n'
+        yield 'data: {"delta": "answer"}\n\n'
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
+    url = cs.endpoint_base_url("f" * 32)
+    assert asyncio.run(llm_core.llm_call_async(url, "opus", [{"role": "user", "content": "thinking-test"}])) == "answer"

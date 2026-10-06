@@ -203,11 +203,21 @@ def cli_env(mode: str, token: Optional[str]) -> Dict[str, str]:
     return env
 
 
+_WORKDIR: Optional[str] = None
+_WORKDIR_LOCK = threading.Lock()
+
+
 def _workdir() -> str:
-    """An empty directory outside any project, so no CLAUDE.md is picked up."""
-    path = os.path.join(tempfile.gettempdir(), "odysseus-claude-subscription")
-    os.makedirs(path, exist_ok=True)
-    return path
+    """A private empty directory outside any project, so no CLAUDE.md is picked up.
+
+    Created once per process with ``mkdtemp`` (0700, unpredictable name), so
+    another local user cannot pre-create it and plant files in it.
+    """
+    global _WORKDIR
+    with _WORKDIR_LOCK:
+        if _WORKDIR is None or not os.path.isdir(_WORKDIR):
+            _WORKDIR = tempfile.mkdtemp(prefix="odysseus-claude-")
+        return _WORKDIR
 
 
 def cli_version(timeout: float = 10.0) -> Optional[str]:
@@ -492,7 +502,9 @@ def resolve_runtime_credentials(auth_id: str, owner: Optional[str] = None) -> Di
             ProviderAuthSession.provider == CLAUDE_SUBSCRIPTION_PROVIDER,
         )
         if owner:
-            q = q.filter(ProviderAuthSession.owner == owner)
+            # Same visibility as the endpoint row: the owner's own connection,
+            # or a legacy shared one from before multi-user mode.
+            q = q.filter((ProviderAuthSession.owner == owner) | (ProviderAuthSession.owner == None))  # noqa: E711
         row = q.first()
         if row is None:
             raise ClaudeSubscriptionError("Claude Subscription credentials were not found for this user.", 401)
@@ -562,9 +574,19 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
     if proc is None or proc.poll() is not None:
         return
     try:
-        proc.kill()
+        if os.name != "nt":
+            # The CLI runs in its own session; take any children with it so a
+            # stopped call cannot keep spending subscription quota.
+            import signal
+
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
     except Exception:
-        pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
 
 
 def _drain_stderr(proc: subprocess.Popen, sink: List[str]) -> None:
@@ -758,9 +780,20 @@ def provision(owner: Optional[str], mode: str, token: Optional[str]) -> Dict[str
             ProviderAuthSession.provider == CLAUDE_SUBSCRIPTION_PROVIDER,
             ProviderAuthSession.owner == owner,
         ).first()
+        reuse_ep_id = None
+        if auth is not None and len(auth.id or "") < 32:
+            # Connections made before ids were 128-bit: the id is the only
+            # thing in the endpoint URL that selects these credentials, so
+            # re-issue it under a fresh unguessable id. The endpoint row is
+            # kept (settings refer to it by id) and repointed below.
+            old_ep = db.query(ModelEndpoint).filter(ModelEndpoint.provider_auth_id == auth.id).first()
+            reuse_ep_id = old_ep.id if old_ep else None
+            db.delete(auth)
+            db.flush()
+            auth = None
         if auth is None:
             auth = ProviderAuthSession(
-                id=uuid.uuid4().hex[:12],
+                id=uuid.uuid4().hex,
                 provider=CLAUDE_SUBSCRIPTION_PROVIDER,
                 owner=owner,
                 label=CLAUDE_SUBSCRIPTION_LABEL,
@@ -777,6 +810,8 @@ def provision(owner: Optional[str], mode: str, token: Optional[str]) -> Dict[str
             ModelEndpoint.provider_auth_id == auth.id,
             ModelEndpoint.owner == owner,
         ).first()
+        if ep is None and reuse_ep_id:
+            ep = db.query(ModelEndpoint).filter(ModelEndpoint.id == reuse_ep_id).first()
         if ep is None:
             ep = ModelEndpoint(
                 id=uuid.uuid4().hex[:8],

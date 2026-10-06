@@ -75,8 +75,9 @@ def test_parse_ranking_ignores_unknown_and_repeated_labels_and_case():
     assert council.parse_ranking(text, ["A", "B"]) == ["B", "A"]
 
 
-def test_parse_ranking_falls_back_to_mention_order():
-    assert council.parse_ranking("I prefer Response C, then Response A.", ["A", "C"]) == ["C", "A"]
+def test_review_without_final_ranking_counts_as_unranked():
+    # Mention order is not a vote; it would present noise as a blind ranking.
+    assert council.parse_ranking("I prefer Response C, then Response A.", ["A", "C"]) == []
     assert council.parse_ranking("", ["A"]) == []
 
 
@@ -216,6 +217,57 @@ def test_checkpoint_sees_each_completed_stage():
     _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full",
          stream_fn=_fake_stream(), checkpoint=checkpoint)
     assert seen == [(2, 0), (2, 2)]
+
+
+def test_usage_and_cost_are_tracked_per_call():
+    async def priced_stream(url, model, messages, **kwargs):
+        yield 'data: {"delta": "answer FINAL RANKING: 1. Response A 2. Response B"}\n\n'
+        yield 'data: {"type": "usage", "data": {"input_tokens": 1000, "output_tokens": 500}}\n\n'
+        yield "data: [DONE]\n\n"
+
+    paid = _member("paid")
+    paid.input_per_mtok, paid.output_per_mtok = 2.0, 8.0
+    sub = _member("sub")
+    sub.billing = "subscription"
+    result, events = _run(question="Q?", members=[paid, sub], chairman=paid, mode="full", stream_fn=priced_stream)
+    by_member = {o["member"]: o for o in result["opinions"]}
+    assert by_member[0]["usage"] == {"input_tokens": 1000, "output_tokens": 500}
+    assert by_member[0]["cost_usd"] == 0.006            # 1000*2/1e6 + 500*8/1e6
+    assert by_member[1]["cost_usd"] is None             # flat-rate subscription
+    totals = council.usage_totals(result)
+    assert totals["input_tokens"] == 5000 and totals["output_tokens"] == 2500   # 2 opinions + 2 reviews + chair
+    assert totals["cost_usd"] == round(0.006 * 3, 6) and totals["unpriced_calls"] == 2
+    done = [e for e in events if e["type"] == "member_done" and e["stage"] == "opinions" and e["member"] == 0]
+    assert done[0]["cost_usd"] == 0.006
+
+
+def test_state_holds_partial_text_while_running():
+    gate = asyncio.Event()
+    state = {}
+
+    async def slow(url, model, messages, **kwargs):
+        yield 'data: {"delta": "half an "}\n\n'
+        await gate.wait()
+        yield 'data: {"delta": "answer"}\n\n'
+
+    async def go():
+        async def emit(ev):
+            pass
+        task = asyncio.create_task(council.run_council(question="Q", members=[_member("a")], chairman=_member("a"),
+                                                       mode="quick", history=[], emit=emit, stream_fn=slow,
+                                                       state=state))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        partial = state["opinions"][0]["text"]
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return partial
+
+    assert asyncio.run(go()) == "half an "
+    assert state["opinions"][0]["pending"] is True
 
 
 def test_history_reaches_every_stage_model():

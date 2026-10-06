@@ -80,6 +80,9 @@ class Member:
     provider: str
     url: str = field(repr=False, default="")
     headers: Optional[Dict[str, str]] = field(repr=False, default=None)
+    billing: str = "metered"                 # metered | subscription | local
+    input_per_mtok: Optional[float] = None
+    output_per_mtok: Optional[float] = None
 
     def public(self, index: Any) -> Dict[str, Any]:
         return {
@@ -89,7 +92,16 @@ class Member:
             "endpoint_name": self.endpoint_name,
             "kind": self.kind,
             "provider": self.provider,
+            "billing": self.billing,
         }
+
+    def cost_usd(self, usage: Optional[Dict[str, int]]) -> Optional[float]:
+        """Metered cost of one call, or None when free, flat-rate or unpriced."""
+        if not usage or self.billing != "metered" or self.input_per_mtok is None:
+            return None
+        out_price = self.output_per_mtok if self.output_per_mtok is not None else self.input_per_mtok
+        return round((usage.get("input_tokens", 0) * self.input_per_mtok
+                      + usage.get("output_tokens", 0) * out_price) / 1_000_000, 6)
 
 
 class CouncilError(RuntimeError):
@@ -122,14 +134,17 @@ def assign_labels(member_indexes: List[int], rng: Optional[random.Random] = None
 def parse_ranking(text: str, valid_labels: List[str]) -> List[str]:
     """Labels in ranked order from a review's FINAL RANKING section.
 
-    Falls back to the order labels are first mentioned when a reviewer skipped
-    the section. Unknown and repeated labels are ignored.
+    A review without that section counts as unranked: the order a reviewer
+    happens to mention answers in is not a vote, and averaging it in would
+    present noise as a blind ranking. Unknown and repeated labels are ignored.
     """
     if not text:
         return []
     valid = set(valid_labels)
     matches = list(_RANKING_HEADER_RE.finditer(text))
-    section = text[matches[-1].end():] if matches else text
+    if not matches:
+        return []
+    section = text[matches[-1].end():]
     ranked: List[str] = []
     for label in _RESPONSE_LABEL_RE.findall(section):
         if label in valid and label not in ranked:
@@ -301,12 +316,20 @@ async def run_member(
     index: Any,
     emit: Emit,
     timeout: int,
+    sink: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Stream one member's reply, emitting deltas; returns {text, error, ms}."""
+    """Stream one member's reply, emitting deltas; returns {text, error, ms, usage, cost_usd}.
+
+    ``sink`` (when given) is updated in place as text arrives and when the call
+    ends, so a run that is stopped midway still has what was written.
+    """
     started = time.monotonic()
     parts: List[str] = []
     thinking_sent = False
     error: Optional[str] = None
+    usage: Optional[Dict[str, int]] = None
+    if sink is not None:
+        sink.update({"text": "", "error": None, "ms": None, "pending": True})
     try:
         async for chunk in stream_fn(member.url, member.model, messages, headers=member.headers,
                                      timeout=timeout, workload="foreground"):
@@ -316,6 +339,14 @@ async def run_member(
                     break
                 if payload is None or not isinstance(payload, dict):
                     continue
+                if payload.get("type") == "usage" and isinstance(payload.get("data"), dict):
+                    data = payload["data"]
+                    try:
+                        usage = {"input_tokens": int(data.get("input_tokens") or 0),
+                                 "output_tokens": int(data.get("output_tokens") or 0)}
+                    except (TypeError, ValueError):
+                        usage = None
+                    continue
                 delta = payload.get("delta")
                 if isinstance(delta, str) and delta:
                     if payload.get("thinking"):
@@ -324,6 +355,8 @@ async def run_member(
                             await emit({"type": "thinking", "stage": stage, "member": index})
                         continue
                     parts.append(delta)
+                    if sink is not None:
+                        sink["text"] = sink.get("text", "") + delta
                     await emit({"type": "delta", "stage": stage, "member": index, "text": delta})
             if error:
                 break
@@ -342,11 +375,18 @@ async def run_member(
     if not error and not text:
         error = "The model returned an empty answer."
     ms = int((time.monotonic() - started) * 1000)
+    cost = member.cost_usd(usage)
+    outcome = {"text": text, "error": error, "ms": ms, "usage": usage, "cost_usd": cost}
+    if sink is not None:
+        sink.update(outcome)
+        sink.pop("pending", None)
     if error:
-        await emit({"type": "member_error", "stage": stage, "member": index, "error": error, "ms": ms})
+        await emit({"type": "member_error", "stage": stage, "member": index, "error": error, "ms": ms,
+                    "usage": usage, "cost_usd": cost})
     else:
-        await emit({"type": "member_done", "stage": stage, "member": index, "ms": ms})
-    return {"text": text, "error": error, "ms": ms}
+        await emit({"type": "member_done", "stage": stage, "member": index, "ms": ms,
+                    "usage": usage, "cost_usd": cost})
+    return outcome
 
 
 async def run_parallel(jobs: List[Awaitable[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -364,14 +404,23 @@ async def run_council(
     stream_fn: Optional[StreamFn] = None,
     rng: Optional[random.Random] = None,
     checkpoint: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+    state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run all stages, emitting progress events; returns the turn's results.
 
     Never raises for a model failure: failed members are recorded and left out
     of later stages. The result's ``error`` is set only when nothing usable
-    came back. ``checkpoint`` receives the partial result after each stage so
-    a run that is stopped or interrupted keeps what it finished.
+    came back.
+
+    ``state`` (when given) is the result dict, filled in place as each member
+    streams and finishes, so a caller that stops the run still holds every
+    answer written so far, including a half-written synthesis.
+    ``checkpoint`` receives it after each completed stage.
     """
+    result: Dict[str, Any] = state if state is not None else {}
+    result.update({"opinions": [], "reviews": [], "ranking": [], "labels": {},
+                   "final": "", "error": None})
+
     async def _checkpoint() -> None:
         if checkpoint is not None:
             try:
@@ -381,17 +430,16 @@ async def run_council(
 
     if stream_fn is None:
         from src.llm_core import stream_llm as stream_fn  # noqa: N806
-    result: Dict[str, Any] = {"opinions": [], "reviews": [], "ranking": [], "labels": {},
-                              "final": "", "error": None}
 
     # Stage 1 - opinions
     await emit({"type": "stage", "stage": "opinions", "status": "start"})
     base = opinion_messages(question, history)
+    result["opinions"] = [{"member": i} for i in range(len(members))]
     outcomes = await run_parallel([
-        run_member(stream_fn, m, base, stage="opinions", index=i, emit=emit, timeout=MEMBER_TIMEOUT)
+        run_member(stream_fn, m, base, stage="opinions", index=i, emit=emit, timeout=MEMBER_TIMEOUT,
+                   sink=result["opinions"][i])
         for i, m in enumerate(members)
     ])
-    result["opinions"] = [{"member": i, **o} for i, o in enumerate(outcomes)]
     await emit({"type": "stage", "stage": "opinions", "status": "done"})
     ok = {i: o["text"] for i, o in enumerate(outcomes) if not o["error"]}
     if not ok:
@@ -404,21 +452,20 @@ async def run_council(
     names = {i: f"{members[i].model} via {members[i].endpoint_name}" for i in ok}
 
     # Stage 2 - blind peer review
-    reviews: List[Dict[str, Any]] = []
     if mode == MODE_FULL and len(ok) >= 2:
         await emit({"type": "stage", "stage": "review", "status": "start", "labels": labels})
         msgs = review_messages(question, labels, ok)
         reviewer_ids = sorted(ok)
-        review_out = await run_parallel([
-            run_member(stream_fn, members[i], msgs, stage="review", index=i, emit=emit, timeout=MEMBER_TIMEOUT)
-            for i in reviewer_ids
+        result["reviews"] = [{"member": i} for i in reviewer_ids]
+        await run_parallel([
+            run_member(stream_fn, members[i], msgs, stage="review", index=i, emit=emit, timeout=MEMBER_TIMEOUT,
+                       sink=sink)
+            for i, sink in zip(reviewer_ids, result["reviews"])
         ])
         valid = list(labels)
-        for i, r in zip(reviewer_ids, review_out):
-            reviews.append({"member": i, "text": r["text"], "error": r["error"], "ms": r["ms"],
-                            "ranking": [] if r["error"] else parse_ranking(r["text"], valid)})
-        result["reviews"] = reviews
-        result["ranking"] = aggregate_rankings([r for r in reviews if not r["error"]], labels)
+        for review in result["reviews"]:
+            review["ranking"] = [] if review.get("error") else parse_ranking(review.get("text", ""), valid)
+        result["ranking"] = aggregate_rankings([r for r in result["reviews"] if not r.get("error")], labels)
         await emit({"type": "ranking", "ranking": result["ranking"], "labels": labels})
         await emit({"type": "stage", "stage": "review", "status": "done"})
         await _checkpoint()
@@ -426,9 +473,10 @@ async def run_council(
     # Stage 3 - chairman synthesis
     await emit({"type": "stage", "stage": "synthesis", "status": "start"})
     msgs = chair_messages(question, history, labels, ok, names,
-                          [r for r in reviews if not r["error"]], result["ranking"])
+                          [r for r in result["reviews"] if not r.get("error")], result["ranking"])
+    result["chair"] = {"member": "chair"}
     chair = await run_member(stream_fn, chairman, msgs, stage="synthesis", index="chair",
-                             emit=emit, timeout=CHAIR_TIMEOUT)
+                             emit=emit, timeout=CHAIR_TIMEOUT, sink=result["chair"])
     await emit({"type": "stage", "stage": "synthesis", "status": "done"})
     if chair["error"]:
         result["error"] = f"Chairman failed: {chair['error']}"
@@ -442,3 +490,25 @@ async def run_council(
         result["final"] = chair["text"]
     result["chair_ms"] = chair["ms"]
     return result
+
+
+def usage_totals(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Tokens and metered cost across every call of a turn."""
+    calls = [*(result.get("opinions") or []), *(result.get("reviews") or [])]
+    if isinstance(result.get("chair"), dict):
+        calls.append(result["chair"])
+    tokens_in = tokens_out = 0
+    cost = 0.0
+    priced = unpriced = 0
+    for call in calls:
+        usage = call.get("usage") or {}
+        tokens_in += int(usage.get("input_tokens") or 0)
+        tokens_out += int(usage.get("output_tokens") or 0)
+        if call.get("cost_usd") is not None:
+            cost += float(call["cost_usd"])
+            priced += 1
+        elif usage:
+            unpriced += 1
+    return {"input_tokens": tokens_in, "output_tokens": tokens_out,
+            "cost_usd": round(cost, 6) if priced else None, "priced_calls": priced,
+            "unpriced_calls": unpriced}

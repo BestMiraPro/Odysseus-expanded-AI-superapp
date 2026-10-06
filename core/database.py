@@ -639,6 +639,7 @@ class CouncilTurn(TimestampMixin, Base):
     labels = Column(Text, nullable=True)             # JSON {"A": member_index, ...}
     final = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
+    usage = Column(Text, nullable=True)              # JSON {input_tokens, output_tokens, cost_usd, ...}
 
 
 class Signature(TimestampMixin, Base):

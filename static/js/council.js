@@ -156,6 +156,8 @@ function injectStyles() {
 .council-session.active { background: color-mix(in srgb, var(--accent, var(--red, #888)) 18%, transparent); }
 .council-session .grow { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .council-session .del { opacity: 0; background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; }
+.council-session:focus-within .del, .council-session .del:focus-visible { opacity: 0.6; }
+@media (hover: none) { .council-session .del { opacity: 0.5; } }
 .council-session:hover .del { opacity: 0.6; }
 .council-session .del:hover { opacity: 1; }
 .council-connect { border-top: 1px solid var(--border); padding: 10px; display: flex; flex-direction: column; gap: 10px;
@@ -206,6 +208,11 @@ function injectStyles() {
 .council-picker { position: absolute; left: 14px; top: 100%; margin-top: 4px; z-index: 5; width: min(560px, calc(100% - 28px));
   max-height: 55vh; overflow-y: auto; background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
   box-shadow: 0 10px 30px rgba(0,0,0,0.25); padding: 8px; }
+.council-star { color: #e0b03c; font-size: 11px; line-height: 1; }
+.council-cost { font-size: 9.5px; padding: 0 4px; border-radius: 4px; opacity: 0.75;
+  background: color-mix(in srgb, var(--fg) 8%, transparent); white-space: nowrap; }
+.council-picker-legend { font-size: 10.5px; opacity: 0.55; margin: 6px 4px 2px; }
+.council-picker [hidden] { display: none !important; }
 .council-picker-group { font-size: 10.5px; text-transform: uppercase; letter-spacing: .6px; opacity: 0.5; margin: 8px 6px 4px; }
 .council-picker-ep { padding: 6px; border-radius: 8px; }
 .council-picker-ep .h { font-size: 12px; font-weight: 600; display: flex; gap: 6px; align-items: center; margin-bottom: 5px; }
@@ -258,7 +265,9 @@ function injectStyles() {
 .council-card-b > :last-child { margin-bottom: 0; }
 .council-card-b.pending::after { content: '…'; opacity: 0.5; }
 .council-errtext { color: var(--danger, #e05252); font-size: 12px; }
-.council-rank { width: calc(100% - 20px); margin: 0 10px 10px; border-collapse: collapse; font-size: 12px; }
+.council-rank-wrap { overflow-x: auto; margin: 0 10px 10px; }
+.council-rank { width: 100%; border-collapse: collapse; font-size: 12px; }
+.council-usage { font-size: 11px; opacity: 0.6; white-space: nowrap; }
 .council-rank th, .council-rank td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--border); }
 .council-rank th { font-weight: 600; opacity: 0.6; font-size: 11px; }
 .council-rank tr.top td { font-weight: 600; }
@@ -278,7 +287,10 @@ function injectStyles() {
 .council-composer .hint { font-size: 11px; opacity: 0.55; }
 .council-warn { font-size: 12px; padding: 7px 10px; border-radius: 8px;
   background: color-mix(in srgb, #e0a252 15%, transparent); }
+.council-side-toggle { display: none; }
 @media (max-width: 860px) {
+  .council-side-toggle { display: inline-block; }
+  .council-pane:not(.side-open) .council-side { display: none; }
   .council-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .council-side { border-right: none; border-bottom: 1px solid var(--border); max-height: 32vh; }
   .council-grid { grid-template-columns: 1fr; }
@@ -311,13 +323,14 @@ export function openPanel() {
   _pane.setAttribute('aria-label', 'AI Council');
   _pane.innerHTML = `
     <div class="council-header">
+      <button class="council-x council-side-toggle" id="council-side-toggle" aria-expanded="false" aria-controls="council-side" title="Councils and connections">☰</button>
       <span class="council-title">${ICON} Council</span>
       <span class="council-header-spacer"></span>
       <button class="council-x" id="council-min-btn" title="Minimize" aria-label="Minimize Council">–</button>
       <button class="council-x" id="council-close-btn" title="Close (Esc)" aria-label="Close Council">✕</button>
     </div>
     <div class="council-layout">
-      <aside class="council-side">
+      <aside class="council-side" id="council-side">
         <div class="council-side-top">
           <button class="council-btn primary" id="council-new" style="flex:1">+ New council</button>
         </div>
@@ -342,10 +355,17 @@ export function openPanel() {
   _pane.querySelector('#council-close-btn').addEventListener('click', () => closePanel());
   _pane.querySelector('#council-min-btn').addEventListener('click', () => minimizePanel());
   _pane.querySelector('#council-new').addEventListener('click', () => newSession());
+  _pane.querySelector('#council-side-toggle').addEventListener('click', (e) => {
+    const open = _pane.classList.toggle('side-open');
+    e.currentTarget.setAttribute('aria-expanded', String(open));
+  });
   _pane.querySelector('#council-send').addEventListener('click', () => convene());
   const input = _pane.querySelector('#council-input');
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); convene(); }
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      if (!$('#council-send')?.disabled) convene();
+    }
   });
   input.addEventListener('input', () => {
     input.style.height = 'auto';
@@ -353,12 +373,29 @@ export function openPanel() {
   });
   _pane.addEventListener('click', onPaneClick);
   _pane.addEventListener('change', onPaneChange);
+  _pane.addEventListener('keydown', (e) => {
+    const row = e.target.closest?.('[data-session]');
+    if (row && e.target === row && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      row.click();
+    }
+  });
+  _pane.addEventListener('input', (e) => {
+    if (e.target.id === 'council-picker-filter') applyPickerFilter(e.target.value);
+    if (e.target.id === 'council-claude-token') S.connect.claude.tokenDraft = e.target.value;
+  });
 
   _keyHandler = (e) => {
     if (!_open || !_pane || _pane.classList.contains('hidden')) return;
     if (e.key !== 'Escape') return;
     if (S.picker) { S.picker = false; renderSeats(); return; }
-    if (_pane.contains(document.activeElement) || document.activeElement === document.body) closePanel();
+    const active = document.activeElement;
+    if (active && _pane.contains(active) && /^(TEXTAREA|INPUT|SELECT)$/.test(active.tagName)) {
+      // Leave the field rather than throwing away a half-written question.
+      active.blur();
+      return;
+    }
+    if (_pane.contains(active) || active === document.body) minimizePanel();
   };
   document.addEventListener('keydown', _keyHandler);
   ensureChip();
@@ -460,12 +497,13 @@ function defaultSeats() {
   // council without any clicking.
   const eps = S.roster?.endpoints || [];
   const seats = [];
+  const pick = (ep) => ep.models.find(m => metaFor(`${ep.id}::${m}`)?.recommended) || ep.models[0];
   for (const ep of eps.filter(e => e.kind === 'subscription')) {
-    if (ep.models[0]) seats.push({ endpoint_id: ep.id, model: ep.models[0] });
+    if (ep.models[0]) seats.push({ endpoint_id: ep.id, model: pick(ep) });
   }
   for (const ep of eps.filter(e => e.kind !== 'subscription')) {
     if (seats.length >= 3) break;
-    if (ep.models[0]) seats.push({ endpoint_id: ep.id, model: ep.models[0] });
+    if (ep.models[0]) seats.push({ endpoint_id: ep.id, model: pick(ep) });
   }
   return seats.slice(0, 3);
 }
@@ -497,6 +535,7 @@ async function refreshCurrent() {
 }
 
 async function newSession() {
+  if (S.live) { toast('Wait for the council to finish, or stop it first'); return; }
   try {
     const data = await jpost('/api/council/sessions', { config: currentConfig() });
     S.sessions.unshift(data);
@@ -508,6 +547,7 @@ async function newSession() {
 }
 
 async function deleteSession(id) {
+  if (S.live && S.live.sessionId === id) { toast('Stop this council before deleting it'); return; }
   const s = S.sessions.find(x => x.id === id);
   if (!confirm(`Delete "${s?.title || 'this council'}" and all its answers?`)) return;
   try {
@@ -607,7 +647,7 @@ function renderConnect() {
     claudeBody = '<p>Ask an admin to connect a Claude subscription.</p>';
   } else {
     claudeBody = `<p>In a terminal run <code>claude setup-token</code>, sign in with your Claude account, and paste the token:</p>
-      <input class="council-input" id="council-claude-token" type="password" autocomplete="off" placeholder="sk-ant-oat01-…" aria-label="Claude setup token">
+      <input class="council-input" id="council-claude-token" type="password" autocomplete="off" placeholder="sk-ant-oat01-…" aria-label="Claude setup token" value="${esc(cs.tokenDraft || '')}">
       <div style="display:flex;gap:6px;flex-wrap:wrap">
         <button class="council-btn small primary" data-act="claude-token" ${cs.busy ? 'disabled' : ''}>Connect</button>
         <button class="council-btn small" data-act="claude-host" ${cs.busy ? 'disabled' : ''} title="Use the Claude login already on the Odysseus machine (claude auth login)">Use this machine's login</button>
@@ -649,8 +689,9 @@ function chairmanSeat() {
 
 function seatChip(seat, idx) {
   const info = seatInfo(seat);
-  return `<span class="council-chip ${info.available ? '' : 'missing'}" title="${esc(`${info.model} · ${info.endpoint}`)}">
-    ${logoFor(info.model)}<span class="name">${esc(info.model)}</span><span class="ep">${esc(info.endpoint)}</span>
+  const meta = metaFor(seatKey(seat));
+  return `<span class="council-chip ${info.available ? '' : 'missing'}" title="${esc(seatTitle(info.model, info.endpoint, meta))}">
+    ${meta?.recommended ? '<span class="council-star" aria-label="Recommended">★</span>' : ''}${logoFor(info.model)}<span class="name">${esc(info.model)}</span><span class="ep">${esc(info.endpoint)}</span>${costChip(meta)}
     ${badge(info.kind, info.provider)}
     <button data-remove-seat="${idx}" aria-label="Remove ${esc(info.model)}">✕</button></span>`;
 }
@@ -664,7 +705,8 @@ function allSeatOptions(selectedKey) {
     for (const ep of eps) {
       html += `<optgroup label="${esc(`${ep.name} · ${names[kind]}`)}">${ep.models.map(m => {
         const key = `${ep.id}::${m}`;
-        return `<option value="${esc(key)}" ${key === selectedKey ? 'selected' : ''}>${esc(m)}</option>`;
+        const meta = metaFor(key);
+        return `<option value="${esc(key)}" ${key === selectedKey ? 'selected' : ''}>${meta?.recommended ? '★ ' : ''}${esc(m)}${meta?.cost_band ? ` (${esc(meta.cost_band)})` : ''}</option>`;
       }).join('')}</optgroup>`;
     }
   }
@@ -701,24 +743,62 @@ function renderSeats() {
     ${S.picker ? renderPicker() : ''}`;
 }
 
+function metaFor(key) { return (S.roster?.meta || {})[key] || null; }
+
+function costChip(meta) {
+  if (!meta) return '';
+  const text = meta.billing === 'subscription' ? 'plan' : meta.billing === 'local' ? 'free' : (meta.cost_band || '?');
+  return `<span class="council-cost" title="${esc(meta.cost_label)}">${esc(text)}</span>`;
+}
+
+function seatTitle(model, endpoint, meta) {
+  const bits = [`${model} · ${endpoint}`];
+  if (meta) {
+    if (meta.recommended) bits.push('Recommended: newest of its family');
+    bits.push(`${meta.tier}${meta.traits?.length ? ` · good at ${meta.traits.join(', ')}` : ''}`);
+    bits.push(meta.cost_label);
+  }
+  return bits.join('\n');
+}
+
 function renderPicker() {
   const taken = new Set(S.members.map(seatKey));
   const eps = S.roster?.endpoints || [];
+  const sorted = (ep) => [...ep.models].sort((a, b) =>
+    Number(!!metaFor(`${ep.id}::${b}`)?.recommended) - Number(!!metaFor(`${ep.id}::${a}`)?.recommended));
   const group = (kind, title) => {
     const list = eps.filter(e => e.kind === kind);
     if (!list.length) return '';
     return `<div class="council-picker-group">${title}</div>` + list.map(ep => `
-      <div class="council-picker-ep">
+      <div class="council-picker-ep" data-picker-ep>
         <div class="h">${esc(ep.name)} ${badge(ep.kind, ep.provider)}</div>
-        <div class="council-picker-models">${ep.models.map(m => {
+        <div class="council-picker-models">${sorted(ep).map(m => {
           const key = `${ep.id}::${m}`;
-          return `<button data-add-seat="${esc(key)}" ${taken.has(key) ? 'disabled' : ''}>${logoFor(m)}${esc(m)}</button>`;
+          const meta = metaFor(key);
+          return `<button data-add-seat="${esc(key)}" data-filter-text="${esc(`${m} ${ep.name} ${meta?.tier || ''} ${(meta?.traits || []).join(' ')}`.toLowerCase())}"
+            title="${esc(seatTitle(m, ep.name, meta))}" ${taken.has(key) ? 'disabled' : ''}>
+            ${meta?.recommended ? '<span class="council-star" aria-label="Recommended">★</span>' : ''}${logoFor(m)}${esc(m)}${costChip(meta)}</button>`;
         }).join('')}</div>
       </div>`).join('');
   };
   return `<div class="council-picker" role="dialog" aria-label="Add a council member">
+    <input class="council-input" id="council-picker-filter" type="search" placeholder="Filter models (name, code, fast, flagship…)" aria-label="Filter models">
+    <div class="council-picker-legend">★ recommended (newest of its family) · $–$$$$ metered price band · plan = subscription · free = local</div>
     ${group('subscription', 'Subscriptions')}${group('api', 'API models')}${group('local', 'Local models')}
   </div>`;
+}
+
+function applyPickerFilter(text) {
+  const q = (text || '').trim().toLowerCase();
+  _pane?.querySelectorAll('[data-picker-ep]').forEach(ep => {
+    let any = false;
+    ep.querySelectorAll('[data-add-seat]').forEach(btn => {
+      const hit = !q || btn.dataset.filterText.includes(q);
+      btn.hidden = !hit;
+      any = any || hit;
+    });
+    ep.hidden = !any;
+  });
 }
 
 function renderComposer() {
@@ -767,12 +847,34 @@ function statusText(turn) {
   }
 }
 
+function fmtTokens(n) {
+  if (!n) return '0';
+  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n);
+}
+
+function fmtUsd(v) {
+  if (v == null) return '';
+  if (v === 0) return '$0';
+  return v < 0.01 ? `$${v.toFixed(4)}` : `$${v.toFixed(v < 1 ? 3 : 2)}`;
+}
+
+function usageText(entry, seat) {
+  const u = entry?.usage;
+  if (!u) return '';
+  const parts = [`${fmtTokens(u.input_tokens)} in · ${fmtTokens(u.output_tokens)} out`];
+  if (entry.cost_usd != null) parts.push(fmtUsd(entry.cost_usd));
+  else if (seat?.billing === 'subscription') parts.push('plan');
+  else if (seat?.billing === 'local') parts.push('free');
+  return parts.join(' · ');
+}
+
 function memberCard(stage, seat, idx, entry, label) {
   const text = entry?.text || '';
   const err = entry?.error;
   const streaming = entry?.streaming;
+  const usage = usageText(entry, seat);
   const state = err ? 'error' : streaming ? (entry?.thinking && !text ? 'thinking…' : 'writing…')
-    : entry?.ms != null ? fmtMs(entry.ms) : (entry ? '' : 'waiting…');
+    : entry?.ms != null ? [fmtMs(entry.ms), usage].filter(Boolean).join(' · ') : (entry ? '' : 'waiting…');
   return `<div class="council-card ${err ? 'err' : ''}" data-stage="${stage}" data-member="${idx}">
     <div class="council-card-h">
       ${label ? `<span class="label" title="Anonymous label used in peer review">${esc(label)}</span>` : ''}
@@ -782,6 +884,52 @@ function memberCard(stage, seat, idx, entry, label) {
     </div>
     <div class="council-card-b ${!text && !err ? 'pending' : ''}">${err ? `<div class="council-errtext">${esc(err)}</div>` : md(text)}</div>
   </div>`;
+}
+
+function turnUsage(turn) {
+  const u = turn.usage;
+  if (!u || !(u.input_tokens || u.output_tokens)) return '';
+  const cost = u.cost_usd != null ? ` · ${fmtUsd(u.cost_usd)}${u.unpriced_calls ? '+' : ''}` : '';
+  const title = `${u.input_tokens} input + ${u.output_tokens} output tokens across all members`
+    + (u.cost_usd != null ? `; metered cost ${fmtUsd(u.cost_usd)}` : '')
+    + (u.unpriced_calls ? `; ${u.unpriced_calls} call(s) on subscription, local or unpriced models not included` : '');
+  return `<span class="council-usage" title="${esc(title)}">${fmtTokens(u.input_tokens + u.output_tokens)} tokens${cost}</span>`;
+}
+
+function turnMarkdown(turn) {
+  const seats = seatsOfTurn(turn);
+  const memberLabel = {};
+  for (const [label, idx] of Object.entries(turn.labels || {})) memberLabel[idx] = label;
+  const name = (i) => { const s = seats.members[i] || {}; return `${s.model || '?'}${s.endpoint_name ? ` (${s.endpoint_name})` : ''}`; };
+  const out = [`# ${turn.question}`, '', `*AI Council · ${seats.mode} mode · chairman ${seats.chairman?.model || '?'}*`, '',
+    '## Council answer', '', turn.final || '_No answer_', '', '## Opinions', ''];
+  for (const o of turn.opinions || []) {
+    out.push(`### ${memberLabel[o.member] ? `Response ${memberLabel[o.member]} — ` : ''}${name(o.member)}`, '',
+      o.error ? `_${o.error}_` : (o.text || ''), '');
+  }
+  const ranking = (turn.ranking || []).filter(r => r.avg_rank != null);
+  if (ranking.length) {
+    out.push('## Peer ranking (blind, self-votes excluded)', '', '| # | Answer | Model | Avg rank | 1st-place votes |', '|---|---|---|---|---|');
+    ranking.forEach((r, i) => out.push(`| ${i + 1} | Response ${r.label} | ${name(r.member)} | ${r.avg_rank} | ${r.first_votes} |`));
+    out.push('');
+  }
+  if ((turn.reviews || []).length) {
+    out.push('## Reviews', '');
+    for (const r of turn.reviews) out.push(`### Review by ${name(r.member)}`, '', r.error ? `_${r.error}_` : (r.text || ''), '');
+  }
+  return out.join('\n');
+}
+
+function downloadText(filename, text) {
+  const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function sameScore(a, b) {
@@ -827,11 +975,11 @@ function renderTurn(turn, live = false) {
   const showReview = seats.mode === 'full' && ((turn.reviews || []).length || (turn.stages && turn.stages.review && turn.stages.review !== 'pending'));
   if (showReview) {
     const ranking = (turn.ranking || []).filter(r => r.avg_rank != null);
-    const table = ranking.length ? `<table class="council-rank"><thead><tr><th>#</th><th>Answer</th><th>Model</th><th>Avg rank</th><th>1st-place votes</th></tr></thead><tbody>
+    const table = ranking.length ? `<div class="council-rank-wrap"><table class="council-rank"><thead><tr><th>#</th><th>Answer</th><th>Model</th><th>Avg rank</th><th>1st-place votes</th></tr></thead><tbody>
       ${ranking.map((r, i) => {
         const seat = seats.members[r.member] || {};
         return `<tr class="${i === 0 && !tied(ranking) ? 'top' : ''}"><td>${i > 0 && sameScore(r, ranking[i - 1]) ? '=' : i + 1}</td><td>Response ${esc(r.label)}</td><td>${logoFor(seat.model)} ${esc(seat.model || '?')}</td><td>${esc(r.avg_rank)}</td><td>${esc(r.first_votes)}</td></tr>`;
-      }).join('')}</tbody></table>
+      }).join('')}</tbody></table></div>
       <div style="font-size:11px;opacity:.55;margin:-4px 12px 10px">Each model ranked the answers without knowing who wrote them; votes on its own answer are not counted.</div>` : '';
     const reviewers = seats.members.map((seat, i) => ({ seat, i })).filter(({ i }) => revs[i] || (turn.stages?.review === 'running' && ops[i] && !ops[i].error));
     review = `<details class="council-section" data-sec="review" ${live || running ? 'open' : ''}>
@@ -848,7 +996,8 @@ function renderTurn(turn, live = false) {
   const final = showFinal ? `<section class="council-final" data-final>
     <div class="council-final-h">${ICON}<span class="t">Council answer</span>
       <span class="ep">chairman ${esc(chair.model || '')}${chair.endpoint_name ? ` · ${esc(chair.endpoint_name)}` : ''}</span>
-      <span class="tools">${finalText ? `<button class="council-btn small ghost" data-copy-final="${esc(turn.id)}">Copy</button>` : ''}</span>
+      <span class="tools">${finalText ? `<button class="council-btn small ghost" data-copy-final="${esc(turn.id)}">Copy</button>
+        <button class="council-btn small ghost" data-export-turn="${esc(turn.id)}" title="Download the question, every opinion, the reviews, the ranking and the answer as Markdown">Export .md</button>` : ''}</span>
     </div>
     <div class="council-final-b ${!finalText ? 'pending' : ''}">${finalErr ? `<div class="council-errtext" style="margin-bottom:8px">${esc(finalErr)} Showing the top-ranked answer instead.</div>` : ''}${md(finalText)}</div>
   </section>` : '';
@@ -857,7 +1006,8 @@ function renderTurn(turn, live = false) {
     <div class="council-q">${esc(turn.question)}</div>
     <div class="council-strip">${strip}
       <span class="status ${statusErr ? 'err' : ''}">${esc(status)}</span>
-      ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}">Stop</button>` : ''}
+      ${turnUsage(turn)}
+      ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}" ${String(turn.id).startsWith('live-') ? 'disabled title="Starting…"' : ''}>Stop</button>` : ''}
       ${!running ? `<button class="council-btn small ghost" data-del-turn="${esc(turn.id)}" title="Delete this question">Delete</button>` : ''}
     </div>
     ${opinions}${review}${final}
@@ -931,7 +1081,9 @@ function flushDirty() {
     body.innerHTML = entry.error ? `<div class="council-errtext">${esc(entry.error)}</div>` : md(entry.text);
     body.scrollTop = body.scrollHeight;
     const state = card.querySelector('.state');
-    if (state) state.textContent = entry.error ? 'error' : entry.streaming ? (entry.thinking && !entry.text ? 'thinking…' : 'writing…') : fmtMs(entry.ms);
+    const seat = (live.config?.members || [])[Number(member)];
+    if (state) state.textContent = entry.error ? 'error' : entry.streaming ? (entry.thinking && !entry.text ? 'thinking…' : 'writing…')
+      : [fmtMs(entry.ms), usageText(entry, seat)].filter(Boolean).join(' · ');
     card.classList.toggle('err', !!entry.error);
   }
   _dirty.clear();
@@ -981,6 +1133,8 @@ function onEvent(ev) {
       const entry = liveEntry(ev.stage, ev.member);
       entry.streaming = false;
       entry.ms = ev.ms;
+      entry.usage = ev.usage || null;
+      entry.cost_usd = ev.cost_usd ?? null;
       if (ev.type === 'member_error') entry.error = ev.error;
       markDirty(ev.stage, ev.member);
       break;
@@ -994,6 +1148,7 @@ function onEvent(ev) {
       live.status = ev.status || 'done';
       if (typeof ev.final === 'string' && ev.final) live.final = ev.final;
       live.error = ev.error || null;
+      if (ev.usage) live.usage = ev.usage;
       break;
     default:
       break;
@@ -1077,6 +1232,8 @@ async function convene() {
       renderAll();
       if (wasLive) scrollToEnd();
       maybePoll();
+    } else if (_open) {
+      renderComposer();
     }
   }
 }
@@ -1094,6 +1251,7 @@ async function connectClaude(mode) {
   try {
     const data = await jpost('/api/claude-subscription/connect', { mode, token: token || null });
     cs.msg = `Connected — ${(data.endpoint?.models || []).length} Claude models available.`;
+    cs.tokenDraft = '';
     await afterConnect('claude', data.endpoint);
   } catch (e) {
     cs.err = true; cs.msg = e.message;
@@ -1151,7 +1309,8 @@ async function afterConnect(which, endpoint) {
   // Seat the new subscription's first model if it is not on the council yet.
   const ep = endpoint?.id ? endpointById(endpoint.id) : null;
   if (ep && ep.models[0] && !S.members.some(m => m.endpoint_id === ep.id) && S.members.length < (S.roster?.max_members || 8)) {
-    S.members.push({ endpoint_id: ep.id, model: ep.models[0] });
+    const model = ep.models.find(m => metaFor(`${ep.id}::${m}`)?.recommended && metaFor(`${ep.id}::${m}`)?.tier !== 'flagship') || ep.models[0];
+    S.members.push({ endpoint_id: ep.id, model });
     saveConfigSoon();
   }
   // Same refresh the Settings → Models form does, so the chat model picker
@@ -1211,6 +1370,15 @@ async function onPaneClick(e) {
     } catch (err) { toast(err.message); }
     return;
   }
+  const exp = t.closest('[data-export-turn]');
+  if (exp) {
+    const turn = (S.session?.turns || []).find(x => x.id === exp.dataset.exportTurn);
+    if (turn) {
+      const slug = (turn.question || 'council').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'council';
+      downloadText(`council-${slug}.md`, turnMarkdown(turn));
+    }
+    return;
+  }
   const copy = t.closest('[data-copy-final]');
   if (copy) {
     const turn = (S.session?.turns || []).find(x => x.id === copy.dataset.copyFinal);
@@ -1225,7 +1393,11 @@ async function onPaneClick(e) {
     if (S.picker && !t.closest('.council-picker')) { S.picker = false; renderSeats(); }
     return;
   }
-  if (act === 'toggle-picker') { S.picker = !S.picker; renderSeats(); }
+  if (act === 'toggle-picker') {
+    S.picker = !S.picker;
+    renderSeats();
+    if (S.picker) $('#council-picker-filter')?.focus();
+  }
   else if (act === 'claude-token') await connectClaude('token');
   else if (act === 'claude-host') await connectClaude('host');
   else if (act === 'claude-disconnect') await disconnectClaude();

@@ -9,27 +9,28 @@ explicit call.
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import logging
 import uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
-from src import council
+from src import council, model_roster
 from src.auth_helpers import get_current_user, owner_filter, require_user
 
 logger = logging.getLogger(__name__)
 
-SUBSCRIPTION_PROVIDERS = {"claude-subscription", "chatgpt-subscription", "copilot"}
+SUBSCRIPTION_PROVIDERS = model_roster.SUBSCRIPTION_PROVIDERS
 
-# turn_id -> running task (this process only)
+# turn_id -> running task (this process only). Only touched on the event loop.
 _RUNNING: Dict[str, asyncio.Task] = {}
+# Sessions with an ask being prepared or running. Claimed on the event loop
+# before any thread work, so two tabs cannot start two runs in one thread.
+_ACTIVE_SESSIONS: set = set()
 
 
 class Seat(BaseModel):
@@ -73,48 +74,11 @@ def _loads(raw, default):
     return value if isinstance(value, type(default)) else default
 
 
-def _is_local_host(host: str) -> bool:
-    host = (host or "").lower().rstrip(".")
-    if host in {"localhost", "host.docker.internal"} or host.endswith(".local"):
-        return True
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local
-
-
-def classify_endpoint(ep) -> tuple[str, str]:
-    """(kind, provider) where kind is subscription | api | local."""
-    from src.llm_core import _detect_provider
-
-    base = getattr(ep, "base_url", "") or ""
-    try:
-        provider = _detect_provider(base)
-    except Exception:
-        provider = "openai"
-    if provider in SUBSCRIPTION_PROVIDERS:
-        return "subscription", provider
-    try:
-        host = urlparse(base).hostname or ""
-    except Exception:
-        host = ""
-    if _is_local_host(host):
-        return "local", provider
-    return "api", provider
-
-
-def _chat_models(ep) -> List[str]:
-    from src.endpoint_resolver import _NON_CHAT_MODEL, _endpoint_enabled_models
-
-    return [m for m in _endpoint_enabled_models(ep)
-            if not any(p in m.lower() for p in _NON_CHAT_MODEL)]
-
-
-def _visible_endpoints(db, owner: Optional[str]):
-    q = db.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)  # noqa: E712
-    q = owner_filter(q, ModelEndpoint, owner)
-    return [ep for ep in q.all() if (ep.model_type or "llm") == "llm"]
+# Endpoint classification lives in src.model_roster, shared with the roster API,
+# the Omnigent crew and the chat agent's ask_model tool.
+classify_endpoint = model_roster.classify_endpoint
+_chat_models = model_roster.chat_models
+_visible_endpoints = model_roster.visible_endpoints
 
 
 def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
@@ -142,9 +106,25 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
         db.close()
     order = {"subscription": 0, "api": 1, "local": 2}
     endpoints.sort(key=lambda e: (order.get(e["kind"], 3), e["name"].lower()))
+    # Recommendation, tier and cost per seat option, for the picker badges.
+    rows = [(e["id"], e["name"], m, e["kind"], e["provider"]) for e in endpoints for m in e["models"]]
+    meta: Dict[str, Dict[str, Any]] = {}
+    try:
+        for entry in model_roster.build_entries(rows):
+            meta[entry.key] = {
+                "recommended": entry.recommended,
+                "tier": entry.tier,
+                "traits": entry.traits,
+                "cost_label": entry.cost_label(),
+                "cost_band": entry.cost_band(),
+                "billing": entry.billing,
+            }
+    except Exception as exc:
+        logger.warning("council roster metadata failed error_type=%s", type(exc).__name__)
     claude = claude_subscription.connection(owner)
     return {
         "endpoints": endpoints,
+        "meta": meta,
         "can_connect": is_admin,
         "connections": {
             "claude": {
@@ -196,7 +176,18 @@ def resolve_seat(db, owner: Optional[str], seat: Seat) -> council.Member:
         provider=provider,
         url=build_chat_url(base),
         headers=build_headers(api_key, base) or None,
+        **_seat_pricing(ep, model, kind, provider),
     )
+
+
+def _seat_pricing(ep, model: str, kind: str, provider: str) -> Dict[str, Any]:
+    """Billing and list price for one seat, from the shared model roster."""
+    try:
+        (entry,) = model_roster.build_entries([(ep.id, ep.name or "", model, kind, provider)])
+    except Exception:
+        return {"billing": "subscription" if kind == "subscription" else "local" if kind == "local" else "metered"}
+    return {"billing": entry.billing, "input_per_mtok": entry.input_per_mtok,
+            "output_per_mtok": entry.output_per_mtok}
 
 
 def _session_query(db, owner: Optional[str]):
@@ -225,6 +216,7 @@ def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
         "labels": _loads(turn.labels, {}),
         "final": turn.final or "",
         "error": turn.error,
+        "usage": _loads(turn.usage, {}),
         "created_at": turn.created_at.isoformat() if turn.created_at else None,
     }
 
@@ -251,7 +243,7 @@ def _save_turn(turn_id: str, **fields) -> None:
         if turn is None:
             return
         for key, value in fields.items():
-            if key in ("opinions", "reviews", "ranking", "labels", "config") and not isinstance(value, str):
+            if key in ("opinions", "reviews", "ranking", "labels", "config", "usage") and not isinstance(value, str):
                 value = json.dumps(value)
             setattr(turn, key, value)
         db.commit()
@@ -259,13 +251,31 @@ def _save_turn(turn_id: str, **fields) -> None:
         db.close()
 
 
+def _settled(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Copies of per-member results; anything still streaming is marked stopped."""
+    out = []
+    for call in calls or []:
+        item = {k: v for k, v in call.items() if k != "pending"}
+        if call.get("pending"):
+            item["error"] = "Stopped before this member finished."
+            item["stopped"] = True
+        out.append(item)
+    return out
+
+
 def _result_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+    final = result.get("final") or None
+    chair = result.get("chair") if isinstance(result.get("chair"), dict) else None
+    if not final and chair and chair.get("pending") and chair.get("text"):
+        # Keep a synthesis that was cut off: the user watched it stream in.
+        final = chair["text"].rstrip() + "\n\n*(stopped before the chairman finished)*"
     return {
-        "opinions": result.get("opinions") or [],
-        "reviews": result.get("reviews") or [],
+        "opinions": _settled(result.get("opinions")),
+        "reviews": _settled(result.get("reviews")),
         "ranking": result.get("ranking") or [],
         "labels": result.get("labels") or {},
-        "final": result.get("final") or None,
+        "final": final,
+        "usage": council.usage_totals(result),
     }
 
 
@@ -286,12 +296,6 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
     db = SessionLocal()
     try:
         row = _get_session(db, owner, session_id)
-        busy = [tid for tid, task in _RUNNING.items() if not task.done()]
-        if busy:
-            running_here = db.query(CouncilTurn.id).filter(CouncilTurn.id.in_(busy),
-                                                           CouncilTurn.session_id == row.id).first()
-            if running_here is not None:
-                raise HTTPException(409, "This council is still deliberating. Stop it or wait.")
         try:
             members = [resolve_seat(db, owner, seat) for seat in body.members]
             chairman = resolve_seat(db, owner, body.chairman)
@@ -432,61 +436,63 @@ def setup_council_routes() -> APIRouter:
         finally:
             db.close()
 
-    @router.delete("/sessions/{session_id}")
-    def delete_session(session_id: str, request: Request):
-        owner = _owner(request)
+    def _delete_session_rows(owner, session_id) -> List[str]:
         db = SessionLocal()
         try:
             row = _get_session(db, owner, session_id)
             turns = db.query(CouncilTurn).filter(CouncilTurn.session_id == row.id,
                                                  CouncilTurn.owner == owner).all()
+            ids = [t.id for t in turns]
             for turn in turns:
-                task = _RUNNING.get(turn.id)
-                if task is not None:
-                    task.cancel()
                 db.delete(turn)
             db.delete(row)
             db.commit()
-            return {"deleted": True}
+            return ids
         finally:
             db.close()
+
+    def _owned_turn_id(owner, session_id, turn_id, delete: bool = False) -> str:
+        db = SessionLocal()
+        try:
+            _get_session(db, owner, session_id)
+            turn = db.query(CouncilTurn).filter(CouncilTurn.id == turn_id, CouncilTurn.session_id == session_id,
+                                                CouncilTurn.owner == owner).first()
+            if turn is None:
+                raise HTTPException(404, "Turn not found")
+            if delete:
+                db.delete(turn)
+                db.commit()
+            return turn_id
+        finally:
+            db.close()
+
+    def _cancel(turn_id: str) -> bool:
+        # Async routes run on the event loop, so cancelling here is safe.
+        task = _RUNNING.get(turn_id)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
+
+    @router.delete("/sessions/{session_id}")
+    async def delete_session(session_id: str, request: Request):
+        owner = _owner(request)
+        for turn_id in await asyncio.to_thread(_delete_session_rows, owner, session_id):
+            _cancel(turn_id)
+        return {"deleted": True}
 
     @router.delete("/sessions/{session_id}/turns/{turn_id}")
-    def delete_turn(session_id: str, turn_id: str, request: Request):
+    async def delete_turn(session_id: str, turn_id: str, request: Request):
         owner = _owner(request)
-        db = SessionLocal()
-        try:
-            _get_session(db, owner, session_id)
-            turn = db.query(CouncilTurn).filter(CouncilTurn.id == turn_id, CouncilTurn.session_id == session_id,
-                                                CouncilTurn.owner == owner).first()
-            if turn is None:
-                raise HTTPException(404, "Turn not found")
-            task = _RUNNING.get(turn.id)
-            if task is not None:
-                task.cancel()
-            db.delete(turn)
-            db.commit()
-            return {"deleted": True}
-        finally:
-            db.close()
+        await asyncio.to_thread(_owned_turn_id, owner, session_id, turn_id, True)
+        _cancel(turn_id)
+        return {"deleted": True}
 
     @router.post("/sessions/{session_id}/turns/{turn_id}/stop")
-    def stop_turn(session_id: str, turn_id: str, request: Request):
+    async def stop_turn(session_id: str, turn_id: str, request: Request):
         owner = _owner(request)
-        db = SessionLocal()
-        try:
-            _get_session(db, owner, session_id)
-            turn = db.query(CouncilTurn).filter(CouncilTurn.id == turn_id, CouncilTurn.session_id == session_id,
-                                                CouncilTurn.owner == owner).first()
-            if turn is None:
-                raise HTTPException(404, "Turn not found")
-        finally:
-            db.close()
-        task = _RUNNING.get(turn_id)
-        if task is None:
-            return {"stopped": False}
-        task.cancel()
-        return {"stopped": True}
+        await asyncio.to_thread(_owned_turn_id, owner, session_id, turn_id)
+        return {"stopped": _cancel(turn_id)}
 
     @router.post("/sessions/{session_id}/ask")
     async def ask(session_id: str, request: Request, body: AskRequest):
@@ -498,33 +504,45 @@ def setup_council_routes() -> APIRouter:
         if not body.members:
             raise HTTPException(400, "Seat at least one council member.")
 
-        prepared = await asyncio.to_thread(_prepare_turn, owner, session_id, question, mode, body)
+        if session_id in _ACTIVE_SESSIONS:
+            raise HTTPException(409, "This council is still deliberating. Stop it or wait.")
+        _ACTIVE_SESSIONS.add(session_id)
+        try:
+            prepared = await asyncio.to_thread(_prepare_turn, owner, session_id, question, mode, body)
+        except BaseException:
+            _ACTIVE_SESSIONS.discard(session_id)
+            raise
         turn_id, members, chairman, history, seats = prepared
 
         stream = _Broadcast()
-        latest: Dict[str, Any] = {}
+        state: Dict[str, Any] = {}
+        finished = {"saved": False}
 
         async def checkpoint(result: Dict[str, Any]) -> None:
-            latest.update(result)
             await asyncio.to_thread(_save_turn, turn_id, **_result_fields(result))
 
         async def runner() -> None:
             try:
                 result = await council.run_council(
                     question=question, members=members, chairman=chairman, mode=mode,
-                    history=history, emit=stream.emit, checkpoint=checkpoint,
+                    history=history, emit=stream.emit, checkpoint=checkpoint, state=state,
                 )
                 status = "error" if result.get("error") and not result.get("final") else "done"
                 fields = _result_fields(result)
+                # Set before the save: a Stop that lands while it is being
+                # written must not overwrite the finished turn.
+                finished["saved"] = True
                 await asyncio.to_thread(_save_turn, turn_id, status=status,
                                         error=result.get("error"), **fields)
                 await stream.emit({"type": "done", "status": status, "turn_id": turn_id,
                                    "final": fields["final"] or "", "error": result.get("error"),
+                                   "usage": fields["usage"],
                                    "final_fallback_member": result.get("final_fallback_member")})
             except asyncio.CancelledError:
-                fields = _result_fields(latest) if latest else {}
-                await asyncio.to_thread(_save_turn, turn_id, status="cancelled",
-                                        error="Stopped before the council finished.", **fields)
+                if not finished["saved"]:
+                    fields = _result_fields(state) if state else {}
+                    await asyncio.to_thread(_save_turn, turn_id, status="cancelled",
+                                            error="Stopped before the council finished.", **fields)
                 await stream.emit({"type": "done", "status": "cancelled", "turn_id": turn_id})
             except Exception as exc:
                 logger.exception("council run failed")
@@ -535,6 +553,7 @@ def setup_council_routes() -> APIRouter:
                 del exc
             finally:
                 _RUNNING.pop(turn_id, None)
+                _ACTIVE_SESSIONS.discard(session_id)
                 await stream.emit(None)
 
         task = asyncio.create_task(runner(), name=f"council-{turn_id}")
