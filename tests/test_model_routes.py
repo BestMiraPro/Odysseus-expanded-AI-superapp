@@ -798,10 +798,8 @@ def test_lmstudio_endpoint_error_message_includes_hint_and_probed_url():
 
 def test_lmstudio_error_for_bare_host_port_probes_v1_models(monkeypatch):
     # Regression: build_models_url must add /v1 for path-less LM Studio URLs
-    # (the OpenAI-compatible branch lands on /v1/models for LM Studio).
-    # _is_ollama_native_url would otherwise match localhost+empty path and
-    # route to /api/tags, masking the LM Studio URL we want to assert on.
-    monkeypatch.setattr("src.llm_core._is_ollama_native_url", lambda url: False)
+    # (the OpenAI-compatible branch lands on /v1/models for LM Studio) without
+    # the bare localhost URL being misclassified as native Ollama.
     msg = model_routes._model_endpoint_error_message(
         "http://localhost:1234",
         {"error": "HTTP 200"},

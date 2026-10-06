@@ -312,3 +312,37 @@ class TestGetContextLength:
 
         endpoint = "http://100.117.136.97:34521/v1/chat/completions"
         assert model_context.get_context_length(endpoint, "unknown-proxy-model") == model_context.DEFAULT_CONTEXT
+
+
+class TestLookupKnownCurrentModels:
+    """Claude windows per the Anthropic model catalog (4.6+ and 5.x: 1M;
+    Haiku 4.5 and 4.5-and-earlier Opus/Sonnet: 200K), and the 8K 'gpt-4' key
+    no longer catching dotted GPT-4.x successors."""
+
+    def test_claude_1m_models(self):
+        for name in [
+            "claude-fable-5-1", "claude-fable-5", "claude-mythos-5-1",
+            "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+            "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6",
+            "anthropic/claude-sonnet-4-6",
+        ]:
+            assert _lookup_known(name) == 1000000, name
+
+    def test_claude_200k_models(self):
+        for name in [
+            "claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-opus-4-5-20251101",
+            "claude-opus-4-1-20250805", "claude-opus-4-20250514", "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-20250514",
+        ]:
+            assert _lookup_known(name) == 200000, name
+
+    def test_gpt4_key_does_not_catch_dotted_successors(self):
+        assert _lookup_known("gpt-4.1") == 1047576
+        assert _lookup_known("gpt-4.1-mini") == 1047576
+        assert _lookup_known("gpt-4o-2024-08-06") == 128000
+        assert _lookup_known("gpt-4.5-preview") is None  # unknown, not 8K
+        assert _lookup_known("openai/gpt-4.5-preview") is None
+
+    def test_gpt4_dash_variants_keep_8k(self):
+        assert _lookup_known("gpt-4-0613") == 8192
+        assert _lookup_known("gpt-4-turbo") == 128000

@@ -73,6 +73,52 @@ class TestIsOllamaNativeUrlAcceptsNativePaths:
     def test_ollama_com_api(self):
         assert llm_core._is_ollama_native_url("https://ollama.com/api")
 
+    def test_bare_default_port(self):
+        assert llm_core._is_ollama_native_url("http://localhost:11434")
+        assert llm_core._is_ollama_native_url("http://192.168.1.100:11434/")
+
+    def test_bare_ollama_hostname(self):
+        """Docker service names like ``ollama`` / ``ollama-rocm`` are Ollama."""
+        assert llm_core._is_ollama_native_url("http://ollama:11434")
+        assert llm_core._is_ollama_native_url("http://ollama-rocm")
+        assert llm_core._is_ollama_native_url("http://my-ollama.lan:8080/api")
+
+    def test_local_custom_port_with_explicit_api(self):
+        """Custom OLLAMA_HOST port on loopback still works via an explicit /api."""
+        assert llm_core._is_ollama_native_url("http://localhost:11435/api")
+        assert llm_core._is_ollama_native_url("http://127.0.0.1:9999/api/chat")
+
+
+# ---------------------------------------------------------------------------
+# _is_ollama_native_url: path-less non-Ollama local servers are NOT Ollama
+# ---------------------------------------------------------------------------
+
+class TestIsOllamaNativeUrlRejectsOtherLocalServers:
+    @pytest.mark.parametrize("url", [
+        "http://localhost:1234",       # LM Studio
+        "http://localhost:1234/",
+        "http://127.0.0.1:8080",       # llama.cpp
+        "http://0.0.0.0:8000",         # vLLM
+        "http://[::1]:30000",          # SGLang
+        "http://localhost",
+    ])
+    def test_bare_local_non_ollama_port(self, url):
+        assert not llm_core._is_ollama_native_url(url)
+        assert llm_core._detect_provider(url) == "openai"
+
+    def test_lmstudio_rest_api_is_not_ollama(self):
+        assert not llm_core._is_ollama_native_url("http://localhost:1234/api/v1")
+        assert not llm_core._is_ollama_native_url("http://localhost:1234/api/v0/models")
+
+    def test_remote_api_path_without_ollama_hint(self):
+        assert not llm_core._is_ollama_native_url("https://openrouter.ai/api/v1")
+        assert not llm_core._is_ollama_native_url("https://gpu.example.com/api")
+
+    def test_lookalike_ollama_hosts_are_not_ollama(self):
+        assert not llm_core._is_ollama_native_url("https://notollama.com")
+        assert not llm_core._is_ollama_native_url("https://ollama.com.evil.example")
+        assert not llm_core._is_ollama_native_url("http://myollama:8080")
+
 
 # ---------------------------------------------------------------------------
 # build_chat_url: port 11434 + /v1 → OpenAI-compatible /chat/completions

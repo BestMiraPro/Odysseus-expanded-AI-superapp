@@ -138,11 +138,12 @@ def test_no_session_manager_is_handled(monkeypatch):
 
 
 class _FakeSession:
-    def __init__(self, owner, name, history):
+    def __init__(self, owner, name, history, endpoint_url="http://x", model="test-model"):
         self.owner = owner
         self.name = name
-        self.endpoint_url = "http://x"
-        self.model = "fixture-tool-model"  # offline path: returns transcript, no network
+        self.endpoint_url = endpoint_url
+        self.model = model
+        self.headers = {}
         self._history = history
         self.added = []
 
@@ -161,6 +162,20 @@ class _FakeMgr:
         return self._s.get(sid)
 
 
+def _mock_llm(monkeypatch, reply="model reply"):
+    """Stub the network call send_to_session makes; record what it was sent."""
+    import src.llm_core as llm_core
+
+    calls = []
+
+    async def fake_llm_call_async(url, model, messages, **kwargs):
+        calls.append({"url": url, "model": model, "messages": messages})
+        return reply
+
+    monkeypatch.setattr(llm_core, "llm_call_async", fake_llm_call_async)
+    return calls
+
+
 def test_send_to_session_blocks_null_owner_for_authenticated_caller(monkeypatch):
     # An authenticated caller must not reach a null-owner (legacy / auth-was-off)
     # session: list_sessions and manage_session already hide those, so this path
@@ -170,6 +185,7 @@ def test_send_to_session_blocks_null_owner_for_authenticated_caller(monkeypatch)
     bob_sess = _FakeSession("bob", "Bob", [{"role": "user", "content": "bob secret"}])
     monkeypatch.setattr(st, "get_session_manager",
                         lambda: _FakeMgr({"nsid": null_sess, "bsid": bob_sess}))
+    calls = _mock_llm(monkeypatch)
 
     # authenticated alice: null-owner session is not-found and its history is not leaked
     r = asyncio.run(st.send_to_session("nsid\nhello", owner="alice"))
@@ -181,9 +197,27 @@ def test_send_to_session_blocks_null_owner_for_authenticated_caller(monkeypatch)
     r2 = asyncio.run(st.send_to_session("bsid\nhello", owner="alice"))
     assert r2.get("error", "").endswith("not found")
 
+    assert calls == []  # rejected calls never reach the model
+
     # auth disabled (no owner): single-user still reaches the null-owner session
     r3 = asyncio.run(st.send_to_session("nsid\nhello", owner=None))
-    assert r3.get("offline_transcript") is True
+    assert r3.get("response") == "model reply"
+    assert len(calls) == 1 and calls[0]["messages"][-1] == {"role": "user", "content": "hello"}
+    assert len(null_sess.added) == 2  # user + assistant persisted
+
+
+def test_send_to_session_reaches_cookbook_vllm_on_port_8003(monkeypatch):
+    # A real Cookbook vLLM served on host.docker.internal:8003 used to be
+    # short-circuited by a test-fixture branch and never got the message.
+    sess = _FakeSession("alice", "vLLM", [], endpoint_url="http://host.docker.internal:8003/v1",
+                        model="Qwen/Qwen3-8B")
+    monkeypatch.setattr(st, "get_session_manager", lambda: _FakeMgr({"vsid": sess}))
+    calls = _mock_llm(monkeypatch, reply="hi from vllm")
+
+    r = asyncio.run(st.send_to_session("vsid\nping", owner="alice"))
+    assert r.get("response") == "hi from vllm"
+    assert "offline_transcript" not in r
+    assert calls and calls[0]["url"] == "http://host.docker.internal:8003/v1"
 
 
 def test_dispatched_via_registry_not_dispatch_ai_tool():

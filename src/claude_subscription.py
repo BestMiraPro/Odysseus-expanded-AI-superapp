@@ -369,16 +369,57 @@ def friendly_error(text: str) -> tuple[int, str]:
     return 502, "Claude Subscription request failed. Check the Claude Code CLI on the Odysseus host."
 
 
-class StreamTranslator:
-    """Turns parsed ``claude -p --output-format stream-json`` objects into SSE chunks."""
+# Odysseus's text-mode tool instructions (agent mode on a model without native
+# tool calling, which is what the CLI transport is).
+_TEXT_TOOL_MARKER = "To use a tool, write a fenced code block"
+_TOOL_LINE_RE = re.compile(r"^- ```([A-Za-z_][\w-]*)```", re.M)
+# The body is optional: no-arg calls are written as ```list_models\n```.
+_FENCE_RE = re.compile(r"```([A-Za-z_][\w-]*)[^\n]*\n(?:[\s\S]*?\n)?```")
 
-    def __init__(self, requested_model: str):
+
+def text_tool_names(system: str) -> Optional[set]:
+    """Tool names offered in a text-tool system prompt, or None when not in tool mode."""
+    if not system or _TEXT_TOOL_MARKER not in system:
+        return None
+    return set(_TOOL_LINE_RE.findall(system))
+
+
+class StreamTranslator:
+    """Turns parsed ``claude -p --output-format stream-json`` objects into SSE chunks.
+
+    With ``stop_tools`` (agent mode), the stream ends right after the first
+    complete tool call, the way a stop sequence would on the API: the CLI has
+    none, and without one Claude carries on and writes the tool's result
+    itself instead of letting Odysseus run the tool.
+    """
+
+    def __init__(self, requested_model: str, stop_tools: Optional[set] = None):
         self.requested_model = requested_model
         self.text_emitted = False
         self.done = False
         self.failed = False
+        self.stopped_at_tool_call = False
         self._assistant_text: List[str] = []
         self._model_announced = False
+        self._stop_tools = stop_tools
+        self._seen = ""
+
+    def _tool_call_end(self) -> Optional[int]:
+        """Index just past the first complete tool call in the text so far."""
+        text = self._seen
+        ends = []
+        i = text.find("</function_calls>")
+        if i >= 0:
+            ends.append(i + len("</function_calls>"))
+        elif "<function_calls>" not in text:
+            i = text.find("</invoke>")
+            if i >= 0:
+                ends.append(i + len("</invoke>"))
+        for m in _FENCE_RE.finditer(text):
+            if m.group(1) in (self._stop_tools or ()):
+                ends.append(m.end())
+                break
+        return min(ends) if ends else None
 
     def feed(self, obj: Any) -> List[str]:
         if not isinstance(obj, dict) or self.done:
@@ -397,9 +438,23 @@ class StreamTranslator:
             if event.get("type") == "content_block_delta":
                 delta = event.get("delta") or {}
                 if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-                    if delta["text"]:
+                    text = delta["text"]
+                    if text and self._stop_tools is not None:
+                        before = len(self._seen)
+                        self._seen += text
+                        end = self._tool_call_end()
+                        if end is not None:
+                            text = text[: max(0, end - before)]
+                            if text:
+                                self.text_emitted = True
+                                out.append(_sse({"delta": text}))
+                            self.done = True
+                            self.stopped_at_tool_call = True
+                            out.append("data: [DONE]\n\n")
+                            return out
+                    if text:
                         self.text_emitted = True
-                        out.append(_sse({"delta": delta["text"]}))
+                        out.append(_sse({"delta": text}))
                 elif delta.get("type") == "thinking_delta" and isinstance(delta.get("thinking"), str):
                     if delta["thinking"]:
                         out.append(_sse({"delta": delta["thinking"], "thinking": True}))
@@ -547,6 +602,7 @@ class _Invocation:
         fd = os.open(system_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(system)
+        self.stop_tools = text_tool_names(system)
         self.args = cli_args(cli, model, system_file, effort)
         self.env = cli_env(mode, token)
         self.stdin = prompt.encode("utf-8")
@@ -682,7 +738,7 @@ async def stream_chat(
             sem.release()
 
     threading.Thread(target=_worker, name="claude-subscription-cli", daemon=True).start()
-    translator = StreamTranslator(model)
+    translator = StreamTranslator(model, stop_tools=inv.stop_tools)
     try:
         while True:
             try:
@@ -721,7 +777,7 @@ def run_chat_sync(url: str, model: str, messages: List[Dict], *, timeout: Option
     finally:
         sem.release()
         inv.cleanup()
-    translator = StreamTranslator(model)
+    translator = StreamTranslator(model, stop_tools=inv.stop_tools)
     text: List[str] = []
     chunks: List[str] = []
     for line in (out or b"").decode("utf-8", errors="replace").splitlines():

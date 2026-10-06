@@ -100,8 +100,13 @@ class Member:
         if not usage or self.billing != "metered" or self.input_per_mtok is None:
             return None
         out_price = self.output_per_mtok if self.output_per_mtok is not None else self.input_per_mtok
-        return round((usage.get("input_tokens", 0) * self.input_per_mtok
-                      + usage.get("output_tokens", 0) * out_price) / 1_000_000, 6)
+        # Cached prompt tokens are part of input_tokens but bill differently:
+        # reads at ~0.1x input, 5-minute cache writes at 1.25x.
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        cache_write = int(usage.get("cache_creation_input_tokens") or 0)
+        fresh = max(int(usage.get("input_tokens") or 0) - cache_read - cache_write, 0)
+        input_cost = (fresh + 0.1 * cache_read + 1.25 * cache_write) * self.input_per_mtok
+        return round((input_cost + usage.get("output_tokens", 0) * out_price) / 1_000_000, 6)
 
 
 class CouncilError(RuntimeError):
@@ -344,6 +349,10 @@ async def run_member(
                     try:
                         usage = {"input_tokens": int(data.get("input_tokens") or 0),
                                  "output_tokens": int(data.get("output_tokens") or 0)}
+                        # Anthropic prompt-cache parts (already inside input_tokens).
+                        for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
+                            if int(data.get(key) or 0) > 0:
+                                usage[key] = int(data[key])
                     except (TypeError, ValueError):
                         usage = None
                     continue

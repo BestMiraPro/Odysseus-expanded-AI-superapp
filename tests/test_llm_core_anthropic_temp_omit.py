@@ -6,7 +6,8 @@ This broke every native-Anthropic call to Opus 4.7/4.8, including the research
 endpoint probe (temperature=0) and all DeepResearcher LLM calls, because
 _build_anthropic_payload sent `temperature` unconditionally.
 
-Earlier Claude models (Opus 4.6 and below, every Sonnet/Haiku) still accept
+Every later model (Opus 5/5.5, Sonnet 5/5.5, Fable/Mythos 5.x) rejects them
+too. Earlier Claude models (Opus/Sonnet 4.6 and below, Haiku 4.5) still accept
 temperature in [0.0, 1.0], so the omission is version-gated — the clamp-to-[0,1]
 behavior for those models (test_llm_core_anthropic_temp_clamp.py) is unchanged.
 """
@@ -36,6 +37,17 @@ from src.llm_core import _anthropic_rejects_temperature, _build_anthropic_payloa
         "claude-opus-5-20260101",  # major-only + dated snapshot
         "anthropic/claude-opus-5",  # major-only behind a provider prefix
         "claude-opus-6",  # future major-only
+        # Every 5.x+ family rejects sampling params too (claude-api model docs:
+        # Opus 5.5, Sonnet 5 / 5.5, Fable 5 / 5.1, Mythos 5 / 5.1).
+        "claude-opus-5-5",
+        "claude-sonnet-5",
+        "claude-sonnet-5-5",
+        "anthropic/claude-sonnet-5.5",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-mythos-5-1",
+        "anthropic.claude-sonnet-5-5",  # Bedrock-style prefix
+        "claude-newfamily-6",  # unknown future family at major >= 5
     ],
 )
 def test_opus_47_plus_rejects_temperature(model):
@@ -54,7 +66,13 @@ def test_opus_47_plus_rejects_temperature(model):
         "claude-opus-4-1-20250805",  # Opus 4.1 dated id — explicit minor before the date
         "claude-opus-4-6-20251201",  # dated 4.6 snapshot — older, still keeps temperature
         "claude-sonnet-4-6",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-20250514",  # Sonnet 4.0 dated id
+        "claude-haiku-4-5-20251001",
         "claude-3-5-sonnet",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-haiku-20241022",
         "claude-3-opus-20240229",  # legacy Claude 3 Opus — date directly after
         # "opus-", so the major must not swallow it as version 20240229 (that is
         # what makes capping the major at 1-2 digits necessary once the minor
@@ -95,6 +113,17 @@ def test_payload_keeps_temperature_for_older_models():
     assert payload["temperature"] == 0.3
     # Older models retain the [0,1] clamp (Nietzsche preset at 1.2 -> 1.0).
     assert _payload("claude-3-5-sonnet", 1.2)["temperature"] == 1.0
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-5-5", "claude-fable-5-1", "claude-opus-5-5"])
+def test_payload_omits_temperature_for_current_5x_models(model):
+    # Sonnet 5.5 / Fable 5.1 / Opus 5.5 reject sampling params with HTTP 400;
+    # before the family-agnostic rule only Opus was gated.
+    assert "temperature" not in _payload(model, 0.3)
+
+
+def test_payload_keeps_temperature_for_haiku_4_5():
+    assert _payload("claude-haiku-4-5", 0.4)["temperature"] == 0.4
 
 
 def test_payload_omits_temperature_for_major_only_opus_5():

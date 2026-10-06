@@ -7,6 +7,7 @@ Provides token estimation for context usage tracking.
 
 import ipaddress
 import logging
+import re
 import sys
 from typing import Dict, List, Optional, Tuple
 
@@ -111,10 +112,22 @@ REQUEST_TIMEOUT = 5
 # Substring matching — use the shortest unique prefix so variants get caught.
 KNOWN_CONTEXT_WINDOWS = {
     # --- Anthropic ---
+    # Claude 4.6 and later (and every 5.x family) run a 1M window; 4.5 and
+    # earlier are 200K. Each 4.x minor is listed so the bare 'claude-opus-4' /
+    # 'claude-sonnet-4' keys (Opus 4 / 4.1, Sonnet 4) never catch a 1M model.
+    'claude-fable-5': 1000000,
+    'claude-mythos-5': 1000000,
+    'claude-opus-5': 1000000,
+    'claude-sonnet-5': 1000000,
+    'claude-opus-4-8': 1000000,
+    'claude-opus-4-7': 1000000,
+    'claude-opus-4-6': 1000000,
+    'claude-opus-4-5': 200000,
+    'claude-sonnet-4-6': 1000000,
     'claude-sonnet-4-5': 200000,
-    'claude-sonnet-4-6': 200000,
     'claude-sonnet-4': 200000,
     'claude-opus-4': 200000,
+    'claude-haiku-4-5': 200000,
     'claude-haiku-4': 200000,
     'claude-haiku-3-5': 200000,
     'claude-3-5-sonnet': 200000,
@@ -310,10 +323,28 @@ def _lookup_known(model: str) -> Optional[int]:
     best_key: Optional[str] = None
     best_ctx: Optional[int] = None
     for key, ctx in KNOWN_CONTEXT_WINDOWS.items():
-        if key in basename or key in name:
+        if _known_key_matches(key, basename) or _known_key_matches(key, name):
             if best_key is None or len(key) > len(best_key):
                 best_key, best_ctx = key, ctx
     return best_ctx
+
+
+# Keys naming one legacy model whose dotted successors are different models
+# with different windows: 'gpt-4' (8K) must not catch gpt-4.5 / a future
+# gpt-4.x without its own entry. Dash suffixes (gpt-4-0613, gpt-4-turbo) still
+# match, and gpt-4o / gpt-4.1 win via their own longer keys.
+_NO_DOTTED_SUFFIX_KEYS = frozenset({"gpt-4"})
+
+
+def _known_key_matches(key: str, text: str) -> bool:
+    if key not in _NO_DOTTED_SUFFIX_KEYS:
+        return key in text
+    start = text.find(key)
+    while start != -1:
+        if not re.match(r"\.\d", text[start + len(key):]):
+            return True
+        start = text.find(key, start + 1)
+    return False
 
 
 def _model_ctx_from_entry(m: dict) -> Optional[int]:

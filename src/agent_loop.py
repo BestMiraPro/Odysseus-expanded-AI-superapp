@@ -916,6 +916,17 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
     if has(r"\bapi[ _]call\b", r"\bintegrations?\b",
            r"\b(?:home ?assistant|miniflux|gitea|linkding|jellyfin)\b"):
         domains.add("integrations")
+    # Model-delegation intent — consulting or delegating to another configured
+    # model ("ask the local model", "get a second opinion from gpt", "call
+    # list_models"). Without this such requests matched no domain, took the
+    # direct low-signal reply path, and the delegation tools were never offered.
+    if has(r"\b(?:list_models|chat_with_model|ask_teacher)\b",
+           r"\b(?:second opinion|other models?|another model|different model|"
+           r"cheap(?:er|est) model|best model for|sub-?agents?|delegat\w*)\b",
+           r"\b(?:ask|consult|query)\b.{0,40}\bmodels?\b",
+           r"\b(?:ask|consult)\s+(?:the\s+)?(?:gpt|claude|gemini|grok|deepseek|o[1-9])\b",
+           r"\b(?:which|what)\s+models?\b.{0,40}\b(?:available|configured|connected|use|call)\b"):
+        domains.add("models")
 
     low_signal = not continuation and not domains
     return {
@@ -2613,8 +2624,15 @@ def _usage_bucket(
     input_tokens: int,
     output_tokens: int,
     usage_source: str,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
 ) -> dict:
-    """Build non-secret usage attribution for one concrete Agent round."""
+    """Build non-secret usage attribution for one concrete Agent round.
+
+    ``input_tokens`` is the full prompt size; the optional prompt-cache counts
+    (a subset of it, reported by Anthropic) are kept so the UI can price cache
+    reads/writes at their own rates.
+    """
 
     bucket = {
         "round": round_num,
@@ -2625,6 +2643,17 @@ def _usage_bucket(
         "output_tokens": max(int(output_tokens or 0), 0),
         "usage_source": "real" if usage_source == "real" else "estimated",
     }
+    if bucket["usage_source"] == "real":
+        for key, value in (
+            ("cache_read_input_tokens", cache_read_input_tokens),
+            ("cache_creation_input_tokens", cache_creation_input_tokens),
+        ):
+            try:
+                count = int(value or 0)
+            except (TypeError, ValueError):
+                count = 0
+            if count > 0:
+                bucket[key] = count
     # Persist the owner-resolved route classification so saved usage remains
     # stable even if the session later selects a different endpoint.
     if isinstance(endpoint_cost_tracked, bool):
@@ -4282,6 +4311,8 @@ async def stream_agent_loop(
         _round_actual_endpoint_label = actual_endpoint_label
         _round_real_input_tokens = 0
         _round_real_output_tokens = 0
+        _round_real_cache_read = 0
+        _round_real_cache_write = 0
         _round_has_real_usage = False
         _round_usage_finalized = False
         candidate_index = 0
@@ -4319,6 +4350,8 @@ async def stream_agent_loop(
                 input_tokens=round_input_tokens,
                 output_tokens=round_output_tokens,
                 usage_source=usage_source,
+                cache_read_input_tokens=_round_real_cache_read,
+                cache_creation_input_tokens=_round_real_cache_write,
             ))
         logger.info(
             "[agent-timing] round_start round=%s model=%s endpoint=%s prompt_tokens=%s tools=%s native_tools=%s timeout=%s",
@@ -4472,6 +4505,13 @@ async def stream_agent_loop(
                         real_output_tokens += round_output
                         _round_real_input_tokens += round_input
                         _round_real_output_tokens += round_output
+                        _round_cache = _normalize_usage_counts(
+                            u.get("cache_read_input_tokens") or 0,
+                            u.get("cache_creation_input_tokens") or 0,
+                        )
+                        if _round_cache:
+                            _round_real_cache_read += _round_cache["input_tokens"]
+                            _round_real_cache_write += _round_cache["output_tokens"]
                         last_round_input_tokens = round_input
                         has_real_usage = True
                         _round_has_real_usage = True

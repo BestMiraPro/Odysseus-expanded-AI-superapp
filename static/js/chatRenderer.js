@@ -496,12 +496,29 @@ const TOOL_NARRATION_RE = /(?:The (?:result|output) shows?:?\s*)?-?\s*(?:stdout|
 // Model info: pricing (per 1M tokens) + context window length
 const MODEL_INFO = {
   // --- Anthropic ---
-  'claude-sonnet-4-5':    { input: 3.00,  output: 15.00, ctx: 200000 },
-  'claude-sonnet-4-6':    { input: 3.00,  output: 15.00, ctx: 200000 },
-  'claude-sonnet-4':      { input: 3.00,  output: 15.00, ctx: 200000 },
+  // Prices from platform.claude.com/docs/en/about-claude/pricing. Every version
+  // gets its own key: matchModelKey picks the longest matching key, so a bare
+  // family key (e.g. 'claude-opus-4') must never be the only match for a newer
+  // release priced differently. `cacheRead` is set only where cache hits are
+  // not the standard 0.1x input rate.
+  'claude-fable-5-1':     { input: 10.00, output: 50.00, cacheRead: 0.25, ctx: 1000000 },
+  'claude-fable-5':       { input: 10.00, output: 50.00, ctx: 1000000 },
+  'claude-mythos-5-1':    { input: 10.00, output: 50.00, cacheRead: 0.25, ctx: 1000000 },
+  'claude-mythos-5':      { input: 10.00, output: 50.00, ctx: 1000000 },
+  'claude-opus-5-5':      { input: 4.00,  output: 20.00, cacheRead: 0.20, ctx: 1000000 },
+  'claude-opus-5':        { input: 5.00,  output: 25.00, ctx: 1000000 },
+  'claude-opus-4-8':      { input: 5.00,  output: 25.00, ctx: 1000000 },
+  'claude-opus-4-7':      { input: 5.00,  output: 25.00, ctx: 1000000 },
+  'claude-opus-4-6':      { input: 5.00,  output: 25.00, ctx: 1000000 },
+  'claude-opus-4-5':      { input: 5.00,  output: 25.00, ctx: 200000 },
+  'claude-opus-4-1':      { input: 15.00, output: 75.00, ctx: 200000 },
   'claude-opus-4':        { input: 15.00, output: 75.00, ctx: 200000 },
-  'claude-opus-4-6':      { input: 15.00, output: 75.00, ctx: 200000 },
-  'claude-haiku-4':       { input: 0.80,  output: 4.00,  ctx: 200000 },
+  'claude-sonnet-5-5':    { input: 2.00,  output: 10.00, ctx: 1000000 },
+  'claude-sonnet-5':      { input: 2.00,  output: 10.00, ctx: 1000000 },
+  'claude-sonnet-4-6':    { input: 3.00,  output: 15.00, ctx: 1000000 },
+  'claude-sonnet-4-5':    { input: 3.00,  output: 15.00, ctx: 200000 },
+  'claude-sonnet-4':      { input: 3.00,  output: 15.00, ctx: 200000 },
+  'claude-haiku-4-5':     { input: 1.00,  output: 5.00,  ctx: 200000 },
   'claude-haiku-3-5':     { input: 0.80,  output: 4.00,  ctx: 200000 },
   'claude-3-5-sonnet':    { input: 3.00,  output: 15.00, ctx: 200000 },
   'claude-3-5-haiku':     { input: 0.80,  output: 4.00,  ctx: 200000 },
@@ -809,12 +826,27 @@ export function applyModelColor(roleEl, modelName) {
   }
 }
 
-export function getModelCost(modelName, inputTokens, outputTokens) {
+/**
+ * Estimate request cost. `inputTokens` is the full prompt; the optional
+ * `cache` ({read, write}) says how much of it was a prompt-cache hit / write
+ * (Anthropic usage), priced at the cache-read rate and 1.25x input (5-minute
+ * write) instead of the base input rate.
+ */
+export function getModelCost(modelName, inputTokens, outputTokens, cache) {
   if (!modelName) return null;
   const key = matchModelKey(modelName, Object.keys(MODEL_PRICING));
   if (!key) return null;
   const price = MODEL_PRICING[key];
-  return (inputTokens * price.input + outputTokens * price.output) / 1_000_000;
+  const cacheRead = Math.max(Number(cache && cache.read) || 0, 0);
+  const cacheWrite = Math.max(Number(cache && cache.write) || 0, 0);
+  const uncached = Math.max(inputTokens - cacheRead - cacheWrite, 0);
+  const readRate = price.cacheRead != null ? price.cacheRead : price.input * 0.1;
+  return (
+    uncached * price.input
+    + cacheRead * readRate
+    + cacheWrite * price.input * 1.25
+    + outputTokens * price.output
+  ) / 1_000_000;
 }
 
 /**
@@ -870,7 +902,7 @@ export function isCostTrackedEndpoint(url) {
 }
 
 /** Cost for the current turn, returning null for non-billable endpoints. */
-function _billableCost(model, inputTokens, outputTokens, endpointCostTracked, selectedEndpointUrl) {
+function _billableCost(model, inputTokens, outputTokens, endpointCostTracked, selectedEndpointUrl, cache) {
   // Foreground fallback can answer on a different endpoint than the session's
   // selected route. Prefer the backend's non-secret actual-route
   // classification; retain the selected-endpoint check for older history.
@@ -881,7 +913,7 @@ function _billableCost(model, inputTokens, outputTokens, endpointCostTracked, se
   if (endpointCostTracked !== true && !isCostTrackedEndpoint(selectedUrl)) {
     return null;
   }
-  return getModelCost(model, inputTokens, outputTokens);
+  return getModelCost(model, inputTokens, outputTokens, cache);
 }
 
 /** Sum cost using the route/model that produced each Agent round. */
@@ -894,6 +926,7 @@ function _metricsBillableCost(metrics, model, inputTokens, outputTokens, selecte
       outputTokens,
       metrics.endpoint_cost_tracked,
       selectedEndpointUrl,
+      { read: metrics.cache_read_input_tokens, write: metrics.cache_creation_input_tokens },
     );
   }
   let total = 0;
@@ -906,6 +939,7 @@ function _metricsBillableCost(metrics, model, inputTokens, outputTokens, selecte
       Number(bucket.output_tokens) || 0,
       bucket.endpoint_cost_tracked,
       selectedEndpointUrl,
+      { read: bucket.cache_read_input_tokens, write: bucket.cache_creation_input_tokens },
     );
     if (bucketCost === null) continue;
     total += bucketCost;

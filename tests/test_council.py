@@ -241,6 +241,16 @@ def test_usage_and_cost_are_tracked_per_call():
     assert done[0]["cost_usd"] == 0.006
 
 
+def test_cached_prompt_tokens_are_priced_at_cache_rates():
+    m = _member("paid")
+    m.input_per_mtok, m.output_per_mtok = 10.0, 50.0
+    usage = {"input_tokens": 10000, "output_tokens": 100,
+             "cache_read_input_tokens": 8000, "cache_creation_input_tokens": 1000}
+    # fresh 1000*10 + read 8000*1 + write 1000*12.5 + out 100*50 = 35500 -> $0.0355
+    assert m.cost_usd(usage) == 0.0355
+    assert m.cost_usd({"input_tokens": 10000, "output_tokens": 100}) == 0.105
+
+
 def test_state_holds_partial_text_while_running():
     gate = asyncio.Event()
     state = {}

@@ -50,6 +50,31 @@ def _normalize_usage_counts(input_value=0, output_value=0):
     }
 
 
+def _anthropic_usage_counts(input_value=0, output_value=0, cache_read=0, cache_write=0):
+    """Normalize Anthropic usage, folding prompt-cache tokens into the input count.
+
+    Anthropic reports ``input_tokens`` net of ``cache_read_input_tokens`` and
+    ``cache_creation_input_tokens``, so with prompt caching on the raw field
+    understates the prompt size (context %, totals, cost). ``input_tokens`` here
+    is the full prompt; the cached parts are also exposed separately (only when
+    non-zero) so a cost estimator can apply the cache read/write rates.
+    """
+    usage = _normalize_usage_counts(input_value, output_value)
+    if usage is None:
+        return None
+    cached = _normalize_usage_counts(cache_read or 0, cache_write or 0)
+    if cached is None:
+        return usage
+    read_tokens = cached["input_tokens"]
+    write_tokens = cached["output_tokens"]
+    usage["input_tokens"] += read_tokens + write_tokens
+    if read_tokens:
+        usage["cache_read_input_tokens"] = read_tokens
+    if write_tokens:
+        usage["cache_creation_input_tokens"] = write_tokens
+    return usage
+
+
 def _normalize_http_status(value) -> Optional[int]:
     """Accept only genuine three-digit integral HTTP status values."""
 
@@ -583,37 +608,74 @@ def _set_cached_response(
 
 # ── Anthropic native API adapter ──
 
+# Fallback when Anthropic's /v1/models can't be listed. Newest first: name
+# matching in ai_interaction takes the first partial hit ("opus" -> newest Opus).
 ANTHROPIC_MODELS = [
-    "claude-opus-4-20250514", "claude-opus-4",
-    "claude-sonnet-4-20250514", "claude-sonnet-4", "claude-sonnet-4-5-20250929", "claude-sonnet-4-5",
-    "claude-haiku-4-20250514", "claude-haiku-4", "claude-haiku-3-5-20241022", "claude-haiku-3-5",
+    "claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1",
+    "claude-haiku-4-5-20251001", "claude-haiku-4-5",
+    "claude-opus-4-5-20251101", "claude-opus-4-5",
+    "claude-sonnet-4-5-20250929", "claude-sonnet-4-5",
+    "claude-opus-4-1-20250805", "claude-opus-4-20250514", "claude-sonnet-4-20250514",
+    "claude-3-5-haiku-20241022",
 ]
 
 
+def _ollama_hostname_hint(host: str) -> bool:
+    """True when the host's first DNS label names Ollama as a whole token.
+
+    Covers Docker/Compose service names and LAN names (``ollama``,
+    ``ollama-rocm``, ``my-ollama.lan``) without matching look-alikes such as
+    ``notollama.com`` or ``ollama.com.evil.example`` (only the real ollama.com
+    is Ollama Cloud, handled by ``_host_match``).
+    """
+    first_label = (host or "").split(".", 1)[0]
+    if "ollama" not in re.split(r"[-_]", first_label):
+        return False
+    return not host.startswith("ollama.com.")
+
+
 def _is_ollama_native_url(url: str) -> bool:
-    """Return True for native Ollama API URLs, including Ollama Cloud."""
+    """Return True for native Ollama API URLs, including Ollama Cloud.
+
+    A bare host is only treated as Ollama when it looks like Ollama (default
+    port 11434, or a hostname naming "ollama"). Any other path-less local
+    server (LM Studio :1234, llama.cpp :8080, vLLM :8000) is OpenAI-compatible
+    and must not be routed to ``/api/chat`` / ``/api/tags``. On loopback hosts
+    an explicit ``/api`` path still selects native Ollama (custom OLLAMA_HOST
+    port); ``/api/v<N>`` is excluded because that is LM Studio's REST surface
+    and OpenRouter-style OpenAI-compatible prefixes, never native Ollama.
+    """
     try:
         parsed = urlparse(url or "")
     except Exception as e:
         logger.warning("Failed to parse URL for Ollama detection", exc_info=e)
         return False
-    host = parsed.hostname or ""
+    host = (parsed.hostname or "").lower()
     path = (parsed.path or "").rstrip("/")
     if _host_match(url, "ollama.com"):
         return True
     if path.startswith("/v1"):
         return False
-    local_ollama_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or parsed.port == 11434
-    return local_ollama_host and (path == "" or path == "/api" or path.startswith("/api/"))
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    explicit_api = (path == "/api" or path.startswith("/api/")) and not re.match(r"^/api/v\d", path)
+    if port == 11434 or _ollama_hostname_hint(host):
+        return path == "" or explicit_api
+    local_host = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+    return local_host and explicit_api
 
 
 def _is_ollama_openai_compat_url(url: str) -> bool:
     """Return True for local Ollama's OpenAI-compatible /v1 surface.
 
-    Mirrors the host detection used by ``_is_ollama_native_url`` so that the
-    two helpers stay in lockstep: a localhost Ollama on a non-default port
-    (custom ``OLLAMA_HOST``, reverse proxy, container port remap) is treated
-    the same way here as it is on the native ``/api`` path.
+    Deliberately broader than ``_is_ollama_native_url``: any loopback host on
+    ``/v1`` matches, so a localhost Ollama on a non-default port (custom
+    ``OLLAMA_HOST``, reverse proxy, container port remap) still gets the
+    ``think: false`` suppression. The ``/v1`` path already keeps routing on
+    the OpenAI-compatible surface, so a non-Ollama local server only receives
+    an extra field it ignores.
     """
     try:
         parsed = urlparse(url or "")
@@ -995,6 +1057,27 @@ async def httpx_post_kimi_aware_async(client, url: str, headers: Optional[Dict],
     return last
 
 
+def _opencode_zen_variant(url: str) -> Optional[str]:
+    """Return "opencode-go" / "opencode-zen" for OpenCode's gateways, else None.
+
+    Both live on host opencode.ai and differ only by path (``/zen/go/v1`` vs
+    ``/zen/v1``), so match the host with ``_host_match`` and the path prefix
+    separately — ``_host_match`` compares hostnames and can never match a
+    domain string that carries a path.
+    """
+    if not _host_match(url, "opencode.ai"):
+        return None
+    try:
+        path = (urlparse(url).path or "").rstrip("/").lower()
+    except Exception:
+        return None
+    if path == "/zen/go" or path.startswith("/zen/go/"):
+        return "opencode-go"
+    if path == "/zen" or path.startswith("/zen/"):
+        return "opencode-zen"
+    return None
+
+
 def _detect_provider(url: str) -> str:
     """Detect the API provider from a configured endpoint URL.
 
@@ -1008,10 +1091,9 @@ def _detect_provider(url: str) -> str:
         return "ollama"
     if _host_match(url, "anthropic.com"):
         return "anthropic"
-    if _host_match(url, "opencode.ai/zen/go"):
-        return "opencode-go"
-    if _host_match(url, "opencode.ai/zen"):
-        return "opencode-zen"
+    _opencode = _opencode_zen_variant(url)
+    if _opencode:
+        return _opencode
     if _host_match(url, "openrouter.ai"):
         return "openrouter"
     if _host_match(url, "groq.com"):
@@ -1156,8 +1238,9 @@ def _provider_label(url: str) -> str:
     if _host_match(url, "x.ai"): return "xAI"
     if _host_match(url, "openai.com"): return "OpenAI"
     if _host_match(url, "openrouter.ai"): return "OpenRouter"
-    if _host_match(url, "opencode.ai/zen/go"): return "OpenCode Go"
-    if _host_match(url, "opencode.ai/zen"): return "OpenCode Zen"
+    _opencode = _opencode_zen_variant(url)
+    if _opencode == "opencode-go": return "OpenCode Go"
+    if _opencode == "opencode-zen": return "OpenCode Zen"
     if _host_match(url, "groq.com"): return "Groq"
     from src.chatgpt_subscription import is_chatgpt_subscription_base
     if is_chatgpt_subscription_base(url): return "ChatGPT Subscription"
@@ -1414,15 +1497,34 @@ def _omit_temperature(provider: str, model: str) -> bool:
 
 
 # Anthropic removed the sampling parameters (temperature, top_p, top_k) starting
-# with Claude Opus 4.7. On Opus 4.7 and later, sending `temperature` at all —
-# even 0.0 — returns HTTP 400. Earlier Claude models (Opus 4.6 and below, every
-# Sonnet/Haiku) still accept temperature in [0.0, 1.0], so the omission must be
-# version-gated rather than applied to all `claude-*` models.
+# with Claude Opus 4.7. Every Claude model released since then rejects them:
+# Opus 4.7 / 4.8 / 5 / 5.5, Sonnet 5 / 5.5 (non-default values), and the Fable /
+# Mythos 5.x tier all return HTTP 400 when `temperature` is sent — even 0.0 on
+# the Opus line. Older models (Opus 4.6 and below, Sonnet 4.6 and below, Haiku
+# 4.5 and below) still accept temperature in [0.0, 1.0], so the omission must be
+# version-gated rather than applied to all `claude-*` models. The rule is "any
+# family at major version >= 5, plus Opus >= 4.7", so new 5.x+ releases (of any
+# family name) are covered without another edit here.
+_CLAUDE_FAMILY_VERSION_RE = re.compile(
+    r"(?<![a-z])(opus|sonnet|haiku|fable|mythos)[-_]?(\d{1,2})(?!\d)(?:[-_.](\d{1,2})(?!\d))?"
+)
+# Unknown future family names in the modern `claude-<family>-<major>[-<minor>]`
+# id shape. Legacy `claude-3-5-sonnet` ids have a digit after `claude-` and
+# never match.
+_CLAUDE_GENERIC_FAMILY_VERSION_RE = re.compile(
+    r"(?<![a-z])claude[-_]([a-z]+)[-_](\d{1,2})(?!\d)(?:[-_.](\d{1,2})(?!\d))?"
+)
+
+
 def _anthropic_rejects_temperature(model: str) -> bool:
-    """Check if a native-Anthropic model rejects the temperature field (Opus 4.7+)."""
+    """Check if a native-Anthropic model rejects the temperature field.
+
+    True for Opus 4.7+ and for every Claude family at major version 5 or later
+    (Sonnet 5/5.5, Opus 5/5.5, Fable/Mythos 5.x, ...).
+    """
     if not isinstance(model, str) or not model:
         return False
-    # `(?<![a-z])` anchors "opus" to a word boundary so a substring match like
+    # `(?<![a-z])` anchors the family to a word boundary so a substring match like
     # `oct-opus`/`octopus-4-8` can't be read as Opus (it would otherwise strip
     # temperature). Both version components are capped at 1-2 digits and forbid a
     # trailing digit, so an 8-digit date can never be read as a version number:
@@ -1437,14 +1539,16 @@ def _anthropic_rejects_temperature(model: str) -> bool:
     # this, every Opus 5 call kept `temperature` and failed with HTTP 400 — visible
     # only on paths that pass a temperature, e.g. scheduled tasks inheriting
     # `stream_agent_loop`'s 0.3 default, which returned empty responses.
-    match = re.search(
-        r"(?<![a-z])opus[-_]?(\d{1,2})(?!\d)(?:[-_.](\d{1,2})(?!\d))?", model.lower()
-    )
+    lowered = model.lower()
+    match = _CLAUDE_FAMILY_VERSION_RE.search(lowered) or _CLAUDE_GENERIC_FAMILY_VERSION_RE.search(lowered)
     if not match:
         return False
-    major = int(match.group(1))
-    minor = int(match.group(2)) if match.group(2) else 0
-    return (major, minor) >= (4, 7)
+    family = match.group(1)
+    major = int(match.group(2))
+    minor = int(match.group(3)) if match.group(3) else 0
+    if major >= 5:
+        return True
+    return family == "opus" and (major, minor) >= (4, 7)
 
 # Reasoning effort level sent to Mistral thinking-capable models. Mistral's
 # API accepts "high", "medium", "low", "none" — see
@@ -1592,8 +1696,9 @@ def _build_anthropic_payload(model, messages, temperature, max_tokens, stream=Fa
         "messages": chat_messages,
         "max_tokens": max_tokens if max_tokens and max_tokens > 0 else 4096,
     }
-    # Opus 4.7+ removed the sampling parameters — sending `temperature` (even 0.0)
-    # returns HTTP 400. Omit it for those models; older Claude models still take it.
+    # Opus 4.7+ and every 5.x+ Claude model removed the sampling parameters —
+    # sending `temperature` returns HTTP 400. Omit it for those models; older
+    # Claude models (Opus/Sonnet 4.6 and below, Haiku 4.5) still take it.
     if not _anthropic_rejects_temperature(model):
         payload["temperature"] = temperature
     if system_parts:
@@ -2393,7 +2498,9 @@ async def llm_call_async(
                     if isinstance(reported_model, str) and reported_model.strip():
                         actual_model = reported_model.strip()
                 delta = data.get("delta")
-                if isinstance(delta, str):
+                # Reasoning deltas are display-only; a plain-string caller
+                # (titles, memory, Study) must get the answer alone.
+                if isinstance(delta, str) and not data.get("thinking"):
                     parts.append(delta)
         response = "".join(parts)
         _set_cached_response(cache_key, response, actual_model=actual_model)
@@ -2977,6 +3084,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     if provider == "anthropic":
         _anth_input_tokens = 0
         _anth_output_tokens = 0
+        _anth_cache_read_tokens = 0
+        _anth_cache_write_tokens = 0
         _anth_usage_seen = False
         _anth_actual_model = ""
         _anth_model_announced = False
@@ -3058,8 +3167,12 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             _anth_input_tokens = _u.get("input_tokens", 0)
                             # Surface prompt-cache effectiveness: cache_read > 0 means the
                             # stable system+tools prefix was served from cache this round.
-                            _c_read = _u.get("cache_read_input_tokens", 0)
-                            _c_write = _u.get("cache_creation_input_tokens", 0)
+                            # Anthropic's `input_tokens` excludes cached tokens, so keep
+                            # them for the usage event (context %, cost, totals).
+                            _c_read = _u.get("cache_read_input_tokens") or 0
+                            _c_write = _u.get("cache_creation_input_tokens") or 0
+                            _anth_cache_read_tokens = _c_read
+                            _anth_cache_write_tokens = _c_write
                             if _c_read or _c_write:
                                 logger.info(
                                     "[anthropic-cache] read=%s write=%s fresh_input=%s",
@@ -3072,6 +3185,14 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             if "output_tokens" in _u:
                                 _anth_usage_seen = True
                             _anth_output_tokens = _u.get("output_tokens", 0)
+                            # message_delta usage is cumulative; when it repeats the
+                            # input-side counts, prefer them over message_start's.
+                            if _u.get("input_tokens") is not None:
+                                _anth_input_tokens = _u.get("input_tokens")
+                            if _u.get("cache_read_input_tokens") is not None:
+                                _anth_cache_read_tokens = _u.get("cache_read_input_tokens")
+                            if _u.get("cache_creation_input_tokens") is not None:
+                                _anth_cache_write_tokens = _u.get("cache_creation_input_tokens")
                         elif evt == "message_stop":
                             # Emit accumulated tool calls in OpenAI-compatible format
                             if _anth_tool_blocks:
@@ -3084,9 +3205,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                                         "arguments": tb["arguments"],
                                     })
                                 yield f'data: {json.dumps({"type": "tool_calls", "calls": calls})}\n\n'
-                            normalized_usage = _normalize_usage_counts(
+                            normalized_usage = _anthropic_usage_counts(
                                 _anth_input_tokens,
                                 _anth_output_tokens,
+                                _anth_cache_read_tokens,
+                                _anth_cache_write_tokens,
                             )
                             if normalized_usage and _anth_usage_seen:
                                 _annotate_usage_model(

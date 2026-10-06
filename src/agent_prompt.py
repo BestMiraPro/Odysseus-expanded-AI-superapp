@@ -133,6 +133,12 @@ _DOMAIN_RULES = {
 ## Integration/API rules
 - To query or control a configured service integration (Home Assistant, Miniflux, Gitea, Linkding, Jellyfin, or any other registered service), use `api_call` with the integration name, HTTP method, path, and optional JSON body.
 - Do not use shell, curl, or `app_api` to reach a user's connected integration when `api_call` is available.""",
+    "models": """\
+## Model delegation rules
+- Any configured model can be consulted as a sub-agent. When the user names the model, call `chat_with_model` directly; otherwise call `list_models` first: it shows each model's tier, cost and which picks are RECOMMENDED.
+- Pick by task: fast/cheap models for extraction or bulk work, flagship models for hard reasoning, local models for private data.
+- Delegate with `chat_with_model` (exact model name, a self-contained message, optional `instructions`). Use `ask_teacher` for a strong second opinion.
+- Never invent a delegated answer: wait for the tool result and report what the model actually said.""",
 }
 
 
@@ -148,6 +154,7 @@ _DOMAIN_TOOL_MAP = {
     "settings": {"manage_settings", "manage_endpoints", "manage_mcp", "manage_webhooks", "manage_tokens", "app_api"},
     "contacts": {"resolve_contact", "manage_contact"},
     "integrations": {"api_call"},
+    "models": {"list_models", "chat_with_model", "ask_teacher"},
 }
 
 

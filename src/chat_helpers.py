@@ -43,6 +43,8 @@ def extract_urls(text: str) -> List[str]:
 _VISION_MODEL_KEYWORDS = (
     # hosted
     "gpt-4o", "gpt-4.1", "gpt-4.5", "gpt-4-turbo", "gpt-4-vision",
+    # GPT-5 / 5.x (all variants accept images) and xAI Grok 4.x.
+    "gpt-5", "grok-4",
     "claude-sonnet", "claude-opus", "claude-haiku", "gemini",
     # open / local
     "vision", "multimodal", "llava", "bakllava", "moondream", "pixtral", "minicpm",
@@ -65,6 +67,14 @@ _VISION_MODEL_KEYWORDS = (
 # Catches the "*-VL-*" / "*VL*" family not covered by a literal keyword above
 # (e.g. Qwen2.5-VL and various tags): a standalone "vl" token, plus "vlm".
 _VISION_VL_RE = re.compile(r'(?<![a-z])vl(?![a-z])|vlm')
+# OpenAI o3 / o4 reasoning models accept images; o3-mini is text-only. Anchored
+# so the bare token can't hit an unrelated tag (e.g. "qwen3", "yolo3").
+_VISION_OPENAI_O_SERIES_RE = re.compile(r'(?<![a-z0-9])(?:o3(?!-mini)|o4)(?![a-z0-9])')
+# Every Claude model from Claude 3 on accepts images: legacy ids put the major
+# right after "claude" (claude-3-5-sonnet, claude-3.7-sonnet), newer ids put the
+# family first (claude-opus-4-5, claude-fable-5-1). Claude 2.x / Instant are
+# text-only, so the major version gates it.
+_VISION_CLAUDE_RE = re.compile(r'(?<![a-z])claude[-_.]?(?:(\d+)|[a-z]+[-_.](\d+))(?!\d)')
 
 
 def is_vision_model(model_name: str) -> bool:
@@ -76,6 +86,11 @@ def is_vision_model(model_name: str) -> bool:
     """
     m = (model_name or "").lower()
     if any(kw in m for kw in _VISION_MODEL_KEYWORDS):
+        return True
+    if _VISION_OPENAI_O_SERIES_RE.search(m):
+        return True
+    claude = _VISION_CLAUDE_RE.search(m)
+    if claude and int(claude.group(1) or claude.group(2)) >= 3:
         return True
     return bool(_VISION_VL_RE.search(m))
 

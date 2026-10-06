@@ -474,3 +474,58 @@ def test_llm_call_async_drops_thinking_deltas(monkeypatch):
     monkeypatch.setattr(llm_core, "stream_llm", fake_stream)
     url = cs.endpoint_base_url("f" * 32)
     assert asyncio.run(llm_core.llm_call_async(url, "opus", [{"role": "user", "content": "thinking-test"}])) == "answer"
+
+
+TOOL_SYSTEM = (
+    "To use a tool, write a fenced code block with the tool name as the language tag.\n"
+    "- ```list_models``` — list models\n- ```chat_with_model``` — ask a model\n"
+)
+
+
+def test_text_tool_names_only_in_tool_mode():
+    assert cs.text_tool_names(TOOL_SYSTEM) == {"list_models", "chat_with_model"}
+    assert cs.text_tool_names("You are a helpful assistant.") is None
+
+
+def _feed_text(t, *parts):
+    chunks = []
+    for part in parts:
+        chunks += t.feed(_delta(part))
+    return chunks
+
+
+def test_stream_stops_after_a_complete_xml_tool_call():
+    t = cs.StreamTranslator("haiku", stop_tools={"list_models"})
+    chunks = _feed_text(t, "Let me check.\n<function_calls>\n<invoke name=\"list_models\">\n</inv",
+                        "oke>\n</function_calls>\n\nPerfect! The models are", " gpt and claude.")
+    text = "".join(cs.iter_text(chunks))
+    assert text.endswith("</function_calls>")
+    assert "Perfect" not in text                      # no invented tool result
+    assert t.done and t.stopped_at_tool_call
+    assert chunks[-1].strip() == "data: [DONE]"
+    assert t.feed(_delta("more")) == []
+
+
+def test_stream_stops_after_an_empty_body_tool_fence():
+    t = cs.StreamTranslator("haiku", stop_tools={"list_models"})
+    chunks = _feed_text(t, "```list_models\n``", "`\n\nI'll get the list first, then", " ask the model.")
+    text = "".join(cs.iter_text(chunks))
+    assert text == "```list_models\n```"
+    assert t.done and t.stopped_at_tool_call
+
+
+def test_stream_stops_after_a_fenced_tool_block_but_not_ordinary_code():
+    t = cs.StreamTranslator("haiku", stop_tools={"chat_with_model"})
+    chunks = _feed_text(t, "Example:\n```python\nprint(1)\n```\nNow asking:\n```chat_with_model\nep::m\nhi\n",
+                        "```\nThe model said 42.")
+    text = "".join(cs.iter_text(chunks))
+    assert "```python\nprint(1)\n```" in text         # a plain code block does not stop the stream
+    assert text.endswith("```chat_with_model\nep::m\nhi\n```")
+    assert "42" not in text
+
+
+def test_plain_chat_is_never_cut():
+    t = cs.StreamTranslator("haiku")                  # no tool instructions in the prompt
+    chunks = _feed_text(t, "Here is XML: <function_calls></function_calls> and more text.")
+    assert "".join(cs.iter_text(chunks)).endswith("and more text.")
+    assert not t.done

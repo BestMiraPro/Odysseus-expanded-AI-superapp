@@ -22,22 +22,12 @@ import pytest
 from src import endpoint_resolver, llm_core
 
 
-def _neutralize_provider_detection(monkeypatch):
-    """``_is_ollama_native_url`` matches any localhost host with an empty
-    path, which would route ``http://localhost:1234`` (LM Studio) into the
-    Ollama branch and probe ``/api/tags`` instead of ``/v1/models``. Force
-    provider detection to "openai" so the URL builder takes the LM Studio
-    path the user actually intends."""
-    monkeypatch.setattr(llm_core, "_is_ollama_native_url", lambda url: False)
-
-
 # ── build_models_url: handle LM Studio base shapes ────────────────────
 
 
 def test_build_models_url_inserts_v1_for_bare_host_port(monkeypatch):
     """`http://localhost:1234` must probe `/v1/models` for LM Studio."""
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
-    _neutralize_provider_detection(monkeypatch)
 
     assert (
         endpoint_resolver.build_models_url("http://localhost:1234")
@@ -45,10 +35,26 @@ def test_build_models_url_inserts_v1_for_bare_host_port(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("base_url", [
+    "http://localhost:1234",   # LM Studio
+    "http://127.0.0.1:8080",   # llama.cpp llama-server
+    "http://localhost:8000",   # vLLM
+    "http://[::1]:1234",
+])
+def test_bare_local_openai_servers_are_not_ollama(monkeypatch, base_url):
+    """Path-less local servers on non-Ollama ports are OpenAI-compatible:
+    no ``/api/tags`` probe, no ``/api/chat`` routing."""
+    monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
+
+    assert llm_core._is_ollama_native_url(base_url) is False
+    assert llm_core._detect_provider(base_url) == "openai"
+    assert endpoint_resolver.build_models_url(base_url) == base_url + "/v1/models"
+    assert not endpoint_resolver.build_chat_url(base_url).endswith("/api/chat")
+
+
 def test_build_models_url_accepts_v1_base(monkeypatch):
     """`http://localhost:1234/v1` must probe `/v1/models` (no double v1)."""
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
-    _neutralize_provider_detection(monkeypatch)
 
     assert (
         endpoint_resolver.build_models_url("http://localhost:1234/v1")
@@ -59,7 +65,6 @@ def test_build_models_url_accepts_v1_base(monkeypatch):
 def test_build_models_url_idempotent_for_explicit_models(monkeypatch):
     """`/v1/models` must probe `/v1/models` (normalize_base strips it)."""
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
-    _neutralize_provider_detection(monkeypatch)
 
     assert (
         endpoint_resolver.build_models_url("http://localhost:1234/v1/models")
@@ -70,7 +75,6 @@ def test_build_models_url_idempotent_for_explicit_models(monkeypatch):
 def test_build_models_url_strips_chat_completions(monkeypatch):
     """`/v1/chat/completions` must collapse to `/v1/models` (parity with #3330)."""
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
-    _neutralize_provider_detection(monkeypatch)
 
     assert (
         endpoint_resolver.build_models_url("http://localhost:1234/v1/chat/completions")
@@ -83,7 +87,6 @@ def test_build_models_url_preserves_explicit_non_v1_path(monkeypatch):
     with `/v1`. We only insert `/v1` when the path is empty — that matches
     the documented contract: a custom path is the caller's intent."""
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
-    _neutralize_provider_detection(monkeypatch)
 
     assert (
         endpoint_resolver.build_models_url("http://proxy.example.com/openai")
@@ -98,7 +101,6 @@ def test_build_models_url_preserves_explicit_non_v1_path(monkeypatch):
 ])
 def test_build_models_url_rejects_query_or_fragment_base(monkeypatch, base_url):
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
-    _neutralize_provider_detection(monkeypatch)
 
     with pytest.raises(ValueError, match="query or fragment"):
         endpoint_resolver.build_models_url(base_url)
@@ -141,9 +143,6 @@ def test_llm_core_list_model_ids_queries_v1_models_for_bare_lmstudio(monkeypatch
     """Issue #25: probing `http://localhost:1234` (no /v1) must hit `/v1/models`."""
     monkeypatch.setattr(endpoint_resolver, "resolve_url", lambda url: url)
     monkeypatch.setattr(llm_core, "_configured_cached_model_ids", lambda url, **kwargs: [])
-    # Localhost with empty path would otherwise be misclassified as Ollama
-    # (llm_core._is_ollama_native_url); neutralise that for the test.
-    monkeypatch.setattr(llm_core, "_is_ollama_native_url", lambda url: False)
     seen = []
 
     def fake_get(url, headers=None, timeout=None):

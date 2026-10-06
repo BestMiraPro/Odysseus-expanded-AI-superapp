@@ -212,7 +212,12 @@ fetch it). An unmatched model says "price unknown" rather than guessing.
 In agent mode any chat model can use any other model as a sub-agent: `list_models` shows the
 roster with recommendations and prices, and `chat_with_model` delegates a subtask (optionally
 with its own instructions) to the model the agent picks. `ask_teacher auto` uses a
-recommended flagship when no teacher model is set.
+recommended flagship when no teacher model is set. Asking for this in plain words ("ask the
+local model", "get a second opinion from GPT", "which models can you use?") is enough.
+
+Sending your chat to another model is network egress, so once untrusted text is in the turn
+(MCP tool descriptions, a provider's model list, a web page) Odysseus asks before delegating.
+Choose **Allow for this chat session** once and later delegations in that chat run without asking.
 
 ## Moving to another machine
 

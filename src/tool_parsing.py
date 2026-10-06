@@ -1281,6 +1281,10 @@ def _iter_xml_direct(text):
     return _iter_backref_blocks(text, _XML_DIRECT_OPEN_RE, _XML_DIRECT_CLOSE_ANY_RE, ci=True)
 
 
+# No-argument listing tools: an empty fenced block is a complete call.
+_EMPTY_BODY_LIST_TOOLS = frozenset({"list_models", "list_sessions"})
+
+
 def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
     """Extract executable tool blocks from LLM response text.
 
@@ -1324,9 +1328,11 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
                 # local models really emit for no-arg tools. Dispatch with
                 # empty args and let the tool's own validation answer;
                 # silently dropping the call left models concluding email was
-                # broken. Other tags (bash, python, ...) keep skipping: empty
-                # content is nothing to run.
-                if tag in BUILTIN_EMAIL_TOOLS:
+                # broken. The same holds for listing tools whose body is only an
+                # optional filter (```list_models``` / ```list_sessions```).
+                # Other tags (bash, python, ...) keep skipping: empty content is
+                # nothing to run.
+                if tag in BUILTIN_EMAIL_TOOLS or tag in _EMPTY_BODY_LIST_TOOLS:
                     blocks.append(ToolBlock(tag, ""))
                 continue
             # If a code block's content is an <invoke> XML call (some models wrap

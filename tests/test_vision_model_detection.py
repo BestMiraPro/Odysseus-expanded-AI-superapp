@@ -46,3 +46,28 @@ def test_new_keywords_do_not_overmatch_text_models():
     # The added families must not flag their text-only siblings.
     for name in ["gemma2:9b", "gemma:7b", "llama3.3", "mistral-small", "phi-3-mini"]:
         assert not is_vision_model(name), f"{name!r} should not be flagged as vision"
+
+
+def test_recognizes_current_hosted_vision_models():
+    # GPT-5.x, o3/o4, Grok 4, and every Claude 3+ id shape (legacy
+    # "claude-3-5-sonnet-*" puts the version before the family, newer ids like
+    # "claude-fable-5-1" use a family the keyword list never had).
+    for name in [
+        "gpt-5", "gpt-5.1", "gpt-5-mini", "openai/gpt-5.2",
+        "o3", "o3-pro", "o3-2025-04-16", "openai/o3", "o4-mini",
+        "grok-4", "grok-4-fast", "x-ai/grok-4.1",
+        "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5", "claude-sonnet-5-5",
+        "claude-haiku-4-5", "claude-3-5-sonnet-20241022", "claude-3-opus-20240229",
+        "claude-3-haiku-20240307", "anthropic/claude-3.7-sonnet",
+        "anthropic.claude-opus-4-7",
+    ]:
+        assert is_vision_model(name), f"{name!r} should be detected as vision-capable"
+
+
+def test_current_hosted_rules_do_not_overmatch_text_only_models():
+    for name in [
+        "o3-mini", "o1-mini", "claude-2.1", "claude-2", "claude-instant-1.2",
+        "qwen3:8b", "gpt-oss:20b", "grok-3-mini", "grok-code-fast-1",
+        "deepseek-v3", "kimi-k2", "command-r",
+    ]:
+        assert not is_vision_model(name), f"{name!r} should not be flagged as vision"
