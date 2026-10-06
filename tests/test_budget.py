@@ -547,3 +547,63 @@ def test_observed_lengths_ignore_malformed_history():
     turns = [{"opinions": "not a list", "reviews": None, "usage": "?"}, None,
              {"opinions": [None, {"usage": {"output_tokens": "x"}}], "usage": {"output_tokens": 5}}]
     assert council.observed_output_tokens(turns) == {}
+
+
+def test_declared_price_editor_keeps_other_fields(tmp_path):
+    from src.omnigent_catalog import load_declared, save_declared_price
+
+    path = tmp_path / "omnigent-model-costs.json"
+    path.write_text(json.dumps({"m1": {"notes": "keep me", "context_k": 128}, "_policy": {"x": 1}}))
+    assert save_declared_price("m1", 0.5, 2.0, path=str(path)) == {
+        "notes": "keep me", "context_k": 128, "input_per_mtok": 0.5, "output_per_mtok": 2.0}
+    save_declared_price("m2", 1.0, None, path=str(path))
+    data = load_declared(str(path))
+    assert data["m2"] == {"input_per_mtok": 1.0, "output_per_mtok": 1.0} and data["_policy"] == {"x": 1}
+    save_declared_price("m2", None, None, path=str(path))
+    save_declared_price("m1", None, None, path=str(path))
+    data = load_declared(str(path))
+    assert "m2" not in data and data["m1"] == {"notes": "keep me", "context_k": 128}
+
+
+def test_price_routes_list_metered_models_and_save(db, monkeypatch, tmp_path):
+    from routes.budget_routes import setup_budget_routes
+    from src import model_roster, omnigent_catalog
+
+    path = tmp_path / "omnigent-model-costs.json"
+    monkeypatch.setattr(omnigent_catalog, "_costs_path", lambda: str(path))
+
+    def fake_roster(owner):
+        rows = [("wb", "W&B Inference", "Qwen/Qwen3.6-27B", "api", "openai"),
+                ("wb", "W&B Inference", "meta-llama/Llama-3.1-8B-Instruct", "api", "openai"),
+                ("loc", "Ollama", "qwen3:8b", "local", "ollama")]
+        return model_roster.build_entries(rows, prices=None)
+    monkeypatch.setattr(model_roster, "roster", fake_roster)
+    monkeypatch.setattr(model_roster.PRICES, "lookup", lambda model: None)
+
+    app = FastAPI()
+    admin = {"ok": True}
+
+    def fake_require_admin(request):
+        if not admin["ok"]:
+            raise HTTPException(403, "Admin only")
+    monkeypatch.setattr("core.middleware.require_admin", fake_require_admin)
+
+    @app.middleware("http")
+    async def _user(request: Request, call_next):
+        request.state.current_user = "alice"
+        return await call_next(request)
+
+    app.include_router(setup_budget_routes())
+    c = TestClient(app)
+    out = c.get("/api/budget/prices").json()
+    assert out["can_edit"] is True
+    assert [r["model"] for r in out["models"]] == ["meta-llama/Llama-3.1-8B-Instruct", "Qwen/Qwen3.6-27B"]
+    assert all(r["input_per_mtok"] is None for r in out["models"])        # local model not listed
+    assert c.put("/api/budget/prices", json={"model": "Qwen/Qwen3.6-27B", "input_per_mtok": 0.6,
+                                              "output_per_mtok": 3.6}).status_code == 200
+    rows = {r["model"]: r for r in c.get("/api/budget/prices").json()["models"]}
+    assert (rows["Qwen/Qwen3.6-27B"]["input_per_mtok"], rows["Qwen/Qwen3.6-27B"]["price_source"]) == (0.6, "declared")
+    assert c.put("/api/budget/prices", json={"model": "x", "input_per_mtok": -1}).status_code == 422
+    admin["ok"] = False
+    assert c.put("/api/budget/prices", json={"model": "x", "input_per_mtok": 1}).status_code == 403
+    assert c.get("/api/budget/prices").json()["can_edit"] is False

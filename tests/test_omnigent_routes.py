@@ -578,6 +578,41 @@ def test_orchestrator_route_validates_choice_and_saves(tmp_path, monkeypatch):
     assert og.load_crew_settings()["reasoning_effort"] == "xhigh"
 
 
+def test_apply_during_a_launch_saves_nothing_and_pending_restart_is_reported(tmp_path, monkeypatch):
+    """Found live: applying a new orchestrator while the panel's auto-launch was
+    starting saved the choice but left the server on the old crew, silently."""
+    og = _isolate(monkeypatch, tmp_path)
+    monkeypatch.setattr(og, "require_admin", lambda request: None)
+    monkeypatch.setattr(og, "orchestrator_options", lambda user: [{"id": "claude"}, {"id": "codex::gpt-5.5"}])
+    router = og.setup_omnigent_routes(_FakeManager())
+    set_orch = _handler(router, "POST", "/api/omnigent/orchestrator")
+
+    class Req:
+        state = SimpleNamespace(current_user="admin")
+
+        def __init__(self, body):
+            self._body = body
+
+        async def json(self):
+            return self._body
+
+    from fastapi import HTTPException
+    assert og._LAUNCH_LOCK.acquire(blocking=False)          # a launch is in flight
+    try:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(set_orch(Req({"orchestrator": "codex::gpt-5.5"})))
+        assert exc.value.status_code == 409
+        assert og.load_crew_settings()["orchestrator"] == "claude"      # nothing saved
+    finally:
+        og._LAUNCH_LOCK.release()
+
+    og.mark_crew_launched(og.load_crew_settings())
+    assert og.crew_pending_restart(True) is False
+    og.save_crew_settings({**og.load_crew_settings(), "orchestrator": "codex::gpt-5.5"})
+    assert og.crew_pending_restart(True) is True
+    assert og.crew_pending_restart(False) is False                       # nothing running, nothing stale
+
+
 def test_omnigent_env_drops_secrets_but_keeps_harness_logins():
     from src.omnigent_manager import scrubbed_env
 

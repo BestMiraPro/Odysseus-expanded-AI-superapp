@@ -252,6 +252,19 @@ check before the others are recorded, so the cap can be overshot by about one tu
 
 Chat titles, memory extraction and Omnigent are not counted yet.
 
+**Model prices.** The Budget panel lists every metered model you can use with the price it is billed
+at. Providers whose prices are not in the public list (W&B Inference, most self-hosted gateways) show
+as *unpriced* until an admin sets a price there (USD per 1M tokens, saved to
+`data/omnigent-model-costs.json`). That price then applies to the budget, the pickers and the
+Council estimate.
+
+### W&B Inference
+
+Pick **W&B Inference** in Settings → Add Models and paste your W&B API key; the model list loads
+from your account. If your account bills by project, set `WANDB_ENTITY` and `WANDB_PROJECT` (or
+`WANDB_PROJECT="entity/project"`) and Odysseus sends the `OpenAI-Project` header. A new endpoint
+with many models defaults to a recommended one rather than the first listed.
+
 ## Moving to another machine
 
 Your whole Study app moves between Odysseus installs: subjects, flashcards with their

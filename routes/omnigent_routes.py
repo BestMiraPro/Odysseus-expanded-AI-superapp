@@ -416,6 +416,28 @@ def save_crew_settings(settings: dict) -> None:
     _chmod_600(path)
 
 
+def _launched_crew_path() -> Path:
+    return _crew_settings_path().with_name("omnigent-crew-launched.json")
+
+
+def mark_crew_launched(settings: dict) -> None:
+    """Remember which crew settings the running server was started with."""
+    path = _launched_crew_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def crew_pending_restart(running: bool) -> bool:
+    """True when the running server's crew is older than the saved choice."""
+    if not running:
+        return False
+    try:
+        launched = json.loads(_launched_crew_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(launched, dict) and launched != load_crew_settings()
+
+
 def parse_orchestrator_id(value: str | None) -> dict:
     """``claude`` / ``claude::<model>`` / ``codex[::<model>]`` / ``api::<endpoint>::<model>``."""
     value = (value or "claude").strip()
@@ -1244,6 +1266,9 @@ def setup_omnigent_routes(
         data["install"] = INSTALL_GUIDANCE
         data["ui_port"] = int(os.environ.get("OMNIGENT_UI_PORT") or os.environ.get("OMNIGENT_BRIDGE_PORT") or 6868)
         data["crew"] = {"name": _CREW_NAME, **load_crew_settings()}
+        # Saved crew settings the running server has not picked up yet (e.g.
+        # applied while it was still starting): the panel offers a restart.
+        data["crew_pending_restart"] = crew_pending_restart(bool(data.get("running")))
         data["native"] = native_manager.status(model_ready=_has_visible_model_endpoint(request))
         return data
 
@@ -1353,6 +1378,7 @@ def setup_omnigent_routes(
             _LAUNCH_LOCK.release()
 
     def _launch_locked(user):
+        launching_with = load_crew_settings()
         try:
             api = _install_api_models(user)
         except Exception as exc:
@@ -1372,6 +1398,10 @@ def setup_omnigent_routes(
             pass
         try:
             data = manager.restart(env_extra=env_extra or None)
+            try:
+                mark_crew_launched(launching_with)
+            except OSError:
+                pass
             try:
                 data["refreshed_generated_agent_rows"] = _refresh_generated_session_agent_rows()
             except Exception:
@@ -1423,13 +1453,17 @@ def setup_omnigent_routes(
                 settings["max_workers"] = max(1, min(_MAX_WORKERS, int(body["max_workers"])))
             except (TypeError, ValueError):
                 raise HTTPException(400, "max_workers must be a number")
-        await asyncio.to_thread(save_crew_settings, settings)
         restart = bool(body.get("apply", True))
         if not restart:
+            await asyncio.to_thread(save_crew_settings, settings)
             return {"settings": settings, "restarted": False}
+        # Take the launch lock BEFORE saving: a choice saved while a launch is
+        # in flight would be reported as applied while the server keeps the
+        # crew it was started with.
         if not _LAUNCH_LOCK.acquire(blocking=False):
-            raise HTTPException(409, "Omnigent is already being launched. Try again in a moment.")
+            raise HTTPException(409, "Omnigent is still starting. Apply again once it is up.")
         try:
+            await asyncio.to_thread(save_crew_settings, settings)
             running = await asyncio.to_thread(lambda: bool(manager.status().get("running")))
             if running:
                 data = await asyncio.to_thread(_launch_locked, user)

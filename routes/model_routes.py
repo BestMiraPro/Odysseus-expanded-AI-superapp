@@ -2212,9 +2212,9 @@ def setup_model_routes(model_discovery):
                 current_default_endpoint=current_default_ep,
                 current_default_model=settings.get("default_model") or "",
             ):
-                from src.endpoint_resolver import _first_chat_model
+                from src.endpoint_resolver import preferred_default_model
                 settings["default_endpoint_id"] = ep.id
-                settings["default_model"] = _first_chat_model(model_ids) or ""
+                settings["default_model"] = preferred_default_model(model_ids) or ""
                 _save_settings(settings)
             _invalidate_models_cache()
             _local_probe_cache["data"] = None

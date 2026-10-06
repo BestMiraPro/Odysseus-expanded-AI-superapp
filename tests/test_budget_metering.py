@@ -211,3 +211,14 @@ def test_wandb_inference_gets_its_project_header(monkeypatch):
     monkeypatch.setenv("WANDB_PROJECT", "other/proj2")
     assert build_headers("k", "https://api.inference.wandb.ai/v1")["OpenAI-Project"] == "other/proj2"
     assert "OpenAI-Project" not in build_headers("k", "https://api.openai.com/v1")
+
+
+def test_new_multi_model_endpoint_defaults_to_a_recommended_model():
+    from src.endpoint_resolver import preferred_default_model
+
+    wandb = ["ibm-granite/granite-4.2-8b", "moonshotai/Kimi-K2.6", "Qwen/Qwen3.6-27B", "Qwen/Qwen3.8-27B",
+             "meta-llama/Llama-3.1-8B-Instruct", "text-embedding-3-small"]
+    assert preferred_default_model(wandb) == "moonshotai/Kimi-K2.6"
+    assert preferred_default_model(["qwen3:8b"]) == "qwen3:8b"                     # single local model
+    assert preferred_default_model(["nomic-embed-text", "llama3.2:3b"]) == "llama3.2:3b"
+    assert preferred_default_model([]) is None

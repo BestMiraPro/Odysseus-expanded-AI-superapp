@@ -68,7 +68,9 @@ def money(value: Optional[float]) -> str:
     if value is None:
         return "unknown"
     if value < 0.01:
-        return f"${value:.4f}" if value else "$0"
+        if not value:
+            return "$0"
+        return f"${value:.4f}" if value >= 0.0001 else "<$0.0001"
     return f"${value:,.2f}"
 
 
@@ -435,8 +437,11 @@ def summary(owner: Optional[str], now: Optional[datetime] = None) -> Dict[str, A
         if row.cost_usd is None:
             unpriced += 1
         for bucket, key in ((by_source, row.source or "other"), (by_model, row.model or "?")):
-            agg = bucket.setdefault(key, {"cost_usd": 0.0, "calls": 0, "input_tokens": 0, "output_tokens": 0})
+            agg = bucket.setdefault(key, {"cost_usd": 0.0, "calls": 0, "unpriced": 0,
+                                          "input_tokens": 0, "output_tokens": 0})
             agg["calls"] += 1
+            if row.cost_usd is None:
+                agg["unpriced"] += 1
             agg["cost_usd"] += float(row.cost_usd or 0.0)
             agg["input_tokens"] += row.input_tokens or 0
             agg["output_tokens"] += row.output_tokens or 0

@@ -78,6 +78,38 @@ def _first_chat_model(models) -> Optional[str]:
     return (models[0] if models else None)
 
 
+def preferred_default_model(models) -> Optional[str]:
+    """The model a new endpoint should become the default with.
+
+    One chat model: that model. Several (a hosted catalogue such as W&B
+    Inference, OpenRouter or Together): the first in the provider's order
+    that the model roster recommends (newest of its family), preferring the
+    balanced tier, then flagship, over the provider's first-listed model,
+    which is often a small or legacy one.
+    """
+    chat = [m for m in (models or []) if not any(p in str(m).lower() for p in _NON_CHAT_MODEL)]
+    if len(chat) <= 1:
+        return _first_chat_model(models)
+    try:
+        from src import model_roster
+
+        class _NoCatalog:
+            def lookup(self, _model):
+                return None
+
+        entries = model_roster.build_entries([("", "", m, "api", "openai") for m in chat],
+                                             declared={}, prices=_NoCatalog())
+        for wanted in (lambda e: e.recommended and e.tier == "balanced",
+                       lambda e: e.recommended and e.tier == "flagship",
+                       lambda e: e.recommended):
+            hit = next((e.model for e in entries if wanted(e)), None)
+            if hit:
+                return hit
+    except Exception as exc:
+        logger.debug("default model ranking failed: %s", exc)
+    return chat[0]
+
+
 def _endpoint_cached_models(ep) -> list:
     """Return cached model ids from the current or legacy endpoint field."""
     raw = getattr(ep, "cached_models", None) or getattr(ep, "models", None)

@@ -238,6 +238,8 @@ function renderCrew() {
   const changed = crew.settings && (d.orchestrator !== crew.settings.orchestrator
     || d.reasoning_effort !== crew.settings.reasoning_effort || Number(d.max_workers) !== Number(crew.settings.max_workers));
   const running = !!_state.status?.running;
+  // Saved choice the running server hasn't picked up (applied mid-launch).
+  const pending = running && !!_state.status?.crew_pending_restart && !changed;
   const workers = crew.workers || [];
   return `<section class="omnigent-crew" aria-label="Crew">
     <h5>Universal crew</h5>
@@ -266,9 +268,10 @@ function renderCrew() {
         <td>${esc(w.endpoint)}</td><td>${esc(w.tier || '')}</td><td>${esc(w.cost_label || '')}</td></tr>`).join('')}
       </tbody></table></div>
       ${crew.omitted ? `<p class="sub">${esc(crew.omitted)} more model(s) left off by the worker cap.</p>` : ''}` : ''}
+    ${pending ? '<p class="sub" role="status">Omnigent is still running the previous crew. Restart it to use this one.</p>' : ''}
     <div class="omnigent-actions">
-      <button class="admin-btn-add" data-omnigent-action="apply" ${(!changed || _state.busy) ? 'disabled' : ''}>
-        ${_state.busy === 'apply' ? 'Applying…' : running ? 'Apply & restart Omnigent' : 'Apply'}</button>
+      <button class="admin-btn-add" data-omnigent-action="apply" ${((!changed && !pending) || _state.busy) ? 'disabled' : ''}>
+        ${_state.busy === 'apply' ? 'Applying…' : pending ? 'Restart Omnigent to apply' : running ? 'Apply & restart Omnigent' : 'Apply'}</button>
     </div>
   </section>`;
 }

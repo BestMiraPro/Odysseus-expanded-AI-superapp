@@ -138,6 +138,33 @@ def load_declared(path: str | None = None) -> dict[str, dict]:
         return {}
 
 
+def save_declared_price(model_id: str, input_per_mtok: float | None, output_per_mtok: float | None,
+                        path: str | None = None) -> dict[str, Any]:
+    """Set (or, with both prices None, clear) one model's declared list price.
+
+    Other fields of the model's entry (notes, context_k, ...) and the
+    ``_policy`` block are kept. Returns the model's entry after the change.
+    """
+    from core.atomic_io import atomic_write_json
+
+    p = path or _costs_path()
+    data = load_declared(p)
+    entry = dict(data.get(model_id) or {}) if isinstance(data.get(model_id), dict) else {}
+    if input_per_mtok is None and output_per_mtok is None:
+        entry.pop("input_per_mtok", None)
+        entry.pop("output_per_mtok", None)
+    else:
+        entry["input_per_mtok"] = input_per_mtok
+        entry["output_per_mtok"] = output_per_mtok if output_per_mtok is not None else input_per_mtok
+    if entry:
+        data[model_id] = entry
+    else:
+        data.pop(model_id, None)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+    atomic_write_json(p, data, indent=2)
+    return entry
+
+
 def describe_model(model_id: str, declared: dict[str, dict] | None = None) -> dict[str, Any]:
     """Everything known about one model, derived and declared kept separate."""
     declared = declared if declared is not None else load_declared()

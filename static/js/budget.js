@@ -16,6 +16,7 @@ export function money(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return 'unknown';
   const n = Number(value);
   if (n === 0) return '$0';
+  if (n < 0.0001) return '<$0.0001';
   if (n < 0.01) return `$${n.toFixed(4)}`;
   return `$${n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
@@ -98,6 +99,8 @@ function injectStyles() {
 .budget-table td.model { word-break: break-all; }
 .budget-empty { font-size: 12px; opacity: 0.6; padding: 6px 0; }
 .budget-note { font-size: 11.5px; opacity: 0.6; margin-top: 14px; line-height: 1.45; }
+.budget-unpriced { color: #b58800; font-weight: 600; }
+.budget-prices input.settings-select { width: 90px; max-width: 90px; padding: 3px 6px; }
 .budget-recent > summary { cursor: pointer; font-size: 12.5px; font-weight: 600; margin: 16px 0 6px; opacity: 0.85; }
 .budget-banner { display: flex; align-items: center; gap: 10px; margin: 0 auto 6px; max-width: var(--chat-max-width, 820px);
   width: calc(100% - 24px); padding: 7px 12px; border-radius: 10px; font-size: 12.5px;
@@ -123,7 +126,8 @@ function breakdownTable(rows, firstHeader, labelFor) {
     <th class="num">Tokens in / out</th><th class="num">Cost</th></tr></thead><tbody>${rows.map(r => `
     <tr><td class="model">${labelFor(r)}</td><td class="num">${r.calls}</td>
     <td class="num">${tokens(r.input_tokens)} / ${tokens(r.output_tokens)}</td>
-    <td class="num">${money(r.cost_usd)}</td></tr>`).join('')}</tbody></table>`;
+    <td class="num">${r.unpriced && r.unpriced === r.calls ? '<span class="budget-unpriced">unpriced</span>'
+      : `${money(r.cost_usd)}${r.unpriced ? ` <span class="budget-unpriced">+${r.unpriced} unpriced</span>` : ''}`}</td></tr>`).join('')}</tbody></table>`;
 }
 
 function heroHtml(s) {
@@ -183,13 +187,78 @@ function recentHtml(rows) {
     }).join('')}</tbody></table></details>`;
 }
 
+/* ── Model prices ──────────────────────────────────────────────────── */
+
+const PRICE_SOURCES = { declared: 'set here', openrouter: 'OpenRouter list' };
+
+function pricesHtml(p) {
+  const rows = (p && p.models) || [];
+  if (!rows.length) return '';
+  const unpriced = rows.filter(r => r.input_per_mtok == null).length;
+  const num = v => (v == null ? '' : String(v));
+  const body = rows.map((r, i) => {
+    const src = r.input_per_mtok == null ? '<span class="budget-unpriced">unpriced</span>'
+      : esc(PRICE_SOURCES[r.price_source] || r.price_source || '');
+    const inputs = p.can_edit
+      ? `<td class="num"><input class="settings-select budget-price-in" data-i="${i}" type="number" min="0" step="0.01"
+           inputmode="decimal" value="${num(r.input_per_mtok)}" aria-label="${esc(r.model)} input price"></td>
+         <td class="num"><input class="settings-select budget-price-out" data-i="${i}" type="number" min="0" step="0.01"
+           inputmode="decimal" value="${num(r.output_per_mtok)}" aria-label="${esc(r.model)} output price"></td>
+         <td><button type="button" class="admin-btn-sm budget-price-save" data-i="${i}">Save</button></td>`
+      : `<td class="num">${num(r.input_per_mtok) || '–'}</td><td class="num">${num(r.output_per_mtok) || '–'}</td><td></td>`;
+    return `<tr><td class="model">${esc(r.model)}<div class="budget-sub">${esc((r.endpoints || []).join(', '))}</div></td>
+      ${inputs}<td>${src}</td></tr>`;
+  }).join('');
+  return `<details class="budget-recent budget-prices"${unpriced ? ' open' : ''}>
+    <summary>Model prices${unpriced ? ` · ${unpriced} unpriced` : ''}</summary>
+    <div class="budget-help">USD per 1M tokens. Unpriced models are billed as unknown. A price set here applies to every
+      endpoint serving that model and wins over the public list${p.can_edit ? '' : ' (only an admin can change it)'}.
+      Leave both empty and save to clear it.</div>
+    <table class="budget-table"><thead><tr><th>Model</th><th class="num">In $/1M</th><th class="num">Out $/1M</th>
+      <th></th><th>Source</th></tr></thead><tbody>${body}</tbody></table>
+    <div class="budget-save-status" id="budget-price-status" role="status" aria-live="polite"></div></details>`;
+}
+
+async function savePrice(root, rows, i) {
+  const status = root.querySelector('#budget-price-status');
+  const read = cls => {
+    const el = root.querySelector(`.${cls}[data-i="${i}"]`);
+    if (el.validity && el.validity.badInput) return NaN;
+    const raw = el.value.trim();
+    return raw === '' ? null : Number(raw);
+  };
+  const inp = read('budget-price-in');
+  const out = read('budget-price-out');
+  if ([inp, out].some(v => v !== null && (!Number.isFinite(v) || v < 0))) {
+    status.textContent = 'Prices must be plain numbers, zero or more.';
+    status.classList.add('error');
+    return;
+  }
+  status.classList.remove('error');
+  status.textContent = 'Saving…';
+  try {
+    await getJSON(`${API}/prices`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: rows[i].model, input_per_mtok: inp, output_per_mtok: out }),
+    });
+    await renderPanel(root);
+    const fresh = root.querySelector('#budget-price-status');
+    if (fresh) fresh.textContent = `Saved ${rows[i].model}.`;
+    loadServerPrices();
+  } catch (err) {
+    status.textContent = err.message;
+    status.classList.add('error');
+  }
+}
+
 export async function renderPanel(root = document.getElementById('budget-panel-body')) {
   if (!root) return;
   injectStyles();
   loadServerPrices();
   let s;
+  let prices = null;
   try {
-    s = await fetchSummary();
+    [s, prices] = await Promise.all([fetchSummary(), getJSON(`${API}/prices`).catch(() => null)]);
   } catch (err) {
     root.innerHTML = `<div class="budget-empty">Could not load the budget: ${esc(err.message)}</div>`;
     return;
@@ -200,12 +269,16 @@ export async function renderPanel(root = document.getElementById('budget-panel-b
     <div class="budget-h3">By model</div>
     ${breakdownTable(s.by_model, 'Model', r => `${esc(r.name)}${r.endpoint_name ? ` <span style="opacity:.6">· ${esc(r.endpoint_name)}</span>` : ''}`)}
     ${recentHtml(s.recent)}
+    ${pricesHtml(prices)}
     <div class="budget-note">Counted: chat, agent rounds (scheduled tasks included, and stopped turns up to where
       they stopped), agent delegations, Council turns, research jobs and Study (cards, questions, grading, the Study
       tutor) on metered models, priced from your declared costs or OpenRouter's public price list. Rows marked ≈ were
       estimated from text length because the provider reported no token counts. Requests running at the same moment
       can overshoot the cap by about one turn. Not counted yet: chat titles, memory extraction and Omnigent. Months
       follow UTC.</div>`;
+  root.querySelectorAll('.budget-price-save').forEach(btn => {
+    btn.addEventListener('click', () => savePrice(root, prices.models, Number(btn.dataset.i)));
+  });
   const form = root.querySelector('#budget-form');
   form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
