@@ -488,6 +488,21 @@ class ResearchHandler:
                 pass
         return None
 
+    def get_search_error(self, session_id: str) -> str:
+        """Why web search failed for this run, or "" when it didn't."""
+        stats = None
+        entry = self._active_tasks.get(session_id)
+        if entry is not None:
+            stats = entry.get("stats")
+        if stats is None:
+            path = _research_json_path(session_id)
+            if path is not None and path.exists():
+                try:
+                    stats = json.loads(path.read_text(encoding="utf-8")).get("stats")
+                except Exception:
+                    stats = None
+        return str((stats or {}).get("Search error") or "")
+
     def get_sources(self, session_id: str) -> Optional[list]:
         """Get deduplicated source list from research findings."""
         # Check in-memory first

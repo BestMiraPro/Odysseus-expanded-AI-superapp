@@ -244,13 +244,15 @@ What counts:
 - Council turns.
 - Research jobs (deep research and inline research), call by call.
 - Study: card and question generation, grading, imports and the Study tutor.
+- Chat titles (one short call per new chat), and the background memory and skill extraction that
+  can follow a turn. These are skipped once a blocking cap is reached.
 
 Each agent round is billed when it ends, so a turn you stop is still counted, and a long agent turn stops
 at the cap. Research and Study calls are checked one by one, so a long research job stops at the cap
 too. The default single-action limit is $1. Requests running at the same moment can each pass the
 check before the others are recorded, so the cap can be overshot by about one turn's cost.
 
-Chat titles, memory extraction and Omnigent are not counted yet.
+Omnigent is not counted yet.
 
 **Model prices.** The Budget panel lists every metered model you can use with the price it is billed
 at. Providers whose prices are not in the public list (W&B Inference, most self-hosted gateways) show

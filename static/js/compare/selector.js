@@ -472,6 +472,7 @@ async function showModelSelector() {
         matches.forEach(m => {
           const opt = buildOption(m);
           const item = document.createElement('div');
+          item.className = 'cmp-picker-item';
           item.style.cssText = 'padding:6px 12px;cursor:pointer;font-size:0.85em;transition:background 0.08s;';
           item.textContent = opt.label;
           const isSelected = currentSel && currentSel.model === m.id && (currentSel.endpoint === m.url || !modelList.some(o => o.id === m.id && o !== m));
@@ -534,7 +535,9 @@ async function showModelSelector() {
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
           e.preventDefault();
-          const first = dropdown.querySelector('div[style*="cursor:pointer"]');
+          // Browsers serialise inline styles as "cursor: pointer", so match a
+          // class rather than the style attribute.
+          const first = dropdown.querySelector('.cmp-picker-item');
           if (first) first.click();
         }
       });

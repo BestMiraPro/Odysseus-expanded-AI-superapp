@@ -839,6 +839,7 @@ export function getModelCost(modelName, inputTokens, outputTokens, cache) {
   // the table above does not know.
   const serverPrices = (typeof globalThis !== 'undefined' && globalThis.__odyServerPrices) || null;
   const sp = serverPrices ? serverPrices[String(modelName).toLowerCase()] : null;
+  if (sp && sp.unpriced) return null;   // the budget bills it as unpriced: show no guess
   const key = matchModelKey(modelName, Object.keys(MODEL_PRICING));
   let price = key ? MODEL_PRICING[key] : null;
   if (sp && (sp.source === 'declared' || !price)) {

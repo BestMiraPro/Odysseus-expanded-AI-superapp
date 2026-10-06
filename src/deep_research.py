@@ -238,6 +238,9 @@ class DeepResearcher:
         # run, in arrival order — surfaced in the visual report so users can
         # see whether searxng / brave / tavily etc. carried the work.
         self.providers_used: List[str] = []
+        # Why web search failed (unreachable, HTTP error, missing key), when
+        # it did. Distinct from "searched fine, found nothing".
+        self.search_failure: str = ""
         self.findings: List[Dict] = []
         self.evolving_report: str = ""
         self.research_plan: str = ""
@@ -363,6 +366,12 @@ class DeepResearcher:
                     "finding(s) as a fallback", len(findings)
                 )
                 return self._fallback_report(question, findings)
+            if self.search_failure and not self.urls_fetched:
+                return (
+                    f"**Search unavailable** — Web search failed. "
+                    f"Error: {self.search_failure}\n\n"
+                    "Please check your search provider settings and ensure the service is running."
+                )
             return "No information could be gathered for this question."
 
         self.evolving_report = report  # preserve pre-synthesis report
@@ -560,7 +569,7 @@ class DeepResearcher:
     async def _search(self, query: str) -> List[Dict]:
         """Run a search query using the configured research search provider."""
         try:
-            from src.search.providers import _get_search_settings
+            from src.search.providers import _get_search_settings, describe_failure, last_failure
             from src.search.core import _call_provider, _build_provider_chain
 
             settings = _get_search_settings()
@@ -577,6 +586,7 @@ class DeepResearcher:
             # Try primary provider, then fallbacks
             chain = _build_provider_chain(provider)
             raised = False
+            started = time.time()
             for prov in chain:
                 try:
                     results = await asyncio.to_thread(_call_provider, prov, query, 10)
@@ -588,14 +598,22 @@ class DeepResearcher:
                 except Exception as e:
                     raised = True
                     logger.warning(f"Research search: {prov} failed: {e}")
-                    self._last_search_error = f"{prov}: {e}"
+                    self._last_search_error = f"{prov}: {describe_failure(e)}"
+                    self.search_failure = self._last_search_error
             # Every provider ran but none returned results. If none of them
             # raised, record an actionable reason here — otherwise this empty
             # path leaves `_last_search_error` unset and the caller surfaces a
             # bare "unknown error" (issue #344). This is exactly the SearXNG
             # case where the service is reachable but all its engines fail, so
             # each provider returns [] without throwing.
-            if not raised:
+            # Providers swallow their own errors and return [], so ask them
+            # why; a refused connection or a 403 is not "no results".
+            reasons = [f"{p}: {why}" for p in chain
+                       if (why := last_failure(p, since=started))]
+            if reasons:
+                self._last_search_error = "; ".join(reasons)
+                self.search_failure = self._last_search_error
+            elif not raised:
                 self._last_search_error = (
                     f"no results from search provider(s): "
                     f"{', '.join(chain) if chain else provider}"
@@ -924,6 +942,8 @@ class DeepResearcher:
         }
         if self.providers_used:
             stats["Search"] = ", ".join(self.providers_used)
+        if self.search_failure and not self.urls_fetched:
+            stats["Search error"] = self.search_failure
         if self.category:
             stats["Category"] = self.category.capitalize()
         return stats

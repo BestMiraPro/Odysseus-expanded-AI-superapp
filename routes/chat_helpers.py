@@ -302,18 +302,21 @@ async def auto_name_session(session_manager, sess):
         # plus the actual title — 200 used to clip them mid-reasoning
         # so strip_think left an empty string and no rename happened.
         # Timeout matches: 60s gives slow local reasoners room to finish.
-        title = await llm_call_async(
-            t_url,
-            t_model,
-            [
-                {"role": "system", "content": "Generate a short title (3-6 words, no quotes) for a conversation that starts with this message. Reply with ONLY the title, nothing else. Do NOT include any thinking, reasoning, or explanation — just the title."},
-                {"role": "user", "content": first_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4096,
-            headers=t_headers,
-            timeout=60,
-        )
+        # Billed as "title"; a blocking cap skips naming (402 below).
+        from src import budget as _budget
+        with _budget.metering(owner, "title", sess.id):
+            title = await llm_call_async(
+                t_url,
+                t_model,
+                [
+                    {"role": "system", "content": "Generate a short title (3-6 words, no quotes) for a conversation that starts with this message. Reply with ONLY the title, nothing else. Do NOT include any thinking, reasoning, or explanation — just the title."},
+                    {"role": "user", "content": first_msg},
+                ],
+                temperature=0.3,
+                max_tokens=4096,
+                headers=t_headers,
+                timeout=60,
+            )
 
         title = title.strip().strip('"\'').strip()
         # Strip <think>/<thinking> blocks (closed, dangling, or stray tags)
@@ -325,6 +328,9 @@ async def auto_name_session(session_manager, sess):
             logger.info(f"Auto-named session {sess.id}: {title}")
 
     except Exception as e:
+        if isinstance(e, HTTPException) and e.status_code == 402:
+            logger.info(f"Auto-name skipped for {sess.id}: {e.detail}")
+            return
         import traceback
         logger.error(f"Auto-name failed for {sess.id}: {e}\n{traceback.format_exc()}")
 
@@ -1154,6 +1160,14 @@ def _is_session_stream_active(session_id: str) -> bool:
         return False
 
 
+async def _metered_job(coro, owner, source: str, session_id: str):
+    """Await a background LLM job inside a budget scope, so its calls are billed
+    to ``owner`` as ``source`` and refused once a blocking cap is reached."""
+    from src import budget as _budget
+    with _budget.metering(owner, source, session_id):
+        return await coro
+
+
 async def _run_extraction_jobs_sequentially(session_id: str, jobs: list, max_wait_s: float = 120.0):
     """Run queued background-extraction coroutines one at a time, only once
     no chat completion is actively streaming for this session.
@@ -1236,10 +1250,10 @@ def run_post_response_tasks(
         t_url, t_model, t_headers = resolve_task_endpoint(
             sess.endpoint_url, sess.model, sess.headers, owner=owner,
         )
-        _extraction_jobs.append(("memory", extract_and_store(
+        _extraction_jobs.append(("memory", _metered_job(extract_and_store(
             sess, memory_manager, memory_vector,
             t_url, t_model, t_headers,
-        )))
+        ), owner, "memory", session_id)))
 
     # Skill extraction from complex agent runs. Only when the user actually
     # chose agent mode — not a chat we auto-escalated for a notes/calendar
@@ -1275,12 +1289,12 @@ def run_post_response_tasks(
                 sess.endpoint_url, sess.model, sess.headers, owner=owner,
             )
             logger.debug("[skill-extract] dispatching extractor (model=%s)", s_model)
-            _extraction_jobs.append(("skill", maybe_extract_skill(
+            _extraction_jobs.append(("skill", _metered_job(maybe_extract_skill(
                 sess, skills_manager,
                 s_url, s_model, s_headers,
                 agent_rounds, agent_tool_calls,
                 owner=owner,
-            )))
+            ), owner, "skill", session_id)))
 
     if _extraction_jobs:
         _spawn_bg(_run_extraction_jobs_sequentially(session_id, _extraction_jobs))

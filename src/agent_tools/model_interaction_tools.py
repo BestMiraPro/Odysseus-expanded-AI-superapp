@@ -121,14 +121,17 @@ def _budget_guard(owner: Optional[str], url: str, model: str, messages: list, wh
 
 
 def _record_delegation(owner: Optional[str], session_id: Optional[str], price, model: str,
-                       messages: list, response: str, source: str) -> Optional[float]:
+                       messages: list, response: str, source: str,
+                       url: Optional[str] = None) -> Optional[float]:
     """Bill a finished delegation from its prompt and reply (token estimates)."""
     if price is None or not price.metered:
         return None
     from src import budget
 
+    _kind, endpoint_name, endpoint_id = budget.endpoint_for_url(url or "")
     usage = {"input_tokens": budget.estimate_tokens(messages), "output_tokens": budget.text_tokens(response)}
     return budget.record(owner, source=source, model=model, usage=usage, price=price,
+                         endpoint_id=endpoint_id, endpoint_name=endpoint_name,
                          session_id=session_id, estimated=True)
 
 
@@ -169,7 +172,7 @@ async def chat_with_model(content: str, session_id: Optional[str] = None, owner:
             timeout=AI_CHAT_TIMEOUT,
         )
         spent = await asyncio.to_thread(_record_delegation, owner, session_id, price, model,
-                                        messages, response or "", "delegation")
+                                        messages, response or "", "delegation", url)
         # Truncate very long responses
         if len(response) > 10000:
             response = response[:10000] + "\n... (truncated)"
@@ -252,7 +255,7 @@ async def ask_teacher(content: str, session_id: Optional[str] = None, owner: Opt
             timeout=AI_CHAT_TIMEOUT,
         )
         spent = await asyncio.to_thread(_record_delegation, owner, session_id, price, model,
-                                        messages, response or "", "teacher")
+                                        messages, response or "", "teacher", url)
         if len(response) > 8000:
             response = response[:8000] + "\n... (truncated)"
         result = {"model": model, "response": response, "teacher": True}

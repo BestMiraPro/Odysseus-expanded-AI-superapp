@@ -991,9 +991,10 @@ function _buildJobCard(job) {
     const doneBadge = failed
       ? `<span class="research-cat-badge research-cat-failed">${_cancelIcon} no results</span>`
       : (job.category ? `<span class="research-cat-badge">${_esc(job.category)}</span>` : `<span class="research-cat-badge research-cat-standard">standard</span>`);
-    const failNote = failed
-      ? `<div class="research-job-failnote">Couldn't extract anything — try rephrasing the question, or switch the search engine in Settings.</div>`
-      : '';
+    const failNote = !failed ? ''
+      : job.searchError
+        ? `<div class="research-job-failnote">Web search failed (${_esc(job.searchError)}). Check the search engine in Settings → Search.</div>`
+        : `<div class="research-job-failnote">Couldn't extract anything — try rephrasing the question, or switch the search engine in Settings.</div>`;
     const thumbSource = (job.sources || []).find(s => s && (s.image || s.og_image));
     const thumbUrl = job.thumbnail || thumbSource?.image || thumbSource?.og_image || '';
     const thumbnail = thumbUrl

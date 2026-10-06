@@ -213,7 +213,7 @@ async def send_to_session(content: str, session_id: Optional[str] = None, owner:
             timeout=AI_CHAT_TIMEOUT,
         )
         await asyncio.to_thread(_record_delegation, owner, target_sid, price, sess.model,
-                                context, response or "", "delegation")
+                                context, response or "", "delegation", sess.endpoint_url)
 
         # Save both messages to session
         sess.add_message(ChatMessage("user", message))

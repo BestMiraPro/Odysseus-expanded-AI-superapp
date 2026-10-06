@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import re
+import time
 from typing import List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs
 
@@ -25,6 +27,49 @@ PROVIDER_INFO = {
     "serper":   ("Serper",            True,  False),
     "disabled": ("Disabled",          False, False),
 }
+
+
+# ── Failure notes ──
+# Providers return [] on every failure so a fallback chain can move on. The
+# last failure per provider is kept here so a caller that only sees [] (deep
+# research) can say why search came back empty instead of blaming the query.
+_LAST_FAILURE: dict = {}
+
+
+def _short_error(err) -> str:
+    resp = getattr(err, "response", None)
+    code = getattr(resp, "status_code", None) if resp is not None else None
+    if code:
+        return f"HTTP {code} {getattr(resp, 'reason_phrase', '') or ''}".strip()
+    text = str(err).strip()
+    return (text.splitlines()[0] if text else type(err).__name__)[:160]
+
+
+_SECRET_IN_URL = re.compile(r"(://)[^/@\s]+@|((?:api_?)?key|token|secret)=[^&\s]+", re.IGNORECASE)
+
+
+def describe_failure(err) -> str:
+    """Short, credential-free text for a search failure (shown in the UI and
+    saved with research stats). An HTTP error becomes its status, since its
+    message carries the request URL, and Google PSE puts its key there."""
+    text = err if isinstance(err, str) else _short_error(err)
+    return _SECRET_IN_URL.sub(lambda m: m.group(1) + "***@" if m.group(1) else m.group(2) + "=***", text)
+
+
+def _note_failure(provider: str, err) -> None:
+    _LAST_FAILURE[provider] = (time.time(), describe_failure(err))
+
+
+def clear_failure(provider: str) -> None:
+    _LAST_FAILURE.pop(provider, None)
+
+
+def last_failure(provider: str, since: float = 0.0) -> Optional[str]:
+    """Why ``provider`` last failed, if that happened at or after ``since``."""
+    rec = _LAST_FAILURE.get(provider)
+    if rec and rec[0] >= since:
+        return rec[1]
+    return None
 
 
 # ── Settings helpers ──
@@ -274,8 +319,10 @@ def searxng_search(query, max_results=10):
                 results.append({"title": title, "url": url, "snippet": snippet})
             logger.info(f"SearXNG search (HTML) returned {len(results)} results")
             return results
+        _note_failure("searxng", f"HTTP {response.status_code} from {instance}")
     except Exception as e:
         logger.error(f"SearXNG search failed: {e}")
+        _note_failure("searxng", f"{_short_error(e)} ({instance})")
     return []
 
 
@@ -299,6 +346,7 @@ def _brave_search_impl(query: str, count: int, time_filter: Optional[str] = None
 
     if not brave_api_key:
         logger.warning("Brave API key not found, returning empty results for fallback")
+        _note_failure("brave", "no API key set")
         return []
 
     headers = {"X-Subscription-Token": brave_api_key, "Accept": "application/json"}
@@ -325,9 +373,11 @@ def _brave_search_impl(query: str, count: int, time_filter: Optional[str] = None
         response.raise_for_status()
     except httpx.RequestError as e:
         error_logger.error(f"NetworkError during Brave search: {e}")
+        _note_failure("brave", e)
         return []
     except RateLimitError as e:
         error_logger.error(str(e))
+        _note_failure("brave", "rate limited")
         return []
 
     try:
@@ -412,6 +462,7 @@ def duckduckgo_search(query: str, count: Optional[int] = None, time_filter: Opti
             return parsed
         except Exception as e:
             logger.warning(f"DuckDuckGo HTML search failed: {e}")
+            _note_failure("duckduckgo", e)
             return []
 
     try:
@@ -467,6 +518,7 @@ def google_pse_search(query: str, count: Optional[int] = None, time_filter: Opti
 
     if not api_key or not cx:
         logger.warning("Google PSE: missing API key or CX ID")
+        _note_failure("google_pse", "missing API key or CX ID")
         return []
 
     params = {
@@ -495,9 +547,11 @@ def google_pse_search(query: str, count: Optional[int] = None, time_filter: Opti
         response.raise_for_status()
     except httpx.RequestError as e:
         error_logger.error(f"Google PSE search failed: {e}")
+        _note_failure("google_pse", e)
         return []
     except RateLimitError as e:
         error_logger.error(str(e))
+        _note_failure("google_pse", "rate limited")
         return []
 
     try:
@@ -529,6 +583,7 @@ def tavily_search(query: str, count: Optional[int] = None, time_filter: Optional
     api_key = _get_provider_key("tavily") or os.environ.get("TAVILY_API_KEY", "")
     if not api_key:
         logger.warning("Tavily: no API key configured")
+        _note_failure("tavily", "no API key set")
         return []
 
     payload = {
@@ -553,9 +608,11 @@ def tavily_search(query: str, count: Optional[int] = None, time_filter: Optional
         response.raise_for_status()
     except httpx.RequestError as e:
         error_logger.error(f"Tavily search failed: {e}")
+        _note_failure("tavily", e)
         return []
     except RateLimitError as e:
         error_logger.error(str(e))
+        _note_failure("tavily", "rate limited")
         return []
 
     try:
@@ -588,6 +645,7 @@ def serper_search(query: str, count: Optional[int] = None, time_filter: Optional
     api_key = _get_provider_key("serper") or os.environ.get("SERPER_API_KEY", "")
     if not api_key:
         logger.warning("Serper: no API key configured")
+        _note_failure("serper", "no API key set")
         return []
 
     payload = {
@@ -614,9 +672,11 @@ def serper_search(query: str, count: Optional[int] = None, time_filter: Optional
         response.raise_for_status()
     except httpx.RequestError as e:
         error_logger.error(f"Serper search failed: {e}")
+        _note_failure("serper", e)
         return []
     except RateLimitError as e:
         error_logger.error(str(e))
+        _note_failure("serper", "rate limited")
         return []
 
     try:

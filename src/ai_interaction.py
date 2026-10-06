@@ -343,7 +343,7 @@ async def do_pipeline(content: str, session_id: Optional[str] = None, owner: Opt
                 url, model, messages, headers=headers, timeout=AI_CHAT_TIMEOUT
             )
             await asyncio.to_thread(_record_delegation, owner, session_id, price, model,
-                                    messages, response or "", "delegation")
+                                    messages, response or "", "delegation", url)
 
             step_outputs.append({
                 "step": i + 1,

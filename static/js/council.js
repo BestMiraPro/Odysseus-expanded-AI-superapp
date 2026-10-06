@@ -1008,7 +1008,10 @@ function turnMarkdown(turn) {
   const name = (i) => { const s = seats.members[i] || {}; return `${s.model || '?'}${s.endpoint_name ? ` (${s.endpoint_name})` : ''}`; };
   const out = [`# ${turn.question}`, '', `*AI Council · ${seats.mode} mode · chairman ${seats.chairman?.model || '?'}*`, '',
     '## Council answer', '', turn.final || '_No answer_', '', '## Opinions', ''];
-  for (const o of turn.opinions || []) {
+  // Response A, B, C… in order; seats that failed (no label) go last.
+  const opinions = [...(turn.opinions || [])].sort((x, y) =>
+    (memberLabel[x.member] || '~').localeCompare(memberLabel[y.member] || '~'));
+  for (const o of opinions) {
     out.push(`### ${memberLabel[o.member] ? `Response ${memberLabel[o.member]} — ` : ''}${name(o.member)}`, '',
       o.error ? `_${o.error}_` : (o.text || ''), '');
   }

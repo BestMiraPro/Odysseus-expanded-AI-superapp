@@ -222,3 +222,49 @@ def test_new_multi_model_endpoint_defaults_to_a_recommended_model():
     assert preferred_default_model(["qwen3:8b"]) == "qwen3:8b"                     # single local model
     assert preferred_default_model(["nomic-embed-text", "llama3.2:3b"]) == "llama3.2:3b"
     assert preferred_default_model([]) is None
+
+
+def _title_session(owner="alice"):
+    from types import SimpleNamespace
+    return SimpleNamespace(id="s-title", owner=owner, endpoint_url=URL, model="gpt-x", headers={},
+                           history=[SimpleNamespace(role="user", content="How do I bake bread?")])
+
+
+def test_chat_titles_are_billed_as_title(db, fake_http, monkeypatch):
+    from types import SimpleNamespace
+    import src.task_endpoint as task_endpoint
+    from routes.chat_helpers import auto_name_session
+
+    monkeypatch.setattr(task_endpoint, "resolve_task_endpoint", lambda u, m, h, owner=None: (u, m, h))
+    names = []
+    asyncio.run(auto_name_session(SimpleNamespace(update_session_name=lambda sid, t: names.append(t)),
+                                  _title_session()))
+
+    assert names == ["the answer"]
+    assert _rows(db) == [("alice", "title", "gpt-x", 1000, 250, False, 0.004)]
+
+
+def test_blocking_cap_skips_the_title_call(db, fake_http, monkeypatch, caplog):
+    from types import SimpleNamespace
+    import src.task_endpoint as task_endpoint
+    from routes.chat_helpers import auto_name_session
+
+    monkeypatch.setattr(task_endpoint, "resolve_task_endpoint", lambda u, m, h, owner=None: (u, m, h))
+    budget.save_settings("alice", {"monthly_cap_usd": 0.001})
+    budget.record("alice", source="chat", model="gpt-x", usage={"input_tokens": 1000, "output_tokens": 0},
+                  price=PRICED)
+    names = []
+    with caplog.at_level("INFO"):
+        asyncio.run(auto_name_session(SimpleNamespace(update_session_name=lambda sid, t: names.append(t)),
+                                      _title_session()))
+
+    assert names == [] and fake_http == []
+    assert "Auto-name skipped" in caplog.text and "Auto-name failed" not in caplog.text
+
+
+def test_background_extraction_jobs_are_billed(db, fake_http):
+    from routes.chat_helpers import _metered_job
+
+    asyncio.run(_metered_job(_call(content="extract facts"), "alice", "memory", "s9"))
+    assert _rows(db) == [("alice", "memory", "gpt-x", 1000, 250, False, 0.004)]
+    assert budget.current_scope() is None

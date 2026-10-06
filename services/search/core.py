@@ -32,6 +32,7 @@ from .providers import (
     _get_search_settings,
     _get_provider_key,
     _get_result_count,
+    clear_failure,
 )
 from .content import (
     fetch_webpage_content,
@@ -96,18 +97,22 @@ def update_search_config(api_key: str = None, **kwargs):
 def _call_provider(provider_name: str, query: str, count: int, time_filter: str = None) -> List[dict]:
     """Call a search provider by name. Returns list of results or empty list."""
     if provider_name == "searxng":
-        return searxng_search_api(query, count, time_filter=time_filter)
+        results = searxng_search_api(query, count, time_filter=time_filter)
     elif provider_name == "brave":
-        return brave_search(query, count, time_filter)
+        results = brave_search(query, count, time_filter)
     elif provider_name == "duckduckgo":
-        return duckduckgo_search(query, count, time_filter)
+        results = duckduckgo_search(query, count, time_filter)
     elif provider_name == "google_pse":
-        return google_pse_search(query, count, time_filter)
+        results = google_pse_search(query, count, time_filter)
     elif provider_name == "tavily":
-        return tavily_search(query, count, time_filter)
+        results = tavily_search(query, count, time_filter)
     elif provider_name == "serper":
-        return serper_search(query, count, time_filter)
-    return []
+        results = serper_search(query, count, time_filter)
+    else:
+        return []
+    if results:
+        clear_failure(provider_name)
+    return results
 
 
 # If the self-hosted SearXNG instance is up but all enabled engines return

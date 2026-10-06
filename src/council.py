@@ -331,6 +331,7 @@ async def run_member(
     started = time.monotonic()
     parts: List[str] = []
     thinking_sent = False
+    thinking_chars = 0          # reasoning is billed too, though never shown
     error: Optional[str] = None
     usage: Optional[Dict[str, int]] = None
     from src.budget import estimate_tokens
@@ -364,6 +365,9 @@ async def run_member(
                 delta = payload.get("delta")
                 if isinstance(delta, str) and delta:
                     if payload.get("thinking"):
+                        thinking_chars += len(delta)
+                        if sink is not None:
+                            sink["thinking_chars"] = thinking_chars
                         if not thinking_sent:
                             thinking_sent = True
                             await emit({"type": "thinking", "stage": stage, "member": index})
@@ -392,6 +396,8 @@ async def run_member(
     cost = member.cost_usd(usage)
     outcome = {"text": text, "error": error, "ms": ms, "usage": usage, "cost_usd": cost,
                "input_estimate": input_estimate}
+    if thinking_chars:
+        outcome["thinking_chars"] = thinking_chars
     if sink is not None:
         sink.update(outcome)
         sink.pop("pending", None)
@@ -633,7 +639,8 @@ def billable_calls(result: Dict[str, Any], members: List[Member], chairman: Memb
 
     A call with provider-reported usage is billed as reported. One without
     (a provider that sends no usage, or a call stopped midway) is billed from
-    its prompt estimate plus the text it produced, and flagged as estimated.
+    its prompt estimate plus the text and reasoning it produced, and flagged
+    as estimated.
     """
     from src.budget import text_tokens
 
@@ -654,8 +661,11 @@ def billable_calls(result: Dict[str, Any], members: List[Member], chairman: Memb
             out.append((member, stage, usage, call.get("cost_usd"), False))
             continue
         text = call.get("text") or ""
-        if not text:
+        thinking = int(call.get("thinking_chars") or 0)
+        if not text and not thinking:
             continue        # failed before producing anything: nothing billable
-        usage = {"input_tokens": int(call.get("input_estimate") or 0), "output_tokens": text_tokens(text)}
+        # Same chars-to-tokens ratio as budget.text_tokens (0.3 per char).
+        output_tokens = (text_tokens(text) if text else 0) + int(thinking * 0.3)
+        usage = {"input_tokens": int(call.get("input_estimate") or 0), "output_tokens": output_tokens}
         out.append((member, stage, usage, member.cost_usd(usage), True))
     return out

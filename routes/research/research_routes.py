@@ -398,6 +398,7 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                     "status": d.get("status", "done"),
                     "duration": d.get("stats", {}).get("Duration", ""),
                     "rounds": d.get("stats", {}).get("Rounds", ""),
+                    "search_error": (d.get("stats") or {}).get("Search error", ""),
                     "started_at": d.get("started_at", 0),
                     "completed_at": d.get("completed_at", 0),
                     "archived": bool(d.get("archived")),
@@ -626,11 +627,13 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
                     "sources": d.get("sources", []),
                     "raw_findings": d.get("raw_findings", []),
                     "category": d.get("category") or "",
+                    "search_error": (d.get("stats") or {}).get("Search error", ""),
                 }
             raise HTTPException(404, "No research result available")
         sources = research_handler.get_sources(session_id) or []
         raw_findings = research_handler.get_raw_findings(session_id) or []
-        return {"result": result, "sources": sources, "raw_findings": raw_findings, "category": ""}
+        return {"result": result, "sources": sources, "raw_findings": raw_findings, "category": "",
+                "search_error": research_handler.get_search_error(session_id)}
 
     @router.post("/api/research/spinoff/{session_id}")
     async def research_spinoff(session_id: str, request: Request):

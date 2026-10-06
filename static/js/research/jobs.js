@@ -110,6 +110,7 @@ async function _syncLibrary(options = {}) {
             sourceCount: item.source_count || existing.sourceCount || 0,
             thumbnail: item.thumbnail || existing.thumbnail || '',
             category: item.category || existing.category || '',
+            searchError: item.search_error || existing.searchError || '',
             _fromLibrary: true,
           };
           for (const [key, value] of Object.entries(updates)) {
@@ -128,6 +129,7 @@ async function _syncLibrary(options = {}) {
           sourceCount: item.source_count || 0,
           thumbnail: item.thumbnail || '',
           category: item.category || '',
+          searchError: item.search_error || '',
           errorMsg: null, avgDuration: null, modelName: null,
           settings: { max_rounds: item.rounds || 8 },
           _es: null, _timerInterval: null, _fromLibrary: true,
@@ -375,6 +377,7 @@ async function _fetchResult(job) {
     job.sources = d.sources;
     job.findings = d.raw_findings;
     if (d.category && !job.category) job.category = d.category;
+    if (d.search_error) job.searchError = d.search_error;
     _notify();
   } catch {}
 }

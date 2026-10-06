@@ -927,6 +927,16 @@ def _classify_agent_request(messages: List[Dict], last_user: str) -> Dict[str, o
            r"\b(?:ask|consult)\s+(?:the\s+)?(?:gpt|claude|gemini|grok|deepseek|o[1-9])\b",
            r"\b(?:which|what)\s+models?\b.{0,40}\b(?:available|configured|connected|use|call)\b"):
         domains.add("models")
+    # Memory intent — "remember that I...", "forget my...", "I prefer...".
+    # These matched no domain, so a fresh chat took the direct low-signal
+    # path, which sends no tools: the model said "noted" and nothing was
+    # saved. manage_memory is always available once the turn has tools.
+    if has(r"\b(?:remember|forget)\b.{0,24}\b(?:about me|that i|i'm|i am|my)\b",
+           r"\b(?:remember|forget)\s+(?:this|that)\b",
+           r"\bi prefer\b|\bcall me\b|\bmy name is\b",
+           r"\b(?:update|delete|clear|show|list)\s+(?:my\s+)?memor(?:y|ies)\b",
+           r"\bwhat do you (?:know|remember) about me\b"):
+        domains.add("memory")
 
     low_signal = not continuation and not domains
     return {
@@ -2012,7 +2022,10 @@ def _build_system_prompt(
     elif (
         relevant_tools
         and not suppress_local_context
-        and (set(relevant_tools) & _WORKSPACE_TERMINUS_TOOLS)
+        # File/shell tools mark machine work. The rest of the Terminus set
+        # (ask_user, update_plan, web_search...) rides on almost every turn,
+        # and these rules tell the model to avoid memory, notes and email.
+        and (set(relevant_tools) & _DOMAIN_TOOL_MAP["files"])
     ):
         agent_prompt += _local_computer_rules()
 
@@ -2159,7 +2172,19 @@ def _build_system_prompt(
     # MCP tool descriptions — sourced from external servers, must not be in system role.
     if mcp_mgr:
         try:
-            _mcp_desc = mcp_mgr.get_tool_descriptions_for_prompt(mcp_disabled_map or {})
+            # Describe only the MCP tools this turn can call; the full catalog
+            # (31 tools for the built-in browser) otherwise rides on every round.
+            # Keyword turns keep it: text-tool models get every MCP tool then.
+            _last_lc = str(_extract_last_user_message(messages) or "").lower()
+            _mcp_only = (
+                {t for t in relevant_tools if str(t).startswith("mcp__")}
+                if relevant_tools is not None and not any(k in _last_lc for k in _MCP_KEYWORDS)
+                else None
+            )
+            _mcp_desc = (
+                "" if _mcp_only is not None and not _mcp_only
+                else mcp_mgr.get_tool_descriptions_for_prompt(mcp_disabled_map or {}, only=_mcp_only)
+            )
             if _mcp_desc:
                 _mcp_desc_message = untrusted_context_message(
                     "MCP tools",

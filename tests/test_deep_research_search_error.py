@@ -26,9 +26,12 @@ def _make_researcher():
     return r
 
 
-def _install_search_fakes(monkeypatch, *, chain, call_provider):
+def _install_search_fakes(monkeypatch, *, chain, call_provider, failures=None):
     providers_mod = types.ModuleType("src.search.providers")
     providers_mod._get_search_settings = lambda: {"search_provider": chain[0]}
+    providers_mod.last_failure = lambda prov, since=0.0: (failures or {}).get(prov)
+    from services.search.providers import describe_failure
+    providers_mod.describe_failure = describe_failure
     core_mod = types.ModuleType("src.search.core")
     core_mod._build_provider_chain = lambda provider: list(chain)
     core_mod._call_provider = call_provider
@@ -82,3 +85,89 @@ def test_results_are_returned_and_provider_recorded(monkeypatch):
 
     assert results == hits
     assert r.providers_used == ["brave"]
+
+
+def test_swallowed_provider_failures_are_named(monkeypatch):
+    # Real providers catch their own errors and return []. The reasons they
+    # noted must reach the report instead of "no results" (which reads as
+    # "rephrase the question").
+    _install_search_fakes(
+        monkeypatch,
+        chain=["searxng", "duckduckgo"],
+        call_provider=lambda prov, query, n: [],
+        failures={"searxng": "[Errno 111] Connection refused (http://localhost:8080)",
+                  "duckduckgo": "HTTP 403 Forbidden"},
+    )
+    r = _make_researcher()
+    assert asyncio.run(r._search("anything")) == []
+
+    assert "Connection refused" in r._last_search_error
+    assert "duckduckgo: HTTP 403 Forbidden" in r._last_search_error
+    assert "no results" not in r._last_search_error
+    assert r.search_failure == r._last_search_error
+
+
+def _full_researcher(monkeypatch, *, search_failure):
+    from src.deep_research import DeepResearcher
+    r = DeepResearcher(llm_endpoint="http://x/v1/chat/completions", llm_model="m",
+                       max_rounds=1, min_rounds=1)
+
+    async def _plan(q):
+        return "plan"
+
+    async def _category(q):
+        return None
+
+    async def _queries(q, report, n):
+        return ["q1", "q2"]
+
+    async def _search_and_extract(queries, q):
+        r.search_failure = search_failure
+        return []
+
+    async def _stop(*a, **k):
+        return False
+
+    monkeypatch.setattr(r, "_create_plan", _plan)
+    monkeypatch.setattr(r, "_classify_category", _category)
+    monkeypatch.setattr(r, "_generate_queries", _queries)
+    monkeypatch.setattr(r, "_search_and_extract", _search_and_extract)
+    monkeypatch.setattr(r, "_should_stop", _stop)
+    return r
+
+
+def test_round_limit_with_failed_search_reports_the_failure(monkeypatch):
+    # One round (below max_empty_rounds), every search failed: the report and
+    # stats must name the failure, not claim nothing could be gathered.
+    r = _full_researcher(monkeypatch, search_failure="searxng: Connection refused")
+    out = asyncio.run(r.research("What is the Krebs cycle?"))
+
+    assert out.startswith("**Search unavailable**")
+    assert "searxng: Connection refused" in out
+    assert r.get_stats()["Search error"] == "searxng: Connection refused"
+
+
+def test_round_limit_with_working_search_keeps_no_information(monkeypatch):
+    r = _full_researcher(monkeypatch, search_failure="")
+    out = asyncio.run(r.research("What is the Krebs cycle?"))
+
+    assert out == "No information could be gathered for this question."
+    assert "Search error" not in r.get_stats()
+
+
+def test_raised_http_error_does_not_leak_the_request_url(monkeypatch):
+    # Google PSE carries its API key in the query string; an HTTP error's
+    # message includes that URL. Only the status may reach the report/UI.
+    import httpx
+
+    url = "https://www.googleapis.com/customsearch/v1?key=AIzaSECRET&cx=1&q=x"
+
+    def _forbidden(prov, query, n):
+        resp = httpx.Response(403, request=httpx.Request("GET", url))
+        resp.raise_for_status()
+
+    _install_search_fakes(monkeypatch, chain=["google_pse"], call_provider=_forbidden)
+    r = _make_researcher()
+    assert asyncio.run(r._search("anything")) == []
+    assert r.search_failure == "google_pse: HTTP 403 Forbidden"
+    assert "AIzaSECRET" not in r._last_search_error

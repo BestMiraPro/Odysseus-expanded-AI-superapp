@@ -93,3 +93,17 @@ def test_cache_tokens_use_cache_rates():
     assert _run("getModelCost('claude-fable-5-1', 1000000, 0, {read: 1000000})") == pytest.approx(0.25)
     # Without cache info the full input rate applies (unchanged behaviour).
     assert _run("getModelCost('claude-haiku-4-5', 1000000, 1000000)") == pytest.approx(6.0)
+
+
+@pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
+def test_server_prices_override_the_name_matched_table():
+    # A model the budget bills as unpriced (Kimi on W&B) shows no cost, even
+    # though the built-in table name-matches the vendor's own price.
+    base = _run("getModelCost('moonshotai/Kimi-K2.6', 1000, 1000)")
+    assert base is not None and base > 0
+    unpriced = _run("(globalThis.__odyServerPrices = {'moonshotai/kimi-k2.6': {unpriced: true}},"
+                    " getModelCost('moonshotai/Kimi-K2.6', 1000, 1000))")
+    assert unpriced is None
+    declared = _run("(globalThis.__odyServerPrices = {'moonshotai/kimi-k2.6': {input: 1, output: 3, source: 'declared'}},"
+                    " getModelCost('moonshotai/Kimi-K2.6', 1000000, 1000000))")
+    assert declared == 4.0

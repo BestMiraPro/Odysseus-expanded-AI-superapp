@@ -30,7 +30,8 @@ function tokens(n) {
 
 const SOURCE_LABELS = {
   chat: 'Chat', agent: 'Agent', delegation: 'Delegations', teacher: 'Teacher', council: 'Council',
-  research: 'Research', study: 'Study',
+  research: 'Research', study: 'Study', title: 'Chat titles', memory: 'Memory extraction',
+  skill: 'Skill learning',
 };
 
 async function getJSON(url, opts) {
@@ -58,8 +59,12 @@ export async function loadServerPrices() {
     const data = await getJSON('/api/models/roster');
     const map = {};
     for (const m of data.models || []) {
-      if (m.billing !== 'metered' || m.input_per_mtok == null) continue;
+      if (m.billing !== 'metered') continue;
       const key = String(m.model).toLowerCase();
+      // Billed as unpriced (e.g. Kimi on W&B): the chat must not show the
+      // vendor's own price from its name-matched table. A priced listing of
+      // the same model on another endpoint replaces this marker.
+      if (m.input_per_mtok == null) { if (!map[key]) map[key] = { unpriced: true }; continue; }
       if (map[key] && map[key].source === 'declared') continue;
       map[key] = { input: m.input_per_mtok, output: m.output_per_mtok, source: m.price_source };
     }
@@ -101,6 +106,16 @@ function injectStyles() {
 .budget-note { font-size: 11.5px; opacity: 0.6; margin-top: 14px; line-height: 1.45; }
 .budget-unpriced { color: #b58800; font-weight: 600; }
 .budget-prices input.settings-select { width: 90px; max-width: 90px; padding: 3px 6px; }
+@media (max-width: 600px) {
+  /* One card per model: name and source on top, prices and Save below. */
+  .budget-prices .budget-table thead { display: none; }
+  .budget-prices .budget-table tr { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px 8px; align-items: center;
+    padding: 8px 0; border-bottom: 1px solid var(--border, rgba(127,127,127,0.18)); }
+  .budget-prices .budget-table td { border: 0; padding: 0; text-align: left; }
+  .budget-prices .budget-table td.model { grid-column: 1 / 3; grid-row: 1; word-break: normal; overflow-wrap: anywhere; }
+  .budget-prices .budget-table td.src { grid-column: 3; grid-row: 1; text-align: right; }
+  .budget-prices input.settings-select { width: 100%; max-width: none; }
+}
 .budget-recent > summary { cursor: pointer; font-size: 12.5px; font-weight: 600; margin: 16px 0 6px; opacity: 0.85; }
 .budget-banner { display: flex; align-items: center; gap: 10px; margin: 0 auto 6px; max-width: var(--chat-max-width, 820px);
   width: calc(100% - 24px); padding: 7px 12px; border-radius: 10px; font-size: 12.5px;
@@ -201,13 +216,13 @@ function pricesHtml(p) {
       : esc(PRICE_SOURCES[r.price_source] || r.price_source || '');
     const inputs = p.can_edit
       ? `<td class="num"><input class="settings-select budget-price-in" data-i="${i}" type="number" min="0" step="0.01"
-           inputmode="decimal" value="${num(r.input_per_mtok)}" aria-label="${esc(r.model)} input price"></td>
+           inputmode="decimal" placeholder="in $/1M" value="${num(r.input_per_mtok)}" aria-label="${esc(r.model)} input price"></td>
          <td class="num"><input class="settings-select budget-price-out" data-i="${i}" type="number" min="0" step="0.01"
-           inputmode="decimal" value="${num(r.output_per_mtok)}" aria-label="${esc(r.model)} output price"></td>
+           inputmode="decimal" placeholder="out $/1M" value="${num(r.output_per_mtok)}" aria-label="${esc(r.model)} output price"></td>
          <td><button type="button" class="admin-btn-sm budget-price-save" data-i="${i}">Save</button></td>`
       : `<td class="num">${num(r.input_per_mtok) || '–'}</td><td class="num">${num(r.output_per_mtok) || '–'}</td><td></td>`;
     return `<tr><td class="model">${esc(r.model)}<div class="budget-sub">${esc((r.endpoints || []).join(', '))}</div></td>
-      ${inputs}<td>${src}</td></tr>`;
+      ${inputs}<td class="src">${src}</td></tr>`;
   }).join('');
   return `<details class="budget-recent budget-prices"${unpriced ? ' open' : ''}>
     <summary>Model prices${unpriced ? ` · ${unpriced} unpriced` : ''}</summary>

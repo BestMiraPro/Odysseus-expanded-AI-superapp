@@ -296,6 +296,17 @@ def test_billable_calls_use_real_usage_or_estimates():
     assert calls[1][2]["input_tokens"] == 120 and calls[1][2]["output_tokens"] > 0
 
 
+def test_stopped_reasoning_call_is_billed_for_its_thinking():
+    # Stopped while a reasoning model was still thinking: no visible text yet,
+    # but the provider charges for the prompt and the reasoning so far.
+    a = _member("paid-a")
+    result = {"opinions": [{"member": 0, "text": "", "pending": True, "input_estimate": 200,
+                            "thinking_chars": 1000}]}
+    [(member, stage, usage, cost, estimated)] = council.billable_calls(result, [a], a)
+    assert (member.model, stage, estimated) == ("paid-a", "opinions", True)
+    assert usage == {"input_tokens": 200, "output_tokens": 300} and cost > 0
+
+
 @pytest.fixture
 def council_client(db, monkeypatch, prices):
     import routes.council_routes as cr
@@ -404,12 +415,17 @@ def test_delegation_within_budget_is_billed(db, prices, monkeypatch):
     async def fake_call(url, model, messages, headers=None, timeout=None):
         return "the answer is 42"
     monkeypatch.setattr(llm_core, "llm_call_async", fake_call)
+    s = db()
+    s.add(ModelEndpoint(id="ep-x", name="X Cloud", base_url="https://api.x.com/v1"))
+    s.commit()
+    s.close()
     out = asyncio.run(mit.chat_with_model("paid-a\nwhat is 6 x 7?", owner="alice"))
     assert out["response"] == "the answer is 42" and out["spent_usd"] > 0
     s = db()
     row = s.query(SpendEntry).one()
     s.close()
     assert (row.owner, row.source, row.estimated) == ("alice", "delegation", True)
+    assert (row.endpoint_id, row.endpoint_name) == ("ep-x", "X Cloud")
 
 
 # --- API -------------------------------------------------------------------
