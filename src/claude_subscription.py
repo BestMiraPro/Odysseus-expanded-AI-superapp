@@ -167,6 +167,12 @@ def valid_token(token: Optional[str]) -> bool:
     return bool(token) and bool(_TOKEN_RE.match(str(token)))
 
 
+def normalize_token(token: Optional[str]) -> Optional[str]:
+    """Rejoin a pasted token. Tokens never contain whitespace, but copying one
+    from a terminal that wrapped it picks up a line break and indent per line."""
+    return re.sub(r"\s+", "", token or "") or None
+
+
 # ---------------------------------------------------------------------------
 # CLI discovery and environment
 # ---------------------------------------------------------------------------

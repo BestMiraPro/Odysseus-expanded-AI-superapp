@@ -1380,7 +1380,8 @@ async function convene() {
 
 async function connectClaude(mode) {
   const cs = S.connect.claude;
-  const token = mode === 'token' ? ($('#council-claude-token')?.value || '').trim() : '';
+  // A token copied from a terminal that wrapped it carries line breaks; tokens never contain whitespace.
+  const token = mode === 'token' ? ($('#council-claude-token')?.value || '').replace(/\s+/g, '') : '';
   if (mode === 'token' && !token) { cs.msg = 'Paste the token printed by claude setup-token.'; cs.err = true; renderConnect(); return; }
   cs.busy = true; cs.err = false; cs.msg = 'Checking with a tiny test call…';
   renderConnect();

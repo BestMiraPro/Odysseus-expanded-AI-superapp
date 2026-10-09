@@ -66,6 +66,14 @@ def test_token_validation():
     assert not cs.valid_token(None)
 
 
+def test_normalize_token_rejoins_a_terminal_wrapped_paste():
+    wrapped = " " + TOKEN[:20] + "\r\n " + TOKEN[20:40] + "\n " + TOKEN[40:] + "\n"
+    assert cs.normalize_token(wrapped) == TOKEN
+    assert cs.valid_token(cs.normalize_token(wrapped))
+    assert cs.normalize_token("  \n ") is None
+    assert cs.normalize_token(None) is None
+
+
 def test_build_prompt_single_user_turn_is_sent_verbatim():
     system, prompt = cs.build_prompt([
         {"role": "system", "content": "Be terse."},
