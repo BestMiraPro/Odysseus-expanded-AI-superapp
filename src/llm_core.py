@@ -1412,11 +1412,10 @@ def _build_chatgpt_responses_payload(
         "stream": stream,
         "store": False,
     }
-    if not _restricts_temperature(model):
-        payload["temperature"] = temperature
-    # ChatGPT Subscription Codex API does not support max_output_tokens —
-    # passing it returns HTTP 400 "Unsupported parameter: max_output_tokens".
-    # Do not include it in the payload.
+    # ChatGPT Subscription Codex API supports neither temperature nor
+    # max_output_tokens — passing either returns HTTP 400 "Unsupported
+    # parameter: ...". It serves only reasoning models (gpt-5.x, gpt-6.x), so
+    # a model-name allowlist misses every new family. Never send them.
     return payload
 
 

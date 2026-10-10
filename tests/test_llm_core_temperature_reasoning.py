@@ -131,3 +131,17 @@ def test_chatgpt_subscription_payload_omits_max_output_tokens_when_zero():
     )
 
     assert "max_output_tokens" not in payload
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.1-codex"])
+def test_chatgpt_subscription_payload_omits_temperature(model):
+    # The Codex API returns HTTP 400 "Unsupported parameter: temperature" for
+    # every model it serves, including families no name prefix anticipated.
+    payload = llm_core._build_chatgpt_responses_payload(
+        model,
+        [{"role": "user", "content": "Say OK"}],
+        temperature=0.7,
+        max_tokens=256,
+    )
+
+    assert "temperature" not in payload
