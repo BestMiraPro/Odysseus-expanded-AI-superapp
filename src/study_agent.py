@@ -1246,12 +1246,53 @@ def trim_history(msgs: List[Dict], *, keep_rounds: int = 2,
 
 _FENCE_RE = re.compile(r"```tool_call\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
 _XML_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL | re.IGNORECASE)
+_FUNCTION_CALLS_TAG_RE = re.compile(r"</?function_calls>", re.IGNORECASE)
+
+
+def _coerce_invoke_arg(spec: ToolSpec, name: str, raw: str) -> Any:
+    """Type a <parameter> value per the tool's schema. It arrives as text, and
+    a string "false" would pass a truthy check such as a destructive tool's
+    confirm."""
+    kind = (spec.properties.get(name) or {}).get("type")
+    value = raw.strip()
+    if kind == "boolean":
+        return value.lower() == "true"
+    if kind in ("integer", "number", "array", "object"):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
+def _tool_parsing():
+    """src.tool_parsing, loaded through src.agent_tools: the two import each
+    other, and only that order initializes them."""
+    import src.agent_tools  # noqa: F401
+    from src import tool_parsing
+    return tool_parsing
+
+
+def _parse_invoke_tool_calls(text: str) -> List[Dict]:
+    """<invoke name="tool"><parameter name="x">v</parameter></invoke>, the shape
+    Claude writes when its tools are offered as text (Claude Subscription)."""
+    tp = _tool_parsing()
+    calls: List[Dict] = []
+    for name, body in tp._iter_xml_invoke(text or ""):
+        spec = TOOLS.get(name)
+        if spec is None:
+            continue
+        args = {pname: _coerce_invoke_arg(spec, pname, pval)
+                for pname, pval in tp._iter_named_blocks(body, tp._XML_PARAM_OPEN_RE, tp._XML_PARAM_CLOSE_RE)}
+        calls.append({"name": name, "arguments": json.dumps(args)})
+    return calls
 
 
 def parse_fallback_tool_calls(text: str) -> List[Dict]:
     """Tool calls written as text by models that can't emit native ones:
-    fenced ```tool_call {json}``` or <tool_call>{json}</tool_call>. Only
-    registered tool names are accepted."""
+    fenced ```tool_call {json}```, <tool_call>{json}</tool_call>, or
+    <invoke name=...><parameter ...> blocks. Only registered tool names are
+    accepted."""
     calls: List[Dict] = []
     for m in list(_FENCE_RE.finditer(text or "")) + list(_XML_RE.finditer(text or "")):
         raw = m.group(1).strip()
@@ -1270,11 +1311,14 @@ def parse_fallback_tool_calls(text: str) -> List[Dict]:
                 args = {}
         if name in TOOLS and isinstance(args, dict):
             calls.append({"id": f"fb_{len(calls) + 1}", "name": name, "arguments": json.dumps(args)})
+    for call in _parse_invoke_tool_calls(text):
+        calls.append({"id": f"fb_{len(calls) + 1}", **call})
     return calls
 
 
 def strip_fallback_blocks(text: str) -> str:
-    return _XML_RE.sub("", _FENCE_RE.sub("", text or "")).strip()
+    text = _XML_RE.sub("", _FENCE_RE.sub("", text or ""))
+    return _FUNCTION_CALLS_TAG_RE.sub("", _tool_parsing()._strip_bare_invoke_markup(text)).strip()
 
 
 def _parse_args(raw) -> Dict:
