@@ -185,7 +185,8 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
     if not runtime:
         kind, provider = classify_endpoint(ep)
         return council.Member(endpoint_id=ep.id, model=model, endpoint_name=ep.name or "", kind=kind,
-                              provider=provider, **_seat_pricing(ep, model, kind, provider))
+                              provider=provider, context_tokens=_seat_context(model),
+                              **_seat_pricing(ep, model, kind, provider))
     try:
         base, api_key = resolve_endpoint_runtime(ep, owner=owner)
     except Exception as exc:
@@ -193,16 +194,37 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
                        ep.id, type(exc).__name__)
         raise council.CouncilError(f"{ep.name} needs reconnecting before it can sit on the council.", 401)
     kind, provider = classify_endpoint(ep)
+    url = build_chat_url(base)
     return council.Member(
         endpoint_id=ep.id,
         model=model,
         endpoint_name=ep.name or "",
         kind=kind,
         provider=provider,
-        url=build_chat_url(base),
+        url=url,
         headers=build_headers(api_key, base) or None,
+        context_tokens=_seat_context(model, url),
         **_seat_pricing(ep, model, kind, provider),
     )
+
+
+def _seat_context(model: str, url: str = "") -> Optional[int]:
+    """The seat's context window in tokens, or None when nothing reports it.
+
+    With a chat URL the endpoint is asked (a local server reports the window it
+    was started with); without one only the known-models table is read, so a
+    cost estimate never waits on the network.
+    """
+    from src import model_context
+
+    try:
+        if not url:
+            return model_context.known_context_length(model)
+        ctx, known = model_context.get_context_length_known(url, model)
+        return ctx if known else None
+    except Exception as exc:
+        logger.warning("council: context window lookup failed error_type=%s", type(exc).__name__)
+        return None
 
 
 def _seat_pricing(ep, model: str, kind: str, provider: str) -> Dict[str, Any]:

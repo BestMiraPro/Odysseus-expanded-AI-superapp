@@ -126,14 +126,16 @@ def test_review_prompt_is_anonymous_and_chair_prompt_names_models():
 def test_long_answers_are_clipped_in_later_stages():
     big = "x" * (council.MAX_ANSWER_CHARS + 500)
     body = council.review_messages("Q", {"A": 0}, {0: big})[-1]["content"]
-    assert "[... truncated ...]" in body
+    assert "[NOTE: this answer is clipped" in body and "[... CUT: " in body
     assert len(body) < council.MAX_ANSWER_CHARS + 2000
 
 
-def test_history_keeps_only_recent_completed_turns():
+def test_history_keeps_the_first_and_the_recent_completed_turns():
     history = [{"question": f"q{i}", "final": f"a{i}"} for i in range(6)] + [{"question": "q", "final": ""}]
     msgs = council.history_messages(history)
-    assert [m["content"] for m in msgs] == ["q4", "a4", "q5", "a5"]
+    assert [m["content"] for m in msgs] == [
+        "q0", "a0", "[NOTE: 2 earlier rounds are not replayed here.]\n\nq3", "a3", "q4", "a4", "q5", "a5"]
+    assert [m["role"] for m in msgs] == ["user", "assistant"] * 4
 
 
 # ---------------------------------------------------------------------------
@@ -287,3 +289,97 @@ def test_history_reaches_every_stage_model():
     for _stage, _model, messages in stream.calls:
         contents = [m["content"] for m in messages]
         assert "Earlier?" in contents and "Earlier answer" in contents
+
+
+# ---------------------------------------------------------------------------
+# history budget
+# ---------------------------------------------------------------------------
+
+def _long(tag: str, size: int) -> str:
+    """``size`` characters of numbered lines, so any cut shows as missing lines."""
+    body = "".join(f"{tag} line {i:05d}\n" for i in range(size // 10))
+    return body[:size - 4] + " END"
+
+
+BRIEF = _long("brief", 12_000)           # round 1: the user's brief
+ROUND1 = _long("round1", 19_000)         # round 1: the council's answer
+REPLY = "1 - all\n3 - mixed"             # round 2: the user answers its questions
+PREVIOUS = _long("previous", 20_000)     # round 2: the council's answer
+HISTORY = [{"question": BRIEF, "final": ROUND1}, {"question": REPLY, "final": PREVIOUS}]
+
+
+def _sized(name: str, context_tokens: int) -> council.Member:
+    member = _member(name)
+    member.context_tokens = context_tokens
+    return member
+
+
+def _history_part(messages):
+    """The replayed history: everything between the system prompt and the new question."""
+    return [m["content"] for m in messages[1:-1]]
+
+
+def _run_round3(context_tokens: int, answers=None):
+    stream = _fake_stream(answers=answers)
+    members = [_sized("a", context_tokens), _sized("b", context_tokens)]
+    _run(question="Round 3?", members=members, chairman=_sized("a", context_tokens), mode="full",
+         stream_fn=stream, history=HISTORY)
+    stages = {call[0] for call in stream.calls}
+    assert stages == {s.split(".")[0] for s in (council.OPINION_SYSTEM, council.REVIEW_SYSTEM, council.CHAIR_SYSTEM)}
+    assert len(stream.calls) == 5               # 2 opinions, 2 reviews, 1 chairman
+    return stream.calls
+
+
+def test_large_windows_replay_the_brief_and_the_previous_answer_in_full():
+    long_answer = _long("member", 20_000)
+    for stage, _model, messages in _run_round3(1_000_000, answers={"a": long_answer}):
+        assert _history_part(messages) == [BRIEF, ROUND1, REPLY, PREVIOUS], stage
+        if stage != council.OPINION_SYSTEM.split(".")[0]:
+            # A member's long answer also reaches reviewers and chairman uncut.
+            assert long_answer in messages[-1]["content"] and "[NOTE:" not in messages[-1]["content"], stage
+
+
+def test_small_windows_clip_the_middle_turns_first_and_say_so():
+    for stage, _model, messages in _run_round3(40_000):
+        brief, round1, reply, previous = _history_part(messages)
+        assert (brief, reply, previous) == (BRIEF, REPLY, PREVIOUS), stage
+        assert round1.startswith("[NOTE: this earlier council answer is clipped"), stage
+        assert "[... CUT: " in round1 and "characters" in round1
+        assert len(round1) < len(ROUND1) // 2
+        assert "round1 line 00000" in round1 and round1.endswith(" END")   # start and end kept
+
+
+def test_tiny_windows_clip_the_brief_and_the_previous_answer_with_a_note():
+    for stage, _model, messages in _run_round3(8_000):
+        brief, round1, reply, previous = _history_part(messages)
+        assert reply == REPLY, stage
+        assert round1.startswith("[NOTE: this earlier council answer is left out"), stage
+        assert brief.startswith("[NOTE: this earlier question is clipped"), stage
+        assert previous.startswith("[NOTE: this earlier council answer is clipped"), stage
+        assert "brief line 00000" in brief and "previous line 00000" in previous
+        assert sum(map(len, (brief, round1, reply, previous))) <= council.prompt_room(
+            [_sized("a", 8_000)]) // 4 + 100
+
+
+def test_clip_note_names_the_cut_characters():
+    text = _long("x", 10_000)
+    clipped = council._clip_middle(text, 3_000, "earlier question")
+    head, cut = clipped.split("\n\n")[1:3]
+    start = len(head) + 1
+    assert f"characters {start:,}-" in clipped.splitlines()[0]
+    assert cut.startswith("[... CUT: ") and f"of {len(text):,}" in cut
+    assert len(clipped) <= 3_000
+
+
+def test_unknown_windows_fall_back_to_a_conservative_budget():
+    known = council.plan_limits([_sized("a", 1_000_000)], _sized("a", 1_000_000), "quick", "Q", HISTORY)
+    unknown = council.plan_limits([_member("a")], _sized("a", 1_000_000), "quick", "Q", HISTORY)
+    assert unknown.history < known.history
+    assert unknown == council.plan_limits([_sized("a", council.FALLBACK_CONTEXT_TOKENS)],
+                                          _sized("a", 1_000_000), "quick", "Q", HISTORY)
+
+
+def test_estimate_counts_the_replayed_history():
+    small = council.estimate_turn([_sized("a", 8_000)], _sized("a", 8_000), "quick", "Q", HISTORY)
+    large = council.estimate_turn([_sized("a", 1_000_000)], _sized("a", 1_000_000), "quick", "Q", HISTORY)
+    assert large["calls"][0]["input_tokens"] > small["calls"][0]["input_tokens"] + 10_000
