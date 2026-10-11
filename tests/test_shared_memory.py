@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 from types import SimpleNamespace
 
@@ -10,18 +11,25 @@ import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
-from src import secret_storage, shared_memory as sm
+from src import shared_memory as sm
 from src.chat_processor import ChatProcessor
 
 _REAL_CLIENT = httpx.Client
 PROFILE = "# Profile\n\n## How to respond\n- Short answers.\n- End with one action."
 
 
+def _secrets():
+    return importlib.import_module("src.secret_storage")
+
+
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(sm, "CONFIG_FILE", str(tmp_path / "shared_memory.json"))
-    monkeypatch.setattr(secret_storage, "_KEY_PATH", tmp_path / ".app_key")
-    monkeypatch.setattr(secret_storage, "_fernet", None)
+    # Other suites swap src.secret_storage in sys.modules; patch the module
+    # shared_memory will import, not a stale package attribute.
+    secrets = _secrets()
+    monkeypatch.setattr(secrets, "_KEY_PATH", tmp_path / ".app_key")
+    monkeypatch.setattr(secrets, "_fernet", None)
     sm._cache.clear()
     yield
     sm._cache.clear()
@@ -85,7 +93,7 @@ def test_token_is_encrypted_kept_and_never_returned():
     assert public["has_token"] is True and "token" not in public
 
     _enable(token=None)                         # untouched
-    assert secret_storage.decrypt(sm.load_config("alice").token) == "ghp_secret"
+    assert _secrets().decrypt(sm.load_config("alice").token) == "ghp_secret"
     _enable(token="")                           # removed
     assert sm.load_config("alice").token == ""
 
