@@ -274,17 +274,19 @@ def plan_limits(
     mode: str,
     question: str,
     history: List[Dict[str, str]],
+    context: str = "",
 ) -> Limits:
     """Budgets that keep the chairman's prompt, the largest, inside the smallest window.
 
-    History gets what is left after the question and room for every answer
-    and review at their default size, but never less than a quarter of the
-    room. Whatever the history does not use goes to the answers and reviews.
+    History gets what is left after the question, the context about the user
+    and room for every answer and review at their default size, but never
+    less than a quarter of the room. Whatever the history does not use goes
+    to the answers and reviews.
     """
     room = prompt_room([*members, chairman])
     n = max(1, len(members))
     reviews = mode == MODE_FULL and len(members) >= 2
-    fixed = len(question or "") + PROMPT_OVERHEAD_CHARS
+    fixed = len(question or "") + len(context or "") + PROMPT_OVERHEAD_CHARS
     payload = n * (MAX_ANSWER_CHARS + (MAX_REVIEW_CHARS if reviews else 0))
     history_chars = max(room // 4, room - fixed - payload)
     used = sum(len(m["content"]) for m in history_messages(history, history_chars))
@@ -293,6 +295,13 @@ def plan_limits(
         return Limits(history_chars, max(MAX_ANSWER_CHARS, free * 2 // (3 * n)),
                       max(MAX_REVIEW_CHARS, free // (3 * n)))
     return Limits(history_chars, max(MAX_ANSWER_CHARS, free // n), MAX_REVIEW_CHARS)
+
+
+def with_context(messages: List[Dict[str, str]], context: str) -> List[Dict[str, str]]:
+    """``messages`` with ``context`` (what the council may know about the user) in the system prompt."""
+    if not context:
+        return messages
+    return [{**messages[0], "content": f"{messages[0]['content']}\n\n{context}"}, *messages[1:]]
 
 
 def _command_text(tool: str, command: Any) -> str:
@@ -660,6 +669,7 @@ async def run_council(
     rng: Optional[random.Random] = None,
     checkpoint: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     state: Optional[Dict[str, Any]] = None,
+    context: str = "",
 ) -> Dict[str, Any]:
     """Run all stages, emitting progress events; returns the turn's results.
 
@@ -671,6 +681,8 @@ async def run_council(
     streams and finishes, so a caller that stops the run still holds every
     answer written so far, including a half-written synthesis.
     ``checkpoint`` receives it after each completed stage.
+    ``context`` (the user's shared and saved memories) joins every stage's
+    system prompt.
     """
     result: Dict[str, Any] = state if state is not None else {}
     result.update({"opinions": [], "reviews": [], "ranking": [], "labels": {},
@@ -686,11 +698,11 @@ async def run_council(
     if stream_fn is None:
         from src.llm_core import stream_llm as stream_fn  # noqa: N806
 
-    limits = plan_limits(members, chairman, mode, question, history)
+    limits = plan_limits(members, chairman, mode, question, history, context)
 
     # Stage 1 - opinions
     await emit({"type": "stage", "stage": "opinions", "status": "start"})
-    base = opinion_messages(question, history, limits)
+    base = with_context(opinion_messages(question, history, limits), context)
     result["opinions"] = [{"member": i} for i in range(len(members))]
     outcomes = await run_parallel([
         run_member(stream_fn, m, base, stage="opinions", index=i, emit=emit, timeout=MEMBER_TIMEOUT,
@@ -711,7 +723,7 @@ async def run_council(
     # Stage 2 - blind peer review
     if mode == MODE_FULL and len(ok) >= 2:
         await emit({"type": "stage", "stage": "review", "status": "start", "labels": labels})
-        msgs = review_messages(question, labels, ok, history, limits)
+        msgs = with_context(review_messages(question, labels, ok, history, limits), context)
         reviewer_ids = sorted(ok)
         result["reviews"] = [{"member": i} for i in reviewer_ids]
         await run_parallel([
@@ -729,8 +741,9 @@ async def run_council(
 
     # Stage 3 - chairman synthesis
     await emit({"type": "stage", "stage": "synthesis", "status": "start"})
-    msgs = chair_messages(question, history, labels, ok, names,
-                          [r for r in result["reviews"] if not r.get("error")], result["ranking"], limits)
+    msgs = with_context(chair_messages(question, history, labels, ok, names,
+                                       [r for r in result["reviews"] if not r.get("error")],
+                                       result["ranking"], limits), context)
     result["chair"] = {"member": "chair"}
     chair = await run_member(stream_fn, chairman, msgs, stage="synthesis", index="chair",
                              emit=emit, timeout=CHAIR_TIMEOUT, sink=result["chair"])
@@ -815,6 +828,7 @@ def estimate_turn(
     question: str,
     history: List[Dict[str, str]],
     expected: Optional[Dict[str, int]] = None,
+    context: str = "",
 ) -> Dict[str, Any]:
     """What one council turn should cost before it runs.
 
@@ -832,17 +846,18 @@ def estimate_turn(
     blank = {i: "" for i in range(n)}
     names = {i: f"{m.model} via {m.endpoint_name}" for i, m in enumerate(members)}
     answers_tokens = exp["opinions"] * n
-    limits = plan_limits(members, chairman, mode, question, history)
+    limits = plan_limits(members, chairman, mode, question, history, context)
     plan: List[tuple] = []
-    opinion_in = budget.estimate_tokens(opinion_messages(question, history, limits))
+    opinion_in = budget.estimate_tokens(with_context(opinion_messages(question, history, limits), context))
     plan += [("opinions", i, m, opinion_in, exp["opinions"]) for i, m in enumerate(members)]
     reviews_tokens = 0
     if mode == MODE_FULL and n >= 2:
-        review_in = (budget.estimate_tokens(review_messages(question, labels, blank, history, limits))
-                     + answers_tokens)
+        review_in = (budget.estimate_tokens(with_context(
+            review_messages(question, labels, blank, history, limits), context)) + answers_tokens)
         plan += [("review", i, m, review_in, exp["review"]) for i, m in enumerate(members)]
         reviews_tokens = exp["review"] * n
-    chair_in = (budget.estimate_tokens(chair_messages(question, history, labels, blank, names, [], [], limits))
+    chair_in = (budget.estimate_tokens(with_context(
+        chair_messages(question, history, labels, blank, names, [], [], limits), context))
                 + answers_tokens + reviews_tokens)
     plan.append(("synthesis", "chair", chairman, chair_in, exp["synthesis"]))
 

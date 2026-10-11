@@ -371,3 +371,37 @@ def test_stop_during_synthesis_keeps_the_partial_answer(db, monkeypatch):
     assert turn["status"] == "cancelled"
     assert turn["final"].startswith("The council leans towards")
     assert "stopped before the chairman finished" in turn["final"]
+
+
+class _SavedMemories:
+    def load(self, owner=None):
+        return [{"id": "m1", "text": "User trains strength three times a week.", "pinned": True,
+                 "category": "identity", "timestamp": 1}]
+
+
+@pytest.mark.parametrize("memory,pref_on,expect", [(True, True, True), (False, True, False), (True, False, False)])
+def test_council_memory_follows_the_toggle_and_the_memory_switch(client, db, monkeypatch, memory, pref_on, expect):
+    from src.chat_processor import ChatProcessor
+
+    monkeypatch.setattr(cr, "_CHAT_PROCESSOR", ChatProcessor(memory_manager=_SavedMemories(),
+                                                             personal_docs_manager=SimpleNamespace(rag_manager=None)))
+    monkeypatch.setattr("src.shared_memory.context_text", lambda owner, wait=False: f"SHARED PROFILE of {owner}")
+    monkeypatch.setattr("routes.prefs_routes._load_for_user", lambda owner: {"memory_enabled": pref_on})
+    systems = []
+
+    async def recording(url, model, messages, **kwargs):
+        systems.append(messages[0]["content"])
+        bare = [{**messages[0], "content": messages[0]["content"].split("\n\nSHARED PROFILE")[0]}, *messages[1:]]
+        async for chunk in _fake_stream(url, model, bare, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", recording)
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    resp = client.post(f"/api/council/sessions/{sid}/ask", json={"question": "Plan my week", "memory": memory, **SEATS})
+    events = _events(resp.text)
+    assert events[0]["memory"] is expect and events[-1]["status"] == "done"
+    assert len(systems) == 5
+    for system in systems:
+        assert ("SHARED PROFILE of alice" in system) is expect
+        assert ("User trains strength three times a week." in system) is expect
+    assert client.get(f"/api/council/sessions/{sid}").json()["config"]["memory"] is memory

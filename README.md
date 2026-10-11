@@ -221,6 +221,22 @@ them; each source can be removed again from the same panel. Only text is kept (n
 attachments), and the archive is per user. `ODYSSEUS_TRANSCRIPT_DIRS` adds folders to scan
 (e.g. a host `~/.claude/projects` mounted into the container).
 
+### Memory
+
+**Memory** under the seats (on by default, per council) gives every member and the chairman
+your shared memory repo (below) and the saved memories that match the question, the same
+selection chat uses. It follows the memory switch in the Memory panel: memory off there means
+none here either. Turns that used it are marked *memory*.
+
+**Shared memory repo** (Memory → Settings) points Odysseus at a GitHub repository where you
+keep notes for AI assistants, such as a `USER.md` profile that several tools share. Give the
+repository (`owner/name` or its URL), the branch and the files to read; a private repository
+needs a fine-grained token with read-only *Contents* access, stored encrypted. Odysseus reads
+the files through the GitHub API, read-only, and adds them to chat and Council prompts as your
+standing instructions, so point it only at a repository you control. Files are re-read every
+ten minutes, on **Reload now** and on save; if GitHub is unreachable the last good copy stays
+in use. The setting is per user, and incognito chats leave it out.
+
 ## Omnigent
 
 **Omnigent** in the left rail, or **Tools → Omnigent**. Its own web UI is bridged to

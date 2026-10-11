@@ -383,3 +383,37 @@ def test_estimate_counts_the_replayed_history():
     small = council.estimate_turn([_sized("a", 8_000)], _sized("a", 8_000), "quick", "Q", HISTORY)
     large = council.estimate_turn([_sized("a", 1_000_000)], _sized("a", 1_000_000), "quick", "Q", HISTORY)
     assert large["calls"][0]["input_tokens"] > small["calls"][0]["input_tokens"] + 10_000
+
+
+# ---------------------------------------------------------------------------
+# context about the user
+# ---------------------------------------------------------------------------
+
+def test_context_reaches_every_stage_system_prompt():
+    stream = _fake_stream()
+    calls = []
+
+    async def recording(url, model, messages, **kwargs):
+        calls.append(messages)
+        # The fake keys on the bare stage prompt, so hand it the prompt without the context.
+        bare = [{**messages[0], "content": messages[0]["content"].split("\n\nABOUT THE USER")[0]}, *messages[1:]]
+        async for chunk in stream(url, model, bare, **kwargs):
+            yield chunk
+
+    result, _ = _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full",
+                     stream_fn=recording, context="ABOUT THE USER: prefers short answers.")
+    assert result["final"] == "FINAL ANSWER"
+    assert len(calls) == 5
+    for messages in calls:
+        assert messages[0]["role"] == "system" and messages[0]["content"].endswith("prefers short answers.")
+        assert sum("ABOUT THE USER" in m["content"] for m in messages) == 1
+
+
+def test_context_counts_against_the_history_budget():
+    members, chair = [_sized("a", 40_000)], _sized("a", 40_000)
+    plain = council.plan_limits(members, chair, "quick", "Q", HISTORY)
+    with_memory = council.plan_limits(members, chair, "quick", "Q", HISTORY, context="m" * 20_000)
+    assert with_memory.history == plain.history - 20_000
+    est = council.estimate_turn(members, chair, "quick", "Q", [], context="m" * 20_000)
+    assert est["calls"][0]["input_tokens"] > council.estimate_turn(members, chair, "quick", "Q", [])["calls"][0][
+        "input_tokens"] + 5_000
