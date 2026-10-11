@@ -34,6 +34,7 @@ import subprocess
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, Iterable, Iterator, List, Optional
 from urllib.parse import urlparse
 
@@ -329,20 +330,42 @@ def build_prompt(messages: Iterable[Dict]) -> tuple[str, str]:
     return system, "\n".join(lines)
 
 
-def cli_args(cli: str, model: str, system_file: str, effort: Optional[str] = None) -> List[str]:
+@dataclass
+class NativeTools:
+    """Claude Code's own tools for one run (Council seats).
+
+    ``builtin`` goes to ``--tools``; ``allowed`` (built-ins plus MCP tool names)
+    to ``--allowedTools`` with ``--permission-mode dontAsk``, so anything not
+    listed is refused instead of waiting for a prompt nobody can answer.
+    ``cwd`` is the workspace the file tools may touch (None: a private empty
+    directory).
+    """
+
+    builtin: List[str] = field(default_factory=list)
+    allowed: List[str] = field(default_factory=list)
+    mcp_config: Optional[str] = None
+    cwd: Optional[str] = None
+
+
+def cli_args(cli: str, model: str, system_file: str, effort: Optional[str] = None,
+             tools: Optional[NativeTools] = None) -> List[str]:
     args = [
         cli, "-p",
         "--output-format", "stream-json",
         "--verbose",
         "--include-partial-messages",
         "--model", model,
-        "--tools", "",
+        "--tools", ",".join(tools.builtin) if tools else "",
         "--strict-mcp-config",
         "--setting-sources", "",
         "--disable-slash-commands",
         "--no-session-persistence",
         "--system-prompt-file", system_file,
     ]
+    if tools:
+        args += ["--allowedTools", ",".join(tools.allowed), "--permission-mode", "dontAsk"]
+        if tools.mcp_config:
+            args += ["--mcp-config", tools.mcp_config]
     if effort in ("low", "medium", "high", "xhigh", "max"):
         args += ["--effort", effort]
     return args
@@ -399,8 +422,10 @@ class StreamTranslator:
     itself instead of letting Odysseus run the tool.
     """
 
-    def __init__(self, requested_model: str, stop_tools: Optional[set] = None):
+    def __init__(self, requested_model: str, stop_tools: Optional[set] = None, native_tools: bool = False):
         self.requested_model = requested_model
+        self.native_tools = native_tools
+        self._tool_names: Dict[str, str] = {}
         self.text_emitted = False
         self.done = False
         self.failed = False
@@ -469,6 +494,21 @@ class StreamTranslator:
             for block in message.get("content") or []:
                 if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
                     self._assistant_text.append(block["text"])
+                elif (self.native_tools and isinstance(block, dict) and block.get("type") == "tool_use"
+                      and block.get("id") not in self._tool_names):
+                    name = tool_display_name(block.get("name"))
+                    self._tool_names[block.get("id")] = name
+                    out.append(_sse({"type": "tool_start", "tool": name,
+                                     "command": tool_input_summary(block.get("name"), block.get("input")),
+                                     "id": block.get("id")}))
+        elif kind == "user" and self.native_tools:
+            message = obj.get("message") or {}
+            for block in message.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tid = block.get("tool_use_id")
+                    out.append(_sse({"type": "tool_output", "tool": self._tool_names.get(tid, "tool"),
+                                     "output": tool_result_text(block.get("content"))[:_TOOL_OUTPUT_PREVIEW],
+                                     "exit_code": 1 if block.get("is_error") else 0, "id": tid}))
         elif kind == "result":
             self.done = True
             if obj.get("is_error") or str(obj.get("subtype") or "").startswith("error"):
@@ -506,6 +546,48 @@ class StreamTranslator:
             logger.warning("claude subscription CLI exited rc=%s without a result", returncode)
         status, text = friendly_error(stderr_tail)
         return [_error_chunk(status, text)]
+
+
+_TOOL_OUTPUT_PREVIEW = 1500
+_MCP_PREFIX_RE = re.compile(r"^mcp__[^_]+(?:_[^_]+)*?__")
+
+
+def tool_display_name(name: Any) -> str:
+    """``mcp__odysseus__search_history`` -> ``search_history``; built-ins as is."""
+    name = str(name or "tool")
+    return _MCP_PREFIX_RE.sub("", name) if name.startswith("mcp__") else name
+
+
+def tool_input_summary(name: Any, data: Any) -> str:
+    """One line saying what a tool call does (command, path, query, URL)."""
+    if not isinstance(data, dict):
+        return ""
+    for key in ("command", "query", "url", "pattern", "file_path", "path", "notebook_path",
+                "conversation_id", "description", "prompt"):
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            text = value.strip()
+            if key == "pattern" and data.get("path"):
+                text += f"  in {data['path']}"
+            return text[:300]
+    try:
+        return json.dumps(data, ensure_ascii=False)[:300]
+    except (TypeError, ValueError):
+        return ""
+
+
+def tool_result_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, dict) and item.get("type") == "image":
+                parts.append("[image]")
+        return "\n".join(parts)
+    return "" if content is None else str(content)
 
 
 def _parse_line(line: str) -> Any:
@@ -587,7 +669,7 @@ class _Invocation:
     """Prepared CLI call: argv, env, stdin and a private system-prompt file."""
 
     def __init__(self, url: str, model: str, messages: List[Dict], effort: Optional[str] = None,
-                 credentials: Optional[tuple] = None):
+                 credentials: Optional[tuple] = None, tools: Optional[NativeTools] = None):
         if not valid_model_id(model):
             raise ClaudeSubscriptionError("Invalid Claude model id.")
         cli = find_cli()
@@ -608,11 +690,12 @@ class _Invocation:
         fd = os.open(system_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(system)
-        self.stop_tools = text_tool_names(system)
-        self.args = cli_args(cli, model, system_file, effort)
+        self.native_tools = tools is not None
+        self.stop_tools = None if tools else text_tool_names(system)
+        self.args = cli_args(cli, model, system_file, effort, tools)
         self.env = cli_env(mode, token)
         self.stdin = prompt.encode("utf-8")
-        self.cwd = _workdir()
+        self.cwd = (tools.cwd if tools and tools.cwd else None) or _workdir()
 
     def cleanup(self) -> None:
         if self._tmpdir:
@@ -676,8 +759,12 @@ async def stream_chat(
     timeout: Optional[float] = None,
     effort: Optional[str] = None,
     credentials: Optional[tuple] = None,
+    tools: Optional[NativeTools] = None,
 ) -> AsyncIterator[str]:
     """Stream one Claude reply as Odysseus SSE chunks (``data: {"delta": ...}``).
+
+    With ``tools`` Claude Code runs with its own tools, and each call shows up
+    as ``tool_start`` / ``tool_output`` events between the text.
 
     ``timeout`` is an idle timeout, like the read timeout of the HTTP providers:
     it restarts whenever the CLI emits something, so a long answer that keeps
@@ -688,7 +775,7 @@ async def stream_chat(
     always run. Closing the generator (client gone, task cancelled) kills it.
     """
     try:
-        inv = _Invocation(url, model, messages, effort, credentials)
+        inv = _Invocation(url, model, messages, effort, credentials, tools)
     except ClaudeSubscriptionError as exc:
         yield _error_chunk(exc.status, str(exc))
         return
@@ -744,7 +831,7 @@ async def stream_chat(
             sem.release()
 
     threading.Thread(target=_worker, name="claude-subscription-cli", daemon=True).start()
-    translator = StreamTranslator(model, stop_tools=inv.stop_tools)
+    translator = StreamTranslator(model, stop_tools=inv.stop_tools, native_tools=inv.native_tools)
     try:
         while True:
             try:

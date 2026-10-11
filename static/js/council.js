@@ -43,7 +43,17 @@ const S = {
   connect: { claude: { busy: false, msg: '', err: false }, chatgpt: { busy: false, msg: '', err: false, code: '', url: '' } },
   pollTimer: null,
   estimate: null,        // /api/council/estimate for the current seats
+  tools: 'research',     // off | research | full: what members may do
+  workspace: '',         // folder for their file tools (admin)
+  expanded: new Set(),   // keys of long messages / tool rows the user opened
+  history: { open: false, stats: null, busy: false, msg: '', err: false, query: '', results: null, reader: null },
 };
+
+const TOOL_MODES = [
+  ['off', 'Off', 'Text only: members answer from what they know.'],
+  ['research', 'Research', 'Web search, your files in the workspace, and your claude.ai / ChatGPT / Claude Code / Codex history.'],
+  ['full', 'Full', 'Research plus shell commands, Python and file edits in the workspace, like Claude Code or Codex.'],
+];
 
 // ---------------------------------------------------------------------------
 // utils
@@ -90,6 +100,85 @@ function md(text) {
 function fmtMs(ms) {
   if (!ms && ms !== 0) return '';
   return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(ms < 10000 ? 1 : 0)} s`;
+}
+
+function autosize(input) {
+  if (!input) return;
+  if ($('#council-composer')?.classList.contains('tall')) { input.style.height = ''; return; }
+  input.style.height = 'auto';
+  input.style.height = `${Math.min(Math.round(window.innerHeight * 0.45), input.scrollHeight + 2)}px`;
+}
+
+// Long messages render clipped (".clamped") with a Show more toggle; which
+// ones the user opened survives re-renders via S.expanded.
+function clampAttrs(key) {
+  return `data-clamp="${esc(key)}" class="council-clamp${S.expanded.has(key) ? '' : ' clamped'}"`;
+}
+function moreButton(key) {
+  return `<button class="council-more" data-more="${esc(key)}" hidden>${S.expanded.has(key) ? 'Show less' : 'Show more'}</button>`;
+}
+function updateClamps(root) {
+  for (const el of (root || _pane || document).querySelectorAll('[data-clamp]')) {
+    const key = el.dataset.clamp;
+    const btn = el.parentElement?.querySelector(`.council-more[data-more="${CSS.escape(key)}"]`);
+    if (!btn) continue;
+    if (S.expanded.has(key)) { btn.hidden = false; continue; }
+    const overflows = el.scrollHeight > el.clientHeight + 4;
+    btn.hidden = !overflows;
+    if (!overflows) el.classList.remove('clamped');
+  }
+}
+
+// ---- tool activity ----
+const TOOL_ICONS = {
+  search: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>',
+  web: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg>',
+  history: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></svg>',
+  file: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>',
+  shell: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="m5 8 4 4-4 4M12 16h7"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20h4L19 9l-4-4L4 16z"/></svg>',
+  plan: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg>',
+  tool: '<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.4-.6-.6-2.4z"/></svg>',
+};
+function toolIcon(name) {
+  const n = String(name || '').toLowerCase();
+  if (/history|odysseus_chats|search_chats/.test(n)) return TOOL_ICONS.history;
+  if (/fetch|webfetch/.test(n)) return TOOL_ICONS.web;
+  if (/search/.test(n)) return TOOL_ICONS.search;
+  if (/^(read|read_file|glob|grep|ls|get_workspace)$/.test(n)) return TOOL_ICONS.file;
+  if (/bash|shell|python|exec/.test(n)) return TOOL_ICONS.shell;
+  if (/edit|write|patch/.test(n)) return TOOL_ICONS.edit;
+  if (/todo|plan/.test(n)) return TOOL_ICONS.plan;
+  return TOOL_ICONS.tool;
+}
+function toolsBlock(steps, key, live) {
+  const list = Array.isArray(steps) ? steps : [];
+  const calls = list.filter(st => st.kind === 'tool');
+  if (!calls.length && !list.length) return '';
+  const running = calls.filter(st => st.status === 'running').length;
+  const failed = calls.filter(st => st.status === 'error').length;
+  const listKey = `tl:${key}`;
+  // Open while the member is working; afterwards closed unless the user opened it.
+  const open = S.expanded.has(listKey) ? true : S.expanded.has(`${listKey}:closed`) ? false : !!live;
+  const names = [...new Set(calls.map(st => st.tool))].slice(0, 4).join(', ');
+  const rows = list.map((st, i) => {
+    if (st.kind === 'note') return `<li class="note">${esc(st.text || '')}</li>`;
+    const rowKey = `to:${key}:${i}`;
+    const outOpen = S.expanded.has(rowKey);
+    const mark = st.status === 'running' ? '…' : st.status === 'error' ? '✗' : '✓';
+    return `<li class="${esc(st.status || 'done')}">
+      <button class="row" data-tool-out="${esc(rowKey)}" ${st.output ? '' : 'disabled'} title="${esc(st.command || '')}">
+        <span class="ic">${toolIcon(st.tool)}</span><b>${esc(st.tool)}</b><code>${esc(st.command || '')}</code><span class="st">${mark}</span>
+      </button>${st.output ? `<pre ${outOpen ? '' : 'hidden'}>${esc(st.output)}</pre>` : ''}</li>`;
+  }).join('');
+  return `<div class="council-tools ${open ? 'open' : ''}" data-tools="${esc(listKey)}">
+    <button class="council-tools-h" data-tools-toggle="${esc(listKey)}" aria-expanded="${open}">
+      <span class="chev">▸</span><span>${calls.length} tool call${calls.length === 1 ? '' : 's'}</span>
+      <span class="sum">${esc(names)}${failed ? ` · ${failed} failed` : ''}</span>
+      ${running ? '<span class="live">working…</span>' : ''}
+    </button>
+    <ol>${rows}</ol>
+  </div>`;
 }
 
 function seatKey(seat) { return seat ? `${seat.endpoint_id}::${seat.model}` : ''; }
@@ -150,10 +239,10 @@ function injectStyles() {
 .council-x:hover { opacity: 1; border-color: var(--border); }
 /* minmax(0, …): a plain 1fr track grows to its widest child and the pane
    scrolls sideways on a phone. */
-.council-layout { flex: 1; display: grid; grid-template-columns: 230px minmax(0, 1fr); min-height: 0; }
+.council-layout { flex: 1; display: grid; grid-template-columns: 250px minmax(0, 1fr); min-height: 0; }
 .council-side { border-right: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .council-side-top { padding: 10px; display: flex; gap: 6px; }
-.council-sessions { flex: 1; overflow-y: auto; padding: 0 6px 8px; }
+.council-sessions { flex: 1; overflow-y: auto; padding: 0 6px 8px; min-height: 110px; }
 .council-session { display: flex; align-items: center; gap: 6px; padding: 7px 8px; border-radius: 7px;
   cursor: pointer; font-size: 12.5px; }
 .council-session:hover { background: color-mix(in srgb, var(--fg) 7%, transparent); }
@@ -165,7 +254,7 @@ function injectStyles() {
 .council-session:hover .del { opacity: 0.6; }
 .council-session .del:hover { opacity: 1; }
 .council-connect { border-top: 1px solid var(--border); padding: 10px; display: flex; flex-direction: column; gap: 10px;
-  font-size: 12px; max-height: 55%; overflow-y: auto; }
+  font-size: 12px; max-height: 40%; overflow-y: auto; flex-shrink: 0; }
 .council-conn-h { display: flex; align-items: center; gap: 6px; font-weight: 600; }
 .council-conn-h .state { margin-left: auto; font-weight: 500; font-size: 11px; opacity: 0.75; }
 .council-conn-h .state.on { color: var(--ok, #3ba55d); opacity: 1; }
@@ -253,9 +342,9 @@ function injectStyles() {
 .council-section[open] > summary::before { transform: rotate(90deg); }
 .council-section > summary .sub { font-weight: 400; opacity: 0.6; }
 .council-section[open] > :not(summary) { animation: none; }
-.council-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; padding: 0 10px 10px; }
+.council-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 10px; padding: 0 10px 10px; }
 .council-card { border: 1px solid var(--border); border-radius: 9px; display: flex; flex-direction: column; min-width: 0;
-  background: var(--bg); max-height: 460px; }
+  background: var(--bg); }
 .council-card.err { border-color: color-mix(in srgb, var(--danger, #e05252) 60%, var(--border)); }
 .council-card-h { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--border);
   font-size: 12px; min-width: 0; }
@@ -264,7 +353,8 @@ function injectStyles() {
 .council-card-h .state { margin-left: auto; font-size: 10.5px; opacity: 0.65; white-space: nowrap; }
 .council-card-h .label { font-weight: 700; font-size: 11px; padding: 0 5px; border-radius: 4px;
   background: color-mix(in srgb, var(--fg) 10%, transparent); }
-.council-card-b { padding: 8px 12px; overflow-y: auto; font-size: 13px; line-height: 1.55; min-height: 40px; }
+.council-card-b { padding: 8px 12px; font-size: 13px; line-height: 1.55; min-height: 40px; overflow-wrap: anywhere; }
+.council-card-b.streaming { max-height: 340px; overflow-y: auto; }
 .council-card-b > :first-child { margin-top: 0; }
 .council-card-b > :last-child { margin-bottom: 0; }
 .council-card-b.pending::after { content: '…'; opacity: 0.5; }
@@ -286,8 +376,92 @@ function injectStyles() {
 .council-final-b > :first-child { margin-top: 0; }
 .council-final-b > :last-child { margin-bottom: 0; }
 .council-composer { border-top: 1px solid var(--border); padding: 10px 14px; display: flex; gap: 8px; align-items: flex-end; }
-.council-composer textarea { flex: 1; resize: none; min-height: 40px; max-height: 200px; padding: 9px 11px; font: inherit;
-  font-size: 13.5px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--fg); }
+.council-composer textarea { flex: 1; resize: none; min-height: 40px; max-height: 45vh; padding: 9px 34px 9px 11px; font: inherit;
+  font-size: 13.5px; line-height: 1.5; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--fg);
+  width: 100%; box-sizing: border-box; }
+.council-composer.tall textarea { min-height: 55vh; max-height: 70vh; }
+.council-input-wrap { position: relative; display: flex; }
+.council-grow { position: absolute; right: 6px; top: 6px; background: none; border: none; color: var(--fg); opacity: .5;
+  cursor: pointer; font-size: 13px; padding: 2px 5px; border-radius: 5px; }
+.council-grow:hover { opacity: 1; background: color-mix(in srgb, var(--fg) 8%, transparent); }
+/* Long messages: clipped with a fade and a Show more toggle instead of a
+   scroll box inside the scroll box. */
+.council-clamp { position: relative; }
+.council-clamp.clamped { max-height: 22em; overflow: hidden; }
+.council-clamp.clamped::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 3.5em; pointer-events: none;
+  background: linear-gradient(to bottom, transparent, var(--bg)); }
+.council-q.council-clamp.clamped { max-height: 9.5em; }
+.council-q.council-clamp.clamped::after { background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--fg) 8%, var(--bg))); }
+.council-more { align-self: flex-start; margin: 0 12px 8px; background: none; border: none; padding: 2px 0; cursor: pointer;
+  color: var(--accent, var(--red, #888)); font: inherit; font-size: 11.5px; }
+.council-more[hidden] { display: none; }
+.council-q-wrap { align-self: flex-end; max-width: 80%; display: flex; flex-direction: column; align-items: flex-end; }
+.council-q-wrap .council-q { max-width: 100%; align-self: stretch; }
+.council-q-wrap .council-more { align-self: flex-end; margin: 2px 4px 0; }
+.council-card-b h1, .council-card-b h2, .council-final-b h1 { font-size: 1.15em; margin: .8em 0 .4em; }
+.council-card-b h3, .council-card-b h4, .council-final-b h2 { font-size: 1.05em; margin: .7em 0 .35em; }
+.council-final-b h3, .council-final-b h4 { font-size: 1em; }
+.council-card-b table, .council-final-b table { display: block; overflow-x: auto; max-width: 100%; }
+/* Tool activity: what each member looked up or ran. */
+.council-tools { margin: 6px 10px 0; border: 1px solid var(--border); border-radius: 8px; font-size: 11.5px;
+  background: color-mix(in srgb, var(--fg) 3%, transparent); }
+.council-tools-h { display: flex; align-items: center; gap: 6px; width: 100%; background: none; border: none; color: var(--fg);
+  font: inherit; padding: 5px 8px; cursor: pointer; text-align: left; }
+.council-tools-h .chev { opacity: .5; transition: transform .15s; }
+.council-tools.open .council-tools-h .chev { transform: rotate(90deg); }
+.council-tools-h .sum { opacity: .7; }
+.council-tools-h .live { margin-left: auto; color: var(--accent, var(--red, #888)); }
+.council-tools ol { list-style: none; margin: 0; padding: 0 6px 6px; display: none; }
+.council-tools.open ol { display: block; }
+.council-tools li { padding: 3px 2px; border-top: 1px dashed color-mix(in srgb, var(--border) 70%, transparent); }
+.council-tools li.note { opacity: .72; font-style: italic; white-space: pre-wrap; line-height: 1.45; }
+.council-tools .row { display: flex; align-items: baseline; gap: 6px; min-width: 0; background: none; border: none; color: var(--fg);
+  font: inherit; width: 100%; text-align: left; padding: 0; cursor: pointer; }
+.council-tools .row:disabled { cursor: default; }
+.council-tools .row .ic { flex-shrink: 0; width: 13px; opacity: .7; }
+.council-tools .row b { flex-shrink: 0; font-weight: 600; }
+.council-tools .row code { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .8; font-size: 11px; }
+.council-tools .row .st { flex-shrink: 0; margin-left: auto; }
+.council-tools li.running .st { color: var(--accent, var(--red, #888)); }
+.council-tools li.done .st { color: var(--ok, #3ba55d); }
+.council-tools li.error .st { color: var(--danger, #e05252); }
+.council-tools pre { margin: 4px 0 2px 19px; padding: 6px 8px; max-height: 260px; overflow: auto; white-space: pre-wrap;
+  font-size: 11px; border-radius: 6px; background: var(--bg); border: 1px solid var(--border); }
+.council-final .council-tools { margin: 8px 14px 0; }
+.council-toolbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.council-ws { min-width: 0; flex: 1 1 220px; max-width: 420px; padding: 4px 8px; font-size: 12px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--fg); font-family: inherit; }
+.council-mode button:disabled { opacity: .3; cursor: not-allowed; }
+/* History (claude.ai / ChatGPT / Claude Code / Codex archive) */
+.council-history { border-top: 1px solid var(--border); padding: 8px 10px; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+  flex-shrink: 0; max-height: 46%; overflow-y: auto; }
+.council-history-h { display: flex; align-items: center; gap: 6px; font-weight: 600; background: none; border: none; color: var(--fg);
+  font: inherit; font-weight: 600; padding: 0; cursor: pointer; text-align: left; }
+.council-history-h .n { margin-left: auto; font-weight: 400; opacity: .6; font-size: 11px; }
+.council-history .src { display: flex; align-items: center; gap: 6px; }
+.council-history .src .c { margin-left: auto; opacity: .65; font-variant-numeric: tabular-nums; }
+.council-history .src button { background: none; border: none; color: inherit; opacity: .45; cursor: pointer; font-size: 11px; }
+.council-history .src button:hover { opacity: 1; }
+.council-history .help { opacity: .7; line-height: 1.45; }
+.council-history .help summary { cursor: pointer; }
+.council-history .help ul { margin: 4px 0 0; padding-left: 16px; }
+.council-history-results { display: flex; flex-direction: column; gap: 4px; }
+.council-history-hit { text-align: left; background: none; border: 1px solid var(--border); border-radius: 7px; padding: 5px 7px;
+  color: var(--fg); cursor: pointer; font: inherit; font-size: 11.5px; line-height: 1.4; }
+.council-history-hit:hover { border-color: var(--accent, var(--red, #888)); }
+.council-history-hit .t { font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.council-history-hit .m { opacity: .6; font-size: 10.5px; }
+.council-history-hit .s { opacity: .8; display: block; }
+.council-reader { position: absolute; inset: 0; z-index: 6; background: var(--panel, var(--bg)); display: flex; flex-direction: column; }
+.council-reader[hidden] { display: none; }
+.council-reader-h { display: flex; align-items: center; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.council-reader-h .t { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.council-reader-h .m { opacity: .6; font-size: 11.5px; white-space: nowrap; }
+.council-reader-b { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+.council-reader-msg { border: 1px solid var(--border); border-radius: 9px; padding: 8px 12px; font-size: 13px; line-height: 1.55; }
+.council-reader-msg.user { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.council-reader-msg .r { font-size: 10.5px; text-transform: uppercase; letter-spacing: .5px; opacity: .55; margin-bottom: 3px; }
+.council-main { position: relative; }
 .council-composer .hint { font-size: 11px; opacity: 0.55; }
 .council-estimate { font-size: 11px; opacity: 0.8; font-variant-numeric: tabular-nums; }
 .council-estimate[hidden] { display: none; }
@@ -304,7 +478,7 @@ function injectStyles() {
   .council-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .council-side { border-right: none; border-bottom: 1px solid var(--border); max-height: 32vh; }
   .council-grid { grid-template-columns: 1fr; }
-  .council-q { max-width: 92%; }
+  .council-q, .council-q-wrap { max-width: 92%; }
 }
 `;
   document.head.appendChild(st);
@@ -345,14 +519,19 @@ export function openPanel() {
           <button class="council-btn primary" id="council-new" style="flex:1">+ New council</button>
         </div>
         <div class="council-sessions" id="council-sessions" role="list"></div>
+        <div class="council-history" id="council-history"></div>
         <div class="council-connect" id="council-connect"></div>
       </aside>
       <section class="council-main">
         <div class="council-seats" id="council-seats"></div>
         <div class="council-scroll" id="council-scroll"></div>
-        <div class="council-composer">
-          <div style="flex:1;display:flex;flex-direction:column;gap:4px;">
-            <textarea id="council-input" rows="2" placeholder="Ask the council…" aria-label="Question for the council"></textarea>
+        <div class="council-reader" id="council-reader" hidden role="dialog" aria-label="Archived conversation"></div>
+        <div class="council-composer" id="council-composer">
+          <div style="flex:1;display:flex;flex-direction:column;gap:4px;min-width:0;">
+            <div class="council-input-wrap">
+              <textarea id="council-input" rows="2" placeholder="Ask the council…" aria-label="Question for the council"></textarea>
+              <button class="council-grow" data-act="grow" title="Bigger editor for a long question" aria-label="Toggle a bigger editor" aria-pressed="false">⤢</button>
+            </div>
             <span class="hint" id="council-hint">Enter to convene · Shift+Enter for a new line</span>
             <span class="council-estimate" id="council-estimate" role="status" aria-live="polite" hidden></span>
           </div>
@@ -379,8 +558,7 @@ export function openPanel() {
     }
   });
   input.addEventListener('input', () => {
-    input.style.height = 'auto';
-    input.style.height = `${Math.min(200, input.scrollHeight)}px`;
+    autosize(input);
     scheduleEstimate();
   });
   _pane.addEventListener('click', onPaneClick);
@@ -395,11 +573,16 @@ export function openPanel() {
   _pane.addEventListener('input', (e) => {
     if (e.target.id === 'council-picker-filter') applyPickerFilter(e.target.value);
     if (e.target.id === 'council-claude-token') S.connect.claude.tokenDraft = e.target.value;
+    if (e.target.id === 'council-history-q') S.history.query = e.target.value;
+  });
+  _pane.addEventListener('keydown', (e) => {
+    if (e.target.id === 'council-history-q' && e.key === 'Enter') { e.preventDefault(); searchHistory(); }
   });
 
   _keyHandler = (e) => {
     if (!_open || !_pane || _pane.classList.contains('hidden')) return;
     if (e.key !== 'Escape') return;
+    if (S.history.reader) { closeReader(); return; }
     if (S.picker) { S.picker = false; renderSeats(); return; }
     const active = document.activeElement;
     if (active && _pane.contains(active) && /^(TEXTAREA|INPUT|SELECT)$/.test(active.tagName)) {
@@ -480,7 +663,7 @@ const $ = (sel) => _pane?.querySelector(sel);
 // ---------------------------------------------------------------------------
 
 async function init() {
-  await Promise.all([loadRoster(), loadSessions()]);
+  await Promise.all([loadRoster(), loadSessions(), loadHistoryStats()]);
   const last = storeGet();
   const target = S.sessions.find(s => s.id === last) || S.sessions[0];
   if (target) await openSession(target.id);
@@ -501,8 +684,13 @@ function applyConfig(cfg) {
   S.members = Array.isArray(cfg?.members) ? cfg.members.filter(m => m && m.endpoint_id && m.model).slice(0, 8) : [];
   S.chairman = cfg?.chairman && cfg.chairman.endpoint_id ? cfg.chairman : null;
   S.mode = cfg?.mode === 'quick' ? 'quick' : 'full';
+  S.tools = TOOL_MODES.some(([id]) => id === cfg?.tools) ? cfg.tools : 'research';
+  if (S.tools === 'full' && !isAdmin()) S.tools = 'research';
+  S.workspace = typeof cfg?.workspace === 'string' ? cfg.workspace : '';
   if (!S.members.length) S.members = defaultSeats();
 }
+
+function isAdmin() { return !!S.roster?.can_connect; }
 
 function defaultSeats() {
   // First model of each subscription, then fill with API models: a useful
@@ -575,7 +763,7 @@ async function deleteSession(id) {
 }
 
 function currentConfig() {
-  return { members: S.members, chairman: S.chairman, mode: S.mode };
+  return { members: S.members, chairman: S.chairman, mode: S.mode, tools: S.tools, workspace: S.workspace };
 }
 
 let _saveTimer = null;
@@ -616,6 +804,7 @@ function stopPolling() {
 function renderAll() {
   if (!_pane) return;
   renderSessions();
+  renderHistory();
   renderConnect();
   renderSeats();
   renderTurns();
@@ -752,6 +941,19 @@ function renderSeats() {
         <button data-mode="quick" class="${S.mode === 'quick' ? 'on' : ''}" role="radio" aria-checked="${S.mode === 'quick'}" title="Opinions, then synthesis (no peer review)">Quick</button>
       </span>
     </div>
+    <div class="council-seat-row council-toolbar">
+      <span class="council-seat-label">Tools</span>
+      <span class="council-mode" role="radiogroup" aria-label="What members may do">
+        ${TOOL_MODES.map(([id, label, title]) => {
+          const locked = id === 'full' && !isAdmin();
+          return `<button data-tools-mode="${id}" class="${S.tools === id ? 'on' : ''}" role="radio" aria-checked="${S.tools === id}"
+            ${locked ? 'disabled' : ''} title="${esc(locked ? 'Full tools need an admin account.' : title)}">${label}</button>`;
+        }).join('')}
+      </span>
+      ${S.tools !== 'off' && isAdmin() ? `<input class="council-ws" id="council-workspace" value="${esc(S.workspace)}"
+          placeholder="Workspace folder for file tools (optional)" aria-label="Workspace folder"
+          title="Members can read${S.tools === 'full' ? ', run commands in and edit' : ''} files only inside this folder.">` : ''}
+    </div>
     ${S.picker ? renderPicker() : ''}`;
 }
 
@@ -827,7 +1029,7 @@ function renderComposer() {
   if (hint) {
     hint.textContent = !S.members.length ? 'Seat at least one member first.'
       : !ready ? 'A seat points at a model that is no longer available — remove or replace it.'
-      : `${S.members.length} member${S.members.length === 1 ? '' : 's'} · ${S.mode === 'full' ? 'opinions → blind review → synthesis' : 'opinions → synthesis'} · Enter to convene`;
+      : `${S.members.length} member${S.members.length === 1 ? '' : 's'} · ${S.mode === 'full' ? 'opinions → blind review → synthesis' : 'opinions → synthesis'} · tools: ${S.tools} · Enter to convene, Shift+Enter for a new line`;
   }
   scheduleEstimate();
 }
@@ -973,13 +1175,30 @@ function usageText(entry, seat) {
   return parts.join(' · ');
 }
 
-function memberCard(stage, seat, idx, entry, label) {
+function cardState(entry, seat) {
+  const text = entry?.text || '';
+  if (entry?.error) return 'error';
+  if (entry?.streaming) {
+    const running = (entry.tools || []).find(st => st.kind === 'tool' && st.status === 'running');
+    if (running) return `${running.tool}…`;
+    return entry.thinking && !text ? 'thinking…' : 'writing…';
+  }
+  return entry?.ms != null ? [fmtMs(entry.ms), usageText(entry, seat)].filter(Boolean).join(' · ') : (entry ? '' : 'waiting…');
+}
+
+function cardBody(key, entry) {
   const text = entry?.text || '';
   const err = entry?.error;
-  const streaming = entry?.streaming;
-  const usage = usageText(entry, seat);
-  const state = err ? 'error' : streaming ? (entry?.thinking && !text ? 'thinking…' : 'writing…')
-    : entry?.ms != null ? [fmtMs(entry.ms), usage].filter(Boolean).join(' · ') : (entry ? '' : 'waiting…');
+  if (entry?.streaming) {
+    return `<div class="council-card-b streaming ${!text ? 'pending' : ''}">${md(text)}</div>`;
+  }
+  return `<div ${clampAttrs(key).replace('class="', 'class="council-card-b ' + (!text && !err ? 'pending ' : ''))}>${err ? `<div class="council-errtext">${esc(err)}</div>` : md(text)}</div>${moreButton(key)}`;
+}
+
+function memberCard(stage, seat, idx, entry, label, turnId = '') {
+  const err = entry?.error;
+  const key = `${turnId}:${stage}:${idx}`;
+  const state = cardState(entry, seat);
   return `<div class="council-card ${err ? 'err' : ''}" data-stage="${stage}" data-member="${idx}">
     <div class="council-card-h">
       ${label ? `<span class="label" title="Anonymous label used in peer review">${esc(label)}</span>` : ''}
@@ -987,7 +1206,8 @@ function memberCard(stage, seat, idx, entry, label) {
       <span class="ep">${esc(seat?.endpoint_name || '')}</span>
       <span class="state">${esc(state)}</span>
     </div>
-    <div class="council-card-b ${!text && !err ? 'pending' : ''}">${err ? `<div class="council-errtext">${esc(err)}</div>` : md(text)}</div>
+    <div class="council-card-t">${toolsBlock(entry?.tools, key, !!entry?.streaming)}</div>
+    <div class="council-card-bw">${cardBody(key, entry)}</div>
   </div>`;
 }
 
@@ -1011,8 +1231,12 @@ function turnMarkdown(turn) {
   // Response A, B, C… in order; seats that failed (no label) go last.
   const opinions = [...(turn.opinions || [])].sort((x, y) =>
     (memberLabel[x.member] || '~').localeCompare(memberLabel[y.member] || '~'));
+  const toolLines = (steps) => (steps || []).filter(st => st.kind === 'tool')
+    .map(st => `- ${st.status === 'error' ? '✗' : '✓'} \`${st.tool}\`${st.command ? ` ${st.command.replace(/\n/g, ' ')}` : ''}`);
   for (const o of opinions) {
+    const used = toolLines(o.tools);
     out.push(`### ${memberLabel[o.member] ? `Response ${memberLabel[o.member]} — ` : ''}${name(o.member)}`, '',
+      ...(used.length ? ['Tools used:', ...used, ''] : []),
       o.error ? `_${o.error}_` : (o.text || ''), '');
   }
   const ranking = (turn.ranking || []).filter(r => r.avg_rank != null);
@@ -1076,7 +1300,7 @@ function renderTurn(turn, live = false) {
   const opinionsOpen = live || running || !turn.final;
   const opinions = `<details class="council-section" data-sec="opinions" ${opinionsOpen ? 'open' : ''}>
     <summary>Opinions <span class="sub">${seats.members.length} member${seats.members.length === 1 ? '' : 's'}</span></summary>
-    <div class="council-grid">${seats.members.map((seat, i) => memberCard('opinions', seat, i, ops[i], memberLabel[i])).join('')}</div>
+    <div class="council-grid">${seats.members.map((seat, i) => memberCard('opinions', seat, i, ops[i], memberLabel[i], turn.id)).join('')}</div>
   </details>`;
 
   let review = '';
@@ -1093,11 +1317,12 @@ function renderTurn(turn, live = false) {
     review = `<details class="council-section" data-sec="review" ${live || running ? 'open' : ''}>
       <summary>Peer review <span class="sub">${rankingSummary(ranking, seats)}</span></summary>
       ${table}
-      <div class="council-grid">${reviewers.map(({ seat, i }) => memberCard('review', seat, i, revs[i], memberLabel[i] ? `by ${memberLabel[i]}` : '')).join('')}</div>
+      <div class="council-grid">${reviewers.map(({ seat, i }) => memberCard('review', seat, i, revs[i], memberLabel[i] ? `by ${memberLabel[i]}` : '', turn.id)).join('')}</div>
     </details>`;
   }
 
   const chair = seats.chairman || {};
+  const chairTools = live ? (turn.chairTools || []) : (turn.chair?.tools || []);
   const finalText = turn.final || '';
   const finalErr = turn.status === 'done' && turn.error ? turn.error : '';
   const showFinal = finalText || (turn.stages && turn.stages.synthesis && turn.stages.synthesis !== 'pending') || (!running && turn.status !== 'running' && turn.error);
@@ -1107,13 +1332,19 @@ function renderTurn(turn, live = false) {
       <span class="tools">${finalText ? `<button class="council-btn small ghost" data-copy-final="${esc(turn.id)}">Copy</button>
         <button class="council-btn small ghost" data-export-turn="${esc(turn.id)}" title="Download the question, every opinion, the reviews, the ranking and the answer as Markdown">Export .md</button>` : ''}</span>
     </div>
+    <div class="council-final-t">${toolsBlock(chairTools, `${turn.id}:synthesis:chair`, live && turn.stages?.synthesis === 'running')}</div>
     <div class="council-final-b ${!finalText ? 'pending' : ''}">${finalErr ? `<div class="council-errtext" style="margin-bottom:8px">${esc(finalErr)} Showing the top-ranked answer instead.</div>` : ''}${md(finalText)}</div>
   </section>` : '';
 
+  const qKey = `q:${turn.id}`;
+  const toolsMode = turn.config?.tools || seats.tools;
+  const toolsNote = toolsMode && toolsMode !== 'off'
+    ? `<span class="council-usage" title="${esc((TOOL_MODES.find(([id]) => id === toolsMode) || [])[2] || '')}${turn.config?.workspace ? ` Workspace: ${turn.config.workspace}` : ''}">tools: ${esc(toolsMode)}</span>` : '';
   return `<article class="council-turn" data-turn="${esc(turn.id)}">
-    <div class="council-q">${esc(turn.question)}</div>
+    <div class="council-q-wrap"><div ${clampAttrs(qKey).replace('class="', 'class="council-q ')}>${esc(turn.question)}</div>${moreButton(qKey)}</div>
     <div class="council-strip">${strip}
       <span class="status ${statusErr ? 'err' : ''}">${esc(status)}</span>
+      ${toolsNote}
       ${turnUsage(turn)}
       ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}" ${String(turn.id).startsWith('live-') ? 'disabled title="Starting…"' : ''}>Stop</button>` : ''}
       ${!running ? `<button class="council-btn small ghost" data-del-turn="${esc(turn.id)}" title="Delete this question">Delete</button>` : ''}
@@ -1143,6 +1374,7 @@ function renderTurns() {
   } else {
     box.innerHTML = html;
     try { renderMath(box); } catch { /* optional */ }
+    updateClamps(box);
   }
   renderComposer();
 }
@@ -1179,19 +1411,26 @@ function flushDirty() {
     if (stage === 'synthesis') {
       const body = article.querySelector('[data-final] .council-final-b');
       if (body) { body.classList.toggle('pending', !live.final); body.innerHTML = md(live.final); }
+      const tools = article.querySelector('[data-final] .council-final-t');
+      if (tools) tools.innerHTML = toolsBlock(live.chairTools, `${live.id}:synthesis:chair`, live.stages?.synthesis === 'running');
       continue;
     }
     const entry = (stage === 'opinions' ? live.opinions : live.reviews).find(e => String(e.member) === member);
     const card = article.querySelector(`.council-card[data-stage="${stage}"][data-member="${member}"]`);
     if (!card || !entry) continue;
-    const body = card.querySelector('.council-card-b');
-    body.classList.toggle('pending', !entry.text && !entry.error);
-    body.innerHTML = entry.error ? `<div class="council-errtext">${esc(entry.error)}</div>` : md(entry.text);
-    body.scrollTop = body.scrollHeight;
+    const cardKey = `${live.id}:${stage}:${member}`;
+    const tools = card.querySelector('.council-card-t');
+    if (tools) tools.innerHTML = toolsBlock(entry.tools, cardKey, !!entry.streaming);
+    const wrap = card.querySelector('.council-card-bw');
+    if (wrap) {
+      wrap.innerHTML = cardBody(cardKey, entry);
+      const body = wrap.querySelector('.council-card-b');
+      if (body && entry.streaming) body.scrollTop = body.scrollHeight;
+      if (!entry.streaming) updateClamps(wrap);
+    }
     const state = card.querySelector('.state');
     const seat = (live.config?.members || [])[Number(member)];
-    if (state) state.textContent = entry.error ? 'error' : entry.streaming ? (entry.thinking && !entry.text ? 'thinking…' : 'writing…')
-      : [fmtMs(entry.ms), usageText(entry, seat)].filter(Boolean).join(' · ');
+    if (state) state.textContent = cardState(entry, seat);
     card.classList.toggle('err', !!entry.error);
   }
   _dirty.clear();
@@ -1211,7 +1450,7 @@ function onEvent(ev) {
   switch (ev.type) {
     case 'turn':
       live.id = ev.turn_id;
-      live.config = { members: ev.members, chairman: ev.chairman, mode: ev.mode };
+      live.config = { members: ev.members, chairman: ev.chairman, mode: ev.mode, tools: ev.tools, workspace: ev.workspace };
       renderTurns();
       scrollToEnd();
       break;
@@ -1247,6 +1486,24 @@ function onEvent(ev) {
       markDirty(ev.stage, ev.member);
       break;
     }
+    case 'tool': {
+      // A tool call: text written so far becomes a working note, and the
+      // answer starts again after the call.
+      const synth = ev.stage === 'synthesis';
+      const entry = synth ? null : liveEntry(ev.stage, ev.member);
+      const steps = synth ? (live.chairTools = live.chairTools || []) : (entry.tools = entry.tools || []);
+      if (ev.phase === 'start') {
+        if (ev.note) steps.push({ kind: 'note', text: ev.note });
+        steps.push({ kind: 'tool', tool: ev.tool, command: ev.command || '', status: 'running' });
+        if (synth) live.final = ''; else entry.text = '';
+      } else {
+        const step = [...steps].reverse().find(st => st.kind === 'tool' && st.status === 'running' && st.tool === ev.tool)
+          || [...steps].reverse().find(st => st.kind === 'tool' && st.status === 'running');
+        if (step) { step.status = ev.ok ? 'done' : 'error'; step.output = ev.output || ''; }
+      }
+      markDirty(ev.stage, synth ? 'chair' : ev.member);
+      break;
+    }
     case 'ranking':
       live.ranking = ev.ranking || [];
       live.labels = ev.labels || live.labels;
@@ -1279,15 +1536,16 @@ async function convene() {
   }
   S.picker = false;
   S.live = {
-    id: `live-${Date.now()}`, sessionId: S.session.id, question, status: 'running', config: { members: [], chairman: null, mode: S.mode },
-    opinions: [], reviews: [], ranking: [], labels: {}, final: '', error: null,
+    id: `live-${Date.now()}`, sessionId: S.session.id, question, status: 'running',
+    config: { members: [], chairman: null, mode: S.mode, tools: S.tools, workspace: S.workspace },
+    opinions: [], reviews: [], ranking: [], labels: {}, final: '', error: null, chairTools: [],
     stages: { opinions: 'running', review: 'pending', synthesis: 'pending' }, reader: null,
   };
   // Show the seats immediately, before the server's first event.
   S.live.config.members = S.members.map((m, i) => ({ index: i, model: m.model, endpoint_name: seatInfo(m).endpoint }));
   S.live.config.chairman = { model: chair.model, endpoint_name: seatInfo(chair).endpoint };
   input.value = '';
-  input.style.height = 'auto';
+  autosize(input);
   renderSeats();
   renderTurns();
   scrollToEnd();
@@ -1299,7 +1557,8 @@ async function convene() {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, members, chairman: chair, mode, budget_confirmed: budgetConfirmed }),
+    body: JSON.stringify({ question, members, chairman: chair, mode, budget_confirmed: budgetConfirmed,
+      tools: S.tools, workspace: S.tools !== 'off' ? S.workspace : '' }),
   });
   try {
     let res = await send(false);
@@ -1372,6 +1631,152 @@ async function convene() {
       renderComposer();
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// history: claude.ai / ChatGPT / Claude Code / Codex archive
+// ---------------------------------------------------------------------------
+
+async function loadHistoryStats() {
+  try { S.history.stats = await jget('/api/archive/stats'); }
+  catch { S.history.stats = null; }
+}
+
+function historySummary(imported) {
+  const labels = { claude_ai: 'claude.ai', chatgpt: 'ChatGPT', claude_code: 'Claude Code', codex: 'Codex' };
+  const parts = Object.entries(imported || {}).map(([k, n]) => `${n} ${labels[k] || k}`);
+  return parts.length ? `Imported ${parts.join(', ')} conversation${Object.values(imported).reduce((a, b) => a + b, 0) === 1 ? '' : 's'}.` : 'Nothing new found.';
+}
+
+function renderHistory() {
+  const box = $('#council-history');
+  if (!box) return;
+  const H = S.history;
+  const total = H.stats?.total;
+  const sources = H.stats?.sources || {};
+  const rows = Object.entries(sources).map(([id, v]) => `<div class="src"><span>${esc(v.label)}</span>
+    <span class="c" title="${esc(v.messages)} messages">${esc(v.conversations)}</span>
+    <button data-history-del="${esc(id)}" title="Remove all ${esc(v.label)} conversations" aria-label="Remove ${esc(v.label)} history">✕</button></div>`).join('');
+  const hits = H.results ? (H.results.length ? H.results.map(r => `
+      <button class="council-history-hit" data-history-open="${esc(r.conversation_id)}" data-pos="${esc(r.position)}">
+        <span class="t">${esc(r.title)}</span><span class="m">${esc(r.source_label)}${r.date ? ` · ${esc(r.date.slice(0, 10))}` : ''}</span>
+        <span class="s">${esc(r.snippet).replace(/«/g, '<mark>').replace(/»/g, '</mark>')}</span></button>`).join('')
+    : '<div class="help">No matches.</div>') : '';
+  box.innerHTML = `
+    <button class="council-history-h" data-act="history-toggle" aria-expanded="${H.open}">
+      <span>${H.open ? '▾' : '▸'} Your history</span>
+      <span class="n">${total == null ? '' : `${total} conversation${total === 1 ? '' : 's'}`}</span>
+    </button>
+    ${H.open ? `
+      ${rows || '<div class="help">Nothing imported yet. With tools on, members search this when a question touches your past chats.</div>'}
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="council-btn small" data-act="history-import" ${H.busy ? 'disabled' : ''}>${H.busy ? 'Working…' : 'Import…'}</button>
+        ${isAdmin() ? `<button class="council-btn small" data-act="history-scan" ${H.busy ? 'disabled' : ''} title="Import the Claude Code and Codex sessions saved on the Odysseus machine">Scan this machine</button>` : ''}
+        <input type="file" id="council-history-file" accept=".zip,.json,.jsonl" hidden>
+      </div>
+      ${H.msg ? `<div class="council-conn-msg ${H.err ? 'err' : ''}" role="status">${esc(H.msg)}</div>` : ''}
+      <details class="help"><summary>Where do I get these?</summary><ul>
+        <li><b>claude.ai</b>: Settings → Privacy → Export data, then upload the zip from the email.</li>
+        <li><b>ChatGPT</b>: Settings → Data controls → Export data, then upload the zip.</li>
+        <li><b>Claude Code</b>: zip <code>~/.claude/projects</code> and upload it.</li>
+        <li><b>Codex</b>: zip <code>~/.codex/sessions</code> and upload it.</li>
+      </ul>Importing the same history again replaces it.</details>
+      ${total ? `<input class="council-input" id="council-history-q" placeholder="Search your history (Enter)" value="${esc(H.query)}" aria-label="Search your history">
+        <div class="council-history-results">${hits}</div>` : ''}
+    ` : ''}`;
+}
+
+async function importHistory(file) {
+  S.history.busy = true; S.history.msg = `Importing ${file.name}…`; S.history.err = false;
+  renderHistory();
+  try {
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    const res = await fetch('/api/archive/import', { method: 'POST', credentials: 'same-origin', body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `Import failed (${res.status})`);
+    S.history.stats = { sources: data.sources, total: data.total };
+    S.history.msg = historySummary(data.imported);
+  } catch (e) {
+    S.history.msg = e.message; S.history.err = true;
+  } finally {
+    S.history.busy = false;
+    renderHistory();
+  }
+}
+
+async function scanHistory() {
+  S.history.busy = true; S.history.msg = 'Scanning…'; S.history.err = false;
+  renderHistory();
+  try {
+    const data = await jpost('/api/archive/scan', {});
+    S.history.stats = { sources: data.sources, total: data.total };
+    S.history.msg = data.scanned?.length ? historySummary(data.imported)
+      : 'No Claude Code or Codex sessions on this machine (~/.claude/projects, ~/.codex/sessions).';
+  } catch (e) {
+    S.history.msg = e.message; S.history.err = true;
+  } finally {
+    S.history.busy = false;
+    renderHistory();
+  }
+}
+
+async function deleteHistorySource(source) {
+  const label = S.history.stats?.sources?.[source]?.label || source;
+  if (!confirm(`Remove all imported ${label} conversations from Odysseus?`)) return;
+  try {
+    const data = await jdel(`/api/archive/sources/${encodeURIComponent(source)}`);
+    S.history.stats = { sources: data.sources, total: data.total };
+    S.history.results = null;
+    S.history.msg = `Removed ${data.removed} ${label} conversation${data.removed === 1 ? '' : 's'}.`;
+    S.history.err = false;
+  } catch (e) { S.history.msg = e.message; S.history.err = true; }
+  renderHistory();
+}
+
+async function searchHistory() {
+  const q = (S.history.query || '').trim();
+  if (!q) { S.history.results = null; renderHistory(); return; }
+  try {
+    S.history.results = (await jget(`/api/archive/search?${new URLSearchParams({ q, limit: '15' })}`)).results || [];
+  } catch (e) { S.history.results = []; S.history.msg = e.message; S.history.err = true; }
+  renderHistory();
+  const field = $('#council-history-q');
+  if (field) { field.focus(); field.setSelectionRange(field.value.length, field.value.length); }
+}
+
+const READER_PAGE = 40;
+async function openReader(id, position = 0, exact = false) {
+  const start = exact ? Math.max(0, position) : Math.max(0, position - 3);
+  let conv;
+  try {
+    conv = await jget(`/api/archive/conversations/${encodeURIComponent(id)}?${new URLSearchParams({ start: String(start), limit: String(READER_PAGE) })}`);
+  } catch (e) { toast(e.message); return; }
+  S.history.reader = conv;
+  const box = $('#council-reader');
+  if (!box) return;
+  const end = conv.start + conv.messages.length;
+  box.innerHTML = `
+    <div class="council-reader-h">
+      <span class="t">${esc(conv.title)}</span>
+      <span class="m">${esc(conv.source_label)}${conv.started_at ? ` · ${esc(conv.started_at.slice(0, 10))}` : ''} · ${esc(conv.message_count)} messages${conv.project ? ` · ${esc(conv.project)}` : ''}</span>
+      <span style="flex:1"></span>
+      <button class="council-x" data-act="reader-close" aria-label="Close" title="Close (Esc)">✕</button>
+    </div>
+    <div class="council-reader-b">
+      ${conv.start > 0 ? `<button class="council-btn small" data-act="reader-page" data-start="${Math.max(0, conv.start - READER_PAGE)}">Earlier messages</button>` : ''}
+      ${conv.messages.map(m => `<div class="council-reader-msg ${esc(m.role)}"><div class="r">#${esc(m.position)} ${esc(m.role)}</div>${md(m.content)}</div>`).join('')}
+      ${end < conv.message_count ? `<button class="council-btn small" data-act="reader-page" data-start="${end}">Later messages (${conv.message_count - end} more)</button>` : ''}
+    </div>`;
+  box.hidden = false;
+  box.querySelector('.council-reader-b').scrollTop = 0;
+  box.querySelector('[data-act="reader-close"]')?.focus();
+}
+
+function closeReader() {
+  S.history.reader = null;
+  const box = $('#council-reader');
+  if (box) { box.hidden = true; box.innerHTML = ''; }
 }
 
 // ---------------------------------------------------------------------------
@@ -1525,9 +1930,71 @@ async function onPaneClick(e) {
     return;
   }
 
+  const more = t.closest('[data-more]');
+  if (more) {
+    const key = more.dataset.more;
+    const el = more.parentElement?.querySelector(`[data-clamp="${CSS.escape(key)}"]`);
+    if (S.expanded.has(key)) { S.expanded.delete(key); el?.classList.add('clamped'); more.textContent = 'Show more'; }
+    else { S.expanded.add(key); el?.classList.remove('clamped'); more.textContent = 'Show less'; }
+    return;
+  }
+  const toolsToggle = t.closest('[data-tools-toggle]');
+  if (toolsToggle) {
+    const key = toolsToggle.dataset.toolsToggle;
+    const box = toolsToggle.closest('.council-tools');
+    const open = !box.classList.contains('open');
+    box.classList.toggle('open', open);
+    toolsToggle.setAttribute('aria-expanded', String(open));
+    if (open) { S.expanded.add(key); S.expanded.delete(`${key}:closed`); }
+    else { S.expanded.delete(key); S.expanded.add(`${key}:closed`); }
+    return;
+  }
+  const toolOut = t.closest('[data-tool-out]');
+  if (toolOut) {
+    const key = toolOut.dataset.toolOut;
+    const pre = toolOut.parentElement?.querySelector('pre');
+    if (!pre) return;
+    pre.hidden = !pre.hidden;
+    if (pre.hidden) S.expanded.delete(key); else S.expanded.add(key);
+    return;
+  }
+  const toolsMode = t.closest('[data-tools-mode]');
+  if (toolsMode && !toolsMode.disabled) {
+    S.tools = toolsMode.dataset.toolsMode;
+    saveConfigSoon(); renderSeats(); renderComposer();
+    return;
+  }
+  const hit = t.closest('[data-history-open]');
+  if (hit) { await openReader(hit.dataset.historyOpen, Number(hit.dataset.pos || 0)); return; }
+  const histDel = t.closest('[data-history-del]');
+  if (histDel) { await deleteHistorySource(histDel.dataset.historyDel); return; }
+
   const act = t.closest('[data-act]')?.dataset.act;
   if (!act) {
     if (S.picker && !t.closest('.council-picker')) { S.picker = false; renderSeats(); }
+    return;
+  }
+  if (act === 'grow') {
+    const comp = $('#council-composer');
+    const tall = comp.classList.toggle('tall');
+    t.closest('[data-act]').setAttribute('aria-pressed', String(tall));
+    autosize($('#council-input'));
+    $('#council-input')?.focus();
+    return;
+  }
+  if (act === 'history-toggle') {
+    S.history.open = !S.history.open;
+    if (S.history.open) await loadHistoryStats();
+    renderHistory();
+    if (S.history.open) $('#council-history-q')?.focus();
+    return;
+  }
+  if (act === 'history-import') { $('#council-history-file')?.click(); return; }
+  if (act === 'history-scan') { await scanHistory(); return; }
+  if (act === 'reader-close') { closeReader(); return; }
+  if (act === 'reader-page') {
+    const r = S.history.reader;
+    if (r) await openReader(r.conversation_id, Number(t.closest('[data-act]').dataset.start || 0), true);
     return;
   }
   if (act === 'toggle-picker') {
@@ -1543,6 +2010,17 @@ async function onPaneClick(e) {
 }
 
 function onPaneChange(e) {
+  if (e.target.id === 'council-workspace') {
+    S.workspace = e.target.value.trim();
+    saveConfigSoon();
+    return;
+  }
+  if (e.target.id === 'council-history-file') {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (file) importHistory(file);
+    return;
+  }
   if (e.target.id === 'council-chair') {
     const val = e.target.value;
     if (!val) return;

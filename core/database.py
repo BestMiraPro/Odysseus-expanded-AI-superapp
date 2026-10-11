@@ -640,6 +640,40 @@ class CouncilTurn(TimestampMixin, Base):
     final = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
     usage = Column(Text, nullable=True)              # JSON {input_tokens, output_tokens, cost_usd, ...}
+    chair = Column(Text, nullable=True)              # JSON {tools: [...]} the chairman's tool activity
+
+
+class ArchiveConversation(Base):
+    """A conversation imported from outside Odysseus: a claude.ai or ChatGPT
+    data export, or a Claude Code / Codex CLI transcript. Searchable by the
+    user and by agents (Council members, agent mode). ``external_id`` is the
+    id in the source, so importing the same export again replaces rather than
+    duplicates."""
+    __tablename__ = "archive_conversations"
+
+    id = Column(String, primary_key=True, index=True)
+    owner = Column(String, nullable=True, index=True)
+    source = Column(String, nullable=False, index=True)   # claude_ai | chatgpt | claude_code | codex
+    external_id = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=False, default="")
+    project = Column(String, nullable=True)                # working directory of a CLI session
+    started_at = Column(DateTime, nullable=True, index=True)
+    updated_at = Column(DateTime, nullable=True)
+    message_count = Column(Integer, nullable=False, default=0)
+    imported_at = Column(DateTime, default=utcnow_naive, nullable=False)
+
+
+class ArchiveMessage(Base):
+    """One user or assistant message of an archived conversation (text only)."""
+    __tablename__ = "archive_messages"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(String, nullable=False, index=True)
+    owner = Column(String, nullable=True, index=True)
+    position = Column(Integer, nullable=False, default=0)
+    role = Column(String, nullable=False)                  # user | assistant
+    content = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, nullable=True)
 
 
 class SpendEntry(Base):
@@ -2240,6 +2274,18 @@ def _migrate_add_crew_member_id():
     except Exception as e:
         logging.getLogger(__name__).warning(f"crew_member_id migration: {e}")
 
+def _migrate_add_council_chair_column():
+    """council_turns.chair: the chairman's tool activity (JSON)."""
+    try:
+        with engine.connect() as conn:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(council_turns)"))]
+            if cols and "chair" not in cols:
+                conn.execute(text("ALTER TABLE council_turns ADD COLUMN chair TEXT"))
+                conn.commit()
+                logging.getLogger(__name__).info("Added chair column to council_turns")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"council_turns.chair migration: {e}")
+
 def _migrate_add_assistant_columns():
     """Add is_default_assistant + timezone columns to crew_members for the personal-assistant feature."""
     try:
@@ -2834,6 +2880,7 @@ def init_db():
     _migrate_add_notifications_enabled()
     _migrate_drop_ping_notes_tasks()
     _migrate_add_crew_member_id()
+    _migrate_add_council_chair_column()
     _migrate_add_assistant_columns()
     _migrate_add_email_smtp_security()
     _migrate_email_account_default_invariant()

@@ -788,6 +788,8 @@ from routes.claude_subscription_routes import setup_claude_subscription_routes
 app.include_router(setup_claude_subscription_routes())
 from routes.council_routes import setup_council_routes
 app.include_router(setup_council_routes())
+from routes.archive_routes import setup_archive_routes
+app.include_router(setup_archive_routes())
 from routes.model_roster_routes import setup_model_roster_routes
 app.include_router(setup_model_roster_routes())
 from routes.budget_routes import setup_budget_routes

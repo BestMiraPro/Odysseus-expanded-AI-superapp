@@ -767,7 +767,7 @@ async def _execute_tool_block_impl(
     events while the command is in flight. Ignored by other tools.
     """
     from src.tool_implementations import (
-        do_search_chats, do_manage_tasks,
+        do_search_chats, do_search_history, do_read_history, do_manage_tasks,
         do_manage_skills, do_api_call, do_manage_notes,
         do_manage_calendar,
         do_download_model, do_serve_model, do_list_served_models, do_stop_served_model,
@@ -936,6 +936,10 @@ async def _execute_tool_block_impl(
         query = content.split("\n")[0].strip()
         desc = f"search_chats: {query[:80]}"
         result = await do_search_chats(query, owner=owner)
+    elif tool in ("search_history", "read_history"):
+        desc = f"{tool}: {content.strip()[:80]}"
+        handler = do_search_history if tool == "search_history" else do_read_history
+        result = await handler(content, owner=owner)
     elif tool in ("chat_with_model", "ask_teacher", "list_models"):
         # Migrated to the agent_tools registry (#3629): dispatched through
         # TOOL_HANDLERS with the owner/session ctx these tools need, instead

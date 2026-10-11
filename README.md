@@ -169,11 +169,57 @@ Models) and then work everywhere else in Odysseus too — chat, Study, research.
   (`npm install -g @anthropic-ai/claude-code`). Either run `claude setup-token` and paste
   the token, or use the Claude login already on that machine (`claude auth login`).
   Anthropic only allows subscription sign-ins inside Claude Code itself, so Odysseus drives
-  the CLI rather than calling the API with your subscription token. Text only: no tools or
-  images on these seats.
+  the CLI rather than calling the API with your subscription token.
 
 Runs live on the server: closing the page does not stop a council, and reopening the thread
 shows the saved result. Follow-up questions in the same thread see the earlier answers.
+
+### Tools
+
+**Tools** under the seats sets what members may do, per council:
+
+- **Research** (default) — web search and page fetch, reading and searching files in the
+  **workspace** folder, your **history** (below) and your Odysseus chats.
+- **Full** — Research plus shell commands, Python and file edits in the workspace, the way
+  Claude Code or Codex work on your own machine. Admin only (single-user installs count).
+- **Off** — text only, as before.
+
+Each seat uses the strongest engine it has:
+
+| Seat | Engine | Web | Files, shell | History |
+|---|---|---|---|---|
+| Claude Subscription | the Claude Code CLI with its own tools | WebSearch, WebFetch | Read/Grep/Glob; Bash/Edit/Write in Full | Odysseus MCP server |
+| ChatGPT Subscription | the Codex CLI (`codex exec`) | live web search | read-only sandbox; no sandbox in Full | Odysseus MCP server |
+| API / local model | the Odysseus agent loop | web_search, web_fetch | read_file/grep/glob; bash/python/edits in Full | search_history tool |
+
+Every call shows up in the member's card as it happens (what it searched or ran, and the
+result on click); what a model writes before a tool call is kept as a working note, and its
+answer is what comes after the last call. Reviewers are told to check doubtful claims with
+the tools, and the chairman has them too. A tool that needs Odysseus's approval prompt is
+refused in a council run, since nobody is there to approve it.
+
+The Codex seat reuses your ChatGPT Subscription login: each run gets a throwaway
+`CODEX_HOME` with the current access token and no refresh token, so Codex can never log
+Odysseus out. A run that outlives the token fails with a sign-in error; run it again.
+
+In Docker the workspace must be a folder the container can see (mount it, e.g. with
+`docker-compose.code.yml`).
+
+### History
+
+**Your history** in the Council sidebar imports your conversations from outside Odysseus so
+members (and agent mode, via `search_history`) can search them:
+
+- **claude.ai** — Settings → Privacy → Export data; upload the zip from the email.
+- **ChatGPT** — Settings → Data controls → Export data; upload the zip.
+- **Claude Code** — zip `~/.claude/projects` and upload it, or **Scan this machine** when
+  Odysseus runs where you code.
+- **Codex** — zip `~/.codex/sessions` and upload it, or **Scan this machine**.
+
+One upload can mix sources. Importing again replaces conversations rather than duplicating
+them; each source can be removed again from the same panel. Only text is kept (no images or
+attachments), and the archive is per user. `ODYSSEUS_TRANSCRIPT_DIRS` adds folders to scan
+(e.g. a host `~/.claude/projects` mounted into the container).
 
 ## Omnigent
 

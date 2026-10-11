@@ -43,6 +43,10 @@ HISTORY_CHARS = 4000
 MEMBER_TIMEOUT = 600
 CHAIR_TIMEOUT = 900
 
+# Tool activity kept per call (saved with the turn and shown in the UI).
+MAX_TOOL_STEPS = 60
+TOOL_OUTPUT_CHARS = 1200
+
 OPINION_SYSTEM = (
     "You are one member of an AI council. Several independent models answer the same "
     "question; your answer will be peer reviewed and then synthesized by a chairman.\n"
@@ -202,6 +206,21 @@ def _clip(text: str, limit: int) -> str:
     return text[:limit].rstrip() + "\n[... truncated ...]"
 
 
+def _command_text(tool: str, command: Any) -> str:
+    """A tool call's arguments as one readable line (raw JSON args -> the query/path/command)."""
+    text = str(command or "").strip()
+    if text.startswith("{"):
+        try:
+            from src.claude_subscription import tool_input_summary
+
+            summary = tool_input_summary(tool, json.loads(text))
+            if summary:
+                return summary[:300]
+        except (ValueError, TypeError):
+            pass
+    return text[:300]
+
+
 def history_messages(history: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """Earlier council turns as chat history (question -> council answer)."""
     msgs: List[Dict[str, str]] = []
@@ -329,7 +348,9 @@ async def run_member(
     ends, so a run that is stopped midway still has what was written.
     """
     started = time.monotonic()
-    parts: List[str] = []
+    parts: List[str] = []           # text since the last tool call: the answer so far
+    steps: List[Dict[str, Any]] = []  # tool calls and the notes written before them
+    self_billed = False
     thinking_sent = False
     thinking_chars = 0          # reasoning is billed too, though never shown
     error: Optional[str] = None
@@ -341,16 +362,58 @@ async def run_member(
     input_estimate = estimate_tokens(messages)
     if sink is not None:
         sink.update({"text": "", "error": None, "ms": None, "pending": True, "input_estimate": input_estimate})
+    extra = {"stage": stage} if getattr(stream_fn, "accepts_stage", False) else {}
+
+    def _publish_steps() -> None:
+        if sink is not None:
+            sink["tools"] = steps
+
     try:
         async for chunk in stream_fn(member.url, member.model, messages, headers=member.headers,
-                                     timeout=timeout, workload="foreground"):
+                                     timeout=timeout, workload="foreground", **extra):
             for event, payload in iter_sse(chunk):
                 if event == "error":
                     error = _error_text(payload)
                     break
                 if payload is None or not isinstance(payload, dict):
                     continue
-                if payload.get("type") == "usage" and isinstance(payload.get("data"), dict):
+                ptype = payload.get("type")
+                if ptype == "self_billed":
+                    self_billed = True
+                    continue
+                if ptype == "tool_start":
+                    # Text written before a tool call is working notes, not the answer.
+                    payload["command"] = _command_text(str(payload.get("tool") or ""), payload.get("command"))
+                    note = "".join(parts).strip()
+                    parts.clear()
+                    if sink is not None:
+                        sink["text"] = ""
+                    if len(steps) < MAX_TOOL_STEPS:
+                        if note:
+                            steps.append({"kind": "note", "text": _clip(note, 4000)})
+                        steps.append({"kind": "tool", "tool": str(payload.get("tool") or "tool")[:60],
+                                      "command": str(payload.get("command") or "")[:300],
+                                      "id": payload.get("id"), "status": "running"})
+                        _publish_steps()
+                    await emit({"type": "tool", "phase": "start", "stage": stage, "member": index,
+                                "tool": str(payload.get("tool") or "tool")[:60],
+                                "command": str(payload.get("command") or "")[:300], "note": note[:4000]})
+                    continue
+                if ptype == "tool_output":
+                    output = str(payload.get("output") or payload.get("stdout") or payload.get("result") or "")
+                    ok = payload.get("exit_code") in (0, None) and not payload.get("error")
+                    step = next((st for st in reversed(steps) if st.get("kind") == "tool"
+                                 and st.get("status") == "running"
+                                 and (payload.get("id") is None or st.get("id") == payload.get("id"))), None)
+                    if step is not None:
+                        step.update({"status": "done" if ok else "error",
+                                     "output": output[:TOOL_OUTPUT_CHARS]})
+                        _publish_steps()
+                    await emit({"type": "tool", "phase": "done", "stage": stage, "member": index,
+                                "tool": str(payload.get("tool") or "tool")[:60], "ok": ok,
+                                "output": output[:TOOL_OUTPUT_CHARS]})
+                    continue
+                if ptype == "usage" and isinstance(payload.get("data"), dict):
                     data = payload["data"]
                     try:
                         usage = {"input_tokens": int(data.get("input_tokens") or 0),
@@ -384,6 +447,13 @@ async def run_member(
         logger.warning("council member call failed stage=%s error_type=%s", stage, type(exc).__name__)
         error = "The model request failed."
     text = "".join(parts).strip()
+    if not text and steps:
+        # Some models finish with their answer before a last bookkeeping tool
+        # call; fall back to the last note rather than reporting nothing.
+        text = next((st["text"] for st in reversed(steps) if st.get("kind") == "note"), "")
+    for st in steps:
+        if st.get("status") == "running":
+            st["status"] = "error" if error else "done"
     try:
         from src.text_helpers import strip_think
 
@@ -396,6 +466,12 @@ async def run_member(
     cost = member.cost_usd(usage)
     outcome = {"text": text, "error": error, "ms": ms, "usage": usage, "cost_usd": cost,
                "input_estimate": input_estimate}
+    if steps:
+        outcome["tools"] = steps
+    if self_billed:
+        # The engine (Odysseus agent loop) already billed every model call.
+        outcome["self_billed"] = True
+        outcome["cost_usd"] = None
     if thinking_chars:
         outcome["thinking_chars"] = thinking_chars
     if sink is not None:
@@ -651,6 +727,8 @@ def billable_calls(result: Dict[str, Any], members: List[Member], chairman: Memb
         stages.append(("synthesis", result["chair"]))
     for stage, call in stages:
         if not isinstance(call, dict) or "input_estimate" not in call and not call.get("usage"):
+            continue
+        if call.get("self_billed"):
             continue
         who = call.get("member")
         member = chairman if who == "chair" else (members[who] if isinstance(who, int) and 0 <= who < len(members) else None)

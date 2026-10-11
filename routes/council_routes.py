@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
-from src import budget, council, model_roster, reasoning_effort
+from src import budget, council, council_tools, model_roster, reasoning_effort
 from src.auth_helpers import get_current_user, owner_filter, require_user
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,11 @@ class AskRequest(BaseModel):
     # Set when the person has seen the cost estimate and agreed to a turn
     # above their single-action limit. It never overrides the monthly cap.
     budget_confirmed: bool = False
+    # What members may do: off | research | full (src/council_tools.py), and
+    # the folder their file tools work in. The Council page sends research by
+    # default; an API caller that leaves it out keeps the text-only council.
+    tools: str = council_tools.TOOLS_OFF
+    workspace: Optional[str] = Field(None, max_length=1024)
 
 
 class EstimateRequest(BaseModel):
@@ -237,6 +242,7 @@ def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
         "final": turn.final or "",
         "error": turn.error,
         "usage": _loads(turn.usage, {}),
+        "chair": _loads(getattr(turn, "chair", None), None),
         "created_at": turn.created_at.isoformat() if turn.created_at else None,
     }
 
@@ -264,6 +270,8 @@ def _save_turn(turn_id: str, **fields) -> None:
             return
         for key, value in fields.items():
             if key in ("opinions", "reviews", "ranking", "labels", "config", "usage") and not isinstance(value, str):
+                value = json.dumps(value)
+            elif key == "chair" and value is not None and not isinstance(value, str):
                 value = json.dumps(value)
             setattr(turn, key, value)
         db.commit()
@@ -296,6 +304,7 @@ def _result_fields(result: Dict[str, Any]) -> Dict[str, Any]:
         "labels": result.get("labels") or {},
         "final": final,
         "usage": council.usage_totals(result),
+        "chair": {"tools": chair.get("tools") or []} if chair and chair.get("tools") else None,
     }
 
 
@@ -345,7 +354,34 @@ def _record_turn_spend(owner: Optional[str], session_id: str, members, chairman,
                       session_id=session_id, cost_usd=cost, estimated=estimated)
 
 
-def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: str, body: AskRequest):
+def _tool_settings(request: Request, owner: Optional[str], body: AskRequest) -> council_tools.ToolSettings:
+    """The members' tool level and workspace for this turn.
+
+    Full tools (shell, edits) and a workspace (host files) need the same
+    privilege as chat's file and shell tools: an admin or a single-user install.
+    """
+    from src.tool_security import owner_is_admin_or_single_user
+
+    mode = council_tools.normalize_mode(body.tools)
+    privileged = owner_is_admin_or_single_user(get_current_user(request))
+    if mode == council_tools.TOOLS_FULL and not privileged:
+        raise HTTPException(403, "Full tools (shell commands and file edits) need an admin account.")
+    workspace = None
+    requested = (body.workspace or "").strip()
+    if requested and mode != council_tools.TOOLS_OFF:
+        if not privileged:
+            raise HTTPException(403, "A workspace folder needs an admin account.")
+        from src.tool_execution import vet_workspace
+
+        workspace = vet_workspace(requested) or None
+        if workspace is None:
+            raise HTTPException(400, "That workspace folder can't be used: it must be an existing, "
+                                     "non-sensitive folder that is not a filesystem root.")
+    return council_tools.ToolSettings(mode=mode, owner=owner, workspace=workspace)
+
+
+def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: str, body: AskRequest,
+                  tools: Optional[council_tools.ToolSettings] = None):
     """Validate the seats, record a running turn, and return what the run needs.
 
     Runs in a worker thread: resolving a ChatGPT seat may refresh its OAuth
@@ -367,15 +403,21 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
             logger.warning("council: estimate failed error_type=%s", type(exc).__name__)
             estimate = {"total_usd": None, "metered": any(m.billing == "metered" for m in [*members, chairman])}
         _budget_gate(owner, estimate, body.budget_confirmed)
+        tools_mode = tools.mode if tools else council_tools.TOOLS_OFF
+        workspace = tools.workspace if tools else None
         config = {
             "members": [{"endpoint_id": s.endpoint_id, "model": s.model} for s in body.members],
             "chairman": {"endpoint_id": body.chairman.endpoint_id, "model": body.chairman.model},
             "mode": mode,
+            "tools": tools_mode,
+            "workspace": workspace or "",
         }
         seats = {
             "members": [m.public(i) for i, m in enumerate(members)],
             "chairman": chairman.public("chair"),
             "mode": mode,
+            "tools": tools_mode,
+            "workspace": workspace or "",
         }
         turn = CouncilTurn(
             id=uuid.uuid4().hex,
@@ -597,11 +639,13 @@ def setup_council_routes() -> APIRouter:
         if not body.members:
             raise HTTPException(400, "Seat at least one council member.")
 
+        tools = _tool_settings(request, owner, body)
+
         if session_id in _ACTIVE_SESSIONS:
             raise HTTPException(409, "This council is still deliberating. Stop it or wait.")
         _ACTIVE_SESSIONS.add(session_id)
         try:
-            prepared = await asyncio.to_thread(_prepare_turn, owner, session_id, question, mode, body)
+            prepared = await asyncio.to_thread(_prepare_turn, owner, session_id, question, mode, body, tools)
         except BaseException:
             _ACTIVE_SESSIONS.discard(session_id)
             raise
@@ -620,6 +664,7 @@ def setup_council_routes() -> APIRouter:
                     result = await council.run_council(
                         question=question, members=members, chairman=chairman, mode=mode,
                         history=history, emit=stream.emit, checkpoint=checkpoint, state=state,
+                        stream_fn=council_tools.stream_fn_for(tools),
                     )
                 status = "error" if result.get("error") and not result.get("final") else "done"
                 fields = _result_fields(result)
