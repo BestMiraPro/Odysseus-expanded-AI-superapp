@@ -195,6 +195,7 @@ async function syncToggles() {
   await syncPrefToggle('auto-approve-skills-toggle', 'auto_approve_skills', 'Auto-approve skills enabled', 'Auto-approve skills disabled', false);
   await syncPrefSlider('skill-confidence-slider', 'skill_min_confidence', 'skill-confidence-label', 0.85);
   await syncPrefNumber('skill-max-input', 'skill_max_injected', 3);
+  await syncSharedMemory();
 
   // Reflect the header toggle into the sidebar dim + modal body opacity.
   const headerToggle = document.getElementById('memory-enabled-header-toggle');
@@ -222,6 +223,95 @@ async function syncToggles() {
       skillsToggle.addEventListener('change', applyDim);
     }
   }
+}
+
+// ── Shared memory repo (Settings tab) ──
+
+async function sharedMemoryRequest(method, path = '', body = null) {
+  const res = await fetch(`${window.location.origin}/api/shared-memory${path}`, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : `Request failed (${res.status})`);
+  return data;
+}
+
+function renderSharedMemory(data) {
+  const cfg = data?.config || {};
+  const st = data?.status || {};
+  const $ = (id) => document.getElementById(id);
+  $('shared-memory-enabled').checked = !!cfg.enabled;
+  $('shared-memory-repo').value = cfg.repo || '';
+  $('shared-memory-branch').value = cfg.branch || 'main';
+  $('shared-memory-files').value = (cfg.files || []).join(', ');
+  $('shared-memory-token').value = '';
+  $('shared-memory-token').placeholder = cfg.has_token ? 'Token saved (type to replace)' : 'Needed for a private repo';
+  $('shared-memory-clear-token').hidden = !cfg.has_token;
+  const status = $('shared-memory-status');
+  status.style.color = '';
+  if (!cfg.enabled || !cfg.repo) {
+    status.textContent = 'Off';
+  } else if (st.error) {
+    status.textContent = st.error;
+    status.style.color = 'var(--danger, #e05252)';
+  } else if (!st.loaded) {
+    status.textContent = 'Not loaded yet';
+  } else {
+    const files = (st.files || []).map(f =>
+      `${f.path} (${Number(f.chars).toLocaleString()} chars${f.truncated ? ', cut at the limit' : ''})`);
+    status.textContent = files.length ? `Loaded ${files.join(', ')}` : 'Loaded, but the files are empty';
+  }
+}
+
+async function syncSharedMemory() {
+  const card = document.getElementById('shared-memory-card');
+  if (!card) return;
+  try {
+    renderSharedMemory(await sharedMemoryRequest('GET'));
+  } catch (e) {
+    console.error('Failed to load shared memory settings:', e);
+  }
+  if (card.dataset.bound) return;
+  card.dataset.bound = '1';
+  const status = document.getElementById('shared-memory-status');
+  const enabled = document.getElementById('shared-memory-enabled');
+  const run = async (work, busyText, doneText) => {
+    status.style.color = '';
+    status.textContent = busyText;
+    try {
+      const data = await work();
+      renderSharedMemory(data);
+      if (data?.status?.error) showError(data.status.error);
+      else if (doneText) showToast(doneText);
+    } catch (e) {
+      status.textContent = e.message;
+      status.style.color = 'var(--danger, #e05252)';
+      showError(e.message);
+      return false;
+    }
+    return true;
+  };
+  const save = (extra = {}) => {
+    const token = document.getElementById('shared-memory-token').value.trim();
+    const body = {
+      enabled: enabled.checked,
+      repo: document.getElementById('shared-memory-repo').value.trim(),
+      branch: document.getElementById('shared-memory-branch').value.trim() || 'main',
+      files: document.getElementById('shared-memory-files').value,
+      ...(token ? { token } : {}),
+      ...extra,
+    };
+    return run(() => sharedMemoryRequest('PUT', '', body), 'Reading the repository…', 'Shared memory saved');
+  };
+  document.getElementById('shared-memory-save').addEventListener('click', () => save());
+  enabled.addEventListener('change', async () => {
+    if (!(await save())) enabled.checked = !enabled.checked;
+  });
+  document.getElementById('shared-memory-refresh').addEventListener('click', () =>
+    run(() => sharedMemoryRequest('POST', '/refresh'), 'Reading the repository…', 'Shared memory reloaded'));
+  document.getElementById('shared-memory-clear-token').addEventListener('click', () => save({ token: '' }));
 }
 
 function reflectMemoryToggleInSidebar(enabled) {

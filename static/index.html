@@ -496,6 +496,30 @@
             </div>
             <span class="admin-toggle-sub" style="display:block;margin-top:6px;opacity:0.5">Set to 0 to disable skill injection.</span>
           </div>
+          <div class="admin-card" id="shared-memory-card">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:32px">
+              <h2 style="margin:0;display:inline-flex;align-items:center;gap:6px"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="opacity:0.7"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>Shared memory repo</h2>
+              <label class="admin-switch" style="flex-shrink:0"><input type="checkbox" id="shared-memory-enabled" aria-label="Use the shared memory repo" /><span class="admin-slider"></span></label>
+            </div>
+            <span class="admin-toggle-sub" style="display:block;margin-top:6px;opacity:0.6">Reads your notes for AI assistants (for example a USER.md) from a GitHub repository and adds them to chat and council prompts as your standing instructions. Read-only. Point it only at a repository you control.</span>
+            <div style="display:grid;grid-template-columns:auto minmax(0,1fr);gap:6px 10px;align-items:center;margin-top:8px">
+              <label for="shared-memory-repo" class="admin-toggle-sub" style="margin:0">Repository</label>
+              <input type="text" id="shared-memory-repo" placeholder="owner/name or https://github.com/owner/name" autocomplete="off" spellcheck="false" style="min-width:0;width:100%;box-sizing:border-box;background:var(--input-bg,var(--panel));color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px" />
+              <label for="shared-memory-branch" class="admin-toggle-sub" style="margin:0">Branch</label>
+              <input type="text" id="shared-memory-branch" placeholder="main" autocomplete="off" spellcheck="false" style="min-width:0;width:100%;box-sizing:border-box;background:var(--input-bg,var(--panel));color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px" />
+              <label for="shared-memory-files" class="admin-toggle-sub" style="margin:0">Files</label>
+              <input type="text" id="shared-memory-files" placeholder="USER.md (comma-separated)" autocomplete="off" spellcheck="false" style="min-width:0;width:100%;box-sizing:border-box;background:var(--input-bg,var(--panel));color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px" />
+              <label for="shared-memory-token" class="admin-toggle-sub" style="margin:0">Access token</label>
+              <input type="password" id="shared-memory-token" placeholder="Needed for a private repo" autocomplete="new-password" spellcheck="false" style="min-width:0;width:100%;box-sizing:border-box;background:var(--input-bg,var(--panel));color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:4px 6px;font-size:12px" />
+            </div>
+            <span class="admin-toggle-sub" style="display:block;margin-top:6px;opacity:0.5">For a private repo, use a fine-grained GitHub token with read-only Contents access to that repository. It is stored encrypted.</span>
+            <div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:8px">
+              <button type="button" id="shared-memory-save" class="memory-toolbar-btn">Save</button>
+              <button type="button" id="shared-memory-refresh" class="memory-toolbar-btn">Reload now</button>
+              <button type="button" id="shared-memory-clear-token" class="memory-toolbar-btn danger" hidden>Remove token</button>
+              <span id="shared-memory-status" class="admin-toggle-sub" role="status" style="margin:0;opacity:0.75;min-width:0;overflow-wrap:anywhere"></span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -2695,7 +2719,7 @@
 <script type="module" src="/static/js/markdown.js"></script>
 <script type="module" src="/static/js/dragSort.js"></script>
 <script type="module" src="/static/js/sessions.js"></script>
-<script type="module" src="/static/js/memory.js?v=20260722memoryloading1"></script>
+<script type="module" src="/static/js/memory.js?v=20261011sharedmemory1"></script>
 <script type="module" src="/static/js/skills.js"></script>
 <script type="module" src="/static/js/tourHints.js"></script>
 <script type="module" src="/static/js/tourAutoplay.js"></script>

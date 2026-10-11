@@ -310,6 +310,11 @@ def budget_context_for_model(endpoint_url: str, model: str, *, fallback: int = 0
         return fallback
 
 
+def known_context_length(model: str) -> Optional[int]:
+    """The model's window from the known-models table alone (no network), or None."""
+    return _lookup_known(model)
+
+
 def _lookup_known(model: str) -> Optional[int]:
     """Check known context windows by substring match.
 

@@ -705,6 +705,9 @@ async def build_chat_context(
     if not allow_tool_preprocessing:
         mem_enabled = False
         skills_enabled = False
+    # The shared memory repo holds the user's standing instructions, so it
+    # stays on for short casual messages (and keeps the system prefix stable).
+    shared_mem_enabled = mem_enabled
     if casual_low_signal:
         mem_enabled = False
         skills_enabled = False
@@ -720,6 +723,7 @@ async def build_chat_context(
     is_research_spinoff = _session_is_research_spinoff(sess)
     if is_research_spinoff:
         mem_enabled = False
+        shared_mem_enabled = False
 
     # Use RAG?
     use_rag_val = (str(use_rag).lower() != "false") if use_rag is not None else True
@@ -746,6 +750,7 @@ async def build_chat_context(
         session=sess,
         use_web=use_web and not skip_web,
         use_memory=mem_enabled,
+        use_shared_memory=shared_mem_enabled,
         time_filter=time_filter,
         preset_system_prompt=preset.system_prompt,
         owner=user,

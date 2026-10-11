@@ -26,6 +26,8 @@ def db(monkeypatch):
     Session = sessionmaker(bind=engine, autoflush=False)
     monkeypatch.setattr(dbmod, "SessionLocal", Session)
     monkeypatch.setattr(cr, "SessionLocal", Session)
+    # No endpoint is reachable here: seats report an unknown context window.
+    monkeypatch.setattr("src.model_context.get_context_length_known", lambda url, model: (128000, False))
     s = Session()
     s.add_all([
         ModelEndpoint(id="api1", name="DeepSeek", base_url="https://api.deepseek.com/v1", owner="alice",
@@ -141,6 +143,53 @@ def test_follow_up_turns_carry_history(client, db, monkeypatch):
     seen.clear()
     client.post(f"/api/council/sessions/{sid}/ask", json={"question": "Second?", **quick})
     assert seen and all("First?" in contents and "the council says 42" in contents for contents in seen)
+
+
+@pytest.mark.parametrize("local_window,whole", [(1_000_000, True), (8_000, False)])
+def test_follow_up_history_fits_the_smallest_seat_window(client, db, monkeypatch, local_window, whole):
+    # The API seat has a large window; the local seat decides.
+    monkeypatch.setattr("src.model_context.get_context_length_known",
+                        lambda url, model: (local_window if "11434" in url else 1_000_000, True))
+    seen = []
+
+    async def recording(url, model, messages, **kwargs):
+        seen.append([m["content"] for m in messages])
+        async for chunk in _fake_stream(url, model, messages, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", recording)
+    brief = "".join(f"brief line {i:05d}\n" for i in range(1_100)).strip()    # ~19k characters
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    client.post(f"/api/council/sessions/{sid}/ask", json={"question": brief, **SEATS})
+    seen.clear()
+    client.post(f"/api/council/sessions/{sid}/ask", json={"question": "1 - all", **SEATS})
+    assert len(seen) == 5                       # 2 opinions, 2 reviews, 1 chairman
+    for contents in seen:
+        replayed = contents[1]
+        assert (replayed == brief) is whole
+        if not whole:
+            assert replayed.startswith("[NOTE: this earlier question is clipped") and "[... CUT: " in replayed
+
+
+def test_seats_carry_their_context_window(db, monkeypatch):
+    asked = []
+
+    def window(url, model):
+        asked.append(url)
+        return (8192, True) if model == "qwen3:8b" else (128000, False)
+
+    monkeypatch.setattr("src.model_context.get_context_length_known", window)
+    s = db()
+    try:
+        local = cr.resolve_seat(s, "alice", cr.Seat(endpoint_id="loc1", model="qwen3:8b"))
+        api = cr.resolve_seat(s, "alice", cr.Seat(endpoint_id="api1", model="deepseek-v4"))
+        estimate = cr.resolve_seat(s, "alice", cr.Seat(endpoint_id="loc1", model="qwen3:8b"), runtime=False)
+    finally:
+        s.close()
+    assert local.context_tokens == 8192        # what the local server reports
+    assert api.context_tokens is None          # a bare default is not a known window
+    assert estimate.context_tokens == 131072   # estimates read the known-models table only
+    assert len(asked) == 2
 
 
 def test_sessions_are_private_to_their_owner(client, db):
@@ -322,3 +371,37 @@ def test_stop_during_synthesis_keeps_the_partial_answer(db, monkeypatch):
     assert turn["status"] == "cancelled"
     assert turn["final"].startswith("The council leans towards")
     assert "stopped before the chairman finished" in turn["final"]
+
+
+class _SavedMemories:
+    def load(self, owner=None):
+        return [{"id": "m1", "text": "User trains strength three times a week.", "pinned": True,
+                 "category": "identity", "timestamp": 1}]
+
+
+@pytest.mark.parametrize("memory,pref_on,expect", [(True, True, True), (False, True, False), (True, False, False)])
+def test_council_memory_follows_the_toggle_and_the_memory_switch(client, db, monkeypatch, memory, pref_on, expect):
+    from src.chat_processor import ChatProcessor
+
+    monkeypatch.setattr(cr, "_CHAT_PROCESSOR", ChatProcessor(memory_manager=_SavedMemories(),
+                                                             personal_docs_manager=SimpleNamespace(rag_manager=None)))
+    monkeypatch.setattr("src.shared_memory.context_text", lambda owner, wait=False: f"SHARED PROFILE of {owner}")
+    monkeypatch.setattr("routes.prefs_routes._load_for_user", lambda owner: {"memory_enabled": pref_on})
+    systems = []
+
+    async def recording(url, model, messages, **kwargs):
+        systems.append(messages[0]["content"])
+        bare = [{**messages[0], "content": messages[0]["content"].split("\n\nSHARED PROFILE")[0]}, *messages[1:]]
+        async for chunk in _fake_stream(url, model, bare, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", recording)
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    resp = client.post(f"/api/council/sessions/{sid}/ask", json={"question": "Plan my week", "memory": memory, **SEATS})
+    events = _events(resp.text)
+    assert events[0]["memory"] is expect and events[-1]["status"] == "done"
+    assert len(systems) == 5
+    for system in systems:
+        assert ("SHARED PROFILE of alice" in system) is expect
+        assert ("User trains strength three times a week." in system) is expect
+    assert client.get(f"/api/council/sessions/{sid}").json()["config"]["memory"] is memory

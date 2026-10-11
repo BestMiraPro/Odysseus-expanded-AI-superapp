@@ -45,6 +45,7 @@ const S = {
   estimate: null,        // /api/council/estimate for the current seats
   tools: 'research',     // off | research | full: what members may do
   workspace: '',         // folder for their file tools (admin)
+  memory: true,          // members see the person's shared and saved memories
   expanded: new Set(),   // keys of long messages / tool rows the user opened
   history: { open: false, stats: null, busy: false, msg: '', err: false, query: '', results: null, reader: null },
 };
@@ -687,6 +688,7 @@ function applyConfig(cfg) {
   S.tools = TOOL_MODES.some(([id]) => id === cfg?.tools) ? cfg.tools : 'research';
   if (S.tools === 'full' && !isAdmin()) S.tools = 'research';
   S.workspace = typeof cfg?.workspace === 'string' ? cfg.workspace : '';
+  S.memory = cfg?.memory !== false;
   if (!S.members.length) S.members = defaultSeats();
 }
 
@@ -763,7 +765,7 @@ async function deleteSession(id) {
 }
 
 function currentConfig() {
-  return { members: S.members, chairman: S.chairman, mode: S.mode, tools: S.tools, workspace: S.workspace };
+  return { members: S.members, chairman: S.chairman, mode: S.mode, tools: S.tools, workspace: S.workspace, memory: S.memory };
 }
 
 let _saveTimer = null;
@@ -953,6 +955,12 @@ function renderSeats() {
       ${S.tools !== 'off' && isAdmin() ? `<input class="council-ws" id="council-workspace" value="${esc(S.workspace)}"
           placeholder="Workspace folder for file tools (optional)" aria-label="Workspace folder"
           title="Members can read${S.tools === 'full' ? ', run commands in and edit' : ''} files only inside this folder.">` : ''}
+      <span class="council-seat-label" style="margin-left:10px">Memory</span>
+      <span class="council-mode" role="radiogroup" aria-label="Share memories with the council"
+        title="Members see your shared memory repo and saved memories relevant to the question. Set up the repo in Memory → Settings.">
+        <button data-memory-mode="on" class="${S.memory ? 'on' : ''}" role="radio" aria-checked="${S.memory}">On</button>
+        <button data-memory-mode="off" class="${!S.memory ? 'on' : ''}" role="radio" aria-checked="${!S.memory}">Off</button>
+      </span>
     </div>
     ${S.picker ? renderPicker() : ''}`;
 }
@@ -1046,7 +1054,7 @@ function estimateKey() {
   const q = $('#council-input')?.value || '';
   const turns = (S.session?.turns || []).filter(t => t.status === 'done').length;
   // Question length in ~200-char steps: typing doesn't refetch every keystroke.
-  return JSON.stringify([S.members, chairmanSeat(), S.mode, S.session?.id || '', turns, Math.ceil(q.length / 200)]);
+  return JSON.stringify([S.members, chairmanSeat(), S.mode, S.memory, S.session?.id || '', turns, Math.ceil(q.length / 200)]);
 }
 
 function scheduleEstimate(force = false) {
@@ -1070,7 +1078,7 @@ async function loadEstimate(key) {
   try {
     const data = await jpost('/api/council/estimate', {
       question: $('#council-input')?.value || '', members: S.members, chairman: chair,
-      mode: S.mode, session_id: S.session?.id || null,
+      mode: S.mode, session_id: S.session?.id || null, memory: S.memory,
     });
     if (seq !== _estSeq) return;
     _estKey = key;
@@ -1345,6 +1353,7 @@ function renderTurn(turn, live = false) {
     <div class="council-strip">${strip}
       <span class="status ${statusErr ? 'err' : ''}">${esc(status)}</span>
       ${toolsNote}
+      ${turn.config?.memory ? '<span class="council-usage" title="Members saw your shared and saved memories">memory</span>' : ''}
       ${turnUsage(turn)}
       ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}" ${String(turn.id).startsWith('live-') ? 'disabled title="Starting…"' : ''}>Stop</button>` : ''}
       ${!running ? `<button class="council-btn small ghost" data-del-turn="${esc(turn.id)}" title="Delete this question">Delete</button>` : ''}
@@ -1450,7 +1459,7 @@ function onEvent(ev) {
   switch (ev.type) {
     case 'turn':
       live.id = ev.turn_id;
-      live.config = { members: ev.members, chairman: ev.chairman, mode: ev.mode, tools: ev.tools, workspace: ev.workspace };
+      live.config = { members: ev.members, chairman: ev.chairman, mode: ev.mode, tools: ev.tools, workspace: ev.workspace, memory: ev.memory };
       renderTurns();
       scrollToEnd();
       break;
@@ -1537,7 +1546,7 @@ async function convene() {
   S.picker = false;
   S.live = {
     id: `live-${Date.now()}`, sessionId: S.session.id, question, status: 'running',
-    config: { members: [], chairman: null, mode: S.mode, tools: S.tools, workspace: S.workspace },
+    config: { members: [], chairman: null, mode: S.mode, tools: S.tools, workspace: S.workspace, memory: S.memory },
     opinions: [], reviews: [], ranking: [], labels: {}, final: '', error: null, chairTools: [],
     stages: { opinions: 'running', review: 'pending', synthesis: 'pending' }, reader: null,
   };
@@ -1558,7 +1567,7 @@ async function convene() {
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ question, members, chairman: chair, mode, budget_confirmed: budgetConfirmed,
-      tools: S.tools, workspace: S.tools !== 'off' ? S.workspace : '' }),
+      tools: S.tools, workspace: S.tools !== 'off' ? S.workspace : '', memory: S.memory }),
   });
   try {
     let res = await send(false);
@@ -1956,6 +1965,12 @@ async function onPaneClick(e) {
     if (!pre) return;
     pre.hidden = !pre.hidden;
     if (pre.hidden) S.expanded.delete(key); else S.expanded.add(key);
+    return;
+  }
+  const memoryMode = t.closest('[data-memory-mode]');
+  if (memoryMode) {
+    S.memory = memoryMode.dataset.memoryMode === 'on';
+    saveConfigSoon(); renderSeats(); renderComposer();
     return;
   }
   const toolsMode = t.closest('[data-tools-mode]');

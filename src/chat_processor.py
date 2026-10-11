@@ -260,6 +260,19 @@ class ChatProcessor:
         scored.sort(key=lambda x: x[0], reverse=True)
         return [mem for _, mem in scored[:k]]
 
+    def select_memories(self, message: str, mem_entries: list) -> Tuple[list, list]:
+        """(pinned, recalled) memories for a request, at most MEMORY_CONTEXT_LIMIT in all.
+
+        Core pinned facts and pinned memories that match come first; the
+        remaining slots go to the best-matching unpinned memories.
+        """
+        pinned = [m for m in mem_entries if m.get("pinned")]
+        extended = [m for m in mem_entries if not m.get("pinned")]
+        selected = self._select_pinned_memories(message, pinned)
+        slots = max(self.MEMORY_CONTEXT_LIMIT - len(selected), 0)
+        relevant = self._hybrid_retrieve(message, extended, k=slots) if extended and slots else []
+        return selected, relevant
+
     def build_context_preface(
         self,
         message: str,
@@ -274,6 +287,7 @@ class ChatProcessor:
         agent_mode: bool = False,
         incognito: bool = False,
         use_skills: bool = True,
+        use_shared_memory: Optional[bool] = None,
     ) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]], List[Dict[str, str]]]:
         """Build the context preface for LLM calls.
 
@@ -302,6 +316,19 @@ class ChatProcessor:
                 "role": "system",
                 "content": preset_system_prompt
             })
+        # The user's shared memory repository: their own standing instructions,
+        # static between turns, so it belongs with the system prefix. Read from
+        # cache only; a stale entry refreshes in the background.
+        if (use_memory if use_shared_memory is None else use_shared_memory) and not incognito:
+            try:
+                from src.shared_memory import context_text
+
+                shared = context_text(owner)
+            except Exception as e:
+                logger.warning("Shared memory unavailable: %s", e)
+                shared = ""
+            if shared:
+                preface.append({"role": "system", "content": shared})
         preface.append({
             "role": "system",
             "content": UNTRUSTED_CONTEXT_POLICY,
@@ -312,11 +339,8 @@ class ChatProcessor:
         if use_memory:
             mem_entries = self.memory_manager.load(owner=owner)
 
-            pinned = [m for m in mem_entries if m.get("pinned")]
-            extended = [m for m in mem_entries if not m.get("pinned")]
-
             _used_ids: list = []
-            selected_pinned = self._select_pinned_memories(message, pinned)
+            selected_pinned, relevant = self.select_memories(message, mem_entries)
             if selected_pinned:
                 pinned_text = "\n- ".join([m["text"] for m in selected_pinned])
                 preface.append(untrusted_context_message(
@@ -331,22 +355,19 @@ class ChatProcessor:
                     if m.get("id"):
                         _used_ids.append(m["id"])
 
-            remaining_memory_slots = max(self.MEMORY_CONTEXT_LIMIT - len(self._last_used_memories), 0)
-            if extended and remaining_memory_slots:
-                relevant = self._hybrid_retrieve(message, extended, k=remaining_memory_slots)
-                if relevant:
-                    ext_text = "\n".join([f"- {m['text']}" for m in relevant])
-                    preface.append(untrusted_context_message(
-                        "saved memory: retrieved context",
-                        (
-                            "Memory context. Do not reference unless the user asks "
-                            f"about these topics.\n{ext_text}"
-                        ),
-                    ))
-                    for m in relevant:
-                        self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
-                        if m.get("id"):
-                            _used_ids.append(m["id"])
+            if relevant:
+                ext_text = "\n".join([f"- {m['text']}" for m in relevant])
+                preface.append(untrusted_context_message(
+                    "saved memory: retrieved context",
+                    (
+                        "Memory context. Do not reference unless the user asks "
+                        f"about these topics.\n{ext_text}"
+                    ),
+                ))
+                for m in relevant:
+                    self._last_used_memories.append({"text": m["text"], "category": m.get("category", "fact"), "type": "recalled"})
+                    if m.get("id"):
+                        _used_ids.append(m["id"])
 
             # Bump usage counters for the memories that were actually injected.
             if _used_ids and hasattr(self.memory_manager, "increment_uses"):
