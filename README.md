@@ -219,6 +219,29 @@ Sending your chat to another model is network egress, so once untrusted text is 
 (MCP tool descriptions, a provider's model list, a web page) Odysseus asks before delegating.
 Choose **Allow for this chat session** once and later delegations in that chat run without asking.
 
+### Effort
+
+The gauge button left of the model name in the chat box sets that model's **reasoning effort**:
+Default (the provider's own), Low, Medium, High, Extra high or Max. The choice is saved per model
+for your account and used for that model's replies in chat, agent mode, Council and the Study
+tutor. Background calls (chat titles, memory extraction, Study question generation) keep the
+provider default. The button only appears for models that take an effort setting, and lists
+only the levels that model accepts:
+
+| Provider | Models | Sent as |
+|---|---|---|
+| Claude Subscription | Opus 4.5+, Sonnet 4.6+, every Claude 5.x model (not Haiku 4.5) | `claude --effort` |
+| Anthropic API | same | `output_config.effort` |
+| ChatGPT Subscription | gpt-5.x (Extra high from gpt-5.2 / codex-max) | `reasoning.effort` |
+| OpenAI API | gpt-5.x, o-series | `reasoning_effort` (agent mode with tools forces `none` on gpt-5.x chat completions) |
+| OpenRouter | reasoning-capable models | `reasoning.effort` (up to High) |
+| Mistral | Magistral / thinking models | `reasoning_effort` |
+| Gemini API | Gemini 2.5+ | `reasoning_effort` |
+| Any server running gpt-oss | vLLM, llama.cpp, Ollama, Groq, Cerebras, W&B | `reasoning_effort` (Ollama native: `think`) |
+
+A saved level above what a model accepts runs at the highest level it does accept (Extra high
+on Claude Opus 4.6 runs as High).
+
 ## Budget
 
 **Settings → Budget** shows what pay-per-token API models cost you this month. It breaks the total down by

@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
-from src import budget, council, model_roster
+from src import budget, council, model_roster, reasoning_effort
 from src.auth_helpers import get_current_user, owner_filter, require_user
 
 logger = logging.getLogger(__name__)
@@ -616,10 +616,11 @@ def setup_council_routes() -> APIRouter:
 
         async def runner() -> None:
             try:
-                result = await council.run_council(
-                    question=question, members=members, chairman=chairman, mode=mode,
-                    history=history, emit=stream.emit, checkpoint=checkpoint, state=state,
-                )
+                with reasoning_effort.for_owner(owner):
+                    result = await council.run_council(
+                        question=question, members=members, chairman=chairman, mode=mode,
+                        history=history, emit=stream.emit, checkpoint=checkpoint, state=state,
+                    )
                 status = "error" if result.get("error") and not result.get("final") else "done"
                 fields = _result_fields(result)
                 # Set before the save: a Stop that lands while it is being

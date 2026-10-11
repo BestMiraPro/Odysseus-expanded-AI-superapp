@@ -1088,6 +1088,10 @@
         </div>
         <!-- Model picker (inside chatbox, top-right) -->
         <div class="model-picker-wrap" id="model-picker-wrap">
+          <div class="effort-wrap" id="effort-wrap" hidden>
+            <button type="button" class="effort-btn is-default" id="effort-btn" title="Reasoning effort" aria-label="Reasoning effort" aria-haspopup="menu" aria-expanded="false"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg><span id="effort-label"></span></button>
+            <div class="effort-menu hidden" id="effort-menu" role="menu" aria-label="Reasoning effort"></div>
+          </div>
           <button type="button" class="model-picker-btn" id="model-picker-btn" title="Switch model"><span id="model-picker-label">Select model</span> <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 15 12 9 18 15"/></svg></button>
           <div class="model-picker-menu hidden" id="model-picker-menu">
             <div class="model-picker-search-row">

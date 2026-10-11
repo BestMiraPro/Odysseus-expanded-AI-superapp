@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 from fastapi import HTTPException
 from typing import Optional, Dict, List, Tuple
 from src.model_context import get_context_length, DEFAULT_CONTEXT, is_local_endpoint
+from src import reasoning_effort
 from urllib.parse import urlparse
 from core.log_safety import redact_url
 
@@ -2809,7 +2810,9 @@ async def _stream_llm_unmetered(url: str, model: str, messages: List[Dict], temp
         # (the endpoint is provisioned with supports_tools=False).
         from src.claude_subscription import stream_chat as _claude_stream_chat
         note_model_activity(url, model)
-        async for chunk in _claude_stream_chat(url, model, _sanitize_llm_messages(messages), timeout=timeout):
+        effort = reasoning_effort.level_for("claude-subscription", model, url)
+        async for chunk in _claude_stream_chat(url, model, _sanitize_llm_messages(messages),
+                                               timeout=timeout, effort=effort):
             yield chunk
         return
     target_url = _stream_target_url(url)
@@ -2909,11 +2912,15 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             payload["think"] = False
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
-        _scrub_openai_chat_tool_reasoning(payload, target_url, model)
         h = _provider_headers(provider, headers)
         if provider == "copilot":
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
+
+    # The user's effort level for this model (chat composer -> Effort), then the
+    # OpenAI tools restriction, which has to win over it.
+    reasoning_effort.apply_to_payload(provider, model, payload, target_url)
+    _scrub_openai_chat_tool_reasoning(payload, target_url, model)
 
     # Connect budget from LLMConfig.CONNECT_TIMEOUT (env LLM_CONNECT_TIMEOUT).
     # The dead-host cooldown still bounds a genuinely unreachable upstream, so a

@@ -23,7 +23,7 @@ from src.llm_core import (
     stream_llm_with_fallback,
 )
 from src.agent_loop import stream_agent_loop
-from src import agent_runs
+from src import agent_runs, reasoning_effort
 from src.model_context import estimate_tokens
 from src.context_compactor import (
     apply_compaction_state,
@@ -2585,8 +2585,9 @@ def setup_chat_routes(
             """Wrapper that guarantees _active_streams cleanup even if stream_with_save
             raises before reaching a mode-specific finally block."""
             try:
-                async for chunk in stream_with_save():
-                    yield chunk
+                with reasoning_effort.for_owner(_user):
+                    async for chunk in stream_with_save():
+                        yield chunk
             finally:
                 _active_streams.pop(session, None)
 
