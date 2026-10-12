@@ -386,6 +386,10 @@ class RosterEntry:
     price_source: Optional[str] = None
     notes: Optional[str] = None
     deprecated: bool = False
+    # Reasoning effort levels this model accepts (empty = no effort control)
+    # and the provider's own default level; see src.reasoning_effort.
+    effort_levels: List[str] = field(default_factory=list)
+    default_effort: Optional[str] = None
 
     @property
     def key(self) -> str:
@@ -597,15 +601,21 @@ def roster(owner: Optional[str]) -> List[RosterEntry]:
     import src.database as dbmod
 
     rows = []
+    base_urls: Dict[str, str] = {}
     db = dbmod.SessionLocal()
     try:
         for ep in visible_endpoints(db, owner):
             kind, provider = classify_endpoint(ep)
+            base_urls[ep.id] = ep.base_url or ""
             for model in chat_models(ep):
                 rows.append((ep.id, ep.name or ep.base_url, model, kind, provider))
     finally:
         db.close()
     entries = build_entries(rows)
+    from src.reasoning_effort import levels_for
+    for entry in entries:
+        levels, default = levels_for(entry.provider, base_urls.get(entry.endpoint_id, ""), entry.model)
+        entry.effort_levels, entry.default_effort = list(levels), default
     order = {"subscription": 0, "api": 1, "local": 2}
     entries.sort(key=lambda e: (order.get(e.kind, 3), not e.recommended, e.endpoint_name.lower(), e.model))
     return entries

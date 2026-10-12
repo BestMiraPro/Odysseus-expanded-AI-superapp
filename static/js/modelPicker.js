@@ -6,6 +6,7 @@ import uiModule from './ui.js';
 import settingsModule from './settings.js';
 import { sortModelObjects } from './modelSort.js';
 import spinnerModule from './spinner.js';
+import { initEffortPicker, refreshEffortPicker } from './effortPicker.js';
 
 const API_BASE = window.location.origin;
 
@@ -192,6 +193,7 @@ async function _ensureDefaultPendingChat() {
 export function initModelPicker(deps) {
   _deps = deps;
   _initModelPickerDropdown();
+  initEffortPicker();
 }
 
 // Recommendation + price per model from /api/models/roster: "★" marks the
@@ -1016,6 +1018,17 @@ export function updateModelPicker() {
   ) {
     _ensureDefaultPendingChat();
   }
+
+  // Effort control for the model the next message goes to (hidden when the
+  // provider has none).
+  let routeUrl = '';
+  if (s && s.model) {
+    routeUrl = s.endpoint_url || '';
+  } else {
+    const pending = _deps.getPendingChat && _deps.getPendingChat();
+    if (pending && pending.modelId === modelId) routeUrl = pending.url || '';
+  }
+  refreshEffortPicker(modelId ? { model: modelId, url: routeUrl } : null);
 
   const displayName = modelId ? modelId.split('/').pop() : 'Select model';
   // The header indicator clips long names with ellipsis; show the full model

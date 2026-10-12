@@ -70,7 +70,7 @@ def setup_claude_subscription_routes() -> APIRouter:
         require_admin(request)
         owner = get_current_user(request) or None
         mode = (body.mode or "").strip().lower()
-        token = (body.token or "").strip() or None
+        token = claude_subscription.normalize_token(body.token)
         if mode not in (claude_subscription.AUTH_MODE_TOKEN, claude_subscription.AUTH_MODE_HOST):
             raise HTTPException(400, "mode must be 'token' or 'host'")
         if mode == claude_subscription.AUTH_MODE_TOKEN and not claude_subscription.valid_token(token):

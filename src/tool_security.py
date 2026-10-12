@@ -97,6 +97,8 @@ PLAN_MODE_READONLY_TOOLS = {
     "web_search",
     "web_fetch",
     "search_chats",
+    "search_history",
+    "read_history",
     "list_models",
     "list_sessions",
     # Read-only email tools. list_email_accounts must be here because the

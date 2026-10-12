@@ -78,6 +78,8 @@ def setup_compare_routes(session_manager: SessionManager):
         endpoint_a_id: str = Form(""),
         endpoint_b_id: str = Form(""),
         is_blind: str = Form("true"),
+        effort_a: str = Form(""),
+        effort_b: str = Form(""),
     ):
         """Create two ephemeral sessions and a comparison record.
 
@@ -181,7 +183,9 @@ def setup_compare_routes(session_manager: SessionManager):
             db.close()
 
         # Both endpoints validated — only now create the ephemeral [CMP]
-        # sessions and copy any resolved headers.
+        # sessions and copy any resolved headers and each column's effort.
+        from src.reasoning_effort import normalize
+        efforts = {sid_a: normalize(effort_a), sid_b: normalize(effort_b)}
         for sid, model, session_endpoint_url, headers in resolved:
             name = f"[CMP] {slot_name[sid]}" if blind else f"[CMP] {model.split('/')[-1]}"
             session_manager.create_session(
@@ -192,10 +196,11 @@ def setup_compare_routes(session_manager: SessionManager):
                 rag=False,
                 owner=user,
             )
-            if headers:
-                s = session_manager.sessions.get(sid)
-                if s:
+            s = session_manager.sessions.get(sid)
+            if s:
+                if headers:
                     s.headers = headers
+                s.reasoning_effort = efforts.get(sid)
 
         # Store comparison record
         db = SessionLocal()

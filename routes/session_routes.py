@@ -310,6 +310,7 @@ def setup_session_routes(
 
         sessions = [{"id": s.id, "name": s.name, "model": _public_model(s.name, s.model),
                      "endpoint_url": s.endpoint_url, "rag": s.rag,
+                     "reasoning_effort": getattr(s, "reasoning_effort", None),
                      "archived": s.archived, "folder": folder_map.get(s.id),
                      "total_tokens": token_map.get(s.id, 0),
                      "is_important": important_map.get(s.id, False),
@@ -337,6 +338,7 @@ def setup_session_routes(
         skip_validation: str = Form(None),
         api_key: str = Form(""),
         endpoint_id: str = Form(""),
+        reasoning_effort: str = Form(""),
     ):
         skip_val = str(skip_validation).lower() == "true"
         user = effective_user(request)
@@ -443,6 +445,18 @@ def setup_session_routes(
             from src.endpoint_resolver import build_headers
             session.headers = build_headers(resolved_key, resolved_base)
             _persist_session_headers(sid, session.headers)
+        # The session's own effort (a Compare column's), picked before it existed.
+        from src.reasoning_effort import normalize
+        if normalize(reasoning_effort):
+            session.reasoning_effort = normalize(reasoning_effort)
+            _db = SessionLocal()
+            try:
+                row = _db.query(DbSession).filter(DbSession.id == sid).first()
+                if row:
+                    row.reasoning_effort = session.reasoning_effort
+                    _db.commit()
+            finally:
+                _db.close()
         # Fire webhook (sync-safe)
         if webhook_manager:
             webhook_manager.fire_and_forget("session.created", {
@@ -463,7 +477,7 @@ def setup_session_routes(
         request: Request, sid: str,
         name: str = Form(None), folder: str = Form(None),
         model: str = Form(None), endpoint_url: str = Form(None),
-        endpoint_id: str = Form(None),
+        endpoint_id: str = Form(None), reasoning_effort: str = Form(None),
     ):
         _verify_session_owner(request, sid)
         try:
@@ -474,6 +488,22 @@ def setup_session_routes(
         if name is not None:
             session_manager.update_session_name(sid, name)
             result["name"] = name
+        # The session's own effort (a Compare column's); "" = none of its own.
+        if reasoning_effort is not None:
+            from src.reasoning_effort import normalize
+            level = normalize(reasoning_effort)
+            if reasoning_effort.strip() and not level:
+                raise HTTPException(400, "Unknown reasoning effort level")
+            session.reasoning_effort = level
+            db = SessionLocal()
+            try:
+                db_session = db.query(DbSession).filter(DbSession.id == sid).first()
+                if db_session:
+                    db_session.reasoning_effort = level
+                    db.commit()
+            finally:
+                db.close()
+            result["reasoning_effort"] = level
         # Update folder assignment
         if folder is not None:
             db = SessionLocal()

@@ -20,7 +20,7 @@ from src.tools.cookbook import (  # noqa: F401
     _scan_running_model_processes, _cookbook_kill_session,
     _MODEL_PROCESS_PATTERNS,
 )
-from src.tools.search import do_search_chats  # noqa: F401
+from src.tools.search import do_search_chats, do_search_history, do_read_history  # noqa: F401
 from src.tools.notes import do_manage_notes  # noqa: F401
 from src.tools.calendar import do_manage_calendar  # noqa: F401
 from src.tools.image import do_edit_image  # noqa: F401

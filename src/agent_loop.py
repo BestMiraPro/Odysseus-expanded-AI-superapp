@@ -2932,6 +2932,7 @@ async def _stream_agent_loop_body(
     workload: str = "foreground",
     external_untrusted_context_seen: bool = False,
     exact_approval: Optional[ExactToolApproval] = None,
+    gated_actions: str = "ask",
     _is_teacher_run: bool = False,
     history_session=None,
     defer_context_shaping: bool = False,
@@ -2946,6 +2947,12 @@ async def _stream_agent_loop_body(
       - data: {"type": "agent_step", "round": N}            (next round)
       - data: {"type": "metrics", "data": {...}}            (final metrics)
       - data: [DONE]                                        (end)
+
+    ``gated_actions`` decides what happens to an action the external-context
+    gate holds back: ``"ask"`` the user (an approval card ends the turn),
+    ``"refuse"`` it and let the run carry on (nobody can answer, e.g. a Council
+    seat), or ``"allow"`` it because the caller already holds the user's
+    authorization for this run's tools.
     """
 
     run_security = ToolRunSecurityContext(
@@ -2958,7 +2965,8 @@ async def _stream_agent_loop_body(
             or messages_contain_external_untrusted_context(messages)
         ),
         approval_gate_bypassed=bool(
-            exact_approval and exact_approval.allow_remaining_actions
+            (exact_approval and exact_approval.allow_remaining_actions)
+            or gated_actions == "allow"
         ),
     )
     _spend_source = "teacher" if _is_teacher_run else "agent"
@@ -5232,6 +5240,18 @@ async def _stream_agent_loop_body(
                 }
                 logger.info(
                     "Tool blocked before approval by current policy: %s",
+                    block.tool_type,
+                )
+            elif not security_decision.allowed and gated_actions == "refuse":
+                # Nobody can answer an approval card here: refuse the call and
+                # let the model finish with what it has.
+                desc, result = blocked_tool_result(
+                    block.tool_type,
+                    (security_decision.reason or "Tool blocked by external-context policy.")
+                    + " Nobody can approve it during this run, so it was not executed.",
+                )
+                logger.info(
+                    "Tool refused after untrusted context (no approval possible): %s",
                     block.tool_type,
                 )
             elif not security_decision.allowed:

@@ -332,7 +332,10 @@ def _resolve_vl_model(configured: str, owner: str | None = None) -> tuple:
     from src.ai_interaction import _resolve_model
 
     if configured:
-        return _resolve_model(configured, owner=owner)
+        from src.reasoning_effort import with_effort
+        from src.settings import get_user_setting
+        url, model_id, headers = _resolve_model(configured, owner=owner)
+        return url, model_id, with_effort(headers, get_user_setting("vision_effort", owner or "", ""))
 
     # Auto-detect: try known vision-capable models in priority order
     candidates = [

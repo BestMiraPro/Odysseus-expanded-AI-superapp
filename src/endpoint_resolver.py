@@ -427,7 +427,9 @@ def resolve_endpoint(
         fallback_headers: Headers to use if using fallback.
 
     Returns:
-        (endpoint_url, model, headers) — resolved or fallback values.
+        (endpoint_url, model, headers) — resolved or fallback values. Resolved
+        headers carry the role's reasoning effort (``{prefix}_effort``, else
+        that of the role that supplied the model) for llm_core to apply.
     """
     try:
         from src.settings import get_user_setting, load_settings
@@ -441,11 +443,13 @@ def resolve_endpoint(
 
     ep_id = _stg(f"{setting_prefix}_endpoint_id")
     model = _stg(f"{setting_prefix}_model")
+    role = setting_prefix
 
     # Fall back to utility model for task/research/auto-naming if not specifically configured.
     if not ep_id and setting_prefix not in ("utility", "default"):
         ep_id = _stg("utility_endpoint_id")
         model = _stg("utility_model")
+        role = "utility"
 
     # If the endpoint is STILL not configured, but the caller provided a
     # valid fallback (e.g. the active session model), use that immediately.
@@ -458,6 +462,7 @@ def resolve_endpoint(
     if not ep_id:
         ep_id = _stg("default_endpoint_id")
         model = _stg("default_model")
+        role = "default"
 
     if not ep_id:
         return fallback_url, fallback_model, fallback_headers
@@ -496,7 +501,18 @@ def resolve_endpoint(
         if not model and not fallback_model:
             logger.warning('[resolve_endpoint] no usable model (all models hidden or list empty)')
 
-        return chat_url, model or fallback_model, headers
+        # The asking place's own effort wins (Study keeps its effort while it
+        # borrows the utility model), else the role that supplied the model.
+        # Only roles with an effort setting (utility, study, vision) have one.
+        from src.reasoning_effort import with_effort
+        from src.settings import DEFAULT_SETTINGS
+
+        def _effort(prefix: str) -> str:
+            key = f"{prefix}_effort"
+            return _stg(key) if key in DEFAULT_SETTINGS else ""
+
+        effort = _effort(setting_prefix) or _effort(role)
+        return chat_url, model or fallback_model, with_effort(headers, effort)
     except Exception as e:
         logger.debug(f"Could not resolve {setting_prefix} endpoint: {e}")
         return fallback_url, fallback_model, fallback_headers

@@ -26,7 +26,7 @@ import {
   stopAll, stopPane, rerollPane, shufflePanePositions, resetCompare,
   _addPane, _removePane, toggleExpandPane, togglePanePreview, copyPaneResponse,
   _showModelSwapDropdown, _createAndAppendPane, _autoPreviewHtml,
-  registerPaneActions,
+  registerPaneActions, _mountPaneEffort,
 } from './panes.js';
 import { handleVote, buildVoteBar, addFinishBadge, spawnConfetti, _saveVote, registerCompareActions } from './vote.js';
 import { showScoreboard } from './scoreboard.js';
@@ -254,6 +254,7 @@ async function _buildCompareUI() {
         fd.append('endpoint_id', m.endpointId);
         fd.append('skip_validation', 'true');
       }
+      if (m.effort) fd.append('reasoning_effort', m.effort);
       const res = await fetch(`${state.API_BASE}/api/session`, { method: 'POST', body: fd });
       if (!res.ok) throw new Error('Failed to create session for ' + modelShorts[i]);
       const data = await res.json();
@@ -470,6 +471,7 @@ async function _buildCompareUI() {
         '</button>' +
       '</div>';
     grid.appendChild(pane);
+    _mountPaneEffort(pane, i);
   }
   grid.addEventListener('click', (e) => {
     const voteBtn = e.target.closest('.pane-vote-btn');

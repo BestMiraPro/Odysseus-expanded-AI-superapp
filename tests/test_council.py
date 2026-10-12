@@ -126,14 +126,16 @@ def test_review_prompt_is_anonymous_and_chair_prompt_names_models():
 def test_long_answers_are_clipped_in_later_stages():
     big = "x" * (council.MAX_ANSWER_CHARS + 500)
     body = council.review_messages("Q", {"A": 0}, {0: big})[-1]["content"]
-    assert "[... truncated ...]" in body
+    assert "[NOTE: this answer is clipped" in body and "[... CUT: " in body
     assert len(body) < council.MAX_ANSWER_CHARS + 2000
 
 
-def test_history_keeps_only_recent_completed_turns():
+def test_history_keeps_the_first_and_the_recent_completed_turns():
     history = [{"question": f"q{i}", "final": f"a{i}"} for i in range(6)] + [{"question": "q", "final": ""}]
     msgs = council.history_messages(history)
-    assert [m["content"] for m in msgs] == ["q4", "a4", "q5", "a5"]
+    assert [m["content"] for m in msgs] == [
+        "q0", "a0", "[NOTE: 2 earlier rounds are not replayed here.]\n\nq3", "a3", "q4", "a4", "q5", "a5"]
+    assert [m["role"] for m in msgs] == ["user", "assistant"] * 4
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +243,47 @@ def test_usage_and_cost_are_tracked_per_call():
     assert done[0]["cost_usd"] == 0.006
 
 
+def _run_member(stream, member):
+    async def emit(ev):
+        pass
+
+    return asyncio.run(council.run_member(stream, member, [{"role": "user", "content": "q"}],
+                                          stage="opinions", index=0, emit=emit, timeout=30))
+
+
+def test_self_billed_seat_shows_its_tokens_and_cost_but_is_not_billed_again():
+    async def agent_loop_stream(url, model, messages, **kwargs):
+        yield 'data: {"type": "self_billed"}\n\n'
+        yield 'data: {"delta": "answer"}\n\n'
+        yield 'data: {"type": "metrics", "data": {"input_tokens": 2000, "output_tokens": 300}}\n\n'
+        yield "data: [DONE]\n\n"
+
+    paid = _member("paid")
+    paid.input_per_mtok, paid.output_per_mtok = 1.0, 4.0
+    out = _run_member(agent_loop_stream, paid)
+    assert out["usage"] == {"input_tokens": 2000, "output_tokens": 300}
+    assert out["cost_usd"] == 0.0032 and out["self_billed"]
+    assert council.usage_totals({"opinions": [out]})["cost_usd"] == 0.0032
+    # The agent loop already put it in the spend ledger.
+    assert council.billable_calls({"opinions": [{**out, "member": 0}]}, [paid], paid) == []
+
+
+def test_a_refused_tool_call_still_ends_the_working_notes():
+    """A call blocked before it starts sends only tool_output; the text before
+    it is a working note, not part of the answer."""
+    async def stream(url, model, messages, **kwargs):
+        yield 'data: {"delta": "Now let me retry the blocked tool:"}\n\n'
+        yield ('data: {"type": "tool_output", "tool": "web_fetch", "command": "example.com", '
+               '"output": "Blocked by policy", "exit_code": 1}\n\n')
+        yield 'data: {"delta": "Final answer."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    out = _run_member(stream, _member("m"))
+    assert out["text"] == "Final answer."
+    assert out["tools"][0] == {"kind": "note", "text": "Now let me retry the blocked tool:"}
+    assert out["tools"][1]["tool"] == "web_fetch" and out["tools"][1]["status"] == "error"
+
+
 def test_cached_prompt_tokens_are_priced_at_cache_rates():
     m = _member("paid")
     m.input_per_mtok, m.output_per_mtok = 10.0, 50.0
@@ -290,29 +333,128 @@ def test_history_reaches_every_stage_model():
 
 
 # ---------------------------------------------------------------------------
-# effort
+# history budget
 # ---------------------------------------------------------------------------
 
-def test_effort_levels_are_per_provider():
-    assert council.effort_options("claude-subscription") == ("low", "medium", "high", "xhigh", "max")
-    assert council.effort_options("chatgpt-subscription") == ("low", "medium", "high", "xhigh")
-    assert council.effort_options("openai") == ()
+def _long(tag: str, size: int) -> str:
+    """``size`` characters of numbered lines, so any cut shows as missing lines."""
+    body = "".join(f"{tag} line {i:05d}\n" for i in range(size // 10))
+    return body[:size - 4] + " END"
 
 
-def test_each_seats_effort_reaches_only_its_own_calls():
-    seen = []
-    base = _fake_stream()
+BRIEF = _long("brief", 12_000)           # round 1: the user's brief
+ROUND1 = _long("round1", 19_000)         # round 1: the council's answer
+REPLY = "1 - all\n3 - mixed"             # round 2: the user answers its questions
+PREVIOUS = _long("previous", 20_000)     # round 2: the council's answer
+HISTORY = [{"question": BRIEF, "final": ROUND1}, {"question": REPLY, "final": PREVIOUS}]
 
-    async def stream(url, model, messages, **kwargs):
-        seen.append((model, kwargs.get("effort", "unset")))
-        async for chunk in base(url, model, messages, **kwargs):
+
+def _sized(name: str, context_tokens: int) -> council.Member:
+    member = _member(name)
+    member.context_tokens = context_tokens
+    return member
+
+
+def _history_part(messages):
+    """The replayed history: everything between the system prompt and the new question."""
+    return [m["content"] for m in messages[1:-1]]
+
+
+def _run_round3(context_tokens: int, answers=None):
+    stream = _fake_stream(answers=answers)
+    members = [_sized("a", context_tokens), _sized("b", context_tokens)]
+    _run(question="Round 3?", members=members, chairman=_sized("a", context_tokens), mode="full",
+         stream_fn=stream, history=HISTORY)
+    stages = {call[0] for call in stream.calls}
+    assert stages == {s.split(".")[0] for s in (council.OPINION_SYSTEM, council.REVIEW_SYSTEM, council.CHAIR_SYSTEM)}
+    assert len(stream.calls) == 5               # 2 opinions, 2 reviews, 1 chairman
+    return stream.calls
+
+
+def test_large_windows_replay_the_brief_and_the_previous_answer_in_full():
+    long_answer = _long("member", 20_000)
+    for stage, _model, messages in _run_round3(1_000_000, answers={"a": long_answer}):
+        assert _history_part(messages) == [BRIEF, ROUND1, REPLY, PREVIOUS], stage
+        if stage != council.OPINION_SYSTEM.split(".")[0]:
+            # A member's long answer also reaches reviewers and chairman uncut.
+            assert long_answer in messages[-1]["content"] and "[NOTE:" not in messages[-1]["content"], stage
+
+
+def test_small_windows_clip_the_middle_turns_first_and_say_so():
+    for stage, _model, messages in _run_round3(40_000):
+        brief, round1, reply, previous = _history_part(messages)
+        assert (brief, reply, previous) == (BRIEF, REPLY, PREVIOUS), stage
+        assert round1.startswith("[NOTE: this earlier council answer is clipped"), stage
+        assert "[... CUT: " in round1 and "characters" in round1
+        assert len(round1) < len(ROUND1) // 2
+        assert "round1 line 00000" in round1 and round1.endswith(" END")   # start and end kept
+
+
+def test_tiny_windows_clip_the_brief_and_the_previous_answer_with_a_note():
+    for stage, _model, messages in _run_round3(8_000):
+        brief, round1, reply, previous = _history_part(messages)
+        assert reply == REPLY, stage
+        assert round1.startswith("[NOTE: this earlier council answer is left out"), stage
+        assert brief.startswith("[NOTE: this earlier question is clipped"), stage
+        assert previous.startswith("[NOTE: this earlier council answer is clipped"), stage
+        assert "brief line 00000" in brief and "previous line 00000" in previous
+        assert sum(map(len, (brief, round1, reply, previous))) <= council.prompt_room(
+            [_sized("a", 8_000)]) // 4 + 100
+
+
+def test_clip_note_names_the_cut_characters():
+    text = _long("x", 10_000)
+    clipped = council._clip_middle(text, 3_000, "earlier question")
+    head, cut = clipped.split("\n\n")[1:3]
+    start = len(head) + 1
+    assert f"characters {start:,}-" in clipped.splitlines()[0]
+    assert cut.startswith("[... CUT: ") and f"of {len(text):,}" in cut
+    assert len(clipped) <= 3_000
+
+
+def test_unknown_windows_fall_back_to_a_conservative_budget():
+    known = council.plan_limits([_sized("a", 1_000_000)], _sized("a", 1_000_000), "quick", "Q", HISTORY)
+    unknown = council.plan_limits([_member("a")], _sized("a", 1_000_000), "quick", "Q", HISTORY)
+    assert unknown.history < known.history
+    assert unknown == council.plan_limits([_sized("a", council.FALLBACK_CONTEXT_TOKENS)],
+                                          _sized("a", 1_000_000), "quick", "Q", HISTORY)
+
+
+def test_estimate_counts_the_replayed_history():
+    small = council.estimate_turn([_sized("a", 8_000)], _sized("a", 8_000), "quick", "Q", HISTORY)
+    large = council.estimate_turn([_sized("a", 1_000_000)], _sized("a", 1_000_000), "quick", "Q", HISTORY)
+    assert large["calls"][0]["input_tokens"] > small["calls"][0]["input_tokens"] + 10_000
+
+
+# ---------------------------------------------------------------------------
+# context about the user
+# ---------------------------------------------------------------------------
+
+def test_context_reaches_every_stage_system_prompt():
+    stream = _fake_stream()
+    calls = []
+
+    async def recording(url, model, messages, **kwargs):
+        calls.append(messages)
+        # The fake keys on the bare stage prompt, so hand it the prompt without the context.
+        bare = [{**messages[0], "content": messages[0]["content"].split("\n\nABOUT THE USER")[0]}, *messages[1:]]
+        async for chunk in stream(url, model, bare, **kwargs):
             yield chunk
 
-    a, b, chair = _member("a"), _member("b"), _member("chair")
-    a.effort, chair.effort = "max", "high"
-    result, _ = _run(question="q", members=[a, b], chairman=chair, mode=council.MODE_FULL, stream_fn=stream)
+    result, _ = _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full",
+                     stream_fn=recording, context="ABOUT THE USER: prefers short answers.")
     assert result["final"] == "FINAL ANSWER"
-    # Opinion and review for each member, then the chair; a seat left on the
-    # provider default sends no effort at all.
-    assert sorted(seen) == [("a", "max"), ("a", "max"), ("b", "unset"), ("b", "unset"), ("chair", "high")]
-    assert a.public(0)["effort"] == "max" and b.public(1)["effort"] is None
+    assert len(calls) == 5
+    for messages in calls:
+        assert messages[0]["role"] == "system" and messages[0]["content"].endswith("prefers short answers.")
+        assert sum("ABOUT THE USER" in m["content"] for m in messages) == 1
+
+
+def test_context_counts_against_the_history_budget():
+    members, chair = [_sized("a", 40_000)], _sized("a", 40_000)
+    plain = council.plan_limits(members, chair, "quick", "Q", HISTORY)
+    with_memory = council.plan_limits(members, chair, "quick", "Q", HISTORY, context="m" * 20_000)
+    assert with_memory.history == plain.history - 20_000
+    est = council.estimate_turn(members, chair, "quick", "Q", [], context="m" * 20_000)
+    assert est["calls"][0]["input_tokens"] > council.estimate_turn(members, chair, "quick", "Q", [])["calls"][0][
+        "input_tokens"] + 5_000

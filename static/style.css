@@ -3193,6 +3193,96 @@ body.bg-pattern-sparkles {
     .model-picker-wrap {
       position: relative;
       flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+    }
+    /* Effort picker — per-model reasoning effort, left of the model name */
+    .effort-wrap {
+      display: inline-flex;
+      align-items: center;
+    }
+    .effort-wrap[hidden] { display: none; }
+    .effort-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      height: 21px;
+      padding: 0 5px;
+      font-size: 11px;
+      font-weight: 500;
+      font-family: inherit;
+      background: none;
+      border: 1px solid transparent;
+      border-radius: 4px;
+      color: color-mix(in srgb, var(--fg) 65%, transparent);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s, color 0.15s, border-color 0.15s;
+    }
+    .effort-btn:hover,
+    .effort-btn[aria-expanded="true"] {
+      border-color: var(--border);
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+      color: var(--fg);
+    }
+    .effort-btn.is-default svg { opacity: 0.5; }
+    .effort-btn.is-default #effort-label { display: none; }
+    .effort-menu {
+      position: absolute;
+      bottom: calc(100% + 16px);
+      right: 0;
+      z-index: 250;
+      min-width: 190px;
+      max-width: 260px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 -4px 20px rgba(0,0,0,0.4);
+      padding: 6px;
+      animation: picker-roll-up 0.2s ease-out;
+      transform-origin: bottom right;
+    }
+    .effort-menu.hidden { display: none; }
+    .effort-menu-head {
+      padding: 4px 8px 6px;
+      font-size: 11px;
+      color: color-mix(in srgb, var(--fg) 60%, transparent);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .effort-menu-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      padding: 6px 8px;
+      font-size: 0.85em;
+      font-family: inherit;
+      text-align: left;
+      background: none;
+      border: none;
+      border-radius: 4px;
+      color: var(--fg);
+      cursor: pointer;
+    }
+    .effort-menu-item:hover,
+    .effort-menu-item:focus-visible {
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+      outline: none;
+    }
+    .effort-menu-item.selected::after {
+      content: "\2713";
+      color: var(--accent, var(--red));
+    }
+    .effort-menu-note {
+      padding: 6px 8px 2px;
+      font-size: 11px;
+      line-height: 1.35;
+      color: color-mix(in srgb, var(--fg) 55%, transparent);
+      border-top: 1px solid var(--border);
+      margin-top: 4px;
     }
     .model-picker-btn {
       display: inline-flex;

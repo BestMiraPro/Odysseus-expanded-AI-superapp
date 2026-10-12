@@ -787,7 +787,12 @@ app.include_router(setup_chatgpt_subscription_routes())
 from routes.claude_subscription_routes import setup_claude_subscription_routes
 app.include_router(setup_claude_subscription_routes())
 from routes.council_routes import setup_council_routes
-app.include_router(setup_council_routes())
+app.include_router(setup_council_routes(chat_processor=chat_processor))
+# Each user's shared memory repository (read-only, from GitHub).
+from routes.shared_memory_routes import setup_shared_memory_routes
+app.include_router(setup_shared_memory_routes())
+from routes.archive_routes import setup_archive_routes
+app.include_router(setup_archive_routes())
 from routes.model_roster_routes import setup_model_roster_routes
 app.include_router(setup_model_roster_routes())
 from routes.budget_routes import setup_budget_routes
@@ -1128,6 +1133,12 @@ async def _startup_event():
         _startup_tasks.append(start_bg_monitor())
     except Exception as _e:
         logger.warning("Failed to start background-job monitor: %s", _e)
+    # Read users' shared memory repositories now, so the first chat has them.
+    try:
+        from src.shared_memory import warm_all as _warm_shared_memory
+        _warm_shared_memory()
+    except Exception as _e:
+        logger.warning("Failed to warm shared memory: %s", _e)
     # MCP servers can be slow or blocked by local tooling. Connect them after
     # the web server is accepting traffic instead of delaying the whole UI.
     async def _startup_mcp_connections():

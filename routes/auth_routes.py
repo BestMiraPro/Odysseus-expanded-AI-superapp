@@ -878,6 +878,9 @@ def setup_auth_routes(auth_manager: AuthManager) -> APIRouter:
                 except (TypeError, ValueError):
                     raise HTTPException(400, f"{key} must be an integer")
                 val = max(lo, min(val, hi))
+            elif key.endswith("_effort"):
+                from src.reasoning_effort import normalize
+                val = normalize(val) or ""
             current[key] = val
         _save_settings(current)
         return without_retired_settings(current)

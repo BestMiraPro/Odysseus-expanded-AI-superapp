@@ -169,11 +169,73 @@ Models) and then work everywhere else in Odysseus too — chat, Study, research.
   (`npm install -g @anthropic-ai/claude-code`). Either run `claude setup-token` and paste
   the token, or use the Claude login already on that machine (`claude auth login`).
   Anthropic only allows subscription sign-ins inside Claude Code itself, so Odysseus drives
-  the CLI rather than calling the API with your subscription token. Text only: no tools or
-  images on these seats.
+  the CLI rather than calling the API with your subscription token.
 
 Runs live on the server: closing the page does not stop a council, and reopening the thread
 shows the saved result. Follow-up questions in the same thread see the earlier answers.
+
+### Tools
+
+**Tools** under the seats sets what members may do, per council:
+
+- **Research** (default) — web search and page fetch, reading and searching files in the
+  **workspace** folder, your **history** (below) and your Odysseus chats.
+- **Full** — Research plus shell commands, Python and file edits in the workspace, the way
+  Claude Code or Codex work on your own machine. Admin only (single-user installs count).
+- **Off** — text only, as before.
+
+Each seat uses the strongest engine it has:
+
+| Seat | Engine | Web | Files, shell | History |
+|---|---|---|---|---|
+| Claude Subscription | the Claude Code CLI with its own tools | WebSearch, WebFetch | Read/Grep/Glob; Bash/Edit/Write in Full | Odysseus MCP server |
+| ChatGPT Subscription | the Codex CLI (`codex exec`) | live web search | read-only sandbox; no sandbox in Full | Odysseus MCP server |
+| API / local model | the Odysseus agent loop | web_search, web_fetch | read_file/grep/glob; bash/python/edits in Full | search_history tool |
+
+Every call shows up in the member's card as it happens (what it searched or ran, and the
+result on click); what a model writes before a tool call is kept as a working note, and its
+answer is what comes after the last call. Reviewers are told to check doubtful claims with
+the tools, and the chairman has them too. A tool that needs Odysseus's approval prompt is
+refused in a council run, since nobody is there to approve it.
+
+The Codex seat reuses your ChatGPT Subscription login: each run gets a throwaway
+`CODEX_HOME` with the current access token and no refresh token, so Codex can never log
+Odysseus out. A run that outlives the token fails with a sign-in error; run it again.
+
+In Docker the workspace must be a folder the container can see (mount it, e.g. with
+`docker-compose.code.yml`).
+
+### History
+
+**Your history** in the Council sidebar imports your conversations from outside Odysseus so
+members (and agent mode, via `search_history`) can search them:
+
+- **claude.ai** — Settings → Privacy → Export data; upload the zip from the email.
+- **ChatGPT** — Settings → Data controls → Export data; upload the zip.
+- **Claude Code** — zip `~/.claude/projects` and upload it, or **Scan this machine** when
+  Odysseus runs where you code.
+- **Codex** — zip `~/.codex/sessions` and upload it, or **Scan this machine**.
+
+One upload can mix sources. Importing again replaces conversations rather than duplicating
+them; each source can be removed again from the same panel. Only text is kept (no images or
+attachments), and the archive is per user. `ODYSSEUS_TRANSCRIPT_DIRS` adds folders to scan
+(e.g. a host `~/.claude/projects` mounted into the container).
+
+### Memory
+
+**Memory** under the seats (on by default, per council) gives every member and the chairman
+your shared memory repo (below) and the saved memories that match the question, the same
+selection chat uses. It follows the memory switch in the Memory panel: memory off there means
+none here either. Turns that used it are marked *memory*.
+
+**Shared memory repo** (Memory → Settings) points Odysseus at a GitHub repository where you
+keep notes for AI assistants, such as a `USER.md` profile that several tools share. Give the
+repository (`owner/name` or its URL), the branch and the files to read; a private repository
+needs a fine-grained token with read-only *Contents* access, stored encrypted. Odysseus reads
+the files through the GitHub API, read-only, and adds them to chat and Council prompts as your
+standing instructions, so point it only at a repository you control. Files are re-read every
+ten minutes, on **Reload now** and on save; if GitHub is unreachable the last good copy stays
+in use. The setting is per user, and incognito chats leave it out.
 
 ## Omnigent
 
@@ -218,6 +280,41 @@ local model", "get a second opinion from GPT", "which models can you use?") is e
 Sending your chat to another model is network egress, so once untrusted text is in the turn
 (MCP tool descriptions, a provider's model list, a web page) Odysseus asks before delegating.
 Choose **Allow for this chat session** once and later delegations in that chat run without asking.
+
+### Effort
+
+The gauge button left of the model name in the chat box sets that model's **reasoning effort**:
+Default (the provider's own), Low, Medium, High, Extra high or Max. The choice is saved per model
+for your account and used for that model's replies in chat, agent mode, Council and the Study
+tutor. Background calls (chat titles, memory extraction, Study question generation) keep the
+provider default.
+
+Places that pick a model can also set their own level, which wins over the one saved for the
+model:
+
+- **Council**: each member and the chairman. The answer cards show the level used.
+- **Compare**: each column (hidden in blind mode, where the levels would hint at the model).
+- **Study**: Study options → Effort, for every Study call including the tutor, even while Study
+  borrows your Utility model.
+- **Settings → Models**: the Utility, Study and Vision roles, for the background work that runs
+  on them (research, tasks, notes, email, image analysis, ...).
+
+Selectors only appear for models that take an effort setting, and list only the levels that
+model accepts (ChatGPT Subscription: exactly the levels ChatGPT reports for each model):
+
+| Provider | Models | Sent as |
+|---|---|---|
+| Claude Subscription | Opus 4.5+, Sonnet 4.6+, every Claude 5.x model (not Haiku 4.5) | `claude --effort` |
+| Anthropic API | same | `output_config.effort` |
+| ChatGPT Subscription | gpt-5.x (Extra high from gpt-5.2 / codex-max) | `reasoning.effort` |
+| OpenAI API | gpt-5.x, o-series | `reasoning_effort` (agent mode with tools forces `none` on gpt-5.x chat completions) |
+| OpenRouter | reasoning-capable models | `reasoning.effort` (up to High) |
+| Mistral | Magistral / thinking models | `reasoning_effort` |
+| Gemini API | Gemini 2.5+ | `reasoning_effort` |
+| Any server running gpt-oss | vLLM, llama.cpp, Ollama, Groq, Cerebras, W&B | `reasoning_effort` (Ollama native: `think`) |
+
+A level above what a model accepts runs at the highest level it does accept (Extra high on
+Claude Opus 4.6 runs as High), so a choice left over from another model never causes an error.
 
 ## Budget
 

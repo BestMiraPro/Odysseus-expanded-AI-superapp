@@ -22,6 +22,8 @@ import { mdToHtml, renderMermaid, renderMath } from './markdown.js';
 import { renderPythonPlots } from './codeRunner.js';
 import { renderAgentTab, setAgentPrefill, setAgentScope } from './studyAgent.js';
 import { createPracticeCoach, captureCoachFocus, restoreCoachFocus } from './studyPracticeCoach.js';
+import { createEffortSelect, effortLabel } from './effortSelect.js';
+import { invalidateSettings } from './appConfig.js';
 
 const API = window.location.origin;
 
@@ -790,6 +792,7 @@ export function openPanel() {
           <select id="study-ep-select" aria-label="Study model endpoint"><option value="">Same as utility</option></select>
           <label class="study-model-label" for="study-model-select">Model</label>
           <select id="study-model-select" aria-label="Study model"><option value="">model…</option></select>
+          <span id="study-effort-slot"></span>
           <span class="study-model-status" id="study-model-status" role="status"></span>
           <span class="study-model-note" id="study-model-note"></span>
         </div>
@@ -1010,7 +1013,7 @@ async function refreshStudyModelSummary(fetchImpl = fetch) {
     if (note) note.textContent = 'No model configured — add one in Settings → Services.';
     return info;
   }
-  label.textContent = `Model: ${info.model}`;
+  label.textContent = `Model: ${info.model}${info.effort ? ` · ${effortLabel(info.effort)}` : ''}`;
   label.title = info.source === 'study'
     ? `Study runs on ${info.model}.`
     : `Study has no model of its own, so it runs on your ${info.source} model (${info.model}). Choose one here to change that.`;
@@ -1022,11 +1025,61 @@ async function refreshStudyModelSummary(fetchImpl = fetch) {
   return info;
 }
 
+// Study's reasoning effort (study_effort), for every Study call including the
+// tutor; it applies even while Study borrows the utility or default model.
+let _studyModelInfo = null;
+let _studyEffort = '';
+
+// The header label plus the effort selector, which offers the levels of the
+// model the label names.
+async function refreshStudyModel() {
+  _studyModelInfo = await refreshStudyModelSummary();
+  renderStudyEffort();
+  return _studyModelInfo;
+}
+
+function renderStudyEffort() {
+  const slot = _pane?.querySelector('#study-effort-slot');
+  if (!slot) return;
+  slot.innerHTML = '';
+  const info = _studyModelInfo;
+  if (!info || !info.configured) return;
+  const sel = createEffortSelect({
+    levels: info.effort_levels || [],
+    value: _studyEffort,
+    defaultLevel: info.default_effort,
+    title: 'Reasoning effort for Study: extraction, grading, hints and the tutor.',
+    onChange: async (level) => {
+      setModelStatus('pending', 'Saving…');
+      try {
+        const res = await fetch('/api/auth/settings', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ study_effort: level }),
+        });
+        invalidateSettings();
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        _studyEffort = level;
+        setModelStatus('ok', 'Saved');
+        refreshStudyModel();
+      } catch (e) {
+        setModelStatus('error', `Not saved: ${e.message}. `);
+        renderStudyEffort();
+      }
+    },
+  });
+  if (!sel) return;
+  const label = document.createElement('label');
+  label.className = 'study-model-label';
+  label.textContent = 'Effort';
+  slot.append(label, sel);
+}
+
 async function initModelSelector() {
   const epSel = _pane?.querySelector('#study-ep-select');
   const mSel = _pane?.querySelector('#study-model-select');
   if (!epSel || !mSel) return;
-  refreshStudyModelSummary();
+  refreshStudyModel();
   try {
     const [eps, settings] = await Promise.all([
       fetchStudyJson('/api/model-endpoints'),
@@ -1037,6 +1090,8 @@ async function initModelSelector() {
       endpointId: settings.study_endpoint_id || '',
       model: settings.study_model || '',
     };
+    _studyEffort = settings.study_effort || '';
+    renderStudyEffort();
     epSel.innerHTML = '<option value="">Same as utility</option>' + _endpoints.map(ep =>
       `<option value="${esc(ep.id)}">${esc(ep.name)}${ep.online === false ? ' (offline)' : ''}</option>`).join('');
     epSel.value = settings.study_endpoint_id || '';
@@ -1053,7 +1108,7 @@ async function initModelSelector() {
     if (result.coalesced) return;      // a later change owns the outcome
     if (result.ok) {
       setModelStatus('ok', desired.endpointId ? 'Saved' : 'Same as utility');
-      refreshStudyModelSummary();   // the header label must not lag the choice
+      refreshStudyModel();   // the header label must not lag the choice
       return;
     }
     // Announce nothing as saved: the server refused, and the last confirmed

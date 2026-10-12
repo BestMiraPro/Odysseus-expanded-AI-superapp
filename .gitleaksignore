@@ -1,0 +1,7 @@
+# Findings gitleaks reports that are not secrets, one fingerprint per line
+# (commit:file:rule:line, as printed in the scan log). Add an entry only after
+# checking the value is a placeholder; anything real must be rotated instead.
+
+# tests/test_claude_subscription.py: the provider_auth_id there is a made-up
+# twelve-character id in a test fixture.
+33688ac8b6620ac39646661f1c8164790fffc7b8:tests/test_claude_subscription.py:generic-api-key:440

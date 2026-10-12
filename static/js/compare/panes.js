@@ -11,6 +11,7 @@ import Storage from '../storage.js';
 import uiModule from '../ui.js';
 import spinnerModule from '../spinner.js';
 import { bindMenuDismiss } from '../escMenuStack.js';
+import { createEffortSelect, effortInfoFromRoster, loadEffortRoster } from '../effortSelect.js';
 
 var escapeHtml = uiModule.esc;
 
@@ -376,6 +377,44 @@ async function _addPane(anchorBtn) {
   // Close on outside click or Escape (the latter via the registry).
   closeMenu = bindMenuDismiss(dropdown, () => dropdown.remove(), (e) => !dropdown.contains(e.target) && e.target !== anchorBtn);}
 
+/** Reasoning effort for a pane, beside its title. It is stored on the pane's
+ *  model selection (persisted) and on its session. Hidden in blind mode, where
+ *  the levels a model offers would hint at which model it is. */
+function _mountPaneEffort(pane, i) {
+  const header = pane && pane.querySelector('.pane-header');
+  const m = state._selectedModels[i];
+  if (!header) return;
+  header.querySelector('.effort-select')?.remove();
+  if (!m || state._blindMode || state._compareMode === 'search') return;
+  const render = () => {
+    const info = effortInfoFromRoster(m.endpointId, m.model);
+    if (!info) return false;
+    const sel = createEffortSelect({
+      levels: info.levels,
+      value: m.effort || '',
+      defaultLevel: info.defaultLevel,
+      onChange: (level) => _setPaneEffort(i, level),
+    });
+    if (sel) header.querySelector('.pane-title')?.after(sel);
+    return true;
+  };
+  if (!render()) loadEffortRoster().then((r) => { if (r) render(); });
+}
+
+async function _setPaneEffort(i, level) {
+  const m = state._selectedModels[i];
+  if (!m) return;
+  m.effort = level || undefined;
+  _persistSelections();
+  const sid = state._paneSessionIds[i];
+  if (!sid) return;
+  const fd = new FormData();
+  fd.append('reasoning_effort', level || '');
+  try {
+    await fetch(`${state.API_BASE}/api/session/${sid}`, { method: 'PATCH', body: fd });
+  } catch (_) { /* the next run re-creates the session with the stored effort */ }
+}
+
 /** Create a new pane for the given model and append it to the compare grid. */
 async function _createAndAppendPane(m) {
   const i = state._selectedModels.length;  // New index
@@ -432,6 +471,7 @@ async function _createAndAppendPane(m) {
   // Append to grid
   const grid = document.querySelector('.compare-grid');
   grid.appendChild(pane);
+  _mountPaneEffort(pane, i);
 
   // Update grid columns
   const n = state._selectedModels.length;
@@ -523,6 +563,7 @@ function _removePane(paneIdx) {
         '</button>' +
       '</div>';
     grid.appendChild(pane);
+    _mountPaneEffort(pane, i);
   }
 
   // Update grid columns
@@ -608,6 +649,7 @@ function _showModelSwapDropdown(paneIdx, titleBtn) {
           ? 'Model ' + _slotChar(paneIdx)
           : m.name;
         titleEl.innerHTML = escapeHtml(displayName) + ' <span class="pane-title-caret">&#x25BE;</span>';
+        _mountPaneEffort(titleEl.closest('.compare-pane'), paneIdx);
       }
 
       // Clear pane history for fresh start
@@ -810,6 +852,7 @@ export {
   copyPaneResponse,
   _addPane,
   _createAndAppendPane,
+  _mountPaneEffort,
   _removePane,
   _showModelSwapDropdown,
   shufflePanePositions,
