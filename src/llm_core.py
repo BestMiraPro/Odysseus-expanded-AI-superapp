@@ -2093,6 +2093,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
              max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
              timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None) -> str:
     """Synchronous LLM call with optional prompt type enhancement."""
+    effort, headers = reasoning_effort.take_effort(headers)
     h = _provider_headers(_detect_provider(url))
     # Tolerate headers that arrive as a JSON string (some sessions stored them
     # double-encoded) — otherwise h.update() throws "dictionary update sequence
@@ -2121,8 +2122,10 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         messages_copy = non_sys
 
     provider = _detect_provider(url)
+    effort = reasoning_effort.effective(provider, url, model, effort)
     cache_key = _get_cache_key(
         url, model, messages_copy, temperature, max_tokens, headers=headers,
+        extra={"reasoning_effort": effort} if effort else None,
     )
     cached_response = _get_cached_response(cache_key)
     if cached_response:
@@ -2133,7 +2136,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         # Served by the local Claude Code CLI, not an HTTP endpoint.
         from src.claude_subscription import ClaudeSubscriptionError, run_chat_sync
         try:
-            response = run_chat_sync(url, model, messages_copy, timeout=timeout)
+            response = run_chat_sync(url, model, messages_copy, timeout=timeout, effort=effort)
         except ClaudeSubscriptionError as exc:
             raise HTTPException(exc.status, str(exc))
         _set_cached_response(cache_key, response)
@@ -2167,6 +2170,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
         _apply_local_generation_stability(payload, target_url, model)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
+    reasoning_effort.apply(payload, provider, effort)
     try:
         note_model_activity(target_url, model)
         r = httpx_post_kimi_aware(target_url, h, json=payload, timeout=timeout)
@@ -2416,6 +2420,8 @@ async def llm_call_async(
 ) -> str | tuple[str, str]:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
+    effort, headers = reasoning_effort.take_effort(headers)
+    effort = reasoning_effort.effective(provider, url, model, effort)
     messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
@@ -2433,7 +2439,7 @@ async def llm_call_async(
 
     cache_key = _get_cache_key(
         url, model, messages_copy, temperature, max_tokens, headers=headers,
-        extra=extra_body,
+        extra={**(extra_body or {}), "reasoning_effort": effort} if effort else extra_body,
     )
     cached_response = _get_cached_response(cache_key)
     if cached_response:
@@ -2449,60 +2455,63 @@ async def llm_call_async(
         # validated SSE path for both and collect the deltas.
         parts: List[str] = []
         actual_model = model
-        async for chunk in stream_llm(
-            url,
-            model,
-            messages_copy,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            headers=headers,
-            timeout=timeout,
-            workload=workload,
-        ):
-            event_is_error = False
-            for line in str(chunk).splitlines():
-                if line.startswith("event:"):
-                    event_is_error = line[6:].strip() == "error"
-                    continue
-                if not line.startswith("data:"):
-                    continue
-                raw = line[5:].strip()
-                if not raw:
-                    continue
-                if raw == "[DONE]":
-                    response = "".join(parts)
-                    _set_cached_response(
-                        cache_key,
-                        response,
-                        actual_model=actual_model,
-                    )
-                    return (
-                        (response, actual_model)
-                        if return_model_metadata
-                        else response
-                    )
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-                if event_is_error or data.get("error") or (data.get("status") and data.get("text")):
-                    status = int(data.get("status") or 502)
-                    text = data.get("text") or data.get("error") or f"{_provider_label(url)} request failed"
-                    error_type = (
-                        _FallbackIneligibleHTTPException
-                        if data.get("fallback_eligible") is False
-                        else HTTPException
-                    )
-                    raise error_type(status, text)
-                if data.get("type") == "model_actual":
-                    reported_model = data.get("model")
-                    if isinstance(reported_model, str) and reported_model.strip():
-                        actual_model = reported_model.strip()
-                delta = data.get("delta")
-                # Reasoning deltas are display-only; a plain-string caller
-                # (titles, memory, Study) must get the answer alone.
-                if isinstance(delta, str) and not data.get("thinking"):
-                    parts.append(delta)
+        # A one-shot call keeps the provider default unless its caller chose a
+        # level: the user's saved per-model levels are for streamed replies.
+        with reasoning_effort.without_saved():
+            async for chunk in stream_llm(
+                url,
+                model,
+                messages_copy,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                headers=reasoning_effort.with_effort(headers, effort),
+                timeout=timeout,
+                workload=workload,
+            ):
+                event_is_error = False
+                for line in str(chunk).splitlines():
+                    if line.startswith("event:"):
+                        event_is_error = line[6:].strip() == "error"
+                        continue
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw:
+                        continue
+                    if raw == "[DONE]":
+                        response = "".join(parts)
+                        _set_cached_response(
+                            cache_key,
+                            response,
+                            actual_model=actual_model,
+                        )
+                        return (
+                            (response, actual_model)
+                            if return_model_metadata
+                            else response
+                        )
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if event_is_error or data.get("error") or (data.get("status") and data.get("text")):
+                        status = int(data.get("status") or 502)
+                        text = data.get("text") or data.get("error") or f"{_provider_label(url)} request failed"
+                        error_type = (
+                            _FallbackIneligibleHTTPException
+                            if data.get("fallback_eligible") is False
+                            else HTTPException
+                        )
+                        raise error_type(status, text)
+                    if data.get("type") == "model_actual":
+                        reported_model = data.get("model")
+                        if isinstance(reported_model, str) and reported_model.strip():
+                            actual_model = reported_model.strip()
+                    delta = data.get("delta")
+                    # Reasoning deltas are display-only; a plain-string caller
+                    # (titles, memory, Study) must get the answer alone.
+                    if isinstance(delta, str) and not data.get("thinking"):
+                        parts.append(delta)
         response = "".join(parts)
         _set_cached_response(cache_key, response, actual_model=actual_model)
         return (response, actual_model) if return_model_metadata else response
@@ -2547,6 +2556,7 @@ async def llm_call_async(
             # Caller-supplied provider hints (e.g. thinking toggles for
             # reasoning models). OpenAI-compatible servers ignore unknown fields.
             payload.update(extra_body)
+    reasoning_effort.apply(payload, provider, effort)
 
     if _is_host_dead(target_url):
         raise HTTPException(503, "The model endpoint is unreachable (temporary "
@@ -2805,12 +2815,14 @@ async def _stream_llm_unmetered(url: str, model: str, messages: List[Dict], temp
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
                      tool_choice_none: bool = False, workload: str = "foreground"):
-    if _detect_provider(url) == "claude-subscription":
+    provider = _detect_provider(url)
+    # The asking place's level, else the user's saved level for this model.
+    effort, headers = reasoning_effort.resolve(provider, url, model, headers)
+    if provider == "claude-subscription":
         # The Claude Code CLI streams the subscription reply; tools stay off
         # (the endpoint is provisioned with supports_tools=False).
         from src.claude_subscription import stream_chat as _claude_stream_chat
         note_model_activity(url, model)
-        effort = reasoning_effort.level_for("claude-subscription", model, url)
         async for chunk in _claude_stream_chat(url, model, _sanitize_llm_messages(messages),
                                                timeout=timeout, effort=effort):
             yield chunk
@@ -2829,6 +2841,7 @@ async def _stream_llm_unmetered(url: str, model: str, messages: List[Dict], temp
             tools=tools,
             session_id=session_id,
             tool_choice_none=tool_choice_none,
+            effort=effort,
         ):
             yield chunk
 
@@ -2837,8 +2850,11 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False, effort: Optional[str] = None):
     """Stream LLM responses with improved error handling.
+
+    ``effort`` is a reasoning effort level already checked against the model
+    (see src.reasoning_effort); None leaves the provider default.
 
     Yields SSE chunks:
       - data: {"delta": "text"}           — text content
@@ -2917,9 +2933,9 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             from src.copilot import apply_request_headers
             apply_request_headers(h, messages_copy)
 
-    # The user's effort level for this model (chat composer -> Effort), then the
-    # OpenAI tools restriction, which has to win over it.
-    reasoning_effort.apply_to_payload(provider, model, payload, target_url)
+    # The reasoning effort, then the OpenAI tools restriction, which has to
+    # win over it.
+    reasoning_effort.apply(payload, provider, effort)
     _scrub_openai_chat_tool_reasoning(payload, target_url, model)
 
     # Connect budget from LLMConfig.CONNECT_TIMEOUT (env LLM_CONNECT_TIMEOUT).

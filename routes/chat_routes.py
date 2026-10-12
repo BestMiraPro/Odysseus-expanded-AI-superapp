@@ -24,6 +24,7 @@ from src.llm_core import (
 )
 from src.agent_loop import stream_agent_loop
 from src import agent_runs, reasoning_effort
+from src.reasoning_effort import session_headers
 from src.model_context import estimate_tokens
 from src.context_compactor import (
     apply_compaction_state,
@@ -831,7 +832,7 @@ def setup_chat_routes(
         foreground_candidates = build_foreground_model_candidates(
             sess.endpoint_url,
             sess.model,
-            sess.headers,
+            session_headers(sess),
             owner=owner,
             policy=foreground_policy,
         )
@@ -1777,7 +1778,7 @@ def setup_chat_routes(
             _foreground_candidates = build_foreground_model_candidates(
                 sess.endpoint_url,
                 sess.model,
-                sess.headers,
+                session_headers(sess),
                 owner=_user,
                 policy=_foreground_policy,
             )
@@ -2325,7 +2326,7 @@ def setup_chat_routes(
                         sess.endpoint_url,
                         sess.model,
                         messages,
-                        headers=sess.headers,
+                        headers=session_headers(sess),
                         temperature=ctx.preset.temperature,
                         max_tokens=ctx.preset.max_tokens,
                         prompt_type=preset_id,
@@ -2753,7 +2754,7 @@ def setup_chat_routes(
                     sess.endpoint_url,
                     sess.model,
                     messages,
-                    headers=sess.headers,
+                    headers=session_headers(sess),
                     temperature=0.7,
                     # 0 = let the server decide (no cap). A hardcoded 4096 made
                     # local reasoning models (Qwen3 / R1) burn the whole budget

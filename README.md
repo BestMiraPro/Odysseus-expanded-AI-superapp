@@ -287,8 +287,20 @@ The gauge button left of the model name in the chat box sets that model's **reas
 Default (the provider's own), Low, Medium, High, Extra high or Max. The choice is saved per model
 for your account and used for that model's replies in chat, agent mode, Council and the Study
 tutor. Background calls (chat titles, memory extraction, Study question generation) keep the
-provider default. The button only appears for models that take an effort setting, and lists
-only the levels that model accepts:
+provider default.
+
+Places that pick a model can also set their own level, which wins over the one saved for the
+model:
+
+- **Council**: each member and the chairman. The answer cards show the level used.
+- **Compare**: each column (hidden in blind mode, where the levels would hint at the model).
+- **Study**: Study options → Effort, for every Study call including the tutor, even while Study
+  borrows your Utility model.
+- **Settings → Models**: the Utility, Study and Vision roles, for the background work that runs
+  on them (research, tasks, notes, email, image analysis, ...).
+
+Selectors only appear for models that take an effort setting, and list only the levels that
+model accepts (ChatGPT Subscription: exactly the levels ChatGPT reports for each model):
 
 | Provider | Models | Sent as |
 |---|---|---|
@@ -301,8 +313,8 @@ only the levels that model accepts:
 | Gemini API | Gemini 2.5+ | `reasoning_effort` |
 | Any server running gpt-oss | vLLM, llama.cpp, Ollama, Groq, Cerebras, W&B | `reasoning_effort` (Ollama native: `think`) |
 
-A saved level above what a model accepts runs at the highest level it does accept (Extra high
-on Claude Opus 4.6 runs as High).
+A level above what a model accepts runs at the highest level it does accept (Extra high on
+Claude Opus 4.6 runs as High), so a choice left over from another model never causes an error.
 
 ## Budget
 

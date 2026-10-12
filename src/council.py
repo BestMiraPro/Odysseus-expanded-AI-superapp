@@ -99,6 +99,7 @@ class Member:
     input_per_mtok: Optional[float] = None
     output_per_mtok: Optional[float] = None
     context_tokens: Optional[int] = None     # context window; None when unknown
+    effort: Optional[str] = None             # reasoning effort used, see src.reasoning_effort
 
     def public(self, index: Any) -> Dict[str, Any]:
         return {
@@ -109,6 +110,7 @@ class Member:
             "kind": self.kind,
             "provider": self.provider,
             "billing": self.billing,
+            "effort": self.effort,
         }
 
     @property

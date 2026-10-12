@@ -153,12 +153,12 @@ def _bearer(headers: Optional[Dict[str, str]]) -> str:
     return ""
 
 
-async def _claude_stream(url, model, messages, settings: ToolSettings, timeout) -> AsyncIterator[str]:
+async def _claude_stream(url, model, messages, headers, settings: ToolSettings, timeout) -> AsyncIterator[str]:
     from src import reasoning_effort
     from src.claude_subscription import stream_chat
     from src.llm_core import _sanitize_llm_messages
 
-    effort = reasoning_effort.level_for("claude-subscription", model, url)
+    effort, _ = reasoning_effort.resolve("claude-subscription", url, model, headers)
     async for chunk in stream_chat(url, model, _sanitize_llm_messages(messages), timeout=timeout,
                                    effort=effort, tools=claude_native_tools(settings)):
         yield chunk
@@ -168,6 +168,7 @@ async def _codex_stream(url, model, messages, headers, settings: ToolSettings, t
     from src import codex_cli, reasoning_effort
     from src.claude_subscription import build_prompt
 
+    effort, headers = reasoning_effort.resolve("chatgpt-subscription", url, model, headers)
     system, prompt = build_prompt(messages)
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
     run = codex_cli.CodexRun(
@@ -176,7 +177,7 @@ async def _codex_stream(url, model, messages, headers, settings: ToolSettings, t
         access_token=_bearer(headers),
         sandbox=codex_cli.SANDBOX_FULL if settings.full else codex_cli.SANDBOX_READ_ONLY,
         cwd=settings.workspace,
-        effort=reasoning_effort.level_for("chatgpt-subscription", model, url),
+        effort=effort,
         mcp_servers={MCP_NAME: mcp_server_spec(settings.owner)},
     )
     async for chunk in codex_cli.stream(run, timeout=timeout):
@@ -251,7 +252,7 @@ def stream_fn_for(settings: ToolSettings):
         msgs = with_tools_brief(messages, settings, stage)
         provider = _detect_provider(url)
         if provider == "claude-subscription":
-            source = _claude_stream(url, model, msgs, settings, timeout)
+            source = _claude_stream(url, model, msgs, headers, settings, timeout)
         elif provider == "chatgpt-subscription":
             source = _codex_stream(url, model, msgs, headers, settings, timeout)
         else:

@@ -27,11 +27,12 @@ class EffortIn(BaseModel):
 def _effort_state(owner: Optional[str], model: str, url: str) -> dict:
     from src.llm_core import _detect_provider
 
-    supported = reasoning_effort.supported_levels(_detect_provider(url), model, url)
+    supported, default = reasoning_effort.levels_for(_detect_provider(url), url, model)
     saved = reasoning_effort.user_levels(owner).get(model)
     return {
         "model": model,
         "levels": [{"id": lvl, "label": reasoning_effort.LABELS[lvl]} for lvl in supported],
+        "default": default,
         "effort": saved,
         # What is actually sent: the saved level clamped to this model's range.
         "applied": reasoning_effort.clamp(saved, supported),
@@ -66,7 +67,7 @@ def setup_model_roster_routes() -> APIRouter:
         require_user(request)
         level = None
         if body.effort not in (None, "", "default"):
-            level = reasoning_effort.normalize_level(body.effort)
+            level = reasoning_effort.normalize(body.effort)
             if not level:
                 raise HTTPException(400, "Unknown effort level")
         owner = effective_user(request)

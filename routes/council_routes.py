@@ -36,6 +36,9 @@ _ACTIVE_SESSIONS: set = set()
 class Seat(BaseModel):
     endpoint_id: str = Field(..., max_length=64)
     model: str = Field(..., max_length=300)
+    # Reasoning effort for this seat; None = the user's saved level for the
+    # model (chat composer -> Effort), else the provider default.
+    effort: Optional[str] = Field(None, max_length=16)
 
 
 class AskRequest(BaseModel):
@@ -106,11 +109,13 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
     from src import claude_subscription
 
     db = SessionLocal()
+    base_urls: Dict[str, str] = {}
     try:
         endpoints = []
         chatgpt = None
         for ep in _visible_endpoints(db, owner):
             kind, provider = classify_endpoint(ep)
+            base_urls[ep.id] = ep.base_url or ""
             models = _chat_models(ep)
             if provider == "chatgpt-subscription" and chatgpt is None:
                 chatgpt = {"endpoint_id": ep.id, "models": models}
@@ -131,7 +136,9 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
     rows = [(e["id"], e["name"], m, e["kind"], e["provider"]) for e in endpoints for m in e["models"]]
     meta: Dict[str, Dict[str, Any]] = {}
     try:
+        from src.reasoning_effort import levels_for
         for entry in model_roster.build_entries(rows):
+            levels, default_effort = levels_for(entry.provider, base_urls.get(entry.endpoint_id, ""), entry.model)
             meta[entry.key] = {
                 "recommended": entry.recommended,
                 "tier": entry.tier,
@@ -139,6 +146,8 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
                 "cost_label": entry.cost_label(),
                 "cost_band": entry.cost_band(),
                 "billing": entry.billing,
+                "effort_levels": list(levels),
+                "default_effort": default_effort,
             }
     except Exception as exc:
         logger.warning("council roster metadata failed error_type=%s", type(exc).__name__)
@@ -173,6 +182,7 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
     token over the network: cost estimates only need billing and prices.
     """
     from src.endpoint_resolver import build_chat_url, build_headers, resolve_endpoint_runtime
+    from src.reasoning_effort import effective, user_levels, with_effort
 
     model = (seat.model or "").strip()
     if not model:
@@ -187,10 +197,14 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
     enabled = _chat_models(ep)
     if enabled and model not in enabled:
         raise council.CouncilError(f"{model} is not enabled on {ep.name}.")
+    kind, provider = classify_endpoint(ep)
+    # The seat's own level rides in its headers; without one the user's saved
+    # level for the model applies. Either way the cards show the level used.
+    seat_effort = effective(provider, ep.base_url or "", model, seat.effort)
+    effort = seat_effort or effective(provider, ep.base_url or "", model, user_levels(owner).get(model))
     if not runtime:
-        kind, provider = classify_endpoint(ep)
         return council.Member(endpoint_id=ep.id, model=model, endpoint_name=ep.name or "", kind=kind,
-                              provider=provider, context_tokens=_seat_context(model),
+                              provider=provider, context_tokens=_seat_context(model), effort=effort,
                               **_seat_pricing(ep, model, kind, provider))
     try:
         base, api_key = resolve_endpoint_runtime(ep, owner=owner)
@@ -198,7 +212,6 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
         logger.warning("council: credential resolution failed endpoint=%s error_type=%s",
                        ep.id, type(exc).__name__)
         raise council.CouncilError(f"{ep.name} needs reconnecting before it can sit on the council.", 401)
-    kind, provider = classify_endpoint(ep)
     url = build_chat_url(base)
     return council.Member(
         endpoint_id=ep.id,
@@ -207,8 +220,9 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
         kind=kind,
         provider=provider,
         url=url,
-        headers=build_headers(api_key, base) or None,
+        headers=with_effort(build_headers(api_key, base), seat_effort) or None,
         context_tokens=_seat_context(model, url),
+        effort=effort,
         **_seat_pricing(ep, model, kind, provider),
     )
 
@@ -483,9 +497,17 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
         _budget_gate(owner, estimate, body.budget_confirmed)
         tools_mode = tools.mode if tools else council_tools.TOOLS_OFF
         workspace = tools.workspace if tools else None
+
+        def _seat_config(s: Seat) -> Dict[str, str]:
+            seat = {"endpoint_id": s.endpoint_id, "model": s.model}
+            level = reasoning_effort.normalize(s.effort)
+            if level:
+                seat["effort"] = level
+            return seat
+
         config = {
-            "members": [{"endpoint_id": s.endpoint_id, "model": s.model} for s in body.members],
-            "chairman": {"endpoint_id": body.chairman.endpoint_id, "model": body.chairman.model},
+            "members": [_seat_config(s) for s in body.members],
+            "chairman": _seat_config(body.chairman),
             "mode": mode,
             "tools": tools_mode,
             "workspace": workspace or "",

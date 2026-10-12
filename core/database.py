@@ -198,7 +198,12 @@ class Session(TimestampMixin, Base):
     
     # Headers stored as JSON
     headers = Column(JSON, default=dict)
-    
+
+    # This session's own reasoning effort (src.reasoning_effort levels), set by
+    # Compare columns; null = the user's saved level for the model, else the
+    # model's own default.
+    reasoning_effort = Column(String, nullable=True, default=None)
+
     # Timestamps are provided by TimestampMixin
     last_accessed = Column(DateTime, default=func.now(), onupdate=func.now())
     # Timestamp of the last actual MESSAGE in this session. Set explicitly

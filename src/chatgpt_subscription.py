@@ -102,6 +102,7 @@ def fetch_available_models(access_token: str, timeout: float = 10.0) -> list[str
     except Exception:
         return []
     entries = data.get("models", []) if isinstance(data, dict) else []
+    _record_reasoning_levels(entries)
     sortable: list[tuple[int, str]] = []
     for item in entries:
         if not isinstance(item, dict):
@@ -123,6 +124,62 @@ def fetch_available_models(access_token: str, timeout: float = 10.0) -> list[str
             ordered.append(slug)
             seen.add(slug)
     return ordered
+
+
+# Reasoning effort levels per Codex model, as the models endpoint reports them
+# (supported_reasoning_levels / default_reasoning_level). They are properties of
+# the model, not of the account, so one cache serves every user.
+_REASONING_LEVELS_TTL_SECONDS = 6 * 3600
+_reasoning_levels: Dict[str, Dict[str, Any]] = {}
+_reasoning_levels_checked_at = 0.0
+_reasoning_levels_lock = threading.Lock()
+
+
+def _record_reasoning_levels(entries: Any) -> None:
+    global _reasoning_levels_checked_at
+    found: Dict[str, Dict[str, Any]] = {}
+    for item in entries if isinstance(entries, list) else []:
+        if not isinstance(item, dict) or not isinstance(item.get("slug"), str):
+            continue
+        levels = [lvl.get("effort") for lvl in item.get("supported_reasoning_levels") or []
+                  if isinstance(lvl, dict) and isinstance(lvl.get("effort"), str)]
+        if levels:
+            default = item.get("default_reasoning_level")
+            found[item["slug"].strip()] = {
+                "levels": levels,
+                "default": default if default in levels else None,
+            }
+    if found:
+        _reasoning_levels.clear()
+        _reasoning_levels.update(found)
+        _reasoning_levels_checked_at = time.time()
+
+
+def reasoning_levels(model: str) -> Optional[Dict[str, Any]]:
+    """{"levels": [...], "default": str|None} for a Codex model, or None when
+    unknown. Refreshes from the models endpoint at most once per TTL, using any
+    stored ChatGPT login."""
+    global _reasoning_levels_checked_at
+    if time.time() - _reasoning_levels_checked_at > _REASONING_LEVELS_TTL_SECONDS:
+        if _reasoning_levels_lock.acquire(blocking=False):
+            try:
+                _reasoning_levels_checked_at = time.time()
+                ProviderAuthSession, SessionLocal, _ = _database_handles()
+                db = SessionLocal()
+                try:
+                    row = db.query(ProviderAuthSession).filter(
+                        ProviderAuthSession.provider == CHATGPT_SUBSCRIPTION_PROVIDER).first()
+                    auth = (row.id, row.owner) if row else None
+                finally:
+                    db.close()
+                if auth:
+                    creds = resolve_runtime_credentials(auth[0], auth[1])
+                    fetch_available_models(creds.get("api_key") or "")
+            except Exception:
+                pass  # levels stay unknown; callers fall back to safe defaults
+            finally:
+                _reasoning_levels_lock.release()
+    return _reasoning_levels.get((model or "").strip())
 
 
 def _raise_for_oauth_response(response: httpx.Response, action: str) -> None:

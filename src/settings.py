@@ -48,6 +48,9 @@ DEFAULT_SETTINGS = {
     "image_model": "",
     "image_quality": "medium",
     "vision_model": "",
+    # Reasoning effort per role ("" = the model's own default), applied only
+    # when the role's model accepts that level. See src.reasoning_effort.
+    "vision_effort": "",
     "vision_enabled": True,
     # Ordered fallback chain for the Vision model (image analysis, OCR, tagging).
     "vision_model_fallbacks": [],
@@ -155,6 +158,7 @@ DEFAULT_SETTINGS = {
     "share_defaults_with_users": False,
     "utility_endpoint_id": "",
     "utility_model": "",
+    "utility_effort": "",
     # Ordered fallback chain for the Utility model (summarization, naming,
     # tidy actions, etc.).
     "utility_model_fallbacks": [],
@@ -162,6 +166,7 @@ DEFAULT_SETTINGS = {
     # Empty -> falls back to utility, then default chat model.
     "study_endpoint_id": "",
     "study_model": "",
+    "study_effort": "",
     # Optional: a separate model on the SAME study endpoint for text-only Study
     # calls (extraction from text, discovery, grading, hints). Lets a vision
     # model (e.g. Kimi) stay selected for image extraction while a faster text
@@ -291,14 +296,14 @@ def is_setting_overridden(key: str) -> bool:
 # model + image-generation model. The owner argument is the authed username
 # resolved by FastAPI deps; an empty/None owner falls through to the global.
 _PER_USER_KEYS = {
-    "vision_model", "vision_enabled", "vision_model_fallbacks",
+    "vision_model", "vision_effort", "vision_enabled", "vision_model_fallbacks",
     "image_model", "image_gen_enabled", "image_quality",
     # Default chat endpoint / model — without per-user resolution every new
     # account inherited whatever the most-recent admin picked, which then
     # got injected into the chat composer on first open.
     "default_endpoint_id", "default_model",
-    "utility_endpoint_id", "utility_model", "utility_model_fallbacks",
-    "study_endpoint_id", "study_model", "study_text_model",
+    "utility_endpoint_id", "utility_model", "utility_effort", "utility_model_fallbacks",
+    "study_endpoint_id", "study_model", "study_effort", "study_text_model",
     "research_endpoint_id", "research_model",
 }
 

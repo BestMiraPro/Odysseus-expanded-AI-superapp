@@ -108,6 +108,9 @@ class Session:
     owner: Optional[str] = None
     is_important: bool = False
     message_count: int = 0
+    # A Compare column's own reasoning effort (src.reasoning_effort); ordinary
+    # chats use the user's saved level for the model instead.
+    reasoning_effort: Optional[str] = None
 
     def __post_init__(self):
         if self.headers is None:

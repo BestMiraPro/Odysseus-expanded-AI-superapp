@@ -2,8 +2,9 @@
 //
 // The level is saved per model for the signed-in user (/api/models/effort) and
 // applied server-side to every streamed reply of that model: chat, agents,
-// Council and the Study tutor. The button is hidden for models whose provider
-// has no effort control.
+// Council and the Study tutor, except where that place sets its own level
+// (a Council seat, Study options). The button is hidden for models whose
+// provider has no effort control.
 
 import uiModule from './ui.js';
 
@@ -11,7 +12,7 @@ const _cache = new Map();   // `${url}::${model}` -> state from the server
 let _route = null;          // {model, url} currently shown
 let _seq = 0;
 
-const SHORT = { low: 'Low', medium: 'Med', high: 'High', xhigh: 'XHigh', max: 'Max' };
+const SHORT = { none: 'None', minimal: 'Min', low: 'Low', medium: 'Med', high: 'High', xhigh: 'XHigh', max: 'Max' };
 
 function _els() {
   return {
@@ -53,7 +54,7 @@ function _render(state) {
   const name = String(state.model || '').split('/').pop();
   let title = applied
     ? `Effort for ${name}: ${(levels.find(l => l.id === applied) || {}).label || applied}`
-    : `Effort for ${name}: provider default`;
+    : `Effort for ${name}: provider default${state.default ? ` (${state.default})` : ''}`;
   if (state.effort && applied && state.effort !== applied) {
     title += ` (saved ${state.effort}; this model goes up to ${applied})`;
   }
@@ -85,7 +86,8 @@ function _openMenu(state) {
   const current = state.effort || '';
   // A saved level above this model's range runs clamped; mark what runs.
   const checkedId = !current || levels.some(l => l.id === current) ? current : state.applied;
-  [{ id: '', label: 'Default' }].concat(levels).forEach(opt => {
+  const defaultLabel = state.default ? `Default (${state.default})` : 'Default';
+  [{ id: '', label: defaultLabel }].concat(levels).forEach(opt => {
     const item = document.createElement('button');
     item.type = 'button';
     item.className = 'effort-menu-item';
@@ -103,7 +105,8 @@ function _openMenu(state) {
 
   const note = document.createElement('div');
   note.className = 'effort-menu-note';
-  note.textContent = 'Saved for this model. Used in chat, agents, Council and the Study tutor.';
+  note.textContent = 'Saved for this model. Used in chat, agents, Council and the Study tutor, '
+    + 'unless a Council seat or Study sets its own.';
   menu.appendChild(note);
 
   menu.classList.remove('hidden');

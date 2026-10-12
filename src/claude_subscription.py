@@ -854,9 +854,10 @@ async def stream_chat(
         inv.cleanup()
 
 
-def run_chat_sync(url: str, model: str, messages: List[Dict], *, timeout: Optional[float] = None) -> str:
+def run_chat_sync(url: str, model: str, messages: List[Dict], *, timeout: Optional[float] = None,
+                  effort: Optional[str] = None) -> str:
     """Blocking single reply for ``llm_core.llm_call``. Raises ClaudeSubscriptionError."""
-    inv = _Invocation(url, model, messages)
+    inv = _Invocation(url, model, messages, effort)
     sem = _semaphore()
     sem.acquire()
     try:

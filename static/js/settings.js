@@ -27,6 +27,7 @@ import { providerLogo } from './providers.js';
 import { isAltGrEvent } from './platform.js';
 import { bindMenuDismiss } from './escMenuStack.js';
 import { invalidateSettings } from './appConfig.js';
+import { createEffortSelect, effortInfoFromRoster, loadEffortRoster } from './effortSelect.js';
 
 let initialized = false;
 let modalEl = null;
@@ -44,6 +45,51 @@ let _authPolicy = { password_min_length: 8 };
  * Reads in this file deliberately stay direct fetches: this panel is the writer
  * and edits what it reads, so it must see the authoritative state, not a cache.
  */
+// Reasoning effort for a model role (utility_effort, study_effort,
+// vision_effort), shown beside the role's model select whenever that model
+// accepts levels. Chat has its own control in the composer (effortPicker.js).
+function _bindRoleEffort(opts) {
+  var holder = document.createElement('span');
+  holder.style.marginLeft = '6px';
+  opts.modelSel.after(holder);
+  var current = opts.initial || '';
+  var asked = false;
+  function render() {
+    var info = effortInfoFromRoster(opts.epSel ? opts.epSel.value : '', opts.modelSel.value);
+    holder.innerHTML = '';
+    if (!info) {
+      if (opts.modelSel.value && !asked) {
+        asked = true;
+        loadEffortRoster().then(function(r) { if (r) render(); });
+      }
+      return;
+    }
+    var sel = createEffortSelect({
+      levels: info.levels,
+      value: current,
+      defaultLevel: info.defaultLevel,
+      title: 'Reasoning effort for this role. Default: the model\'s own.',
+      onChange: async function(level) {
+        current = level;
+        var body = {};
+        body[opts.settingKey] = level;
+        try {
+          var res = await _postSettings(body);
+          if (!res.ok) throw new Error(res.status);
+          if (opts.msg) { opts.msg.textContent = 'Saved'; opts.msg.style.color = 'var(--fg)'; setTimeout(function() { opts.msg.textContent = ''; }, 1500); }
+        } catch (e) {
+          if (opts.msg) { opts.msg.textContent = 'Failed to save'; opts.msg.style.color = 'var(--red)'; }
+        }
+      },
+    });
+    if (sel) holder.appendChild(sel);
+  }
+  opts.modelSel.addEventListener('change', render);
+  if (opts.epSel) opts.epSel.addEventListener('change', render);
+  render();
+  return { render: render };
+}
+
 async function _postSettings(body) {
   try {
     return await fetch('/api/auth/settings', {
@@ -533,6 +579,8 @@ async function initUtilityModel() {
     var settings = await res.json();
     if (settings.utility_endpoint_id) epSel.value = settings.utility_endpoint_id;
     refreshModels(settings.utility_model || '');
+    _bindRoleEffort({ settingKey: 'utility_effort', modelSel: modelSel, epSel: epSel,
+                      initial: settings.utility_effort, msg: msg });
     fallbackWidget = _bindFallbackWidget({
       containerId: 'set-utilityFallbacks',
       addBtnId: 'set-utilityAddFallback',
@@ -605,6 +653,8 @@ async function initStudyModel() {
     var settings = await res.json();
     if (settings.study_endpoint_id) epSel.value = settings.study_endpoint_id;
     refreshModels(settings.study_model || '', settings.study_text_model || '');
+    _bindRoleEffort({ settingKey: 'study_effort', modelSel: modelSel, epSel: epSel,
+                      initial: settings.study_effort, msg: msg });
   } catch (e) { console.warn('Failed to load study model settings', e); }
 
   async function saveStudy() {
@@ -831,6 +881,8 @@ async function initVisionSettings() {
     const settings = await settingsRes.json();
     if (settings.vision_model) vlSel.value = settings.vision_model;
     _syncModelLogo(vlSel);
+    _bindRoleEffort({ settingKey: 'vision_effort', modelSel: vlSel, epSel: null,
+                      initial: settings.vision_effort, msg: msg });
     if (enabledToggle) enabledToggle.checked = settings.vision_enabled !== false;
     visionFallbackWidget = _bindFallbackWidget({
       containerId: 'set-visionFallbacks',

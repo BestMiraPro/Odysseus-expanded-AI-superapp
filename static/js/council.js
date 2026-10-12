@@ -19,6 +19,7 @@ import { mdToHtml, renderMath } from './markdown.js';
 import { providerLogo } from './providers.js';
 import { formatDeviceFlowError, runProviderDeviceFlow } from './providerDeviceFlow.js';
 import { money } from './budget.js';
+import { effortLabel, effortSelectHtml } from './effortSelect.js';
 
 const PANE_ID = 'council-pane';
 const STORE_KEY = 'council:lastSession';
@@ -896,6 +897,7 @@ function seatChip(seat, idx) {
   return `<span class="council-chip ${info.available ? '' : 'missing'}" title="${esc(seatTitle(info.model, info.endpoint, meta))}">
     ${meta?.recommended ? '<span class="council-star" aria-label="Recommended">★</span>' : ''}${logoFor(info.model)}<span class="name">${esc(info.model)}</span><span class="ep">${esc(info.endpoint)}</span>${costChip(meta)}
     ${badge(info.kind, info.provider)}
+    ${effortSelectHtml(meta?.effort_levels, seat.effort, meta?.default_effort, `data-seat-effort="${idx}"`)}
     <button data-remove-seat="${idx}" aria-label="Remove ${esc(info.model)}">✕</button></span>`;
 }
 
@@ -937,6 +939,7 @@ function renderSeats() {
         ${chairKnown ? '' : `<option value="" selected>${chair ? 'Unavailable — pick one' : 'Pick a chairman'}</option>`}
         ${allSeatOptions(chairKey)}
       </select>
+      ${chairKnown ? effortSelectHtml(metaFor(chairKey)?.effort_levels, chair.effort, metaFor(chairKey)?.default_effort, 'id="council-chair-effort"') : ''}
       <span class="council-seat-label" style="margin-left:10px">Mode</span>
       <span class="council-mode" role="radiogroup" aria-label="Council mode">
         <button data-mode="full" class="${S.mode === 'full' ? 'on' : ''}" role="radio" aria-checked="${S.mode === 'full'}" title="Opinions, blind peer review and ranking, then synthesis">Full</button>
@@ -1211,7 +1214,7 @@ function memberCard(stage, seat, idx, entry, label, turnId = '') {
     <div class="council-card-h">
       ${label ? `<span class="label" title="Anonymous label used in peer review">${esc(label)}</span>` : ''}
       ${logoFor(seat?.model)}<span class="name">${esc(seat?.model || '?')}</span>
-      <span class="ep">${esc(seat?.endpoint_name || '')}</span>
+      <span class="ep">${esc(seat?.endpoint_name || '')}${seat?.effort ? ` · ${esc(effortLabel(seat.effort))} effort` : ''}</span>
       <span class="state">${esc(state)}</span>
     </div>
     <div class="council-card-t">${toolsBlock(entry?.tools, key, !!entry?.streaming)}</div>
@@ -1551,8 +1554,8 @@ async function convene() {
     stages: { opinions: 'running', review: 'pending', synthesis: 'pending' }, reader: null,
   };
   // Show the seats immediately, before the server's first event.
-  S.live.config.members = S.members.map((m, i) => ({ index: i, model: m.model, endpoint_name: seatInfo(m).endpoint }));
-  S.live.config.chairman = { model: chair.model, endpoint_name: seatInfo(chair).endpoint };
+  S.live.config.members = S.members.map((m, i) => ({ index: i, model: m.model, endpoint_name: seatInfo(m).endpoint, effort: m.effort }));
+  S.live.config.chairman = { model: chair.model, endpoint_name: seatInfo(chair).endpoint, effort: chair.effort };
   input.value = '';
   autosize(input);
   renderSeats();
@@ -2041,6 +2044,19 @@ function onPaneChange(e) {
     if (!val) return;
     const [endpoint_id, ...rest] = val.split('::');
     S.chairman = { endpoint_id, model: rest.join('::') };
+    saveConfigSoon();
+    renderSeats();  // the effort selector follows the new chairman's levels
+    renderComposer();
+  } else if (e.target.id === 'council-chair-effort') {
+    const chair = chairmanSeat();
+    if (!chair) return;
+    S.chairman = { endpoint_id: chair.endpoint_id, model: chair.model, effort: e.target.value || undefined };
+    saveConfigSoon();
+    renderComposer();
+  } else if (e.target.dataset.seatEffort !== undefined) {
+    const seat = S.members[Number(e.target.dataset.seatEffort)];
+    if (!seat) return;
+    seat.effort = e.target.value || undefined;
     saveConfigSoon();
     renderComposer();
   }
