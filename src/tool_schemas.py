@@ -334,6 +334,37 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "search_history",
+            "description": "Search the user's own conversation history from outside Odysseus: claude.ai and ChatGPT chats (imported data exports) and Claude Code / Codex CLI sessions. Use when the user refers to something they discussed with Claude or ChatGPT, or past work in Claude Code or Codex. Returns matching messages with a conversation_id for read_history.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words to find"},
+                    "source": {"type": "string", "enum": ["claude_ai", "chatgpt", "claude_code", "codex"], "description": "Limit to one source (optional)"},
+                    "limit": {"type": "integer", "description": "Max results (default 10)"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_history",
+            "description": "Read a conversation found with search_history, 30 messages at a time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "conversation_id from search_history"},
+                    "start": {"type": "integer", "description": "First message number to read (default 0)"}
+                },
+                "required": ["conversation_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "chat_with_model",
             "description": "Delegate a subtask to, or get a second opinion from, ANY other configured model (subscription, API or local) and get its answer. Call list_models first to see which models are recommended, what they cost and what they are good at; pick the cheapest one that can do the job, and a different vendor than yourself for an independent opinion.",
             "parameters": {
@@ -1484,6 +1515,8 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
         content = args.get("content", "")
     elif tool_type == "search_chats":
         content = args.get("query", "")
+    elif tool_type in ("search_history", "read_history"):
+        content = json.dumps(args)
     elif tool_type == "chat_with_model":
         if args.get("instructions"):
             # Carries the delegate's system prompt; chat_with_model reads either form.

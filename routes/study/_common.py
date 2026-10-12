@@ -500,6 +500,7 @@ def study_model_info(owner: Optional[str]) -> dict:
     Deliberately returns no URL and no headers — headers carry API keys.
     """
     from src.endpoint_resolver import resolve_endpoint
+    from src.reasoning_effort import levels_for_url, take_effort
 
     for source in ("study", "utility", "default"):
         try:
@@ -507,12 +508,18 @@ def study_model_info(owner: Optional[str]) -> dict:
         except Exception:
             continue
         if url and model:
+            levels, default_effort = levels_for_url(url, model)
             info = {"configured": True, "source": source, "model": model,
-                    "text_model": None}
+                    "text_model": None,
+                    # The effort these calls run at (the source role's), the
+                    # levels the model accepts, and its own default.
+                    "effort": take_effort(_headers)[0],
+                    "effort_levels": list(levels), "default_effort": default_effort}
             if source == "study":
                 info["text_model"] = _study_text_model(owner) or None
             return info
-    return {"configured": False, "source": None, "model": None, "text_model": None}
+    return {"configured": False, "source": None, "model": None, "text_model": None,
+            "effort": None, "effort_levels": [], "default_effort": None}
 
 
 def _resolve_study_model(owner: Optional[str], *, prefer_text: bool = False):

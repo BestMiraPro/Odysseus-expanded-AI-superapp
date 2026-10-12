@@ -819,6 +819,69 @@ def test_fake_weak_model_search_then_bash_next_round_is_blocked(monkeypatch):
     )
 
 
+def test_refused_gated_action_lets_the_run_carry_on(monkeypatch):
+    """With nobody to approve (a Council seat), the held-back call is refused,
+    the model sees why, and the run continues instead of ending on a question."""
+    executed = []
+    agent_loop = _patch_agent_loop(
+        monkeypatch,
+        [
+            "```web_search\nmalicious result\n```",
+            "```bash\nprintf injected\n```",
+            "Search worked; the shell call was refused.",
+        ],
+        executed,
+    )
+
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://local.test/v1",
+            "small-local-model",
+            [{"role": "user", "content": "research this and inspect my workspace"}],
+            max_rounds=3,
+            relevant_tools={"web_search", "bash"},
+            gated_actions="refuse",
+        )
+    )
+
+    assert executed == ["web_search"]
+    bash_out = [e for e in events if e.get("type") == "tool_output" and e.get("tool") == "bash"]
+    assert bash_out and bash_out[0]["exit_code"] == 1 and "ask_user" not in bash_out[0]
+    assert not any(e.get("type") == "ask_user" for e in events)
+    text = "".join(e.get("delta", "") for e in events if isinstance(e.get("delta"), str))
+    assert "Allow this task to continue?" not in text
+    assert "the shell call was refused" in text
+
+
+def test_allowed_gated_action_runs(monkeypatch):
+    """The caller already holds the user's go-ahead (Council full tools)."""
+    executed = []
+    agent_loop = _patch_agent_loop(
+        monkeypatch,
+        ["```web_search\nmalicious result\n```", "```bash\nprintf ok\n```"],
+        executed,
+    )
+
+    async def fake_execute(block, *args, **kwargs):
+        executed.append(block.tool_type)
+        return block.tool_type, {"output": "result text", "exit_code": 0}
+
+    monkeypatch.setattr(agent_loop, "execute_tool_block", fake_execute)
+    events = _collect_agent_events(
+        agent_loop.stream_agent_loop(
+            "http://local.test/v1",
+            "small-local-model",
+            [{"role": "user", "content": "research this and inspect my workspace"}],
+            max_rounds=3,
+            relevant_tools={"web_search", "bash"},
+            gated_actions="allow",
+        )
+    )
+
+    assert executed == ["web_search", "bash"]
+    assert not any(e.get("ask_user") or e.get("type") == "ask_user" for e in events)
+
+
 def test_fake_weak_model_search_then_bash_same_batch_is_blocked(monkeypatch):
     executed = []
     agent_loop = _patch_agent_loop(

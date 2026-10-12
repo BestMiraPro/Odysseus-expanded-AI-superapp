@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
-from src import budget, council, model_roster
+from src import budget, council, council_tools, model_roster, reasoning_effort
 from src.auth_helpers import get_current_user, owner_filter, require_user
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,9 @@ _ACTIVE_SESSIONS: set = set()
 class Seat(BaseModel):
     endpoint_id: str = Field(..., max_length=64)
     model: str = Field(..., max_length=300)
-    effort: Optional[str] = Field(None, max_length=16)   # None: provider default
+    # Reasoning effort for this seat; None = the user's saved level for the
+    # model (chat composer -> Effort), else the provider default.
+    effort: Optional[str] = Field(None, max_length=16)
 
 
 class AskRequest(BaseModel):
@@ -47,6 +49,15 @@ class AskRequest(BaseModel):
     # Set when the person has seen the cost estimate and agreed to a turn
     # above their single-action limit. It never overrides the monthly cap.
     budget_confirmed: bool = False
+    # What members may do: off | research | full (src/council_tools.py), and
+    # the folder their file tools work in. The Council page sends research by
+    # default; an API caller that leaves it out keeps the text-only council.
+    tools: str = council_tools.TOOLS_OFF
+    workspace: Optional[str] = Field(None, max_length=1024)
+    # Give members the person's shared memory repo and relevant saved
+    # memories. The Council page sends it on by default; an API caller that
+    # leaves it out shares nothing about the person.
+    memory: bool = False
 
 
 class EstimateRequest(BaseModel):
@@ -55,6 +66,7 @@ class EstimateRequest(BaseModel):
     chairman: Seat
     mode: str = council.MODE_FULL
     session_id: Optional[str] = Field(None, max_length=64)
+    memory: bool = False
 
 
 class SessionPatch(BaseModel):
@@ -97,11 +109,13 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
     from src import claude_subscription
 
     db = SessionLocal()
+    base_urls: Dict[str, str] = {}
     try:
         endpoints = []
         chatgpt = None
         for ep in _visible_endpoints(db, owner):
             kind, provider = classify_endpoint(ep)
+            base_urls[ep.id] = ep.base_url or ""
             models = _chat_models(ep)
             if provider == "chatgpt-subscription" and chatgpt is None:
                 chatgpt = {"endpoint_id": ep.id, "models": models}
@@ -122,7 +136,9 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
     rows = [(e["id"], e["name"], m, e["kind"], e["provider"]) for e in endpoints for m in e["models"]]
     meta: Dict[str, Dict[str, Any]] = {}
     try:
+        from src.reasoning_effort import levels_for
         for entry in model_roster.build_entries(rows):
+            levels, default_effort = levels_for(entry.provider, base_urls.get(entry.endpoint_id, ""), entry.model)
             meta[entry.key] = {
                 "recommended": entry.recommended,
                 "tier": entry.tier,
@@ -130,6 +146,8 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
                 "cost_label": entry.cost_label(),
                 "cost_band": entry.cost_band(),
                 "billing": entry.billing,
+                "effort_levels": list(levels),
+                "default_effort": default_effort,
             }
     except Exception as exc:
         logger.warning("council roster metadata failed error_type=%s", type(exc).__name__)
@@ -154,7 +172,6 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
         },
         "modes": list(council.MODES),
         "max_members": council.MAX_MEMBERS,
-        "efforts": {provider: list(levels) for provider, levels in council.EFFORTS.items()},
     }
 
 
@@ -165,6 +182,7 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
     token over the network: cost estimates only need billing and prices.
     """
     from src.endpoint_resolver import build_chat_url, build_headers, resolve_endpoint_runtime
+    from src.reasoning_effort import effective, user_levels, with_effort
 
     model = (seat.model or "").strip()
     if not model:
@@ -180,40 +198,52 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
     if enabled and model not in enabled:
         raise council.CouncilError(f"{model} is not enabled on {ep.name}.")
     kind, provider = classify_endpoint(ep)
-    effort = (seat.effort or "").strip().lower() or None
-    if effort and effort not in council.effort_options(provider):
-        levels = council.effort_options(provider)
-        raise council.CouncilError(
-            f"{ep.name} takes effort {', '.join(levels)}." if levels
-            else f"{ep.name} has no effort setting; leave {model} on its default.")
+    # The seat's own level rides in its headers; without one the user's saved
+    # level for the model applies. Either way the cards show the level used.
+    seat_effort = effective(provider, ep.base_url or "", model, seat.effort)
+    effort = seat_effort or effective(provider, ep.base_url or "", model, user_levels(owner).get(model))
     if not runtime:
         return council.Member(endpoint_id=ep.id, model=model, endpoint_name=ep.name or "", kind=kind,
-                              provider=provider, effort=effort, **_seat_pricing(ep, model, kind, provider))
+                              provider=provider, context_tokens=_seat_context(model), effort=effort,
+                              **_seat_pricing(ep, model, kind, provider))
     try:
         base, api_key = resolve_endpoint_runtime(ep, owner=owner)
     except Exception as exc:
         logger.warning("council: credential resolution failed endpoint=%s error_type=%s",
                        ep.id, type(exc).__name__)
         raise council.CouncilError(f"{ep.name} needs reconnecting before it can sit on the council.", 401)
+    url = build_chat_url(base)
     return council.Member(
         endpoint_id=ep.id,
         model=model,
         endpoint_name=ep.name or "",
         kind=kind,
         provider=provider,
-        url=build_chat_url(base),
-        headers=build_headers(api_key, base) or None,
+        url=url,
+        headers=with_effort(build_headers(api_key, base), seat_effort) or None,
+        context_tokens=_seat_context(model, url),
         effort=effort,
         **_seat_pricing(ep, model, kind, provider),
     )
 
 
-def _seat_config(member: council.Member) -> Dict[str, Any]:
-    """A seat as saved in the council's config; effort only when pinned."""
-    out = {"endpoint_id": member.endpoint_id, "model": member.model}
-    if member.effort:
-        out["effort"] = member.effort
-    return out
+def _seat_context(model: str, url: str = "") -> Optional[int]:
+    """The seat's context window in tokens, or None when nothing reports it.
+
+    With a chat URL the endpoint is asked (a local server reports the window it
+    was started with); without one only the known-models table is read, so a
+    cost estimate never waits on the network.
+    """
+    from src import model_context
+
+    try:
+        if not url:
+            return model_context.known_context_length(model)
+        ctx, known = model_context.get_context_length_known(url, model)
+        return ctx if known else None
+    except Exception as exc:
+        logger.warning("council: context window lookup failed error_type=%s", type(exc).__name__)
+        return None
 
 
 def _seat_pricing(ep, model: str, kind: str, provider: str) -> Dict[str, Any]:
@@ -253,6 +283,7 @@ def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
         "final": turn.final or "",
         "error": turn.error,
         "usage": _loads(turn.usage, {}),
+        "chair": _loads(getattr(turn, "chair", None), None),
         "created_at": turn.created_at.isoformat() if turn.created_at else None,
     }
 
@@ -280,6 +311,8 @@ def _save_turn(turn_id: str, **fields) -> None:
             return
         for key, value in fields.items():
             if key in ("opinions", "reviews", "ranking", "labels", "config", "usage") and not isinstance(value, str):
+                value = json.dumps(value)
+            elif key == "chair" and value is not None and not isinstance(value, str):
                 value = json.dumps(value)
             setattr(turn, key, value)
         db.commit()
@@ -312,6 +345,7 @@ def _result_fields(result: Dict[str, Any]) -> Dict[str, Any]:
         "labels": result.get("labels") or {},
         "final": final,
         "usage": council.usage_totals(result),
+        "chair": {"tools": chair.get("tools") or []} if chair and chair.get("tools") else None,
     }
 
 
@@ -334,9 +368,59 @@ def _expected_outputs(db, owner: Optional[str]) -> Dict[str, int]:
 
 
 def _estimate(db, owner: Optional[str], members, chairman, mode: str, question: str,
-              history: List[Dict[str, str]]) -> Dict[str, Any]:
+              history: List[Dict[str, str]], context: str = "") -> Dict[str, Any]:
     return council.estimate_turn(members, chairman, mode, question, history,
-                                 expected=_expected_outputs(db, owner))
+                                 expected=_expected_outputs(db, owner), context=context)
+
+
+# Set by setup_council_routes: the chat processor whose memory selection
+# (core pinned facts, then the best matches) the council reuses.
+_CHAT_PROCESSOR = None
+RECALL_QUERY_CHARS = 4000
+
+
+def _memory_context(owner: Optional[str], question: str, history: List[Dict[str, str]],
+                    *, wait: bool = True) -> str:
+    """What the council may know about the person: shared memory and relevant saved memories.
+
+    Empty when the person turned memory off. ``wait`` reads the shared memory
+    repo first when nothing is cached yet (the ask runs off the event loop);
+    estimates use the cache only.
+    """
+    from routes.prefs_routes import _load_for_user
+    from src import shared_memory
+    from src.prompt_security import UNTRUSTED_CONTEXT_POLICY, untrusted_context_message
+
+    try:
+        if not _load_for_user(owner).get("memory_enabled", True):
+            return ""
+    except Exception:
+        pass
+    parts = []
+    try:
+        shared = shared_memory.context_text(owner, wait=wait)
+    except Exception as exc:
+        logger.warning("council: shared memory unavailable error_type=%s", type(exc).__name__)
+        shared = ""
+    if shared:
+        parts.append(shared)
+    texts: List[str] = []
+    if _CHAT_PROCESSOR is not None:
+        # The first question is usually the brief; later ones can be as short
+        # as "1 - all", which matches nothing on its own.
+        first = history[0].get("question", "") if history else ""
+        query = f"{first}\n{question}".strip()[-RECALL_QUERY_CHARS:]
+        try:
+            entries = _CHAT_PROCESSOR.memory_manager.load(owner=owner)
+            pinned, recalled = _CHAT_PROCESSOR.select_memories(query, entries)
+            texts = [m["text"] for m in [*pinned, *recalled] if m.get("text")]
+        except Exception as exc:
+            logger.warning("council: memory recall failed error_type=%s", type(exc).__name__)
+    if texts:
+        body = "Saved memories about the user. Use them as background where relevant:\n" + "\n".join(
+            f"- {t}" for t in texts)
+        parts += [UNTRUSTED_CONTEXT_POLICY, untrusted_context_message("saved memory", body)["content"]]
+    return "\n\n".join(parts)
 
 
 def _budget_gate(owner: Optional[str], estimate: Dict[str, Any], confirmed: bool) -> None:
@@ -361,7 +445,34 @@ def _record_turn_spend(owner: Optional[str], session_id: str, members, chairman,
                       session_id=session_id, cost_usd=cost, estimated=estimated)
 
 
-def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: str, body: AskRequest):
+def _tool_settings(request: Request, owner: Optional[str], body: AskRequest) -> council_tools.ToolSettings:
+    """The members' tool level and workspace for this turn.
+
+    Full tools (shell, edits) and a workspace (host files) need the same
+    privilege as chat's file and shell tools: an admin or a single-user install.
+    """
+    from src.tool_security import owner_is_admin_or_single_user
+
+    mode = council_tools.normalize_mode(body.tools)
+    privileged = owner_is_admin_or_single_user(get_current_user(request))
+    if mode == council_tools.TOOLS_FULL and not privileged:
+        raise HTTPException(403, "Full tools (shell commands and file edits) need an admin account.")
+    workspace = None
+    requested = (body.workspace or "").strip()
+    if requested and mode != council_tools.TOOLS_OFF:
+        if not privileged:
+            raise HTTPException(403, "A workspace folder needs an admin account.")
+        from src.tool_execution import vet_workspace
+
+        workspace = vet_workspace(requested) or None
+        if workspace is None:
+            raise HTTPException(400, "That workspace folder can't be used: it must be an existing, "
+                                     "non-sensitive folder that is not a filesystem root.")
+    return council_tools.ToolSettings(mode=mode, owner=owner, workspace=workspace)
+
+
+def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: str, body: AskRequest,
+                  tools: Optional[council_tools.ToolSettings] = None):
     """Validate the seats, record a running turn, and return what the run needs.
 
     Runs in a worker thread: resolving a ChatGPT seat may refresh its OAuth
@@ -376,22 +487,39 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
         except council.CouncilError as exc:
             raise HTTPException(exc.status, str(exc))
         history = _history(db, owner, row.id)
+        context = _memory_context(owner, question, history) if body.memory else ""
         try:
-            estimate = _estimate(db, owner, members, chairman, mode, question, history)
+            estimate = _estimate(db, owner, members, chairman, mode, question, history, context)
         except Exception as exc:
             # No estimate: still enforce a reached cap, but never fail the ask.
             logger.warning("council: estimate failed error_type=%s", type(exc).__name__)
             estimate = {"total_usd": None, "metered": any(m.billing == "metered" for m in [*members, chairman])}
         _budget_gate(owner, estimate, body.budget_confirmed)
+        tools_mode = tools.mode if tools else council_tools.TOOLS_OFF
+        workspace = tools.workspace if tools else None
+
+        def _seat_config(s: Seat) -> Dict[str, str]:
+            seat = {"endpoint_id": s.endpoint_id, "model": s.model}
+            level = reasoning_effort.normalize(s.effort)
+            if level:
+                seat["effort"] = level
+            return seat
+
         config = {
-            "members": [_seat_config(m) for m in members],
-            "chairman": _seat_config(chairman),
+            "members": [_seat_config(s) for s in body.members],
+            "chairman": _seat_config(body.chairman),
             "mode": mode,
+            "tools": tools_mode,
+            "workspace": workspace or "",
+            "memory": body.memory,
         }
         seats = {
             "members": [m.public(i) for i, m in enumerate(members)],
             "chairman": chairman.public("chair"),
             "mode": mode,
+            "tools": tools_mode,
+            "workspace": workspace or "",
+            "memory": bool(context),
         }
         turn = CouncilTurn(
             id=uuid.uuid4().hex,
@@ -407,7 +535,7 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
             row.title = question.splitlines()[0][:80]
         row.updated_at = utcnow_naive()
         db.commit()
-        return turn.id, members, chairman, history, seats
+        return turn.id, members, chairman, history, seats, context
     finally:
         db.close()
 
@@ -430,7 +558,10 @@ class _Broadcast:
 # routes
 # ---------------------------------------------------------------------------
 
-def setup_council_routes() -> APIRouter:
+def setup_council_routes(chat_processor=None) -> APIRouter:
+    global _CHAT_PROCESSOR
+    if chat_processor is not None:
+        _CHAT_PROCESSOR = chat_processor
     router = APIRouter(prefix="/api/council", tags=["council"])
 
     def _is_admin(request: Request) -> bool:
@@ -461,7 +592,9 @@ def setup_council_routes() -> APIRouter:
                 row = _session_query(db, owner).filter(CouncilSession.id == body.session_id).first()
                 if row is not None:
                     history = _history(db, owner, row.id)
-            estimate = _estimate(db, owner, members, chairman, mode, (body.question or "").strip(), history)
+            question = (body.question or "").strip()
+            context = _memory_context(owner, question, history, wait=False) if body.memory else ""
+            estimate = _estimate(db, owner, members, chairman, mode, question, history, context)
         finally:
             db.close()
         decision = budget.check(owner, estimate.get("total_usd"), metered=estimate["metered"],
@@ -613,15 +746,17 @@ def setup_council_routes() -> APIRouter:
         if not body.members:
             raise HTTPException(400, "Seat at least one council member.")
 
+        tools = _tool_settings(request, owner, body)
+
         if session_id in _ACTIVE_SESSIONS:
             raise HTTPException(409, "This council is still deliberating. Stop it or wait.")
         _ACTIVE_SESSIONS.add(session_id)
         try:
-            prepared = await asyncio.to_thread(_prepare_turn, owner, session_id, question, mode, body)
+            prepared = await asyncio.to_thread(_prepare_turn, owner, session_id, question, mode, body, tools)
         except BaseException:
             _ACTIVE_SESSIONS.discard(session_id)
             raise
-        turn_id, members, chairman, history, seats = prepared
+        turn_id, members, chairman, history, seats, context = prepared
 
         stream = _Broadcast()
         state: Dict[str, Any] = {}
@@ -632,10 +767,12 @@ def setup_council_routes() -> APIRouter:
 
         async def runner() -> None:
             try:
-                result = await council.run_council(
-                    question=question, members=members, chairman=chairman, mode=mode,
-                    history=history, emit=stream.emit, checkpoint=checkpoint, state=state,
-                )
+                with reasoning_effort.for_owner(owner):
+                    result = await council.run_council(
+                        question=question, members=members, chairman=chairman, mode=mode,
+                        history=history, emit=stream.emit, checkpoint=checkpoint, state=state,
+                        stream_fn=council_tools.stream_fn_for(tools), context=context,
+                    )
                 status = "error" if result.get("error") and not result.get("final") else "done"
                 fields = _result_fields(result)
                 # Set before the save: a Stop that lands while it is being

@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from src import study_agent
+from src import reasoning_effort, study_agent
 from src.auth_helpers import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -95,9 +95,10 @@ def setup_study_agent_routes() -> APIRouter:
         async def _gen():
             yield study_agent._sse({"type": "thread", "thread_id": thread_id})
             try:
-                async for chunk in study_agent.run_study_agent(
-                        user, thread_id, text[:20000], deck_id=body.deck_id, allow_code=body.allow_code):
-                    yield chunk
+                with reasoning_effort.for_owner(user):
+                    async for chunk in study_agent.run_study_agent(
+                            user, thread_id, text[:20000], deck_id=body.deck_id, allow_code=body.allow_code):
+                        yield chunk
             except Exception as e:  # keep the stream well-formed
                 logger.warning("study agent stream failed error_type=%s thread=%s",
                                type(e).__name__, thread_id)

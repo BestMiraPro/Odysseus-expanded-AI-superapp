@@ -195,6 +195,29 @@ async function loadThread(id) {
   renderLog();
 }
 
+// Tool calls a model writes as text run server-side, but their markup streams
+// here first and would stay on screen as raw JSON until a reload.
+const TOOL_MARKUP = [['```tool_call', '```'], ['<tool_call>', '</tool_call>'], ['<invoke', '</invoke>']];
+
+function hideToolMarkup(text) {
+  const lower = text.toLowerCase();
+  let out = '';
+  let pos = 0;
+  while (pos < text.length) {
+    let next = null;
+    for (const [open, close] of TOOL_MARKUP) {
+      const i = lower.indexOf(open, pos);
+      if (i >= 0 && (!next || i < next.i)) next = { i, open, close };
+    }
+    if (!next) { out += text.slice(pos); break; }
+    out += text.slice(pos, next.i);
+    const end = lower.indexOf(next.close, next.i + next.open.length);
+    if (end < 0) break; // still streaming: hide the unfinished block too
+    pos = end + next.close.length;
+  }
+  return out.replace(/<\/?function_calls>/gi, '').trim();
+}
+
 function renderMessage(m) {
   if (m.role === 'user') return `<div class="study-agent-msg user">${A.esc(m.content)}</div>`;
   if (m.role === 'error') return `<div class="study-agent-msg error">${A.esc(m.content)}</div>`;
@@ -206,8 +229,9 @@ function renderMessage(m) {
       <pre>${A.esc(m.output || '')}</pre></details>`;
   }
   const calls = (m.tool_calls || []).map(c => `<div class="study-agent-hint">→ ${A.esc(c.name)}</div>`).join('');
-  if (!(m.content || '').trim() && !calls) return '';
-  return `<div class="study-agent-msg assistant study-md">${md(m.content)}${calls}</div>`;
+  const content = hideToolMarkup(m.content || '');
+  if (!content && !calls) return '';
+  return `<div class="study-agent-msg assistant study-md">${md(content)}${calls}</div>`;
 }
 
 function renderLog() {

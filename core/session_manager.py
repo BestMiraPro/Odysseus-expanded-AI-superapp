@@ -150,6 +150,7 @@ class SessionManager:
             history=[],
             owner=getattr(db_session, "owner", None),
             is_important=getattr(db_session, "is_important", False) or False,
+            reasoning_effort=getattr(db_session, "reasoning_effort", None),
         )
         session.message_count = getattr(db_session, "message_count", 0) or 0
         return session
@@ -208,6 +209,7 @@ class SessionManager:
             history=history,
             owner=getattr(db_session, 'owner', None),
             is_important=getattr(db_session, 'is_important', False) or False,
+            reasoning_effort=getattr(db_session, 'reasoning_effort', None),
         )
 
         # The rows just loaded are the whole transcript, so they — not the

@@ -117,6 +117,8 @@ _register(
         "resolve_contact",
         "scan_email_unsubscribes",
         "search_chats",
+        "search_history",
+        "read_history",
         "search_emails",
         "list_sessions",
         "tail_serve_output",

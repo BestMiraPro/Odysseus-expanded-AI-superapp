@@ -1197,7 +1197,8 @@ function initEndpointForm() {
 
   async function _connectClaudeSubscription(triggerEl) {
     const status = el('adm-deviceAuthStatus') || _endpointMsg('api');
-    const token = (el('adm-epApiKey')?.value || '').trim();
+    // A token copied from a terminal that wrapped it carries line breaks; tokens never contain whitespace.
+    const token = (el('adm-epApiKey')?.value || '').replace(/\s+/g, '');
     const triggerText = triggerEl ? triggerEl.textContent : 'Add';
     if (triggerEl) { triggerEl.disabled = true; triggerEl.textContent = 'Checking...'; }
     if (status) {

@@ -302,6 +302,33 @@ def test_parse_fallback_tool_calls():
     assert sa.parse_fallback_tool_calls("plain prose with ```json\n{}\n```") == []
 
 
+def test_parse_fallback_tool_calls_reads_claude_invoke_markup():
+    # Claude Subscription models write their tool calls as <invoke> markup;
+    # unparsed, the tutor showed it as the reply and stalled.
+    from src import study_agent as sa
+    text = ("I'll start by reading the exam materials.\n"
+            '<invoke name="get_material">\n<parameter name="material_id">bb9d319a</parameter>\n'
+            '<parameter name="page">1</parameter>\n</invoke>\n'
+            '<function_calls><invoke name="get_material"><parameter name="material_id">9224bd65</parameter>'
+            '<parameter name="page">2</parameter></invoke></function_calls>\n'
+            '<invoke name="rm_rf"><parameter name="path">/</parameter></invoke>')
+    calls = sa.parse_fallback_tool_calls(text)
+    assert [c["name"] for c in calls] == ["get_material", "get_material"]
+    assert [c["id"] for c in calls] == ["fb_1", "fb_2"]
+    assert json.loads(calls[0]["arguments"]) == {"material_id": "bb9d319a", "page": 1}
+    assert json.loads(calls[1]["arguments"]) == {"material_id": "9224bd65", "page": 2}
+    assert sa.strip_fallback_blocks(text) == "I'll start by reading the exam materials."
+
+
+def test_invoke_markup_string_false_does_not_confirm_destructive_tools():
+    from src import study_agent as sa
+    name = next(n for n, spec in sa.TOOLS.items()
+                if spec.destructive and spec.properties.get("confirm", {}).get("type") == "boolean")
+    spec = sa.TOOLS[name]
+    assert sa._coerce_invoke_arg(spec, "confirm", "false") is False
+    assert sa._coerce_invoke_arg(spec, "confirm", " true ") is True
+
+
 def test_trim_history_keeps_recent_rounds():
     from src import study_agent as sa
     big = "x" * 2000

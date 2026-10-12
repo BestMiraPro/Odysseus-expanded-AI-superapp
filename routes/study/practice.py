@@ -629,7 +629,7 @@ def register(router: APIRouter) -> None:
             if value is not None and (not str(value).strip() or len(str(value)) > 200):
                 raise HTTPException(400, f"{field} invalid")
 
-        from src import study_agent
+        from src import reasoning_effort, study_agent
         from src.study_practice_coach import build_practice_context, \
             resolve_practice_thread
 
@@ -645,9 +645,10 @@ def register(router: APIRouter) -> None:
         async def _events():
             yield study_agent._sse({"type": "thread", "thread_id": thread_id})
             try:
-                async for chunk in study_agent.run_study_agent(
-                        user, thread_id, message, practice_context=context):
-                    yield chunk
+                with reasoning_effort.for_owner(user):
+                    async for chunk in study_agent.run_study_agent(
+                            user, thread_id, message, practice_context=context):
+                        yield chunk
             except HTTPException as e:
                 # server-authored detail, safe to surface
                 yield study_agent._sse({"type": "error", "retryable": False,

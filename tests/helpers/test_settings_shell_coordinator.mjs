@@ -796,6 +796,20 @@ const STUBS = new Map([
     },
   ],
   [
+    path.join(JS, 'effortSelect.js'),
+    {
+      createEffortSelect() {
+        return null;
+      },
+      effortInfoFromRoster() {
+        return null;
+      },
+      loadEffortRoster() {
+        return Promise.resolve(null);
+      },
+    },
+  ],
+  [
     path.join(JS, 'providers.js'),
     {
       providerLogo() {
