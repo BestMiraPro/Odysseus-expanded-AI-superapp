@@ -29,7 +29,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -194,21 +196,34 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
         allowed -= {"read_file", "grep", "glob", "ls", "get_workspace", "write_file", "edit_file", "apply_patch"}
     blocked = frozenset(known_tool_names() - allowed)
     policy = ToolPolicy(disabled_tools=blocked, mode="council", disable_mcp=True)
+    # Nobody can answer an approval card mid-council. Full tools are the
+    # admin's go-ahead for the whole run, as for the Claude Code and Codex
+    # seats; in research mode a call the external-context gate holds back is
+    # refused and the member carries on.
+    gated = "allow" if settings.full else "refuse"
+    # Shell and Python start in the workspace, else in a scratch folder of
+    # their own rather than the app's data folder.
+    scratch = None if settings.workspace or not settings.full else tempfile.mkdtemp(prefix="ody-council-")
     # The agent loop bills each model call to the budget ledger itself.
     yield f"data: {json.dumps({'type': 'self_billed'})}\n\n"
-    async for chunk in stream_agent_loop(
-        endpoint_url=url,
-        model=model,
-        messages=messages,
-        headers=headers,
-        max_rounds=AGENT_MAX_ROUNDS,
-        owner=settings.owner,
-        relevant_tools=allowed,
-        tool_policy=policy,
-        workspace=settings.workspace,
-        workload=workload,
-    ):
-        yield _approval_refused(chunk, settings.owner)
+    try:
+        async for chunk in stream_agent_loop(
+            endpoint_url=url,
+            model=model,
+            messages=messages,
+            headers=headers,
+            max_rounds=AGENT_MAX_ROUNDS,
+            owner=settings.owner,
+            relevant_tools=allowed,
+            tool_policy=policy,
+            workspace=settings.workspace or scratch,
+            workload=workload,
+            gated_actions=gated,
+        ):
+            yield _approval_refused(chunk, settings.owner)
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _approval_refused(chunk: str, owner: Optional[str]) -> str:

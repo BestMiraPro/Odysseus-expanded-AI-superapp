@@ -104,6 +104,45 @@ def test_api_seat_runs_agent_loop_limited_to_council_tools(monkeypatch):
     policy = seen["tool_policy"]
     assert policy.disable_mcp and policy.blocks("bash") and policy.blocks("send_email")
     assert not policy.blocks("web_search")
+    # Nobody can approve mid-council: research mode refuses gated calls and goes on.
+    assert seen["gated_actions"] == "refuse"
+    assert seen["workspace"] is None
+
+
+def test_full_api_seat_runs_tools_in_a_scratch_folder(monkeypatch):
+    import os
+
+    seen = {}
+
+    async def fake_loop(**kwargs):
+        seen.update(kwargs, existed=os.path.isdir(kwargs["workspace"]))
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: "openai")
+    fn = council_tools.stream_fn_for(_settings("full"))
+    _collect(fn("https://api.example.com/v1/chat/completions", "m", [{"role": "user", "content": "q"}]))
+    # Full tools are the admin's go-ahead, as for the Claude Code / Codex seats.
+    assert seen["gated_actions"] == "allow"
+    assert "bash" in seen["relevant_tools"] and "python" in seen["relevant_tools"]
+    # Shell and Python start in a throwaway folder, not the app's data folder.
+    assert seen["existed"] and "ody-council-" in seen["workspace"]
+    assert not os.path.exists(seen["workspace"])
+
+
+def test_full_api_seat_uses_the_chosen_workspace(monkeypatch, tmp_path):
+    seen = {}
+
+    async def fake_loop(**kwargs):
+        seen.update(kwargs)
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: "openai")
+    fn = council_tools.stream_fn_for(_settings("full", str(tmp_path)))
+    _collect(fn("https://api.example.com/v1/chat/completions", "m", [{"role": "user", "content": "q"}]))
+    assert seen["workspace"] == str(tmp_path) and tmp_path.exists()
+    assert seen["gated_actions"] == "allow"
 
 
 def test_tools_off_uses_plain_streaming(monkeypatch):
