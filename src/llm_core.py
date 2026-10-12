@@ -1401,6 +1401,7 @@ def _build_chatgpt_responses_payload(
     max_tokens: int,
     *,
     stream: bool = False,
+    effort: Optional[str] = None,
 ) -> Dict:
     from src.chatgpt_subscription import build_responses_input
 
@@ -1414,6 +1415,9 @@ def _build_chatgpt_responses_payload(
     }
     if not _restricts_temperature(model):
         payload["temperature"] = temperature
+    if effort:
+        # Left out unless pinned, so the model keeps its own default.
+        payload["reasoning"] = {"effort": effort}
     # ChatGPT Subscription Codex API does not support max_output_tokens —
     # passing it returns HTTP 400 "Unsupported parameter: max_output_tokens".
     # Do not include it in the payload.
@@ -2804,13 +2808,17 @@ async def _stream_llm_unmetered(url: str, model: str, messages: List[Dict], temp
                      max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                      timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                      tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                     tool_choice_none: bool = False, workload: str = "foreground"):
+                     tool_choice_none: bool = False, workload: str = "foreground",
+                     effort: Optional[str] = None):
+    # ``effort`` reaches the Claude subscription (--effort) and the ChatGPT
+    # subscription (reasoning.effort); other providers ignore it.
     if _detect_provider(url) == "claude-subscription":
         # The Claude Code CLI streams the subscription reply; tools stay off
         # (the endpoint is provisioned with supports_tools=False).
         from src.claude_subscription import stream_chat as _claude_stream_chat
         note_model_activity(url, model)
-        async for chunk in _claude_stream_chat(url, model, _sanitize_llm_messages(messages), timeout=timeout):
+        async for chunk in _claude_stream_chat(url, model, _sanitize_llm_messages(messages), timeout=timeout,
+                                               effort=effort):
             yield chunk
         return
     target_url = _stream_target_url(url)
@@ -2827,6 +2835,7 @@ async def _stream_llm_unmetered(url: str, model: str, messages: List[Dict], temp
             tools=tools,
             session_id=session_id,
             tool_choice_none=tool_choice_none,
+            effort=effort,
         ):
             yield chunk
 
@@ -2835,7 +2844,7 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
                             max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None,
                             timeout: int = LLMConfig.STREAM_TIMEOUT, prompt_type: Optional[str] = None,
                             tools: Optional[List[Dict]] = None, session_id: Optional[str] = None,
-                            tool_choice_none: bool = False):
+                            tool_choice_none: bool = False, effort: Optional[str] = None):
     """Stream LLM responses with improved error handling.
 
     Yields SSE chunks:
@@ -2877,7 +2886,8 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
     elif provider == "chatgpt-subscription":
         target_url = _normalize_chatgpt_subscription_url(url)
         h = _provider_headers(provider, headers)
-        payload = _build_chatgpt_responses_payload(model, messages_copy, temperature, max_tokens, stream=True)
+        payload = _build_chatgpt_responses_payload(model, messages_copy, temperature, max_tokens, stream=True,
+                                                   effort=effort)
     else:
         target_url = _normalize_openai_chat_url(url)
         payload = {

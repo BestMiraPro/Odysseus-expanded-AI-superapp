@@ -43,6 +43,18 @@ HISTORY_CHARS = 4000
 MEMBER_TIMEOUT = 600
 CHAIR_TIMEOUT = 900
 
+# Effort levels a seat can pin, per provider: the Claude Code CLI's --effort
+# and the Codex Responses API's reasoning.effort. Other providers have no
+# effort control here and run at their default.
+EFFORTS: Dict[str, tuple] = {
+    "claude-subscription": ("low", "medium", "high", "xhigh", "max"),
+    "chatgpt-subscription": ("low", "medium", "high", "xhigh"),
+}
+
+
+def effort_options(provider: str) -> tuple:
+    return EFFORTS.get(provider, ())
+
 OPINION_SYSTEM = (
     "You are one member of an AI council. Several independent models answer the same "
     "question; your answer will be peer reviewed and then synthesized by a chairman.\n"
@@ -83,6 +95,7 @@ class Member:
     billing: str = "metered"                 # metered | subscription | local
     input_per_mtok: Optional[float] = None
     output_per_mtok: Optional[float] = None
+    effort: Optional[str] = None             # None: the provider's default
 
     def public(self, index: Any) -> Dict[str, Any]:
         return {
@@ -93,6 +106,7 @@ class Member:
             "kind": self.kind,
             "provider": self.provider,
             "billing": self.billing,
+            "effort": self.effort,
         }
 
     @property
@@ -341,9 +355,10 @@ async def run_member(
     input_estimate = estimate_tokens(messages)
     if sink is not None:
         sink.update({"text": "", "error": None, "ms": None, "pending": True, "input_estimate": input_estimate})
+    extra = {"effort": member.effort} if member.effort else {}
     try:
         async for chunk in stream_fn(member.url, member.model, messages, headers=member.headers,
-                                     timeout=timeout, workload="foreground"):
+                                     timeout=timeout, workload="foreground", **extra):
             for event, payload in iter_sse(chunk):
                 if event == "error":
                     error = _error_text(payload)
