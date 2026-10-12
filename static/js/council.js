@@ -109,6 +109,27 @@ function seatInfo(seat) {
   };
 }
 
+// Effort levels the seat's provider takes (empty: no effort control, runs at its default).
+function effortsFor(seat) {
+  return (S.roster?.efforts || {})[seatInfo(seat).provider] || [];
+}
+
+function effortSelect(seat, attrs, label) {
+  const levels = effortsFor(seat);
+  if (!levels.length) return '';
+  const cur = levels.includes(seat.effort) ? seat.effort : '';
+  return `<select class="council-effort ${cur ? 'pinned' : ''}" ${attrs} aria-label="${esc(label)}" title="Effort for this seat. Default leaves it to the provider.">
+    <option value="" ${cur ? '' : 'selected'}>default</option>
+    ${levels.map(l => `<option value="${esc(l)}" ${l === cur ? 'selected' : ''}>${esc(l)}</option>`).join('')}
+  </select>`;
+}
+
+// A seat with ``effort`` set, or removed when blank. Never mutates ``seat``.
+function withEffort(seat, effort) {
+  const { effort: _old, ...rest } = seat;
+  return effort ? { ...rest, effort } : rest;
+}
+
 function logoFor(model) {
   const svg = providerLogo(model || '');
   return svg ? `<span class="council-logo" aria-hidden="true">${svg}</span>` : `<span class="council-logo council-logo-dot" aria-hidden="true"></span>`;
@@ -206,6 +227,10 @@ function injectStyles() {
 .council-badge.kind-local { background: color-mix(in srgb, #3ba55d 22%, transparent); }
 .council-select { padding: 4px 6px; font-size: 12px; border-radius: 6px; border: 1px solid var(--border);
   background: var(--bg); color: var(--fg); max-width: min(320px, 100%); min-width: 0; }
+.council-effort { padding: 1px 2px; font-size: 11px; border-radius: 5px; border: 1px solid var(--border);
+  background: var(--bg); color: var(--fg); flex-shrink: 0; cursor: pointer; }
+.council-effort.pinned { border-color: color-mix(in srgb, #b07cff 60%, var(--border)); }
+.council-card-h .effort { font-size: 10.5px; opacity: 0.6; white-space: nowrap; }
 .council-mode { display: inline-flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
 .council-mode button { background: none; border: none; color: var(--fg); padding: 4px 10px; font-size: 12px; cursor: pointer; opacity: 0.65; }
 .council-mode button.on { opacity: 1; background: color-mix(in srgb, var(--fg) 10%, transparent); font-weight: 600; }
@@ -704,6 +729,7 @@ function seatChip(seat, idx) {
   const meta = metaFor(seatKey(seat));
   return `<span class="council-chip ${info.available ? '' : 'missing'}" title="${esc(seatTitle(info.model, info.endpoint, meta))}">
     ${meta?.recommended ? '<span class="council-star" aria-label="Recommended">★</span>' : ''}${logoFor(info.model)}<span class="name">${esc(info.model)}</span><span class="ep">${esc(info.endpoint)}</span>${costChip(meta)}
+    ${effortSelect(seat, `data-effort-seat="${idx}"`, `Effort for ${info.model}`)}
     ${badge(info.kind, info.provider)}
     <button data-remove-seat="${idx}" aria-label="Remove ${esc(info.model)}">✕</button></span>`;
 }
@@ -746,6 +772,7 @@ function renderSeats() {
         ${chairKnown ? '' : `<option value="" selected>${chair ? 'Unavailable — pick one' : 'Pick a chairman'}</option>`}
         ${allSeatOptions(chairKey)}
       </select>
+      ${chairKnown ? effortSelect(chair, 'id="council-chair-effort"', 'Chairman effort') : ''}
       <span class="council-seat-label" style="margin-left:10px">Mode</span>
       <span class="council-mode" role="radiogroup" aria-label="Council mode">
         <button data-mode="full" class="${S.mode === 'full' ? 'on' : ''}" role="radio" aria-checked="${S.mode === 'full'}" title="Opinions, blind peer review and ranking, then synthesis">Full</button>
@@ -984,6 +1011,7 @@ function memberCard(stage, seat, idx, entry, label) {
     <div class="council-card-h">
       ${label ? `<span class="label" title="Anonymous label used in peer review">${esc(label)}</span>` : ''}
       ${logoFor(seat?.model)}<span class="name">${esc(seat?.model || '?')}</span>
+      ${seat?.effort ? `<span class="effort" title="Effort">${esc(seat.effort)}</span>` : ''}
       <span class="ep">${esc(seat?.endpoint_name || '')}</span>
       <span class="state">${esc(state)}</span>
     </div>
@@ -1284,8 +1312,8 @@ async function convene() {
     stages: { opinions: 'running', review: 'pending', synthesis: 'pending' }, reader: null,
   };
   // Show the seats immediately, before the server's first event.
-  S.live.config.members = S.members.map((m, i) => ({ index: i, model: m.model, endpoint_name: seatInfo(m).endpoint }));
-  S.live.config.chairman = { model: chair.model, endpoint_name: seatInfo(chair).endpoint };
+  S.live.config.members = S.members.map((m, i) => ({ index: i, model: m.model, endpoint_name: seatInfo(m).endpoint, effort: m.effort || null }));
+  S.live.config.chairman = { model: chair.model, endpoint_name: seatInfo(chair).endpoint, effort: chair.effort || null };
   input.value = '';
   input.style.height = 'auto';
   renderSeats();
@@ -1546,9 +1574,26 @@ function onPaneChange(e) {
     const val = e.target.value;
     if (!val) return;
     const [endpoint_id, ...rest] = val.split('::');
-    S.chairman = { endpoint_id, model: rest.join('::') };
+    const prev = chairmanSeat()?.effort;
+    const next = { endpoint_id, model: rest.join('::') };
+    S.chairman = withEffort(next, effortsFor(next).includes(prev) ? prev : '');
     saveConfigSoon();
+    renderSeats();
     renderComposer();
+  } else if (e.target.id === 'council-chair-effort') {
+    // With no chairman picked the first member chairs; pinning the chair's
+    // effort makes that an explicit chairman so the member keeps its own.
+    const chair = chairmanSeat();
+    if (!chair) return;
+    S.chairman = withEffort({ endpoint_id: chair.endpoint_id, model: chair.model }, e.target.value);
+    saveConfigSoon();
+    renderSeats();
+  } else if (e.target.dataset.effortSeat != null) {
+    const idx = Number(e.target.dataset.effortSeat);
+    if (!S.members[idx]) return;
+    S.members[idx] = withEffort(S.members[idx], e.target.value);
+    saveConfigSoon();
+    renderSeats();
   }
 }
 

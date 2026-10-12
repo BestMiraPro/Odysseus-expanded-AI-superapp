@@ -36,6 +36,7 @@ _ACTIVE_SESSIONS: set = set()
 class Seat(BaseModel):
     endpoint_id: str = Field(..., max_length=64)
     model: str = Field(..., max_length=300)
+    effort: Optional[str] = Field(None, max_length=16)   # None: provider default
 
 
 class AskRequest(BaseModel):
@@ -153,6 +154,7 @@ def roster_payload(owner: Optional[str], is_admin: bool) -> Dict[str, Any]:
         },
         "modes": list(council.MODES),
         "max_members": council.MAX_MEMBERS,
+        "efforts": {provider: list(levels) for provider, levels in council.EFFORTS.items()},
     }
 
 
@@ -177,17 +179,22 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
     enabled = _chat_models(ep)
     if enabled and model not in enabled:
         raise council.CouncilError(f"{model} is not enabled on {ep.name}.")
+    kind, provider = classify_endpoint(ep)
+    effort = (seat.effort or "").strip().lower() or None
+    if effort and effort not in council.effort_options(provider):
+        levels = council.effort_options(provider)
+        raise council.CouncilError(
+            f"{ep.name} takes effort {', '.join(levels)}." if levels
+            else f"{ep.name} has no effort setting; leave {model} on its default.")
     if not runtime:
-        kind, provider = classify_endpoint(ep)
         return council.Member(endpoint_id=ep.id, model=model, endpoint_name=ep.name or "", kind=kind,
-                              provider=provider, **_seat_pricing(ep, model, kind, provider))
+                              provider=provider, effort=effort, **_seat_pricing(ep, model, kind, provider))
     try:
         base, api_key = resolve_endpoint_runtime(ep, owner=owner)
     except Exception as exc:
         logger.warning("council: credential resolution failed endpoint=%s error_type=%s",
                        ep.id, type(exc).__name__)
         raise council.CouncilError(f"{ep.name} needs reconnecting before it can sit on the council.", 401)
-    kind, provider = classify_endpoint(ep)
     return council.Member(
         endpoint_id=ep.id,
         model=model,
@@ -196,8 +203,17 @@ def resolve_seat(db, owner: Optional[str], seat: Seat, runtime: bool = True) -> 
         provider=provider,
         url=build_chat_url(base),
         headers=build_headers(api_key, base) or None,
+        effort=effort,
         **_seat_pricing(ep, model, kind, provider),
     )
+
+
+def _seat_config(member: council.Member) -> Dict[str, Any]:
+    """A seat as saved in the council's config; effort only when pinned."""
+    out = {"endpoint_id": member.endpoint_id, "model": member.model}
+    if member.effort:
+        out["effort"] = member.effort
+    return out
 
 
 def _seat_pricing(ep, model: str, kind: str, provider: str) -> Dict[str, Any]:
@@ -368,8 +384,8 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
             estimate = {"total_usd": None, "metered": any(m.billing == "metered" for m in [*members, chairman])}
         _budget_gate(owner, estimate, body.budget_confirmed)
         config = {
-            "members": [{"endpoint_id": s.endpoint_id, "model": s.model} for s in body.members],
-            "chairman": {"endpoint_id": body.chairman.endpoint_id, "model": body.chairman.model},
+            "members": [_seat_config(m) for m in members],
+            "chairman": _seat_config(chairman),
             "mode": mode,
         }
         seats = {

@@ -322,3 +322,56 @@ def test_stop_during_synthesis_keeps_the_partial_answer(db, monkeypatch):
     assert turn["status"] == "cancelled"
     assert turn["final"].startswith("The council leans towards")
     assert "stopped before the chairman finished" in turn["final"]
+
+
+def _claude_seat(client):
+    cs.provision("alice", cs.AUTH_MODE_TOKEN, "sk-ant-oat01-" + "b" * 40)
+    claude = client.get("/api/council/roster").json()["connections"]["claude"]
+    return {"endpoint_id": claude["endpoint_id"], "model": claude["models"][0]}
+
+
+def test_roster_lists_effort_levels_per_provider(client, db):
+    efforts = client.get("/api/council/roster").json()["efforts"]
+    assert efforts["claude-subscription"] == ["low", "medium", "high", "xhigh", "max"]
+    assert efforts["chatgpt-subscription"] == ["low", "medium", "high", "xhigh"]
+
+
+def test_seat_effort_is_sent_saved_and_shown(client, db, monkeypatch):
+    calls = []
+
+    async def stream(url, model, messages, **kwargs):
+        calls.append((model, kwargs.get("effort")))
+        async for chunk in _fake_stream(url, model, messages, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", stream)
+    claude = _claude_seat(client)
+    seats = {
+        "members": [{**claude, "effort": "max"}, {"endpoint_id": "api1", "model": "deepseek-v4"}],
+        "chairman": {**claude, "effort": "low"},
+        "mode": "quick",
+    }
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    events = _events(client.post(f"/api/council/sessions/{sid}/ask", json={"question": "q", **seats}).text)
+
+    assert [m["effort"] for m in events[0]["members"]] == ["max", None]
+    assert events[0]["chairman"]["effort"] == "low"
+    assert sorted(calls, key=str) == sorted(
+        [(claude["model"], "max"), ("deepseek-v4", None), (claude["model"], "low")], key=str)
+    session = client.get(f"/api/council/sessions/{sid}").json()
+    assert session["config"]["members"] == seats["members"]  # no effort key on a default seat
+    assert session["config"]["chairman"] == seats["chairman"]
+    assert session["turns"][0]["config"]["members"][0]["effort"] == "max"
+
+
+@pytest.mark.parametrize("which,effort", [
+    ("api", "high"),       # an API seat has no effort control here
+    ("claude", "ultra"),   # not a Claude level
+])
+def test_ask_rejects_an_effort_the_seat_cannot_take(client, db, which, effort):
+    seat = _claude_seat(client) if which == "claude" else {"endpoint_id": "api1", "model": "deepseek-v4"}
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    body = {"question": "hi", "members": [{**seat, "effort": effort}], "chairman": SEATS["chairman"]}
+    resp = client.post(f"/api/council/sessions/{sid}/ask", json=body)
+    assert resp.status_code == 400
+    assert "effort" in resp.json()["detail"]

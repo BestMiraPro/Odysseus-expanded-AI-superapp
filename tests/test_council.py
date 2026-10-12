@@ -287,3 +287,32 @@ def test_history_reaches_every_stage_model():
     for _stage, _model, messages in stream.calls:
         contents = [m["content"] for m in messages]
         assert "Earlier?" in contents and "Earlier answer" in contents
+
+
+# ---------------------------------------------------------------------------
+# effort
+# ---------------------------------------------------------------------------
+
+def test_effort_levels_are_per_provider():
+    assert council.effort_options("claude-subscription") == ("low", "medium", "high", "xhigh", "max")
+    assert council.effort_options("chatgpt-subscription") == ("low", "medium", "high", "xhigh")
+    assert council.effort_options("openai") == ()
+
+
+def test_each_seats_effort_reaches_only_its_own_calls():
+    seen = []
+    base = _fake_stream()
+
+    async def stream(url, model, messages, **kwargs):
+        seen.append((model, kwargs.get("effort", "unset")))
+        async for chunk in base(url, model, messages, **kwargs):
+            yield chunk
+
+    a, b, chair = _member("a"), _member("b"), _member("chair")
+    a.effort, chair.effort = "max", "high"
+    result, _ = _run(question="q", members=[a, b], chairman=chair, mode=council.MODE_FULL, stream_fn=stream)
+    assert result["final"] == "FINAL ANSWER"
+    # Opinion and review for each member, then the chair; a seat left on the
+    # provider default sends no effort at all.
+    assert sorted(seen) == [("a", "max"), ("a", "max"), ("b", "unset"), ("b", "unset"), ("chair", "high")]
+    assert a.public(0)["effort"] == "max" and b.public(1)["effort"] is None

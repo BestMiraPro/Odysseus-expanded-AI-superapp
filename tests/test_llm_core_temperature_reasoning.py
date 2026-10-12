@@ -5,6 +5,8 @@ value — even 0.0 — returns HTTP 400 "Only the default (1) value is supported
 The OpenAI-compatible payload builders must omit the temperature field for these
 models so chat (with a non-default preset) and endpoint probing don't break.
 """
+import asyncio
+
 import httpx
 import pytest
 
@@ -131,3 +133,52 @@ def test_chatgpt_subscription_payload_omits_max_output_tokens_when_zero():
     )
 
     assert "max_output_tokens" not in payload
+
+
+def test_chatgpt_subscription_payload_carries_reasoning_effort_only_when_set():
+    msgs = [{"role": "user", "content": "Say OK"}]
+    payload = llm_core._build_chatgpt_responses_payload("gpt-6.1-sol", msgs, temperature=0.2, max_tokens=0,
+                                                        effort="xhigh")
+    assert payload["reasoning"] == {"effort": "xhigh"}
+    assert "reasoning" not in llm_core._build_chatgpt_responses_payload("gpt-6.1-sol", msgs, temperature=0.2,
+                                                                        max_tokens=0)
+
+
+def test_stream_llm_passes_effort_to_the_chatgpt_payload(monkeypatch):
+    seen = {}
+
+    def fake_payload(model, messages, temperature, max_tokens, *, stream=False, effort=None):
+        seen["effort"] = effort
+        raise RuntimeError("stop before the network")
+
+    monkeypatch.setattr(llm_core, "_build_chatgpt_responses_payload", fake_payload)
+
+    async def go():
+        try:
+            async for _ in llm_core._stream_llm_unmetered(
+                    "https://chatgpt.com/backend-api/codex", "gpt-6.1-sol",
+                    [{"role": "user", "content": "hi"}], effort="high"):
+                pass
+        except RuntimeError:
+            pass
+
+    asyncio.run(go())
+    assert seen["effort"] == "high"
+
+
+def test_stream_llm_passes_effort_to_the_claude_cli(monkeypatch):
+    seen = {}
+
+    async def fake_chat(url, model, messages, *, timeout=None, effort=None, credentials=None):
+        seen["effort"] = effort
+        yield "data: [DONE]\n\n"
+
+    monkeypatch.setattr("src.claude_subscription.stream_chat", fake_chat)
+
+    async def go():
+        return [c async for c in llm_core._stream_llm_unmetered(
+            "https://claude-subscription.invalid/x", "claude-opus-5-5",
+            [{"role": "user", "content": "hi"}], effort="max")]
+
+    asyncio.run(go())
+    assert seen["effort"] == "max"
