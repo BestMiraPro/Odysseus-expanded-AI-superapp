@@ -404,6 +404,12 @@ function injectStyles() {
 .council-card-b h3, .council-card-b h4, .council-final-b h2 { font-size: 1.05em; margin: .7em 0 .35em; }
 .council-final-b h3, .council-final-b h4 { font-size: 1em; }
 .council-card-b table, .council-final-b table { display: block; overflow-x: auto; max-width: 100%; }
+/* Links (sources, citations) as in the main chat. Without this the final
+   answer kept the browser's dark blue, unreadable on dark themes, and cards
+   picked up the global "details a" rule meant for research reports. */
+.council-pane a { color: var(--hl-function, #5b8def); text-decoration: none; font-size: inherit; opacity: 1;
+  word-break: normal; border-bottom: 1px solid color-mix(in srgb, var(--hl-function, #5b8def) 35%, transparent); }
+.council-pane a:hover { color: var(--hl-function, #5b8def); border-bottom-color: var(--hl-function, #5b8def); }
 /* Tool activity: what each member looked up or ran. */
 .council-tools { margin: 6px 10px 0; border: 1px solid var(--border); border-radius: 8px; font-size: 11.5px;
   background: color-mix(in srgb, var(--fg) 3%, transparent); }
