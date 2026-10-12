@@ -243,6 +243,47 @@ def test_usage_and_cost_are_tracked_per_call():
     assert done[0]["cost_usd"] == 0.006
 
 
+def _run_member(stream, member):
+    async def emit(ev):
+        pass
+
+    return asyncio.run(council.run_member(stream, member, [{"role": "user", "content": "q"}],
+                                          stage="opinions", index=0, emit=emit, timeout=30))
+
+
+def test_self_billed_seat_shows_its_tokens_and_cost_but_is_not_billed_again():
+    async def agent_loop_stream(url, model, messages, **kwargs):
+        yield 'data: {"type": "self_billed"}\n\n'
+        yield 'data: {"delta": "answer"}\n\n'
+        yield 'data: {"type": "metrics", "data": {"input_tokens": 2000, "output_tokens": 300}}\n\n'
+        yield "data: [DONE]\n\n"
+
+    paid = _member("paid")
+    paid.input_per_mtok, paid.output_per_mtok = 1.0, 4.0
+    out = _run_member(agent_loop_stream, paid)
+    assert out["usage"] == {"input_tokens": 2000, "output_tokens": 300}
+    assert out["cost_usd"] == 0.0032 and out["self_billed"]
+    assert council.usage_totals({"opinions": [out]})["cost_usd"] == 0.0032
+    # The agent loop already put it in the spend ledger.
+    assert council.billable_calls({"opinions": [{**out, "member": 0}]}, [paid], paid) == []
+
+
+def test_a_refused_tool_call_still_ends_the_working_notes():
+    """A call blocked before it starts sends only tool_output; the text before
+    it is a working note, not part of the answer."""
+    async def stream(url, model, messages, **kwargs):
+        yield 'data: {"delta": "Now let me retry the blocked tool:"}\n\n'
+        yield ('data: {"type": "tool_output", "tool": "web_fetch", "command": "example.com", '
+               '"output": "Blocked by policy", "exit_code": 1}\n\n')
+        yield 'data: {"delta": "Final answer."}\n\n'
+        yield "data: [DONE]\n\n"
+
+    out = _run_member(stream, _member("m"))
+    assert out["text"] == "Final answer."
+    assert out["tools"][0] == {"kind": "note", "text": "Now let me retry the blocked tool:"}
+    assert out["tools"][1]["tool"] == "web_fetch" and out["tools"][1]["status"] == "error"
+
+
 def test_cached_prompt_tokens_are_priced_at_cache_rates():
     m = _member("paid")
     m.input_per_mtok, m.output_per_mtok = 10.0, 50.0

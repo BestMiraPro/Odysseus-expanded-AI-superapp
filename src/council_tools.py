@@ -26,6 +26,7 @@ Every engine yields Odysseus SSE chunks, including ``tool_start`` /
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -60,6 +61,12 @@ AGENT_RESEARCH_TOOLS = frozenset({
 AGENT_FULL_TOOLS = AGENT_RESEARCH_TOOLS | {"bash", "python", "write_file", "edit_file", "apply_patch"}
 
 AGENT_MAX_ROUNDS = 12
+
+# Codex features a council seat must not have: the user's ChatGPT connectors
+# (Gmail, Slack, Drive, ...), plugins, goals, image generation, browser and
+# computer use, sub-agents. Seats stay on the council's own tools.
+CODEX_FEATURES_OFF = ("apps", "plugins", "remote_plugin", "goals", "image_generation", "browser_use",
+                      "browser_use_external", "computer_use", "multi_agent", "tool_suggest")
 
 
 @dataclass
@@ -103,7 +110,12 @@ def tools_brief(settings: ToolSettings, stage: str) -> str:
         lines.append("- Running shell commands and Python, and editing files"
                      + (" in the workspace." if settings.workspace else "."))
     if stage == "review":
-        lines.append("As a reviewer, use the tools to check claims you doubt instead of guessing.")
+        lines.append("As a reviewer, use a few tool calls to check claims you doubt instead of guessing, "
+                     "then write the review itself: every answer, ending with the FINAL RANKING.")
+    if stage in ("review", "synthesis"):
+        lines.append("Each member answered in its own separate session, and the engines behind the seats "
+                     "differ, so their tools and results can differ from yours. Don't mark an answer wrong "
+                     "only because your own tools or results differ; say what you could and couldn't verify.")
     lines.append("Finish with your complete answer as plain text after the last tool call; "
                  "text written before a tool call is treated as working notes.")
     return "\n".join(lines)
@@ -141,6 +153,10 @@ def claude_native_tools(settings: ToolSettings):
     from src.claude_subscription import NativeTools
 
     builtin = list(CLAUDE_FULL_TOOLS if settings.full else CLAUDE_RESEARCH_TOOLS)
+    if not settings.full and not settings.workspace:
+        # Research without a workspace has no files to read; without this the
+        # seat could read anything on the host (the API seats get no file tools).
+        builtin = [t for t in builtin if t not in ("Read", "Glob", "Grep")]
     allowed = builtin + [f"mcp__{MCP_NAME}__{t}" for t in MCP_TOOLS]
     config = json.dumps({"mcpServers": {MCP_NAME: mcp_server_spec(settings.owner)}})
     return NativeTools(builtin=builtin, allowed=allowed, mcp_config=config, cwd=settings.workspace)
@@ -173,6 +189,11 @@ async def _codex_stream(url, model, messages, headers, settings: ToolSettings, t
     effort, headers = reasoning_effort.resolve("chatgpt-subscription", url, model, headers)
     system, prompt = build_prompt(messages)
     full_prompt = f"{system}\n\n{prompt}" if system else prompt
+    features_off = list(CODEX_FEATURES_OFF)
+    if not settings.full and not await asyncio.to_thread(codex_cli.sandbox_works):
+        # Research runs shell commands in Codex's read-only sandbox, which
+        # cannot start here (e.g. inside Docker): every command would fail.
+        features_off.append("shell_tool")
     run = codex_cli.CodexRun(
         model=model,
         prompt=full_prompt,
@@ -181,6 +202,7 @@ async def _codex_stream(url, model, messages, headers, settings: ToolSettings, t
         cwd=settings.workspace,
         effort=effort,
         mcp_servers={MCP_NAME: mcp_server_spec(settings.owner)},
+        extra_config=[f"features.{name}=false" for name in features_off],
     )
     async for chunk in codex_cli.stream(run, timeout=timeout):
         yield chunk
@@ -196,11 +218,10 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
         allowed -= {"read_file", "grep", "glob", "ls", "get_workspace", "write_file", "edit_file", "apply_patch"}
     blocked = frozenset(known_tool_names() - allowed)
     policy = ToolPolicy(disabled_tools=blocked, mode="council", disable_mcp=True)
-    # Nobody can answer an approval card mid-council. Full tools are the
-    # admin's go-ahead for the whole run, as for the Claude Code and Codex
-    # seats; in research mode a call the external-context gate holds back is
-    # refused and the member carries on.
-    gated = "allow" if settings.full else "refuse"
+    # Nobody can answer an approval card mid-council. The council's tool level
+    # is the user's go-ahead for the whole run, as for the Claude Code and
+    # Codex seats; the policy above already limits research to research tools.
+    gated = "allow"
     # Shell and Python start in the workspace, else in a scratch folder of
     # their own rather than the app's data folder.
     scratch = None if settings.workspace or not settings.full else tempfile.mkdtemp(prefix="ody-council-")
@@ -213,6 +234,9 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
             messages=messages,
             headers=headers,
             max_rounds=AGENT_MAX_ROUNDS,
+            # No output cap, as for the tool-less seats: a reasoning model
+            # would otherwise spend 4096 tokens thinking and never answer.
+            max_tokens=0,
             owner=settings.owner,
             relevant_tools=allowed,
             tool_policy=policy,

@@ -574,6 +574,21 @@ async def run_member(
                     step = next((st for st in reversed(steps) if st.get("kind") == "tool"
                                  and st.get("status") == "running"
                                  and (payload.get("id") is None or st.get("id") == payload.get("id"))), None)
+                    if step is None:
+                        # A call refused before it started (blocked by policy)
+                        # has no tool_start: it still ends the working notes.
+                        note = "".join(parts).strip()
+                        parts.clear()
+                        if sink is not None:
+                            sink["text"] = ""
+                        if len(steps) < MAX_TOOL_STEPS:
+                            if note:
+                                steps.append({"kind": "note", "text": _clip(note, 4000)})
+                            step = {"kind": "tool", "tool": str(payload.get("tool") or "tool")[:60],
+                                    "command": _command_text(str(payload.get("tool") or ""),
+                                                             payload.get("command"))[:300],
+                                    "id": payload.get("id")}
+                            steps.append(step)
                     if step is not None:
                         step.update({"status": "done" if ok else "error",
                                      "output": output[:TOOL_OUTPUT_CHARS]})
@@ -591,6 +606,17 @@ async def run_member(
                         for key in ("cache_read_input_tokens", "cache_creation_input_tokens"):
                             if int(data.get(key) or 0) > 0:
                                 usage[key] = int(data[key])
+                    except (TypeError, ValueError):
+                        usage = None
+                    continue
+                if ptype == "metrics" and isinstance(payload.get("data"), dict) and usage is None:
+                    # The agent loop reports a run's tokens (all rounds) only
+                    # in its closing metrics.
+                    data = payload["data"]
+                    try:
+                        if data.get("input_tokens") or data.get("output_tokens"):
+                            usage = {"input_tokens": int(data.get("input_tokens") or 0),
+                                     "output_tokens": int(data.get("output_tokens") or 0)}
                     except (TypeError, ValueError):
                         usage = None
                     continue
@@ -638,9 +664,9 @@ async def run_member(
     if steps:
         outcome["tools"] = steps
     if self_billed:
-        # The engine (Odysseus agent loop) already billed every model call.
+        # The engine (Odysseus agent loop) already billed every model call:
+        # billable_calls skips this one, and cost_usd is only shown.
         outcome["self_billed"] = True
-        outcome["cost_usd"] = None
     if thinking_chars:
         outcome["thinking_chars"] = thinking_chars
     if sink is not None:

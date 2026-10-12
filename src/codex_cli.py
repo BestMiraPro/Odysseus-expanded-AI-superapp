@@ -68,6 +68,31 @@ def find_cli() -> Optional[str]:
     return shutil.which("codex")
 
 
+_sandbox_ok: Optional[bool] = None
+
+
+def sandbox_works() -> bool:
+    """Whether Codex's own sandbox can start here (checked once per process).
+
+    On Linux it needs unprivileged user namespaces, which Docker's default
+    seccomp profile denies, so inside the Odysseus container every sandboxed
+    shell command fails with a bwrap error.
+    """
+    global _sandbox_ok
+    if _sandbox_ok is None:
+        cli = find_cli()
+        home = tempfile.mkdtemp(prefix="ody-codex-probe-")
+        try:
+            proc = subprocess.run([cli, "sandbox", "--", "true"], capture_output=True, timeout=30,
+                                  env=_env(home)) if cli else None
+            _sandbox_ok = bool(proc and proc.returncode == 0)
+        except Exception:
+            _sandbox_ok = False
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+    return _sandbox_ok
+
+
 def _jwt_claims(token: str) -> Dict[str, Any]:
     try:
         payload = token.split(".")[1]
@@ -164,7 +189,9 @@ def _summary(item: Dict[str, Any]) -> tuple:
             desc = str(args)
         return str(item.get("tool") or "mcp"), desc[:300]
     if kind == "web_search":
-        return "web_search", str(item.get("query") or "")[:300]
+        action = item.get("action") if isinstance(item.get("action"), dict) else {}
+        query = item.get("query") or action.get("query") or action.get("url") or ""
+        return "web_search", str(query)[:300]
     if kind == "file_change":
         paths = [str(c.get("path")) for c in item.get("changes") or [] if isinstance(c, dict)]
         return "edit", ", ".join(paths)[:300]
@@ -198,6 +225,10 @@ def _tool_output(item: Dict[str, Any]) -> tuple:
         lines = [("[x] " if t.get("completed") else "[ ] ") + str(t.get("text") or "")
                  for t in item.get("items") or [] if isinstance(t, dict)]
         return "\n".join(lines)[:_OUTPUT_PREVIEW], 0
+    if kind == "web_search":
+        lines = [f"{r.get('title') or r.get('domain') or ''} - {r.get('url')}".strip(" -")
+                 for r in item.get("results") or [] if isinstance(r, dict) and r.get("url")]
+        return "\n".join(lines)[:_OUTPUT_PREVIEW], int(failed)
     return "", int(failed)
 
 
@@ -222,6 +253,9 @@ class EventTranslator:
         itype = item.get("type")
         out: List[str] = []
         if kind == "item.started" and itype in _TOOL_ITEMS:
+            if itype == "web_search" and not _summary(item)[1]:
+                # The query only arrives with item.completed; start it then.
+                return out
             self._started.add(item.get("id"))
             name, desc = _summary(item)
             out.append(_sse({"type": "tool_start", "tool": name, "command": desc, "id": item.get("id")}))

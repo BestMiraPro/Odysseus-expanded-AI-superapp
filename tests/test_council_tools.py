@@ -42,7 +42,8 @@ def test_claude_seat_runs_claude_code_with_native_tools(monkeypatch):
     _collect(fn("https://x.claude-subscription.invalid", "claude-opus-5-5",
                 [{"role": "system", "content": "SYS"}, {"role": "user", "content": "q"}], stage="review"))
     tools = seen["tools"]
-    assert tools.builtin == council_tools.CLAUDE_RESEARCH_TOOLS
+    # No workspace: research tools without the file readers.
+    assert tools.builtin == [t for t in council_tools.CLAUDE_RESEARCH_TOOLS if t not in ("Read", "Glob", "Grep")]
     assert "Bash" not in tools.allowed
     assert "mcp__odysseus__search_history" in tools.allowed
     cfg = json.loads(tools.mcp_config)["mcpServers"]["odysseus"]
@@ -104,9 +105,12 @@ def test_api_seat_runs_agent_loop_limited_to_council_tools(monkeypatch):
     policy = seen["tool_policy"]
     assert policy.disable_mcp and policy.blocks("bash") and policy.blocks("send_email")
     assert not policy.blocks("web_search")
-    # Nobody can approve mid-council: research mode refuses gated calls and goes on.
-    assert seen["gated_actions"] == "refuse"
+    # Nobody can approve mid-council: the tool level is the go-ahead, and the
+    # policy keeps research to research tools.
+    assert seen["gated_actions"] == "allow"
     assert seen["workspace"] is None
+    # No output cap, so a reasoning model can still answer after thinking.
+    assert seen["max_tokens"] == 0
 
 
 def test_full_api_seat_runs_tools_in_a_scratch_folder(monkeypatch):
@@ -228,6 +232,61 @@ def test_codex_translator_maps_items():
     assert events[5]["output"] == "a.txt\n" and events[5]["exit_code"] == 0
     assert events[6]["tool"] == "search_history" and events[7]["output"] == "Farm plan"
     assert events[9]["data"] == {"input_tokens": 100, "output_tokens": 25}
+
+
+def test_codex_web_search_waits_for_its_query_and_lists_results():
+    """Codex 0.16x starts a web search with an empty query and fills it in on
+    completion (shape captured from a real run)."""
+    tr = codex_cli.EventTranslator()
+    out = tr.feed({"type": "item.started", "item": {"id": "exec-1", "type": "web_search", "query": "",
+                                                    "action": {"type": "other"}}})
+    assert out == []
+    out = tr.feed({"type": "item.completed", "item": {
+        "id": "exec-1", "type": "web_search", "query": "IANA example domains",
+        "action": {"type": "search", "query": "IANA example domains"},
+        "results": [{"type": "text_result", "domain": "www.iana.org", "title": "Example Domains",
+                     "url": "https://www.iana.org/help/example-domains", "snippet": "..."}]}})
+    start, done = (json.loads(c[6:]) for c in out)
+    assert start == {"type": "tool_start", "tool": "web_search", "command": "IANA example domains", "id": "exec-1"}
+    assert done["output"] == "Example Domains - https://www.iana.org/help/example-domains"
+
+
+def test_codex_seat_runs_without_connectors_and_without_a_broken_sandbox(monkeypatch):
+    seen = []
+
+    async def fake_stream(run, *, timeout=None):
+        seen.append(run)
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setattr(codex_cli, "stream", fake_stream)
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: "chatgpt-subscription")
+    for mode, sandbox_ok in (("research", False), ("research", True), ("full", False)):
+        monkeypatch.setattr(codex_cli, "sandbox_works", lambda ok=sandbox_ok: ok)
+        _collect(council_tools.stream_fn_for(_settings(mode))(
+            "https://chatgpt.com/backend-api/codex", "gpt-6-luna", [{"role": "user", "content": "q"}],
+            headers={"Authorization": "Bearer t"}))
+    research_docker, research_host, full = seen
+    for run in seen:
+        # The user's ChatGPT connectors (Gmail, Slack, ...) never sit on the council.
+        assert {"features.apps=false", "features.plugins=false"} <= set(run.extra_config)
+    # Research shells run in Codex's own sandbox: off where it cannot start.
+    assert "features.shell_tool=false" in research_docker.extra_config
+    assert "features.shell_tool=false" not in research_host.extra_config
+    assert "features.shell_tool=false" not in full.extra_config and full.sandbox == codex_cli.SANDBOX_FULL
+
+
+def test_claude_research_without_workspace_reads_no_files(tmp_path):
+    bare = council_tools.claude_native_tools(_settings("research"))
+    assert not {"Read", "Glob", "Grep"} & set(bare.builtin) and "WebFetch" in bare.builtin
+    with_ws = council_tools.claude_native_tools(_settings("research", str(tmp_path)))
+    assert {"Read", "Glob", "Grep"} <= set(with_ws.builtin)
+
+
+def test_review_and_synthesis_briefs_allow_for_different_tools():
+    review = council_tools.tools_brief(_settings(), "review")
+    assert "FINAL RANKING" in review and "own separate session" in review
+    assert "own separate session" in council_tools.tools_brief(_settings(), "synthesis")
+    assert "own separate session" not in council_tools.tools_brief(_settings(), "opinions")
 
 
 def test_codex_translator_reports_failures():
