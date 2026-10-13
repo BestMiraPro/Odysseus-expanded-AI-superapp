@@ -405,3 +405,142 @@ def test_council_memory_follows_the_toggle_and_the_memory_switch(client, db, mon
         assert ("SHARED PROFILE of alice" in system) is expect
         assert ("User trains strength three times a week." in system) is expect
     assert client.get(f"/api/council/sessions/{sid}").json()["config"]["memory"] is memory
+
+
+def _routes():
+    router = cr.setup_council_routes()
+    return SimpleNamespace(
+        create=_handler(router, "POST", "/api/council/sessions"),
+        ask=_handler(router, "POST", "/api/council/sessions/{session_id}/ask"),
+        stop=_handler(router, "POST", "/api/council/sessions/{session_id}/turns/{turn_id}/stop"),
+        get=_handler(router, "GET", "/api/council/sessions/{session_id}"),
+        note=_handler(router, "POST", "/api/council/sessions/{session_id}/turns/{turn_id}/notes"),
+        finish=_handler(router, "POST", "/api/council/sessions/{session_id}/turns/{turn_id}/finish"),
+    )
+
+
+def test_a_stopped_turn_reaches_the_next_question(db, monkeypatch):
+    seen = []
+    first_turn = {"on": True}
+
+    async def chair_hangs(url, model, messages, **kwargs):
+        seen.append("\n".join(m["content"] for m in messages))
+        if messages[0]["content"] == cr.council.CHAIR_SYSTEM and first_turn["on"]:
+            await asyncio.Event().wait()           # the first turn is stopped here
+        async for chunk in _fake_stream(url, model, messages, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", chair_hangs)
+    r = _routes()
+    request = _request()
+
+    async def scenario():
+        sid = r.create(request, cr.SessionCreate())["id"]
+        resp = await r.ask(sid, request, cr.AskRequest(question="Name three rivers", **SEATS))
+        turn_id = None
+        async for raw in resp.body_iterator:
+            ev = json.loads(raw[5:])
+            turn_id = ev.get("turn_id", turn_id)
+            if ev["type"] == "stage" and ev["stage"] == "synthesis" and ev["status"] == "start":
+                await r.stop(sid, turn_id, request)
+            if ev["type"] == "done":
+                break
+        seen.clear()
+        first_turn["on"] = False
+        resp = await r.ask(sid, request, cr.AskRequest(question="Go on", **{**SEATS, "mode": "quick"}))
+        async for raw in resp.body_iterator:
+            if json.loads(raw[5:])["type"] == "done":
+                break
+        return sid
+
+    sid = asyncio.run(scenario())
+    first, second = r.get(sid, request)["turns"]
+    assert first["status"] == "cancelled" and second["status"] == "done"
+    # Every member of the next turn saw the stopped round and its answers.
+    assert seen and all("Name three rivers" in prompt and "deepseek-v4 thinks 42" in prompt
+                        and "stopped before the chairman wrote" in prompt for prompt in seen)
+
+
+def test_notes_and_finish_steer_a_running_council(db, monkeypatch):
+    release = asyncio.Event()
+    prompts = []
+
+    async def slow_local(url, model, messages, **kwargs):
+        prompts.append((messages[0]["content"], messages[-1]["content"]))
+        if model == "qwen3:8b" and messages[0]["content"] == cr.council.OPINION_SYSTEM:
+            yield 'data: {"delta": "qwen started"}\n\n'
+            await release.wait()                  # never set: the slow seat
+        async for chunk in _fake_stream(url, model, messages, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", slow_local)
+    r = _routes()
+    request = _request()
+
+    async def scenario():
+        sid = r.create(request, cr.SessionCreate())["id"]
+        resp = await r.ask(sid, request, cr.AskRequest(question="What is 6x7?", **SEATS))
+        turn_id, events, noted = None, [], False
+        async for raw in resp.body_iterator:
+            ev = json.loads(raw[5:])
+            events.append(ev)
+            turn_id = ev.get("turn_id", turn_id)
+            if ev["type"] == "member_done" and ev["stage"] == "opinions" and not noted:
+                noted = True
+                out = await r.note(sid, turn_id, request, cr.NoteRequest(text="show the working"))
+                assert out["note"]["text"] == "show the working" and out["stage"] == "opinions"
+                assert await r.finish(sid, turn_id, request) == {"finishing": True, "stage": "opinions"}
+            if ev["type"] == "done":
+                break
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as late:
+            await r.note(sid, turn_id, request, cr.NoteRequest(text="too late"))
+        assert late.value.status_code == 409
+        with pytest.raises(HTTPException) as late_finish:
+            await r.finish(sid, turn_id, request)
+        assert late_finish.value.status_code == 409
+        return sid, events
+
+    sid, events = asyncio.run(scenario())
+    kinds = [e["type"] for e in events]
+    assert "note" in kinds and "finishing" in kinds
+    assert not any(e["type"] == "stage" and e["stage"] == "review" for e in events)
+    (turn,) = r.get(sid, request)["turns"]
+    assert turn["status"] == "done" and turn["final"] == "the council says 42"
+    (note,) = turn["notes"]
+    assert note["text"] == "show the working" and {"stage": "synthesis"} in note["delivered"]
+    qwen = turn["opinions"][1]
+    assert qwen["cut_short"] and qwen["text"] == "qwen started"
+    chair_prompt = next(user for system, user in prompts if system == cr.council.CHAIR_SYSTEM)
+    assert "show the working" in chair_prompt and "qwen started" in chair_prompt
+    assert not cr._LIVE and not cr._RUNNING
+
+
+def test_notes_are_owner_scoped(db, monkeypatch):
+    from fastapi import HTTPException
+
+    async def hang(url, model, messages, **kwargs):
+        await asyncio.Event().wait()
+        yield ""
+
+    monkeypatch.setattr("src.llm_core.stream_llm", hang)
+    r = _routes()
+    alice, bob = _request("alice"), _request("bob")
+
+    async def scenario():
+        sid = r.create(alice, cr.SessionCreate())["id"]
+        resp = await r.ask(sid, alice, cr.AskRequest(question="q", **SEATS))
+        turn_id = None
+        async for raw in resp.body_iterator:
+            turn_id = json.loads(raw[5:])["turn_id"]
+            break
+        with pytest.raises(HTTPException) as exc:
+            await r.note(sid, turn_id, bob, cr.NoteRequest(text="hijack"))
+        assert exc.value.status_code == 404
+        await r.stop(sid, turn_id, alice)
+        async for raw in resp.body_iterator:
+            if json.loads(raw[5:])["type"] == "done":
+                break
+
+    asyncio.run(scenario())

@@ -12,7 +12,7 @@ import json
 import re
 import time
 import logging
-from typing import Any, AsyncGenerator, List, Dict, Optional, Set
+from typing import Any, AsyncGenerator, Callable, List, Dict, Optional, Set
 from urllib.parse import urlparse
 
 from src.llm_core import (
@@ -2936,6 +2936,7 @@ async def _stream_agent_loop_body(
     _is_teacher_run: bool = False,
     history_session=None,
     defer_context_shaping: bool = False,
+    interjections: Optional[Callable[[], List[str]]] = None,
     _billing: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[str, None]:
     """Streaming agent loop generator.
@@ -2953,6 +2954,10 @@ async def _stream_agent_loop_body(
     ``"refuse"`` it and let the run carry on (nobody can answer, e.g. a Council
     seat), or ``"allow"`` it because the caller already holds the user's
     authorization for this run's tools.
+
+    ``interjections`` (optional) is called before each model request and
+    returns messages the user sent while the run was working (a Council
+    seat's notes); each joins the conversation as a user message.
     """
 
     run_security = ToolRunSecurityContext(
@@ -4301,6 +4306,15 @@ async def _stream_agent_loop_body(
         round_response = ""
         round_reasoning = ""  # reasoning_content deltas (DeepSeek-thinking, vLLM --reasoning-parser)
         native_tool_calls = []  # populated if model uses function calling
+
+        if interjections is not None:
+            try:
+                _notes = interjections() or []
+            except Exception as exc:
+                logger.debug("[agent] interjections failed: %s", exc)
+                _notes = []
+            for _note in _notes:
+                messages.append({"role": "user", "content": str(_note)})
 
         # Monthly budget cap: earlier rounds of this turn are already on the
         # ledger, so a long metered turn stops once it crosses the cap.

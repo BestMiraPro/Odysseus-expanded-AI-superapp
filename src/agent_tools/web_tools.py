@@ -38,6 +38,11 @@ class WebSearchTool:
                 time_filter = "month"
             elif " news" in q_lc or q_lc.startswith("news ") or q_lc.endswith(" news"):
                 time_filter = "week"
+        from src import council_web
+        seat_web = council_web.current()
+        if seat_web is not None:
+            # A Council seat: fast snippet search shared by the turn's seats.
+            return await seat_web.search(query, time_filter)
         loop = asyncio.get_running_loop()
         if progress_cb:
             await progress_cb({
@@ -109,6 +114,15 @@ class WebFetchTool:
             return {"error": f"web_fetch: unsupported URL scheme (only http/https): {url[:80]}", "exit_code": 1}
         if not low.startswith(("http://", "https://")):
             url = "https://" + url
+        from src import council_web
+        seat_web = council_web.current()
+        output_cap = MAX_OUTPUT_CHARS
+        if seat_web is not None:
+            # A Council seat opens only pages a search returned or the user wrote.
+            refusal = seat_web.fetch_refusal(url)
+            if refusal:
+                return refusal
+            output_cap = council_web.FETCH_CHARS
         loop = asyncio.get_running_loop()
         try:
             def _fetch():
@@ -166,6 +180,6 @@ class WebFetchTool:
             title = title[:300] + "..."
         header = (f"# {title}\n" if title else "") + f"Source: {url}\n\n"
         output = size_note + header + text
-        if len(output) > MAX_OUTPUT_CHARS:
-            output = output[:MAX_OUTPUT_CHARS] + "\n\n[...truncated]"
+        if len(output) > output_cap:
+            output = output[:output_cap] + "\n\n[...truncated]"
         return {"output": output, "exit_code": 0}

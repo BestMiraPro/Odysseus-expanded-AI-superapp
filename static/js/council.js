@@ -400,6 +400,20 @@ function injectStyles() {
 .council-q-wrap { align-self: flex-end; max-width: 80%; display: flex; flex-direction: column; align-items: flex-end; }
 .council-q-wrap .council-q { max-width: 100%; align-self: stretch; }
 .council-q-wrap .council-more { align-self: flex-end; margin: 2px 4px 0; }
+/* Notes sent while the council worked, under the question they steer. */
+.council-notes { align-self: flex-end; max-width: 80%; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.council-note { max-width: 100%; box-sizing: border-box; padding: 6px 11px; border-radius: 12px 12px 3px 12px; font-size: 13px;
+  line-height: 1.45; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: color-mix(in srgb, var(--accent, var(--red, #888)) 10%, transparent);
+  border: 1px dashed color-mix(in srgb, var(--accent, var(--red, #888)) 45%, transparent); }
+.council-note-meta { font-size: 10.5px; opacity: .6; margin: 0 4px 4px; text-align: right; }
+.council-note-meta.late { opacity: .9; color: var(--danger, #e05252); }
+.council-note-meta button { background: none; border: none; padding: 0 0 0 6px; cursor: pointer; font: inherit;
+  color: var(--accent, var(--red, #888)); }
+.council-card-h .noted { font-size: 10px; padding: 1px 6px; border-radius: 999px; white-space: nowrap;
+  background: color-mix(in srgb, var(--accent, var(--red, #888)) 16%, transparent); }
+.council-cut { font-size: 11.5px; opacity: .65; margin-top: 6px; font-style: italic; }
+.council-composer.steering textarea { border-color: color-mix(in srgb, var(--accent, var(--red, #888)) 55%, var(--border)); }
 .council-card-b h1, .council-card-b h2, .council-final-b h1 { font-size: 1.15em; margin: .8em 0 .4em; }
 .council-card-b h3, .council-card-b h4, .council-final-b h2 { font-size: 1.05em; margin: .7em 0 .35em; }
 .council-final-b h3, .council-final-b h4 { font-size: 1em; }
@@ -557,12 +571,12 @@ export function openPanel() {
     const open = _pane.classList.toggle('side-open');
     e.currentTarget.setAttribute('aria-expanded', String(open));
   });
-  _pane.querySelector('#council-send').addEventListener('click', () => convene());
+  _pane.querySelector('#council-send').addEventListener('click', () => submit());
   const input = _pane.querySelector('#council-input');
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
-      if (!$('#council-send')?.disabled) convene();
+      if (!$('#council-send')?.disabled) submit();
     }
   });
   input.addEventListener('input', () => {
@@ -1032,17 +1046,51 @@ function applyPickerFilter(text) {
   });
 }
 
+// The turn being deliberated in the open thread, once the server knows it
+// (null before its first event, or when nothing runs here).
+function runningTurn() {
+  if (S.live && S.live.sessionId === S.session?.id) {
+    return String(S.live.id).startsWith('live-') ? null : S.live;
+  }
+  return (S.session?.turns || []).find(t => t.status === 'running') || null;
+}
+
 function renderComposer() {
   const btn = $('#council-send');
   const input = $('#council-input');
   const hint = $('#council-hint');
   if (!btn) return;
-  const running = !!S.live || (S.session?.turns || []).some(t => t.status === 'running');
+  const here = (S.live && S.live.sessionId === S.session?.id) || (S.session?.turns || []).some(t => t.status === 'running');
+  const running = !!S.live || here;
   const ready = S.members.length > 0 && chairmanSeat() && S.members.every(m => seatInfo(m).available)
     && seatInfo(chairmanSeat()).available;
+  $('#council-composer')?.classList.toggle('steering', here);
+  if (input) {
+    input.disabled = false;
+    input.placeholder = here ? 'Steer the council: a correction, a constraint, what to focus on…' : 'Ask the council…';
+  }
+  if (here) {
+    // Like Claude Code: type while it works, and the note joins the run.
+    const turn = runningTurn();
+    btn.disabled = !turn;
+    btn.textContent = turn ? 'Send note' : 'Starting…';
+    btn.title = 'Add this to the question while the council works';
+    if (hint) {
+      const tools = turn?.config?.tools || S.tools;
+      hint.textContent = tools && tools !== 'off'
+        ? 'Deliberating · Enter sends a note: API and local seats read it before their next step, '
+          + 'Claude and ChatGPT seats at the next stage · Finish now or Stop above'
+        : 'Deliberating · Enter sends a note: the next stage reads it (with tools on, API and local '
+          + 'seats also read it mid-answer) · Finish now or Stop above';
+    }
+    // A note costs no new turn: the estimate is for a question, so hide it.
+    const est = $('#council-estimate');
+    if (est) { est.hidden = true; est.textContent = ''; }
+    return;
+  }
   btn.disabled = running || !ready;
   btn.textContent = running ? 'Deliberating…' : 'Convene';
-  if (input) input.disabled = false;
+  btn.title = '';
   if (hint) {
     hint.textContent = !S.members.length ? 'Seat at least one member first.'
       : !ready ? 'A seat points at a model that is no longer available — remove or replace it.'
@@ -1116,6 +1164,7 @@ function estimateTitle(est) {
 function renderEstimate() {
   const el = $('#council-estimate');
   if (!el) return;
+  if ($('#council-composer')?.classList.contains('steering')) { el.hidden = true; return; }
   const est = S.estimate?.estimate;
   const b = S.estimate?.budget || {};
   if (!est) { el.hidden = true; el.textContent = ''; return; }
@@ -1194,6 +1243,7 @@ function usageText(entry, seat) {
 
 function cardState(entry, seat) {
   const text = entry?.text || '';
+  if (entry?.cut_short) return 'cut short';
   if (entry?.error) return 'error';
   if (entry?.streaming) {
     const running = (entry.tools || []).find(st => st.kind === 'tool' && st.status === 'running');
@@ -1209,11 +1259,20 @@ function cardBody(key, entry) {
   if (entry?.streaming) {
     return `<div class="council-card-b streaming ${!text ? 'pending' : ''}">${md(text)}</div>`;
   }
+  if (entry?.cut_short) {
+    // Finish now: what the member had written still went to the chairman.
+    return `<div ${clampAttrs(key).replace('class="', 'class="council-card-b ')}>${md(text)}<div class="council-cut">${text ? 'Cut short by Finish now; the chairman saw this much.' : 'Cut short by Finish now before it wrote anything.'}</div></div>${moreButton(key)}`;
+  }
   return `<div ${clampAttrs(key).replace('class="', 'class="council-card-b ' + (!text && !err ? 'pending ' : ''))}>${err ? `<div class="council-errtext">${esc(err)}</div>` : md(text)}</div>${moreButton(key)}`;
 }
 
+function notedTag(entry) {
+  const n = (entry?.notes || []).length;
+  return n ? `<span class="noted" title="Read ${n === 1 ? 'your note' : `${n} of your notes`} mid-answer">+ ${n === 1 ? 'note' : `${n} notes`}</span>` : '';
+}
+
 function memberCard(stage, seat, idx, entry, label, turnId = '') {
-  const err = entry?.error;
+  const err = entry?.error && !entry?.cut_short;
   const key = `${turnId}:${stage}:${idx}`;
   const state = cardState(entry, seat);
   return `<div class="council-card ${err ? 'err' : ''}" data-stage="${stage}" data-member="${idx}">
@@ -1221,6 +1280,7 @@ function memberCard(stage, seat, idx, entry, label, turnId = '') {
       ${label ? `<span class="label" title="Anonymous label used in peer review">${esc(label)}</span>` : ''}
       ${logoFor(seat?.model)}<span class="name">${esc(seat?.model || '?')}</span>
       <span class="ep">${esc(seat?.endpoint_name || '')}${seat?.effort ? ` · ${esc(effortLabel(seat.effort))} effort` : ''}</span>
+      <span class="noted-slot">${notedTag(entry)}</span>
       <span class="state">${esc(state)}</span>
     </div>
     <div class="council-card-t">${toolsBlock(entry?.tools, key, !!entry?.streaming)}</div>
@@ -1243,8 +1303,12 @@ function turnMarkdown(turn) {
   const memberLabel = {};
   for (const [label, idx] of Object.entries(turn.labels || {})) memberLabel[idx] = label;
   const name = (i) => { const s = seats.members[i] || {}; return `${s.model || '?'}${s.endpoint_name ? ` (${s.endpoint_name})` : ''}`; };
-  const out = [`# ${turn.question}`, '', `*AI Council · ${seats.mode} mode · chairman ${seats.chairman?.model || '?'}*`, '',
-    '## Council answer', '', turn.final || '_No answer_', '', '## Opinions', ''];
+  const out = [`# ${turn.question}`, '', `*AI Council · ${seats.mode} mode · chairman ${seats.chairman?.model || '?'}*`, ''];
+  if ((turn.notes || []).length) {
+    out.push('## Notes sent while the council worked', '',
+      ...turn.notes.map(n => `- ${n.text.replace(/\n/g, ' ')} *(${noteMeta(n, turn).text})*`), '');
+  }
+  out.push('## Council answer', '', turn.final || '_No answer_', '', '## Opinions', '');
   // Response A, B, C… in order; seats that failed (no label) go last.
   const opinions = [...(turn.opinions || [])].sort((x, y) =>
     (memberLabel[x.member] || '~').localeCompare(memberLabel[y.member] || '~'));
@@ -1295,6 +1359,38 @@ function rankingSummary(ranking, seats) {
     return seats.members.length === 2 ? 'tie (two members cannot separate)' : 'tie at the top';
   }
   return `top: Response ${esc(ranking[0].label)} (${esc(seats.members[ranking[0].member]?.model || '?')})`;
+}
+
+const NOTE_STAGE = { opinions: 'opinions', review: 'peer review', synthesis: 'synthesis' };
+const NOTE_PROMPT = { review: 'peer review', synthesis: 'chairman' };
+
+// Where a note was read: members that took it mid-answer, stages whose prompt carried it.
+function noteMeta(note, turn) {
+  const seats = seatsOfTurn(turn);
+  const delivered = note.delivered || [];
+  const who = (m) => (m === 'chair' ? `${seats.chairman?.model || 'chairman'} (chairman)` : (seats.members[m]?.model || `member ${Number(m) + 1}`));
+  const mid = [...new Set(delivered.filter(d => d.member != null).map(d => who(d.member)))];
+  const prompts = [...new Set(delivered.filter(d => d.member == null && NOTE_PROMPT[d.stage]).map(d => NOTE_PROMPT[d.stage]))];
+  const parts = [`during ${NOTE_STAGE[note.stage] || note.stage}`];
+  if (mid.length) parts.push(`read mid-answer by ${mid.join(', ')}`);
+  if (prompts.length) parts.push(`given to the ${prompts.join(' and ')}`);
+  if (mid.length || prompts.length) return { text: parts.join(' · '), late: false };
+  if (turn.status === 'running') return { text: `${parts[0]} · goes to the next step`, late: false };
+  return { text: `${parts[0]} · arrived after the chairman started, so this answer doesn't use it`, late: true };
+}
+
+function notesBlock(turn) {
+  const notes = turn.notes || [];
+  if (!notes.length) return '';
+  return `<div class="council-notes" data-notes>${notes.map(n => {
+    const meta = noteMeta(n, turn);
+    const again = meta.late ? `<button data-reask="${esc(turn.id)}::${esc(n.id)}" title="Put this note in the box as your next question">Ask it next</button>` : '';
+    return `<div class="council-note">${esc(n.text)}</div><div class="council-note-meta ${meta.late ? 'late' : ''}">${esc(meta.text)}${again}</div>`;
+  }).join('')}</div>`;
+}
+
+function finishedEarly(turn) {
+  return !!turn.finishing || [...(turn.opinions || []), ...(turn.reviews || [])].some(e => e?.cut_short);
 }
 
 function renderTurn(turn, live = false) {
@@ -1359,11 +1455,15 @@ function renderTurn(turn, live = false) {
     ? `<span class="council-usage" title="${esc((TOOL_MODES.find(([id]) => id === toolsMode) || [])[2] || '')}${turn.config?.workspace ? ` Workspace: ${turn.config.workspace}` : ''}">tools: ${esc(toolsMode)}</span>` : '';
   return `<article class="council-turn" data-turn="${esc(turn.id)}">
     <div class="council-q-wrap"><div ${clampAttrs(qKey).replace('class="', 'class="council-q ')}>${esc(turn.question)}</div>${moreButton(qKey)}</div>
+    ${notesBlock(turn)}
     <div class="council-strip">${strip}
       <span class="status ${statusErr ? 'err' : ''}">${esc(status)}</span>
       ${toolsNote}
       ${turn.config?.memory ? '<span class="council-usage" title="Members saw your shared and saved memories">memory</span>' : ''}
+      ${turn.config?.web_off ? `<span class="council-usage" title="${esc(`API and local seats answered without web search: ${turn.config.web_off}. Claude and ChatGPT seats use their own search. Odysseus tries again in a few minutes.`)}">web search off (API seats)</span>` : ''}
+      ${finishedEarly(turn) ? '<span class="council-usage" title="You chose Finish now: the chairman answered from what was in">finished early</span>' : ''}
       ${turnUsage(turn)}
+      ${running ? `<button class="council-btn small ghost" data-finish="${esc(turn.id)}" ${String(turn.id).startsWith('live-') || turn.finishing || turn.stages?.synthesis === 'running' ? 'disabled' : ''} title="Stop waiting for slow members: the chairman answers from what is in, as soon as one member has answered">${turn.finishing ? 'Finishing…' : 'Finish now'}</button>` : ''}
       ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}" ${String(turn.id).startsWith('live-') ? 'disabled title="Starting…"' : ''}>Stop</button>` : ''}
       ${!running ? `<button class="council-btn small ghost" data-del-turn="${esc(turn.id)}" title="Delete this question">Delete</button>` : ''}
     </div>
@@ -1449,7 +1549,9 @@ function flushDirty() {
     const state = card.querySelector('.state');
     const seat = (live.config?.members || [])[Number(member)];
     if (state) state.textContent = cardState(entry, seat);
-    card.classList.toggle('err', !!entry.error);
+    const noted = card.querySelector('.noted-slot');
+    if (noted) noted.innerHTML = notedTag(entry);
+    card.classList.toggle('err', !!entry.error && !entry.cut_short);
   }
   _dirty.clear();
   if (nearBottom) box.scrollTop = box.scrollHeight;
@@ -1468,7 +1570,7 @@ function onEvent(ev) {
   switch (ev.type) {
     case 'turn':
       live.id = ev.turn_id;
-      live.config = { members: ev.members, chairman: ev.chairman, mode: ev.mode, tools: ev.tools, workspace: ev.workspace, memory: ev.memory };
+      live.config = { members: ev.members, chairman: ev.chairman, mode: ev.mode, tools: ev.tools, workspace: ev.workspace, memory: ev.memory, web_off: ev.web_off };
       renderTurns();
       scrollToEnd();
       break;
@@ -1476,8 +1578,38 @@ function onEvent(ev) {
       live.stages[ev.stage] = ev.status === 'start' ? 'running' : 'done';
       if (ev.labels) live.labels = ev.labels;
       if (ev.stage === 'review' && ev.status === 'start') live.reviews = [];
+      if (ev.status === 'start' && NOTE_PROMPT[ev.stage]) {
+        // The server builds this stage's prompt with every note sent so far.
+        for (const n of live.notes) {
+          n.delivered = n.delivered || [];
+          if (!n.delivered.some(d => d.stage === ev.stage && d.member == null)) n.delivered.push({ stage: ev.stage });
+        }
+      }
       renderTurns();
       if (ev.status === 'start') scrollToEnd();
+      break;
+    case 'note':
+      if (ev.note && !live.notes.some(n => n.id === ev.note.id)) live.notes.push(ev.note);
+      renderTurns();
+      scrollToEnd();
+      break;
+    case 'note_delivered': {
+      const note = live.notes.find(n => n.id === ev.note);
+      if (note) (note.delivered = note.delivered || []).push({ stage: ev.stage, member: ev.member });
+      if (ev.stage !== 'synthesis') {
+        const entry = liveEntry(ev.stage, ev.member);
+        entry.notes = [...(entry.notes || []), ev.note];
+      }
+      renderTurns();
+      break;
+    }
+    case 'finishing':
+      live.finishing = true;
+      renderTurns();
+      break;
+    case 'web_off':
+      live.config = { ...live.config, web_off: ev.reason };
+      renderTurns();
       break;
     case 'thinking':
       if (ev.stage === 'synthesis') break;
@@ -1501,6 +1633,7 @@ function onEvent(ev) {
       entry.usage = ev.usage || null;
       entry.cost_usd = ev.cost_usd ?? null;
       if (ev.type === 'member_error') entry.error = ev.error;
+      if (ev.cut_short) entry.cut_short = true;
       markDirty(ev.stage, ev.member);
       break;
     }
@@ -1538,6 +1671,34 @@ function onEvent(ev) {
   }
 }
 
+// Enter / the button: a question when the thread is idle, a note while it deliberates.
+function submit() {
+  const here = (S.live && S.live.sessionId === S.session?.id) || (S.session?.turns || []).some(t => t.status === 'running');
+  if (here) sendNote(); else convene();
+}
+
+async function sendNote() {
+  const input = $('#council-input');
+  const text = (input?.value || '').trim();
+  const turn = runningTurn();
+  if (!text || !turn || !S.session) return;
+  const btn = $('#council-send');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await jpost(`/api/council/sessions/${encodeURIComponent(S.session.id)}/turns/${encodeURIComponent(turn.id)}/notes`, { text });
+    if (input.value.trim() === text) { input.value = ''; autosize(input); }
+    // The live stream announces it too; a run watched by polling shows it now.
+    turn.notes = turn.notes || [];
+    if (res?.note && !turn.notes.some(n => n.id === res.note.id)) turn.notes.push(res.note);
+    renderTurns();
+    scrollToEnd();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    renderComposer();
+  }
+}
+
 async function convene() {
   const input = $('#council-input');
   const question = (input?.value || '').trim();
@@ -1558,6 +1719,7 @@ async function convene() {
     config: { members: [], chairman: null, mode: S.mode, tools: S.tools, workspace: S.workspace, memory: S.memory },
     opinions: [], reviews: [], ranking: [], labels: {}, final: '', error: null, chairTools: [],
     stages: { opinions: 'running', review: 'pending', synthesis: 'pending' }, reader: null,
+    notes: [], finishing: false,
   };
   // Show the seats immediately, before the server's first event.
   S.live.config.members = S.members.map((m, i) => ({ index: i, model: m.model, endpoint_name: seatInfo(m).endpoint, effort: m.effort }));
@@ -1645,6 +1807,17 @@ async function convene() {
       renderAll();
       if (wasLive) scrollToEnd();
       maybePoll();
+      // A note that came too late for the chairman is not lost: like a queued
+      // message in Claude Code it becomes the next question, once you send it.
+      const saved = wasLive && (S.session?.turns || []).find(t => t.id === wasLive.id);
+      const late = (saved?.notes || []).filter(n => !(n.delivered || []).length);
+      const box = $('#council-input');
+      if (late.length && box && !box.value.trim() && saved.status !== 'cancelled') {
+        box.value = late.map(n => n.text).join('\n\n');
+        autosize(box);
+        box.focus();
+        toast('Your note arrived after the chairman had started. It is back in the box: press Enter to ask it.');
+      }
     } else if (_open) {
       renderComposer();
     }
@@ -1912,6 +2085,30 @@ async function onPaneClick(e) {
   const mode = t.closest('[data-mode]');
   if (mode) { S.mode = mode.dataset.mode === 'quick' ? 'quick' : 'full'; saveConfigSoon(); renderSeats(); renderComposer(); return; }
 
+  const fin = t.closest('[data-finish]');
+  if (fin && S.session) {
+    fin.disabled = true;
+    try {
+      const res = await jpost(`/api/council/sessions/${encodeURIComponent(S.session.id)}/turns/${encodeURIComponent(fin.dataset.finish)}/finish`, {});
+      if (!res.finishing) { toast('The chairman is already writing the answer.'); return; }
+      const turn = runningTurn();
+      if (turn && turn.id === fin.dataset.finish) { turn.finishing = true; renderTurns(); }
+    } catch (err) { toast(err.message); fin.disabled = false; }
+    return;
+  }
+  const reask = t.closest('[data-reask]');
+  if (reask) {
+    const [turnId, noteId] = reask.dataset.reask.split('::');
+    const note = ((S.session?.turns || []).find(x => x.id === turnId)?.notes || []).find(n => n.id === noteId);
+    const box = $('#council-input');
+    if (note && box) {
+      box.value = box.value.trim() ? `${box.value.trim()}\n\n${note.text}` : note.text;
+      autosize(box);
+      box.focus();
+      scheduleEstimate();
+    }
+    return;
+  }
   const stop = t.closest('[data-stop]');
   if (stop && S.session) {
     stop.disabled = true;
