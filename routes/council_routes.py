@@ -4,6 +4,11 @@ A council run is an asyncio task owned by this process, not by the HTTP
 request: closing the page does not stop it, the turn is saved when it ends,
 and reopening the thread shows it (still running, or finished). Stop is an
 explicit call.
+
+While it runs the user can steer it: ``.../notes`` adds a note the members
+take into account (mid-answer on API and local seats, at the next stage on
+the others), and ``.../finish`` stops waiting on slow members and has the
+chairman answer from what is in.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
-from src import budget, council, council_tools, model_roster, reasoning_effort
+from src import budget, council, council_tools, council_web, model_roster, reasoning_effort
 from src.auth_helpers import get_current_user, owner_filter, require_user
 
 logger = logging.getLogger(__name__)
@@ -28,6 +33,8 @@ SUBSCRIPTION_PROVIDERS = model_roster.SUBSCRIPTION_PROVIDERS
 
 # turn_id -> running task (this process only). Only touched on the event loop.
 _RUNNING: Dict[str, asyncio.Task] = {}
+# turn_id -> what a running turn can be steered with (same lifetime as _RUNNING).
+_LIVE: Dict[str, "_Run"] = {}
 # Sessions with an ask being prepared or running. Claimed on the event loop
 # before any thread work, so two tabs cannot start two runs in one thread.
 _ACTIVE_SESSIONS: set = set()
@@ -58,6 +65,10 @@ class AskRequest(BaseModel):
     # memories. The Council page sends it on by default; an API caller that
     # leaves it out shares nothing about the person.
     memory: bool = False
+
+
+class NoteRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=council.MAX_NOTE_CHARS)
 
 
 class EstimateRequest(BaseModel):
@@ -284,6 +295,7 @@ def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
         "error": turn.error,
         "usage": _loads(turn.usage, {}),
         "chair": _loads(getattr(turn, "chair", None), None),
+        "notes": _loads(getattr(turn, "notes", None), []),
         "created_at": turn.created_at.isoformat() if turn.created_at else None,
     }
 
@@ -310,7 +322,7 @@ def _save_turn(turn_id: str, **fields) -> None:
         if turn is None:
             return
         for key, value in fields.items():
-            if key in ("opinions", "reviews", "ranking", "labels", "config", "usage") and not isinstance(value, str):
+            if key in ("opinions", "reviews", "ranking", "labels", "config", "usage", "notes") and not isinstance(value, str):
                 value = json.dumps(value)
             elif key == "chair" and value is not None and not isinstance(value, str):
                 value = json.dumps(value)
@@ -332,7 +344,15 @@ def _settled(calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _result_fields(result: Dict[str, Any]) -> Dict[str, Any]:
+def _result_fields(result: Dict[str, Any], steering: Optional[council.Steering] = None,
+                   seats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """What to save of a run's result. Runs on the event loop: the notes and
+    seats are serialized here, not in the worker thread that writes them."""
+    extra: Dict[str, Any] = {}
+    if steering is not None:
+        extra["notes"] = json.dumps(steering.notes)
+    if seats is not None:
+        extra["config"] = json.dumps(seats)
     final = result.get("final") or None
     chair = result.get("chair") if isinstance(result.get("chair"), dict) else None
     if not final and chair and chair.get("pending") and chair.get("text"):
@@ -346,15 +366,27 @@ def _result_fields(result: Dict[str, Any]) -> Dict[str, Any]:
         "final": final,
         "usage": council.usage_totals(result),
         "chair": {"tools": chair.get("tools") or []} if chair and chair.get("tools") else None,
+        **extra,
     }
 
 
 def _history(db, owner: Optional[str], session_id: str) -> List[Dict[str, str]]:
+    """The thread's earlier turns as chat history, stopped and interrupted ones included.
+
+    A stopped turn replays the part it got to (see ``council.history_entry``);
+    only a turn that is still running here is left out.
+    """
     rows = (db.query(CouncilTurn)
-            .filter(CouncilTurn.session_id == session_id, CouncilTurn.owner == owner,
-                    CouncilTurn.status == "done")
+            .filter(CouncilTurn.session_id == session_id, CouncilTurn.owner == owner)
             .order_by(CouncilTurn.created_at.asc()).all())
-    return [{"question": r.question, "final": r.final or ""} for r in rows]
+    return [council.history_entry({
+        "question": r.question,
+        "final": r.final or "",
+        "status": r.status,
+        "opinions": _loads(r.opinions, []),
+        "config": _loads(r.config, {}),
+        "notes": _loads(getattr(r, "notes", None), []),
+    }) for r in rows if not (r.status == "running" and r.id in _RUNNING)]
 
 
 def _expected_outputs(db, owner: Optional[str]) -> Dict[str, int]:
@@ -547,11 +579,50 @@ class _Broadcast:
         self.queue: Optional[asyncio.Queue] = asyncio.Queue()
 
     async def emit(self, event: Dict[str, Any]) -> None:
+        self.put(event)
+
+    def put(self, event: Optional[Dict[str, Any]]) -> None:
         if self.queue is not None:
             self.queue.put_nowait(event)
 
     def detach(self) -> None:
         self.queue = None
+
+
+class _Run:
+    """A running turn's handles for the steering routes."""
+
+    def __init__(self, steering: council.Steering, stream: _Broadcast,
+                 web: Optional[council_web.TurnWeb], seats: Dict[str, Any]):
+        self.steering = steering
+        self.stream = stream
+        self.web = web
+        self.seats = seats
+
+
+def _turn_web(tools: council_tools.ToolSettings, question: str, history: List[Dict[str, str]],
+              members: List[council.Member], chairman: council.Member, seats: Dict[str, Any],
+              stream: _Broadcast) -> Optional[council_web.TurnWeb]:
+    """Web search and fetch for the turn's API and local seats.
+
+    URLs in the user's own questions may be opened. When search is down the
+    turn says so (``seats["web_off"]``), at the start or once it fails.
+    """
+    if not tools.enabled:
+        return None
+    agent_seats = any(council_tools.uses_agent_loop(m.provider) for m in [*members, chairman])
+    web = council_web.TurnWeb(user_text="\n".join([question, *(h.get("question") or "" for h in history)]))
+    if not agent_seats:
+        return web
+    if web.down:
+        seats["web_off"] = web.down
+
+    def _on_down(reason: str) -> None:
+        seats["web_off"] = reason
+        stream.put({"type": "web_off", "reason": reason})
+
+    web.on_down = _on_down
+    return web
 
 
 # ---------------------------------------------------------------------------
@@ -736,6 +807,46 @@ def setup_council_routes(chat_processor=None) -> APIRouter:
         await asyncio.to_thread(_owned_turn_id, owner, session_id, turn_id)
         return {"stopped": _cancel(turn_id)}
 
+    def _live_run(turn_id: str) -> _Run:
+        run = _LIVE.get(turn_id)
+        task = _RUNNING.get(turn_id)
+        if run is None or task is None or task.done():
+            raise HTTPException(409, "This council has already finished. Ask a follow-up instead.")
+        return run
+
+    @router.post("/sessions/{session_id}/turns/{turn_id}/notes")
+    async def add_note(session_id: str, turn_id: str, request: Request, body: NoteRequest):
+        """Steer a running turn: the members take the note into account."""
+        owner = _owner(request)
+        await asyncio.to_thread(_owned_turn_id, owner, session_id, turn_id)
+        run = _live_run(turn_id)
+        text = body.text.strip()
+        if not text:
+            raise HTTPException(400, "Write the note first.")
+        if len(run.steering.notes) >= council.MAX_NOTES:
+            raise HTTPException(409, f"A question takes at most {council.MAX_NOTES} notes. "
+                                     "Ask a follow-up instead.")
+        note = run.steering.add(text)
+        if run.web is not None:
+            run.web.allow_text(text)
+        await run.stream.emit({"type": "note", "note": note})
+        await asyncio.to_thread(_save_turn, turn_id, notes=json.dumps(run.steering.notes))
+        return {"note": note, "stage": run.steering.stage}
+
+    @router.post("/sessions/{session_id}/turns/{turn_id}/finish")
+    async def finish_turn(session_id: str, turn_id: str, request: Request):
+        """Stop waiting on slow members: the chairman answers from what is in."""
+        owner = _owner(request)
+        await asyncio.to_thread(_owned_turn_id, owner, session_id, turn_id)
+        run = _live_run(turn_id)
+        stage = run.steering.stage
+        if stage == "synthesis":
+            return {"finishing": False, "stage": stage}
+        if not run.steering.finish.is_set():
+            run.steering.finish.set()
+            await run.stream.emit({"type": "finishing", "stage": stage})
+        return {"finishing": True, "stage": stage}
+
     @router.post("/sessions/{session_id}/ask")
     async def ask(session_id: str, request: Request, body: AskRequest):
         owner = _owner(request)
@@ -761,9 +872,11 @@ def setup_council_routes(chat_processor=None) -> APIRouter:
         stream = _Broadcast()
         state: Dict[str, Any] = {}
         finished = {"saved": False}
+        steering = council.Steering()
+        web = _turn_web(tools, question, history, members, chairman, seats, stream)
 
         async def checkpoint(result: Dict[str, Any]) -> None:
-            await asyncio.to_thread(_save_turn, turn_id, **_result_fields(result))
+            await asyncio.to_thread(_save_turn, turn_id, **_result_fields(result, steering, seats))
 
         async def runner() -> None:
             try:
@@ -771,10 +884,11 @@ def setup_council_routes(chat_processor=None) -> APIRouter:
                     result = await council.run_council(
                         question=question, members=members, chairman=chairman, mode=mode,
                         history=history, emit=stream.emit, checkpoint=checkpoint, state=state,
-                        stream_fn=council_tools.stream_fn_for(tools), context=context,
+                        stream_fn=council_tools.stream_fn_for(tools, web=web), context=context,
+                        steering=steering,
                     )
                 status = "error" if result.get("error") and not result.get("final") else "done"
-                fields = _result_fields(result)
+                fields = _result_fields(result, steering, seats)
                 # Set before the save: a Stop that lands while it is being
                 # written must not overwrite the finished turn.
                 finished["saved"] = True
@@ -783,22 +897,26 @@ def setup_council_routes(chat_processor=None) -> APIRouter:
                 await stream.emit({"type": "done", "status": status, "turn_id": turn_id,
                                    "final": fields["final"] or "", "error": result.get("error"),
                                    "usage": fields["usage"],
-                                   "final_fallback_member": result.get("final_fallback_member")})
+                                   "final_fallback_member": result.get("final_fallback_member"),
+                                   "finished_early": bool(result.get("finished_early"))})
             except asyncio.CancelledError:
                 if not finished["saved"]:
-                    fields = _result_fields(state) if state else {}
+                    fields = (_result_fields(state, steering, seats) if state
+                              else {"notes": json.dumps(steering.notes), "config": json.dumps(seats)})
                     await asyncio.to_thread(_save_turn, turn_id, status="cancelled",
                                             error="Stopped before the council finished.", **fields)
                 await stream.emit({"type": "done", "status": "cancelled", "turn_id": turn_id})
             except Exception as exc:
                 logger.exception("council run failed")
                 await asyncio.to_thread(_save_turn, turn_id, status="error",
-                                        error="The council run failed unexpectedly.")
+                                        error="The council run failed unexpectedly.",
+                                        notes=json.dumps(steering.notes))
                 await stream.emit({"type": "done", "status": "error", "turn_id": turn_id,
                                    "error": "The council run failed unexpectedly."})
                 del exc
             finally:
                 _RUNNING.pop(turn_id, None)
+                _LIVE.pop(turn_id, None)
                 _ACTIVE_SESSIONS.discard(session_id)
                 # Every call that ran is billed once, whether the turn
                 # finished, was stopped or failed.
@@ -810,6 +928,7 @@ def setup_council_routes(chat_processor=None) -> APIRouter:
 
         task = asyncio.create_task(runner(), name=f"council-{turn_id}")
         _RUNNING[turn_id] = task
+        _LIVE[turn_id] = _Run(steering, stream, web, seats)
 
         async def events():
             yield f"data: {json.dumps({'type': 'turn', 'turn_id': turn_id, 'session_id': session_id, **seats})}\n\n"

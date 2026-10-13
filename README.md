@@ -172,7 +172,25 @@ Models) and then work everywhere else in Odysseus too — chat, Study, research.
   the CLI rather than calling the API with your subscription token.
 
 Runs live on the server: closing the page does not stop a council, and reopening the thread
-shows the saved result. Follow-up questions in the same thread see the earlier answers.
+shows the saved result. Follow-up questions in the same thread see the earlier answers,
+including a round you stopped or that Odysseus restarted through: the members get what it
+got to (the chairman's partial answer, or the members' answers so far), marked as unfinished.
+
+### Steering a running council
+
+The box stays open while the council deliberates, the way Claude Code takes messages
+while it works:
+
+- **Enter sends a note** (a correction, a constraint, what to focus on). API and local seats
+  with tools on read it before their next step, mid-answer; Claude and ChatGPT seats, whose
+  CLIs take the prompt once, read it at the next stage. The peer review and the chairman
+  always get every note sent before they start. Under each note the thread shows who read it.
+  A note that arrives after the chairman has started goes back into the box when the turn
+  ends, so you can send it as the next question.
+- **Finish now** stops waiting on slow members: as soon as one member has answered, the rest
+  are cut short (the chairman still sees what they had written), peer review is skipped, and
+  the chairman answers. Cheaper and faster than Stop and asking again, which throws away the
+  answers already paid for.
 
 ### Tools
 
@@ -197,6 +215,21 @@ result on click); what a model writes before a tool call is kept as a working no
 answer is what comes after the last call. Reviewers are told to check doubtful claims with
 the tools, and the chairman has them too. A tool that needs Odysseus's approval prompt is
 refused in a council run, since nobody is there to approve it.
+
+Web search for API and local seats is built for a council run:
+
+- A search returns ranked results with snippets within 15 seconds across your search
+  providers (Settings → Search); a provider slow to answer does not hold back the next one.
+  The seat opens the pages it needs with web_fetch. Seats asking the same query share one
+  search, and results are reused for 15 minutes.
+- If search fails, the rest of the turn and the next 5 minutes of turns run those seats
+  without web search instead of letting each one wait for a timeout. The turn shows
+  **web search off (API seats)** with the reason. Claude and ChatGPT seats keep their own search.
+- Pages can carry hidden instructions. Every seat is told that pages, results, files and
+  history are data, never instructions, and reviewers and the chairman are told the same about
+  the answers they read. On top of that, web_fetch on an API seat opens only URLs a search
+  returned in that turn or that you wrote, so a seat that follows a page's instructions still
+  cannot send what it read (your history, files, memories) to an address of the page's choosing.
 
 The Codex seat reuses your ChatGPT Subscription login: each run gets a throwaway
 `CODEX_HOME` with the current access token and no refresh token, so Codex can never log

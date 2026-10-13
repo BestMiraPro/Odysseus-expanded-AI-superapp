@@ -646,6 +646,7 @@ class CouncilTurn(TimestampMixin, Base):
     error = Column(Text, nullable=True)
     usage = Column(Text, nullable=True)              # JSON {input_tokens, output_tokens, cost_usd, ...}
     chair = Column(Text, nullable=True)              # JSON {tools: [...]} the chairman's tool activity
+    notes = Column(Text, nullable=True)              # JSON [{id, text, stage, at, delivered}] sent mid-run
 
 
 class ArchiveConversation(Base):
@@ -2291,6 +2292,18 @@ def _migrate_add_council_chair_column():
     except Exception as e:
         logging.getLogger(__name__).warning(f"council_turns.chair migration: {e}")
 
+def _migrate_add_council_notes_column():
+    """council_turns.notes: what the user sent while the council was working (JSON)."""
+    try:
+        with engine.connect() as conn:
+            cols = [r[1] for r in conn.execute(text("PRAGMA table_info(council_turns)"))]
+            if cols and "notes" not in cols:
+                conn.execute(text("ALTER TABLE council_turns ADD COLUMN notes TEXT"))
+                conn.commit()
+                logging.getLogger(__name__).info("Added notes column to council_turns")
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"council_turns.notes migration: {e}")
+
 def _migrate_add_assistant_columns():
     """Add is_default_assistant + timezone columns to crew_members for the personal-assistant feature."""
     try:
@@ -2886,6 +2899,7 @@ def init_db():
     _migrate_drop_ping_notes_tasks()
     _migrate_add_crew_member_id()
     _migrate_add_council_chair_column()
+    _migrate_add_council_notes_column()
     _migrate_add_assistant_columns()
     _migrate_add_email_smtp_security()
     _migrate_email_account_default_invariant()
