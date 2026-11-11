@@ -74,6 +74,29 @@ fill in the commit SHA or release tag and the date.
   upstream; search backends, provider routing, and report rendering are
   Odysseus's own.
 
+### Jane Street agent skills — socratic-tutor
+
+- **Upstream:** [janestreet/agent_skills](https://github.com/janestreet/agent_skills)
+  by **Jane Street** — the `socratic-tutor` skill (`socratic-tutor/SKILL.md`):
+  a diagnostic, a 0-5 skill map, one question at a time, spaced review and a
+  final assessment.
+- **Upstream revision adapted:** `7c6715c29548a3b39d4a9545c698ee4fd17a7213`
+  (2026-11-03), read 2026-11-11.
+- **License:** MIT. Copyright © 2026 Jane Street Group, LLC. Full text in
+  [`licenses/JaneStreet-agent-skills-MIT-LICENSE.txt`](licenses/JaneStreet-agent-skills-MIT-LICENSE.txt).
+- **Present in this repository since:** 2026-11-11.
+- **Local files:** `src/study_socratic.py`, the `SOCRATIC_ROLE` prompt and the
+  teaching-session tools in `src/study_agent.py`, the skill-map panel in
+  `static/js/studyAgent.js`.
+- **Local adaptation:** the teaching method and the skill-map format follow
+  upstream; the prompt is reworded, not copied. Upstream keeps the skill map in
+  the model's context and lets the model grade itself. Here the map, the phases
+  and the grading rules are server code (placement caps, earned level-ups,
+  prompted-recall detection, scheduled surprise reviews, a gated final exam),
+  questions are grounded in the learner's own materials and practice history,
+  and the session is stored with the chat, so upstream's "save state" /
+  "resume from" commands are not needed.
+
 ---
 
 ## Bundled via Docker Compose

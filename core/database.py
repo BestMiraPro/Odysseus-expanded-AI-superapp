@@ -2562,6 +2562,10 @@ class StudyAgentThread(TimestampMixin, Base):
     # Non-null marks a PRACTICE thread: a protected Ask AI conversation bound
     # to one practice question. Ordinary tutor threads stay NULL here.
     question_id = Column(String, nullable=True, index=True)
+    # Non-null marks a TEACHING SESSION ("Teach me"): the Socratic tutor's
+    # skill map, phase and evidence as JSON (src/study_socratic.py). Added to
+    # existing databases by reconcile_schema_with_models.
+    tutor_state = Column(Text, nullable=True)
 
 
 class StudyAgentMessage(TimestampMixin, Base):

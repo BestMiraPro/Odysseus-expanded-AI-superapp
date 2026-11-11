@@ -3,8 +3,9 @@
 
   GET    /api/study/agent/capabilities            model in use, code-tool eligibility, runtime
   GET    /api/study/agent/threads                 the caller's chat threads (newest first)
-  POST   /api/study/agent/threads {deck_id?}      new thread
-  GET    /api/study/agent/threads/{id}/messages   messages in UI shape
+  POST   /api/study/agent/threads {deck_id?, teach_topic?, full_mastery?}
+                                                  new thread; teach_topic starts a teaching session
+  GET    /api/study/agent/threads/{id}/messages   messages in UI shape (+ the session's skill map)
   DELETE /api/study/agent/threads/{id}
   POST   /api/study/agent/chat                    {thread_id?, message, deck_id?, allow_code?} -> SSE
 """
@@ -16,9 +17,9 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from src import reasoning_effort, study_agent
+from src import reasoning_effort, study_agent, study_socratic
 from src.auth_helpers import get_current_user
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,9 @@ logger = logging.getLogger(__name__)
 class ThreadCreate(BaseModel):
     deck_id: Optional[str] = None
     title: Optional[str] = None
+    # "Teach me": a Socratic teaching session on this topic (src/study_socratic.py).
+    teach_topic: Optional[str] = Field(default=None, max_length=200)
+    full_mastery: bool = False
 
 
 class ChatIn(BaseModel):
@@ -64,11 +68,15 @@ def setup_study_agent_routes() -> APIRouter:
 
     @router.post("/threads")
     def create_thread(request: Request, body: ThreadCreate):
-        return study_agent.create_thread(get_current_user(request), deck_id=body.deck_id, title=body.title)
+        return study_agent.create_thread(get_current_user(request), deck_id=body.deck_id, title=body.title,
+                                         teach_topic=body.teach_topic, full_mastery=body.full_mastery)
 
     @router.get("/threads/{thread_id}/messages")
     def thread_messages(request: Request, thread_id: str):
-        return {"messages": study_agent.thread_messages_for_ui(get_current_user(request), thread_id)}
+        user = get_current_user(request)
+        messages = study_agent.thread_messages_for_ui(user, thread_id)  # ownership check
+        return {"messages": messages,
+                "tutor": study_socratic.public_state(study_agent.tutor_state(user, thread_id))}
 
     @router.delete("/threads/{thread_id}")
     def delete_thread(request: Request, thread_id: str):

@@ -46,6 +46,7 @@ from core.database import (
     StudyQuestion,
     StudyReview,
 )
+from src import study_socratic as _socratic
 from src.constants import BASE_DIR
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,9 @@ class ToolSpec:
     required: List[str] = field(default_factory=list)
     destructive: bool = False
     code: bool = False
+    # Tutor tools act on the current thread's teaching session; dispatch
+    # injects the thread id (the model never chooses it).
+    tutor: bool = False
 
     def schema(self) -> Dict:
         return {
@@ -125,17 +129,41 @@ TOOLS: Dict[str, ToolSpec] = {}
 
 def tool(name: str, description: str, properties: Optional[Dict] = None,
          required: Optional[List[str]] = None, *, destructive: bool = False,
-         code: bool = False):
+         code: bool = False, tutor: bool = False):
     """Register an async handler ``(owner, args) -> result`` as an agent tool."""
     def deco(fn: Handler) -> Handler:
         TOOLS[name] = ToolSpec(name=name, description=description, handler=fn,
                                properties=properties or {}, required=required or [],
-                               destructive=destructive, code=code)
+                               destructive=destructive, code=code, tutor=tutor)
         return fn
     return deco
 
 
-def tool_schemas(include_code: bool = False, *, practice: bool = False) -> List[Dict]:
+# A teaching session ("Teach me") is a tutor, not an operator: it can read the
+# learner's materials and question bank, save flashcards when the learner
+# agrees, and drive its own skill map. Nothing that deletes, rewrites or
+# touches code. Enforced at dispatch, like the practice allowlist.
+SOCRATIC_TOOL_NAMES = frozenset({
+    "list_subjects", "list_materials", "search_materials", "get_material",
+    "list_questions", "get_question", "list_cards", "study_stats", "add_cards",
+    "tutor_set_skill_map", "tutor_record_check", "tutor_mark_explained",
+    "tutor_place", "tutor_set_focus", "tutor_adjust_difficulty",
+    "tutor_progress", "tutor_start_final", "tutor_finish",
+})
+# The one tutor tool an ordinary chat has: it turns that chat into a session.
+START_TEACHING_TOOL = "start_teaching_session"
+
+
+def _tool_allowed(spec: ToolSpec, *, socratic: bool) -> bool:
+    if socratic:
+        return spec.name in SOCRATIC_TOOL_NAMES
+    return not spec.tutor or spec.name == START_TEACHING_TOOL
+
+
+def tool_schemas(include_code: bool = False, *, practice: bool = False,
+                 socratic: bool = False) -> List[Dict]:
+    if socratic:
+        return [t.schema() for t in TOOLS.values() if _tool_allowed(t, socratic=True)]
     if practice:
         from src.study_practice_coach import PRACTICE_TOOL_NAMES
         out = []
@@ -155,7 +183,8 @@ def tool_schemas(include_code: bool = False, *, practice: bool = False) -> List[
                     "never invent a page a hit did not report.")
             out.append(schema)
         return out
-    return [t.schema() for t in TOOLS.values() if include_code or not t.code]
+    return [t.schema() for t in TOOLS.values()
+            if (include_code or not t.code) and _tool_allowed(t, socratic=False)]
 
 
 def _s(desc: str, **extra) -> Dict:
@@ -671,7 +700,7 @@ async def _list_cards(owner, args):
         db.close()
 
 
-@tool("add_cards", "Add flashcards to a subject. Each card: {front, back, notes?}. Keep cards atomic (one fact each).",
+@tool("add_cards", "Add flashcards to a subject. Each card: {front, back, notes?, tags?}. Keep cards atomic (one fact each). Tags (list of short strings, e.g. the topic) link cards to exam-plan topics.",
       {"deck_id": _s("Subject id"), "cards": {"type": "array", "items": {"type": "object"}, "description": "Cards"}},
       ["deck_id", "cards"])
 async def _add_cards(owner, args):
@@ -689,8 +718,11 @@ async def _add_cards(owner, args):
             front, back = str(c.get("front") or "").strip(), str(c.get("back") or "").strip()
             if not front or not back:
                 continue
+            tags = c.get("tags")
+            tags = [str(x).strip()[:60] for x in tags if str(x).strip()][:8] if isinstance(tags, list) else []
             row = StudyCard(id=str(uuid.uuid4()), owner=owner, deck_id=deck.id, front=front, back=back,
-                            notes=c.get("notes"), source="ai", state="new", due=now)
+                            notes=c.get("notes"), tags=json.dumps(tags) if tags else None,
+                            source="ai", state="new", due=now)
             db.add(row)
             ids.append(row.id)
         db.commit()
@@ -906,6 +938,185 @@ async def _maintain_bank(owner, args):
     raise HTTPException(400, "unknown action")
 
 
+# ------------------------------------------------------------------ teaching sessions (Socratic tutor)
+#
+# The skill map, phase and evidence of a "Teach me" session live as JSON on
+# the thread (StudyAgentThread.tutor_state); src/study_socratic.py holds the
+# rules. These handlers only load, apply and save. The thread id is injected
+# by dispatch_tool (args["_thread_id"]), never chosen by the model.
+
+def _tutor_txn(owner, args: Dict, fn: Callable[[Dict], Any]) -> Any:
+    """Load the session, apply ``fn(state)``, save. A refused rule saves nothing."""
+    thread_id = args.get("_thread_id")
+    if not thread_id:
+        raise HTTPException(400, "Tutor tools only work inside a teaching session.")
+    db = SessionLocal()
+    try:
+        t = db.query(StudyAgentThread).filter(StudyAgentThread.id == thread_id).first()
+        if not t or (owner is not None and t.owner != owner):
+            raise HTTPException(404, "Thread not found")
+        if not t.tutor_state:
+            raise HTTPException(400, "This chat is not a teaching session.")
+        try:
+            state = json.loads(t.tutor_state)
+            res = fn(state)
+        except _socratic.TutorError as e:
+            raise HTTPException(400, str(e))
+        except ValueError:
+            raise HTTPException(400, "The teaching session's state could not be read.")
+        t.tutor_state = json.dumps(state, ensure_ascii=False)
+        t.updated_at = _now()
+        db.commit()
+        return res
+    finally:
+        db.close()
+
+
+def tutor_state(owner, thread_id: str) -> Optional[Dict]:
+    """The raw session state of a thread, or None for ordinary chats."""
+    db = SessionLocal()
+    try:
+        t = db.query(StudyAgentThread).filter(StudyAgentThread.id == thread_id).first()
+        if not t or (owner is not None and t.owner != owner) or not t.tutor_state:
+            return None
+        try:
+            return json.loads(t.tutor_state)
+        except ValueError:
+            return None
+    finally:
+        db.close()
+
+
+def tutor_begin_turn(owner, thread_id: str) -> None:
+    _tutor_txn(owner, {"_thread_id": thread_id}, _socratic.begin_turn)
+
+
+@tool(START_TEACHING_TOOL,
+      "Turn THIS chat into a structured Socratic teaching session on one topic: diagnostic, skill map with levels 0-5, "
+      "one question at a time, surprise re-tests, final exam. Only when the learner wants to be taught/drilled to "
+      "mastery and has confirmed it (not for a one-off 'explain X').",
+      {"topic": _s("The topic to master, e.g. 'price elasticity of demand'"),
+       "full_mastery": _b("Target 5/5 instead of 4/5 — only if the learner asked for full mastery")},
+      ["topic"], tutor=True)
+async def _start_teaching_session(owner, args):
+    _require(args, "topic")
+    thread_id = args.get("_thread_id")
+    if not thread_id:
+        raise HTTPException(400, "No chat to turn into a teaching session.")
+    try:
+        state = _socratic.new_state(args["topic"], full_mastery=bool(args.get("full_mastery")))
+    except _socratic.TutorError as e:
+        raise HTTPException(400, str(e))
+    db = SessionLocal()
+    try:
+        t = db.query(StudyAgentThread).filter(StudyAgentThread.id == thread_id).first()
+        if not t or (owner is not None and t.owner != owner):
+            raise HTTPException(404, "Thread not found")
+        if t.question_id is not None:
+            raise HTTPException(400, "A practice conversation cannot become a teaching session.")
+        if t.tutor_state:
+            raise HTTPException(400, "This chat already is a teaching session.")
+        t.tutor_state = json.dumps(state, ensure_ascii=False)
+        db.commit()
+    finally:
+        db.close()
+    return {"started": True, "topic": state["topic"], "target": state["target"],
+            "next": "Teaching-session rules apply from now on: define the skill map "
+                    "(tutor_set_skill_map), then start the diagnostic."}
+
+
+@tool("tutor_set_skill_map",
+      "Define the session's 4-10 concrete subskills (fewer for a narrow topic). Diagnostic phase only. For a broad "
+      "topic, map the first branch and list the other branches in outline.",
+      {"skills": {"type": "array", "items": {"type": "string"}, "description": "Subskill names, short and concrete"},
+       "outline": {"type": "array", "items": {"type": "string"}, "description": "Other branches for later sessions"}},
+      ["skills"], tutor=True)
+async def _tutor_set_skill_map(owner, args):
+    return _tutor_txn(owner, args, lambda st: _socratic.set_skill_map(
+        st, args.get("skills") or [], outline=args.get("outline")))
+
+
+@tool("tutor_record_check",
+      "Record ONE graded learner answer for a skill, after every answer that tests something. You report what the "
+      "learner did; the server applies the level rules and returns the new level and what is still needed. Be "
+      "strict: vague or half-right is partial.",
+      {"skill": _s("Skill name (or key like s2)"),
+       "outcome": _s("correct | partial | wrong", enum=list(_socratic.OUTCOMES)),
+       "kind": _s("Teaching phase only: prompted (just after a hint/explanation) | unprompted (recall without "
+                  "recent help) | review (surprise re-test of an earlier skill) | edge_case (edge case or "
+                  "adversarial question) | teach_back (they explained it as if teaching). Ignored in the "
+                  "diagnostic and final phases.", enum=list(_socratic.TEACHING_KINDS)),
+       "note": _s("Short private note on the answer"),
+       "misconception": _s("A misconception the answer revealed, in one line")},
+      ["skill", "outcome"], tutor=True)
+async def _tutor_record_check(owner, args):
+    return _tutor_txn(owner, args, lambda st: _socratic.record_check(
+        st, args.get("skill"), args.get("outcome"), args.get("kind"),
+        note=args.get("note"), misconception=args.get("misconception")))
+
+
+@tool("tutor_place",
+      "End the diagnostic: set each skill's starting level (0-3; 4 and up are earned in the loop) and move to "
+      "teaching. Needs 3+ answered diagnostic questions before placing any skill above 1.",
+      {"levels": {"type": "object", "description": "Skill name -> starting level 0-3, e.g. {\"Elasticity\": 2}"},
+       "focus": _s("Skill to start with (default: the lowest)")},
+      ["levels"], tutor=True)
+async def _tutor_place(owner, args):
+    levels = args.get("levels") or {}
+    if isinstance(levels, str):
+        try:
+            levels = json.loads(levels)
+        except ValueError:
+            raise HTTPException(400, "levels must be an object of skill -> level.")
+    if not isinstance(levels, dict):
+        raise HTTPException(400, "levels must be an object of skill -> level.")
+    return _tutor_txn(owner, args, lambda st: _socratic.place(st, levels, focus=args.get("focus")))
+
+
+@tool("tutor_mark_explained",
+      "Call when you explain a skill's answer directly (after 2-3 failed attempts, or 'just tell me'). The learner's "
+      "next answer on it counts as prompted recall, and its evidence restarts.",
+      {"skill": _s("Skill name")}, ["skill"], tutor=True)
+async def _tutor_mark_explained(owner, args):
+    return _tutor_txn(owner, args, lambda st: _socratic.mark_explained(st, args.get("skill")))
+
+
+@tool("tutor_set_focus", "Change the skill currently being taught (e.g. the learner overrides where to start).",
+      {"skill": _s("Skill name")}, ["skill"], tutor=True)
+async def _tutor_set_focus(owner, args):
+    return _tutor_txn(owner, args, lambda st: _socratic.set_focus(st, args.get("skill")))
+
+
+@tool("tutor_adjust_difficulty", "The learner said 'harder' or 'easier': shift the question difficulty one step.",
+      {"direction": _s("harder | easier", enum=["harder", "easier"])}, ["direction"], tutor=True)
+async def _tutor_adjust_difficulty(owner, args):
+    return _tutor_txn(owner, args, lambda st: _socratic.adjust_difficulty(st, args.get("direction")))
+
+
+@tool("tutor_progress", "The current skill map as text (paste it in a code block when the learner asks for progress).",
+      tutor=True)
+async def _tutor_progress(owner, args):
+    return _tutor_txn(owner, args, lambda st: {"map": _socratic.render_map(st), "phase": st.get("phase"),
+                                               "overall": _socratic.overall(st)})
+
+
+@tool("tutor_start_final",
+      "Open the final mixed assessment. Refused until every skill is at the target level.", tutor=True)
+async def _tutor_start_final(owner, args):
+    return _tutor_txn(owner, args, _socratic.start_final)
+
+
+@tool("tutor_finish",
+      "Grade the final assessment once every skill has a recorded final answer. The server decides pass/fail from "
+      "the recorded answers plus the integrative problem; a fail returns to the teaching loop.",
+      {"integrative_correct": _b("Did the learner solve the integrative problem correctly?"),
+       "summary": _s("Two or three sentences on strengths and the weakest areas")},
+      ["integrative_correct"], tutor=True)
+async def _tutor_finish(owner, args):
+    return _tutor_txn(owner, args, lambda st: _socratic.finish(
+        st, integrative_correct=bool(args.get("integrative_correct")), summary=args.get("summary")))
+
+
 # ------------------------------------------------------------------ code tools (admin, opt-in)
 
 APP_MAP = """Odysseus Study module (FastAPI + SQLAlchemy backend, vanilla-JS ES-module frontend):
@@ -993,6 +1204,7 @@ ROLE = """You are the Study agent inside Odysseus's Study pane — a study assis
 Rules:
 - Use tools for anything about the learner's data; never guess ids or contents. When the user doesn't name a subject, use the focused subject below.
 - Tutoring: ground explanations in the materials (search_materials, then get_material by page); cite "material name, p.N". If nothing covers it, say so before answering from general knowledge. Prefer making the learner retrieve (ask a probing question) over handing out full solutions unless asked.
+- Teaching sessions: when the learner asks to be taught, tutored, quizzed or drilled to mastery on a topic ("teach me X", "drill me on X"), and it is not clear they want a full session, ask one short question first ("Quick answer, or a proper teaching session?"). When they want the session, call start_teaching_session. A one-off "explain X" / "what is X" just gets an answer.
 - Destructive tools (delete_subject, remove_material, delete_question, delete_card, write_file, edit_file, bash) need the user's explicit go-ahead in this conversation first; then pass confirm=true where required.
 - Be concise: short answers, no restating tool output, Markdown with LaTeX ($...$) for math. Never paste whole materials into a reply.
 - Theory materials should get authored questions (mode 'author'); practice/exam materials get extracted questions (mode 'extract').
@@ -1058,16 +1270,121 @@ def build_system_prompt(owner, deck_id: Optional[str], allow_code: bool, model: 
     return "\n\n".join(parts)
 
 
+# The teaching-session role. Pedagogy adapted from Jane Street's
+# socratic-tutor skill (github.com/janestreet/agent_skills, MIT — see
+# ACKNOWLEDGMENTS.md). What differs: the skill map and the grading rules live
+# on the server (src/study_socratic.py), questions are grounded in the
+# learner's own materials and question bank, and save/resume is unnecessary
+# because the session is stored with the chat.
+SOCRATIC_ROLE = """You are a strict Socratic tutor inside Odysseus's Study pane. This chat is a TEACHING SESSION: take the learner from their current level to genuine mastery of one topic by asking questions that make them reason, predict and explain — not by lecturing.
+
+The skill map, levels, phase and review schedule live on the server, not in your memory: the session state below is authoritative, read it every turn. Levels change only through tutor_record_check; you report what the learner did, the server applies the rules and tells you the new level.
+
+Teaching loop:
+- Ask ONE question per message and end the message right after it: no hints, example answers or extra teaching after the question.
+- Prefer questions that make the learner predict an outcome, explain why, find the flaw in a plausible-but-wrong claim, apply an idea to a new case, or connect two ideas.
+- When they are wrong, do not give the answer: ask a narrower question that exposes the contradiction in their reasoning. Explain directly only after 2-3 failed attempts, then call tutor_mark_explained and re-test the idea from a different angle in a later turn.
+- When they are right, sometimes play devil's advocate ("are you sure? what about X?") — they should defend correct answers under pressure.
+- Short explanations (a few sentences) only to introduce material they could not derive; then back to questions.
+- Where it fits, set a practical exercise (compute this, predict what this code prints, sketch this graph) and check their actual work, not their description of it.
+- Match the session's difficulty setting.
+
+Recording — after EVERY learner answer that tests a skill, before you reply:
+- tutor_record_check(skill, outcome, kind, misconception?). Be strict: a vague or partly-right answer is partial, not correct. Never credit an insight the learner did not actually express. Record misconceptions you spot.
+- kind: prompted (right after a hint or explanation), unprompted (recall without recent help), review (a surprise re-test of an earlier skill), edge_case, teach_back. One answer can test two skills: record both.
+- After a level change, say it in one short line ("Elasticity → 3/5"). The learner sees the skill map live beside the chat; only paste the full map (tutor_progress, in a code block) when they ask for progress.
+
+Grounding: when the subject has materials, base questions and short explanations on them (search_materials, then get_material by page) and cite "material, p.N" when you explain. The question bank (list_questions / get_question) is a source of exam-style checks — rephrase, never reveal a stored answer. Do not show what a tool returned if it would give away the answer to your question.
+
+Learner commands, any time: "show progress" → tutor_progress, show the map; "harder" / "easier" → tutor_adjust_difficulty, then continue; "just tell me" → answer the current question directly (this one only), tutor_mark_explained, then continue the loop; "hint" → a narrower question, not the answer.
+
+No flattery: "Not quite — why would X happen if Y were true?" beats "Great try!". Short messages, Markdown, LaTeX ($...$) for math. Do not change the learner's study data except add_cards when they agree."""
+
+_PHASE_GUIDE = {
+    "diagnostic": {
+        False: """NOW: start the session. Break the topic into 4-10 concrete subskills (fewer for a narrow topic; for a broad one, a two-level tree — map the first branch, put the others in outline). If the focused subject has materials, look at what they cover first (search_materials) so the map matches the course. Call tutor_set_skill_map. Then tell the learner you will start with a few questions, one at a time, to see what they already know — and ask the first diagnostic question.""",
+        True: """NOW: diagnostic. 3-5 probing questions in total, easy to hard, spanning the subskills — one per message. Do NOT teach yet, and do not say whether an answer was right beyond a neutral acknowledgement. Record each answer with tutor_record_check for every skill it touched. When you can place the learner, call tutor_place (starting levels 0-3), show them the map it returns, propose where to start, and let them override (tutor_set_focus).""",
+    },
+    "teaching": """NOW: teaching loop on the FOCUS skill (unless a spaced review is due — then re-test that skill first, without warning). When the focus skill reaches the target, move on to the weakest skill below target (tutor_set_focus). When every skill is at the target, tell the learner and call tutor_start_final.""",
+    "final": """NOW: final mixed assessment. At least one question per skill plus one integrative problem that combines several, one question per message, no teaching in between. Record every answer with tutor_record_check. When every skill has an answer and the integrative problem is done, call tutor_finish — it decides pass or fail.""",
+    "complete": """The session is complete (passed). Answer follow-up questions briefly. Offer once to save the misconceptions and weakest skills as flashcards (add_cards, tagged with the topic and the skill) so spaced repetition keeps them alive — ask which subject if none is focused. Suggest a new teaching session for the next branch in the outline, if any.""",
+}
+
+
+def _learner_signals(owner, deck_id: Optional[str]) -> str:
+    """Weakest topics from the learner's own answers in the focused subject.
+
+    This is what a prompt-only tutor cannot see: the diagnostic can aim at
+    where the learner actually struggles."""
+    if not deck_id:
+        return ""
+    from datetime import timedelta
+
+    from src.study_stats import get_weak_question_signals
+    db = SessionLocal()
+    try:
+        qids = [r[0] for r in _owned(db.query(StudyQuestion.id).filter(StudyQuestion.deck_id == deck_id),
+                                     StudyQuestion, owner).all()]
+        if not qids:
+            return ""
+        sig = get_weak_question_signals(db, owner, _now() - timedelta(days=90), question_ids=qids)
+    finally:
+        db.close()
+    topics = sorted((v for v in sig.get("by_topic", {}).values() if v.get("total", 0) >= 2),
+                    key=lambda v: (v["accuracy"], -v["total"]))[:6]
+    if not topics:
+        return ""
+    rows = [f"- {t['topic']}: {round(100 * t['accuracy'])}% right over {t['total']} answers" for t in topics]
+    return ("The learner's practice history in the focused subject (last 90 days, weakest first):\n"
+            + "\n".join(rows)
+            + "\nWhere these belong to this topic, probe them early in the diagnostic and weigh them in placement.")
+
+
+def build_socratic_prompt(owner, deck_id: Optional[str], state: Dict, model: str = "") -> str:
+    phase = state.get("phase") or "diagnostic"
+    guide = _PHASE_GUIDE.get(phase, "")
+    if isinstance(guide, dict):
+        guide = guide[bool(state.get("skills"))]
+    parts = [SOCRATIC_ROLE,
+             f"Today: {datetime.now().date().isoformat()}." + (f" Model: {model}." if model else ""),
+             _socratic.prompt_state(state), guide]
+    try:
+        signals = _learner_signals(owner, deck_id)
+        if signals:
+            parts.append(signals)
+    except Exception as e:  # the learner model is a bonus, never a blocker
+        logger.warning("study tutor: learner signals failed error_type=%s", type(e).__name__)
+    try:
+        parts.append(_live_state(owner, deck_id))
+    except Exception as e:
+        logger.warning("study tutor: live state failed: %s", e)
+    from src.study_ai import _VISUALS_NOTE
+    parts.append(_VISUALS_NOTE.strip())
+    return "\n\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
 def create_thread(owner, deck_id: Optional[str] = None, title: Optional[str] = None,
-                  question_id: Optional[str] = None) -> Dict:
+                  question_id: Optional[str] = None, *, teach_topic: Optional[str] = None,
+                  full_mastery: bool = False) -> Dict:
+    """New chat. ``teach_topic`` makes it a teaching session from the start."""
+    tutor = None
+    if teach_topic is not None:
+        if question_id is not None:
+            raise HTTPException(400, "A practice conversation cannot be a teaching session.")
+        try:
+            tutor = _socratic.new_state(teach_topic, full_mastery=full_mastery)
+        except _socratic.TutorError as e:
+            raise HTTPException(400, str(e))
+        title = title or tutor["topic"]
     db = SessionLocal()
     try:
         t = StudyAgentThread(id=str(uuid.uuid4()), owner=owner, deck_id=deck_id or None,
-                             title=title, question_id=question_id)
+                             title=title, question_id=question_id,
+                             tutor_state=json.dumps(tutor, ensure_ascii=False) if tutor else None)
         db.add(t)
         db.commit()
         return _thread_dict(t)
@@ -1077,7 +1394,7 @@ def create_thread(owner, deck_id: Optional[str] = None, title: Optional[str] = N
 
 def _thread_dict(t: StudyAgentThread) -> Dict:
     return {"id": t.id, "title": t.title or "New chat", "deck_id": t.deck_id,
-            "question_id": t.question_id,
+            "question_id": t.question_id, "mode": "socratic" if t.tutor_state else None,
             "updated_at": (t.updated_at or t.created_at).isoformat() if (t.updated_at or t.created_at) else None}
 
 
@@ -1173,6 +1490,7 @@ def thread_messages_for_ui(owner, thread_id: str) -> List[Dict]:
     their arguments, intermediate content, and review details never leave the
     server; the projection is as safe as the live stream."""
     t = get_thread(owner, thread_id)
+    socratic = bool(t.tutor_state)
     out: List[Dict] = []
     for r in _load_rows(owner, thread_id):
         if t.question_id is not None:
@@ -1188,7 +1506,12 @@ def thread_messages_for_ui(owner, thread_id: str) -> List[Dict]:
                         "when": r.created_at.isoformat() if r.created_at else None})
             continue
         if r.role == "tool":
-            out.append({"role": "tool", "name": r.name, "output": _clip(r.content or "", TOOL_RESULT_UI_CHARS),
+            # Teaching sessions show that a tool ran, never what it returned:
+            # a material snippet or a stored answer would give away the
+            # question the tutor just asked.
+            output = "" if socratic else _clip(r.content or "", TOOL_RESULT_UI_CHARS)
+            out.append({"role": "tool", "name": r.name, "output": output,
+                        "ok": not (r.content or "").startswith("ERROR:"),
                         "tool_call_id": r.tool_call_id, "when": r.created_at.isoformat() if r.created_at else None})
             continue
         item = {"role": r.role, "content": r.content or "", "when": r.created_at.isoformat() if r.created_at else None}
@@ -1332,13 +1655,18 @@ def _parse_args(raw) -> Dict:
 
 
 async def dispatch_tool(name: str, owner, args: Dict, *, allow_code: bool = False,
-                        practice: bool = False) -> Dict:
+                        practice: bool = False, socratic: bool = False,
+                        thread_id: Optional[str] = None) -> Dict:
     """Run one tool. Returns {"ok": bool, "result": ...} / {"ok": False, "error": ...}.
 
     ``practice=True`` is the protected Ask AI mode: an explicit allowlist
     applies before anything else, so a protected thread can never execute a
     write/code/transcribe tool even when the model emits its name, the browser
-    sends ``allow_code``, or the user asks to enable it."""
+    sends ``allow_code``, or the user asks to enable it.
+
+    ``socratic=True`` is a teaching session: its own allowlist (read the
+    materials, save cards, drive the skill map). Tutor tools get the thread
+    id injected here; a value the model wrote for it is overwritten."""
     spec = TOOLS.get(name)
     if spec is None:
         return {"ok": False, "error": f"unknown tool '{name}'"}
@@ -1346,6 +1674,11 @@ async def dispatch_tool(name: str, owner, args: Dict, *, allow_code: bool = Fals
         from src.study_practice_coach import PRACTICE_TOOL_NAMES
         if name not in PRACTICE_TOOL_NAMES:
             return {"ok": False, "error": f"tool '{name}' is not available in practice mode"}
+    if not _tool_allowed(spec, socratic=socratic):
+        where = "in a teaching session" if socratic else "outside a teaching session"
+        return {"ok": False, "error": f"tool '{name}' is not available {where}"}
+    if spec.tutor:
+        args = {**(args or {}), "_thread_id": thread_id}
     if spec.code:
         from src.tool_security import owner_is_admin_or_single_user
         if not allow_code:
@@ -1679,12 +2012,34 @@ async def run_study_agent(owner, thread_id: str, user_text: str, *, deck_id: Opt
         yield DONE
         return
 
-    include_code = bool(allow_code) and owner_is_admin_or_single_user(owner)
-    schemas = tool_schemas(include_code)
+    # A teaching session runs the Socratic tutor: its own prompt and tools,
+    # never code tools, and the skill map pushed to the panel as it changes.
+    socratic = bool(thread.tutor_state)
+    if socratic:
+        deck_id = deck_id or thread.deck_id   # a session stays on its subject
+        try:
+            tutor_begin_turn(owner, thread_id)
+        except HTTPException as e:
+            logger.warning("study tutor: turn count failed: %s", e.detail)
+    include_code = bool(allow_code) and not socratic and owner_is_admin_or_single_user(owner)
+
+    def _system_prompt() -> str:
+        if socratic:
+            st = tutor_state(owner, thread_id) or {}
+            return build_socratic_prompt(owner, deck_id, st, model)
+        return build_system_prompt(owner, deck_id, include_code, model)
+
+    def _tutor_event() -> str:
+        return _sse({"type": "tutor_state", "state": _socratic.public_state(tutor_state(owner, thread_id))})
+
+    schemas = tool_schemas(include_code, socratic=socratic)
     rows = _load_rows(owner, thread_id, HISTORY_MESSAGES)
-    messages = [{"role": "system", "content": build_system_prompt(owner, deck_id, include_code, model)}]
+    messages = [{"role": "system", "content": _system_prompt()}]
     messages += trim_history(rows_to_llm_messages(rows))
-    yield _sse({"type": "model_info", "model": model, "code_tools": include_code})
+    yield _sse({"type": "model_info", "model": model, "code_tools": include_code,
+                "mode": "socratic" if socratic else None})
+    if socratic:
+        yield _tutor_event()
 
     for round_num in range(MAX_ROUNDS):
         text_parts: List[str] = []
@@ -1744,16 +2099,36 @@ async def run_study_agent(owner, thread_id: str, user_text: str, *, deck_id: Opt
                                          "function": {"name": c["name"], "arguments": c["arguments"]}}
                                         for c in stored_calls]})
 
+        tutor_changed = False
         for c in stored_calls:
             args = _parse_args(c["arguments"])
-            yield _sse({"type": "tool_start", "id": c["id"], "name": c["name"], "args_preview": _args_preview(args)})
-            res = await dispatch_tool(c["name"], owner, args, allow_code=include_code)
+            yield _sse({"type": "tool_start", "id": c["id"], "name": c["name"],
+                        "args_preview": "" if socratic else _args_preview(args)})
+            res = await dispatch_tool(c["name"], owner, args, allow_code=include_code,
+                                      socratic=socratic, thread_id=thread_id)
             model_text = result_text(res, TOOL_RESULT_MODEL_CHARS)
             ui_text = result_text(res, TOOL_RESULT_UI_CHARS)
             save_message(owner, thread_id, "tool", ui_text, tool_call_id=c["id"], name=c["name"])
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": model_text})
+            # In a teaching session the panel shows THAT a tool ran, not what it
+            # returned (see thread_messages_for_ui).
             yield _sse({"type": "tool_output", "id": c["id"], "name": c["name"], "ok": bool(res.get("ok")),
-                        "output": ui_text})
+                        "output": "" if socratic else ui_text})
+            spec = TOOLS.get(c["name"])
+            if spec is not None and spec.tutor and res.get("ok"):
+                tutor_changed = True
+                if not socratic:
+                    # start_teaching_session turned this chat into a session:
+                    # the rest of the turn, starting with the next call in this
+                    # batch, runs as the tutor (its tools, no code tools).
+                    socratic, include_code = True, False
+                    schemas = tool_schemas(False, socratic=True)
+                    yield _sse({"type": "mode", "mode": "socratic"})
+        if tutor_changed:
+            # The state block in the system prompt is authoritative: keep it
+            # current for the next round, and push the map to the panel.
+            messages[0] = {"role": "system", "content": _system_prompt()}
+            yield _tutor_event()
         yield _sse({"type": "agent_step", "round": round_num + 1})
     else:
         yield _sse({"type": "error", "message": f"Stopped after {MAX_ROUNDS} tool rounds."})

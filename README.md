@@ -146,6 +146,15 @@ The loop it is built around:
 There is also a **Tutor** tab — an agent grounded in your own materials, so it answers
 from your notes rather than from the internet.
 
+To learn one topic properly, press **🎓 Teach me** there. It is a strict Socratic tutor,
+adapted from Jane Street's open-source `socratic-tutor` skill: a short diagnostic, a skill
+map from 0 to 5, one question at a time, surprise re-tests of earlier skills, and a final
+exam. The difference is that the app keeps the skill map and does the grading, not the
+model. Levels go up one at a time and only on independent recall. An answer given right
+after an explanation doesn't count. The final exam opens only when every skill is at the
+target. Questions come from your materials and aim at the topics your practice history
+shows you get wrong. Misconceptions it spots can be saved as flashcards when you finish.
+
 Which model Study uses is shown in the panel header (`Model: …`); click it to change it,
 or set it in Settings → Services → Study Model.
 
