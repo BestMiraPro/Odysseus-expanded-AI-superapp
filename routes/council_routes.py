@@ -15,7 +15,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
@@ -281,6 +281,7 @@ def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
         "ranking": _loads(turn.ranking, []),
         "labels": _loads(turn.labels, {}),
         "final": turn.final or "",
+        "verdict": council.parse_verdict(turn.final or ""),
         "error": turn.error,
         "usage": _loads(turn.usage, {}),
         "chair": _loads(getattr(turn, "chair", None), None),
@@ -729,6 +730,23 @@ def setup_council_routes(chat_processor=None) -> APIRouter:
         await asyncio.to_thread(_owned_turn_id, owner, session_id, turn_id, True)
         _cancel(turn_id)
         return {"deleted": True}
+
+    def _turn_markdown(owner, session_id, turn_id) -> str:
+        db = SessionLocal()
+        try:
+            _get_session(db, owner, session_id)
+            turn = db.query(CouncilTurn).filter(CouncilTurn.id == turn_id, CouncilTurn.session_id == session_id,
+                                                CouncilTurn.owner == owner).first()
+            if turn is None:
+                raise HTTPException(404, "Turn not found")
+            return council.turn_markdown(_turn_json(turn))
+        finally:
+            db.close()
+
+    @router.get("/sessions/{session_id}/turns/{turn_id}/export.md")
+    def export_turn(session_id: str, turn_id: str, request: Request):
+        owner = _owner(request)
+        return Response(_turn_markdown(owner, session_id, turn_id), media_type="text/markdown; charset=utf-8")
 
     @router.post("/sessions/{session_id}/turns/{turn_id}/stop")
     async def stop_turn(session_id: str, turn_id: str, request: Request):

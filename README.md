@@ -174,6 +174,15 @@ Models) and then work everywhere else in Odysseus too — chat, Study, research.
 Runs live on the server: closing the page does not stop a council, and reopening the thread
 shows the saved result. Follow-up questions in the same thread see the earlier answers.
 
+The chairman ends every answer with a **Verdict** block: the decision, its confidence, who
+dissented and why, what evidence would change it, and the cheapest next test. A follow-up
+round always sees the previous verdict, even when the rest of that answer is clipped to fit a
+small context window. The API returns the parsed fields as `verdict` on each turn.
+
+**Export .md** downloads one turn as Markdown (answer and verdict, run settings, cost, every
+opinion, the reviews and the ranking). The same file is served at
+`GET /api/council/sessions/{session_id}/turns/{turn_id}/export.md`.
+
 ### Tools
 
 **Tools** under the seats sets what members may do, per council:

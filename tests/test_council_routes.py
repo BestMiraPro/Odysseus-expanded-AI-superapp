@@ -405,3 +405,70 @@ def test_council_memory_follows_the_toggle_and_the_memory_switch(client, db, mon
         assert ("SHARED PROFILE of alice" in system) is expect
         assert ("User trains strength three times a week." in system) is expect
     assert client.get(f"/api/council/sessions/{sid}").json()["config"]["memory"] is memory
+
+
+CHAIR_WITH_VERDICT = ("Do the replay.\n\n## Verdict\n- Decision: replay first\n- Confidence: medium\n"
+                      "- Dissent: qwen3:8b wanted a retrain\n- Would change it: no replay gain\n- Next test: none")
+
+
+def _ask_with_verdict(client, monkeypatch):
+    async def stream(url, model, messages, **kwargs):
+        if messages[0]["content"] == cr.council.CHAIR_SYSTEM:
+            yield f"data: {json.dumps({'delta': CHAIR_WITH_VERDICT})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+        async for chunk in _fake_stream(url, model, messages, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", stream)
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    assert client.post(f"/api/council/sessions/{sid}/ask", json={"question": "Replay or retrain?", **SEATS}).status_code == 200
+    (turn,) = client.get(f"/api/council/sessions/{sid}").json()["turns"]
+    return sid, turn
+
+
+def test_a_saved_turn_reports_its_parsed_verdict(client, db, monkeypatch):
+    _, turn = _ask_with_verdict(client, monkeypatch)
+    assert turn["verdict"] == {"decision": "replay first", "confidence": "medium",
+                               "dissent": "qwen3:8b wanted a retrain", "would_change": "no replay gain",
+                               "next_test": "none"}
+
+
+def test_a_turn_without_a_verdict_block_reports_an_empty_verdict(client, db):
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    client.post(f"/api/council/sessions/{sid}/ask", json={"question": "What is 6x7?", **SEATS})
+    (turn,) = client.get(f"/api/council/sessions/{sid}").json()["turns"]
+    assert turn["verdict"] == {}
+
+
+def test_export_returns_the_turn_as_markdown(client, db, monkeypatch):
+    sid, turn = _ask_with_verdict(client, monkeypatch)
+    resp = client.get(f"/api/council/sessions/{sid}/turns/{turn['id']}/export.md")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/markdown")
+    assert resp.text.startswith("# Replay or retrain?\n")
+    assert "- Chairman: deepseek-v4 (DeepSeek)" in resp.text
+    assert "- Decision: replay first" in resp.text
+    assert "deepseek-v4 thinks 42" in resp.text
+    assert "sk-1" not in resp.text
+
+
+def test_export_is_private_to_the_owner(client, db, monkeypatch):
+    sid, turn = _ask_with_verdict(client, monkeypatch)
+    url = f"/api/council/sessions/{sid}/turns/{turn['id']}/export.md"
+    assert client.get(url, headers={"x-user": "bob"}).status_code == 404
+    assert client.get(f"/api/council/sessions/{sid}/turns/nope/export.md").status_code == 404
+
+
+def test_the_next_round_sees_the_previous_dissent(client, db, monkeypatch):
+    sid, _ = _ask_with_verdict(client, monkeypatch)
+    seen = []
+
+    async def recording(url, model, messages, **kwargs):
+        seen.append([m["content"] for m in messages])
+        async for chunk in _fake_stream(url, model, messages, **kwargs):
+            yield chunk
+
+    monkeypatch.setattr("src.llm_core.stream_llm", recording)
+    client.post(f"/api/council/sessions/{sid}/ask", json={"question": "And now?", **SEATS})
+    assert seen and all(any("- Dissent: qwen3:8b wanted a retrain" in content for content in call) for call in seen)

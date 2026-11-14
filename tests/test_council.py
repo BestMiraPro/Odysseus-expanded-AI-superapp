@@ -458,3 +458,126 @@ def test_context_counts_against_the_history_budget():
     est = council.estimate_turn(members, chair, "quick", "Q", [], context="m" * 20_000)
     assert est["calls"][0]["input_tokens"] > council.estimate_turn(members, chair, "quick", "Q", [])["calls"][0][
         "input_tokens"] + 5_000
+
+
+# ---------------------------------------------------------------------------
+# verdict
+# ---------------------------------------------------------------------------
+
+VERDICT = (
+    "## Verdict\n"
+    "- Decision: run the replay ablation before any retrain\n"
+    "- Confidence: medium - one seed only\n"
+    "- Dissent: gpt-5.5 would retrain first, because replays miss tool errors\n"
+    "- Would change it: a replay gain under 1 task on val18\n"
+    "- Next test: replay v32 on 27 dumps; adopt if at least 2 more pass"
+)
+
+
+def test_chair_prompt_asks_for_the_verdict_block():
+    system = council.chair_messages("Q?", [], {"A": 0}, {0: "a"}, {0: "m via EP"}, [], [])[0]["content"]
+    for field in ("## Verdict", "- Decision:", "- Confidence:", "- Dissent:", "- Would change it:", "- Next test:"):
+        assert field in system
+
+
+def test_parse_verdict_reads_the_fields_of_the_last_verdict_block():
+    text = f"Earlier text mentions ## Verdict\n- Decision: stale\n\nThe answer.\n\n{VERDICT}\n"
+    assert council.parse_verdict(text) == {
+        "decision": "run the replay ablation before any retrain",
+        "confidence": "medium - one seed only",
+        "dissent": "gpt-5.5 would retrain first, because replays miss tool errors",
+        "would_change": "a replay gain under 1 task on val18",
+        "next_test": "replay v32 on 27 dumps; adopt if at least 2 more pass",
+    }
+
+
+def test_parse_verdict_tolerates_bold_labels_and_missing_fields():
+    assert council.parse_verdict("Answer.\n\n## Verdict\n- **Decision:** ship it\n* Confidence: high") == {
+        "decision": "ship it", "confidence": "high"}
+
+
+def test_an_answer_without_a_verdict_block_has_no_verdict():
+    assert council.parse_verdict("- Decision: looks like one but has no heading") == {}
+    assert council.parse_verdict("") == {}
+
+
+def test_a_clipped_earlier_answer_keeps_its_verdict_whole():
+    final = _long("body", 30000) + "\n\n" + VERDICT
+    history = [{"question": "brief", "final": final}]
+    # At this budget the plain clip leaves the whole answer out, verdict included.
+    (_, answer) = council.history_messages(history, budget=1000)
+    assert answer["content"].startswith("[NOTE: this earlier council answer is left out.")
+    assert answer["content"].endswith(VERDICT)
+    assert len(answer["content"]) <= 1000
+
+
+def test_a_verdict_larger_than_the_budget_is_clipped_like_any_text():
+    history = [{"question": "brief", "final": "short body\n\n" + VERDICT + "x" * 5000}]
+    (_, answer) = council.history_messages(history, budget=1500)
+    assert len(answer["content"]) <= 1500
+
+
+# ---------------------------------------------------------------------------
+# markdown export
+# ---------------------------------------------------------------------------
+
+def _turn(**over):
+    turn = {
+        "question": "Which experiment next?",
+        "config": {"members": [{"model": "claude-opus", "endpoint_name": "Claude"},
+                               {"model": "gpt-5.5", "endpoint_name": "ChatGPT"}],
+                   "chairman": {"model": "claude-opus", "endpoint_name": "Claude"},
+                   "mode": "full", "tools": "research", "workspace": "/repo/gemma4-astra"},
+        "status": "done",
+        "labels": {"A": 1, "B": 0},
+        "opinions": [{"member": 0, "text": "retrain"},
+                     {"member": 1, "text": "replay first",
+                      "tools": [{"kind": "note", "text": "let me look"},
+                                {"kind": "tool", "tool": "read_file", "command": "QUEUE.md", "status": "done"},
+                                {"kind": "tool", "tool": "web_search", "command": "gemma\n4", "status": "error"}]}],
+        "reviews": [{"member": 0, "text": "A is right"}, {"member": 1, "error": "timed out"}],
+        "ranking": [{"label": "A", "member": 1, "avg_rank": 1.0, "votes": 1, "first_votes": 1},
+                    {"label": "B", "member": 0, "avg_rank": None, "votes": 0, "first_votes": 0}],
+        "final": "Replay first.\n\n" + VERDICT,
+        "usage": {"input_tokens": 1200, "output_tokens": 300, "cost_usd": 0.0123, "unpriced_calls": 2},
+        "chair": {"tools": [{"kind": "tool", "tool": "read_file", "command": "INDEX.md", "status": "done"}]},
+        "created_at": "2026-11-14T10:00:00",
+    }
+    turn.update(over)
+    return turn
+
+
+def test_turn_markdown_has_the_answer_the_run_settings_and_the_cost():
+    text = council.turn_markdown(_turn())
+    assert text.startswith("# Which experiment next?\n")
+    assert "- Mode: full" in text
+    assert "- Chairman: claude-opus (Claude)" in text
+    assert "- Tools: research" in text
+    assert "- Workspace: /repo/gemma4-astra" in text
+    assert "- Asked: 2026-11-14T10:00:00" in text
+    assert "- Usage: 1200 input + 300 output tokens, metered cost $0.0123 (2 calls not priced)" in text
+    assert "## Council answer\n\nReplay first.\n\n## Verdict\n- Decision: run the replay" in text
+
+
+def test_turn_markdown_lists_opinions_by_label_with_their_tools():
+    text = council.turn_markdown(_turn())
+    a, b = text.index("### Response A — gpt-5.5 (ChatGPT)"), text.index("### Response B — claude-opus (Claude)")
+    assert a < b
+    assert "Tools used:\n- ✓ `read_file` QUEUE.md\n- ✗ `web_search` gemma 4\n\nreplay first" in text
+    assert "Chairman tools used:\n- ✓ `read_file` INDEX.md" in text
+
+
+def test_turn_markdown_has_the_ranking_table_and_the_reviews():
+    text = council.turn_markdown(_turn())
+    assert "| 1 | Response A | gpt-5.5 (ChatGPT) | 1.0 | 1 |" in text
+    assert "Response B |" not in text.split("## Reviews")[0].split("## Peer ranking")[1]
+    assert "### Review by claude-opus (Claude)\n\nA is right" in text
+    assert "### Review by gpt-5.5 (ChatGPT)\n\n_timed out_" in text
+
+
+def test_turn_markdown_of_a_failed_turn_says_so():
+    text = council.turn_markdown(_turn(final="", status="error", error="No council member produced an answer.",
+                                       ranking=[], reviews=[], usage={}, chair=None))
+    assert "- Status: error (No council member produced an answer.)" in text
+    assert "_No answer_" in text
+    assert "## Reviews" not in text and "## Peer ranking" not in text and "- Usage:" not in text
