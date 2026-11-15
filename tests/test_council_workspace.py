@@ -438,3 +438,32 @@ def test_a_repository_that_tracks_its_own_messages_outbox_keeps_it(source, tmp_p
     ws.collect_misplaced("seat-1")
     assert (ws.workdir("seat-1") / "messages" / "outbox" / "README.md").exists()
     assert ws.deliver(1) == ([], [])
+
+
+def test_unmerged_lists_the_seats_whose_work_main_does_not_contain(source, tmp_path):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=3)
+    assert ws.unmerged() == []
+    _commit(ws.workdir("seat-1"), "a.txt", "from seat 1\n")
+    _commit(ws.workdir("seat-2"), "b.txt", "from seat 2\n")
+    assert ws.unmerged() == ["seat-1", "seat-2"]          # seat-3 did nothing
+    _git(ws.main, "merge", "-q", "--no-edit", "seat-1")
+    assert ws.unmerged() == ["seat-2"]
+    # The same content typed into main by hand is merged work too.
+    _commit(ws.main, "b.txt", "from seat 2\n")
+    assert ws.unmerged() == []
+
+
+def test_unmerged_includes_a_seat_whose_work_conflicts_with_main(source, tmp_path):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    _commit(ws.workdir("seat-1"), "README.md", "seat version\n")
+    _commit(ws.main, "README.md", "chair version\n")
+    assert ws.unmerged() == ["seat-1"]
+
+
+def test_keep_saves_a_seats_branch_under_a_name_that_survives_the_reset(source, tmp_path):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    _commit(ws.workdir("seat-1"), "a.txt", "work\n")
+    assert ws.keep("seat-1", 2) == "kept/round-2/seat-1"
+    ws.start_round()
+    assert not (ws.workdir("seat-1") / "a.txt").exists()
+    assert _git(ws.main, "show", "kept/round-2/seat-1:a.txt").stdout == "work\n"

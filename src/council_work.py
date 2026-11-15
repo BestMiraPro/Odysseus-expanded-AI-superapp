@@ -160,6 +160,7 @@ def stop_reason(
     status: Optional[str] = None,
     answered: Sequence[bool] = (),
     moved: Sequence[bool] = (),
+    unmerged: bool = False,
     budget_ok: bool = True,
     cancelled: bool = False,
     waiting: bool = False,
@@ -170,10 +171,12 @@ def stop_reason(
 
     ``answered`` and ``moved`` hold one flag per finished round, latest last:
     whether the round produced an answer, and whether main's HEAD moved.
+    ``unmerged`` says a seat's work of this round is not in main: the
+    chairman's "done" is then not taken at its word.
     """
     if cancelled:
         return STOP_CANCELLED
-    if status == "done":
+    if status == "done" and not unmerged:
         return STOP_DONE
     if len(answered) >= 2 and not any(answered[-2:]):
         return STOP_FAILED
@@ -263,6 +266,14 @@ def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.Stream
 def _leftover(who: str, round_no: int) -> str:
     """Commit message for work ``who`` left uncommitted (see ``Workspace.commit_pending``)."""
     return f"{who}: work left uncommitted in round {round_no} (committed by Odysseus)"
+
+
+def _not_done(round_no: int, kept: Sequence[str]) -> str:
+    """Why a "done" verdict was not accepted, and where the work it left out now is."""
+    return (f"The chairman said the goal is met in round {round_no}, but work the seats committed that round "
+            f"is not in the main copy, so the run goes on. That work is kept on these branches of the main "
+            f"copy: {', '.join(kept)}. Chairman: merge what is right (git merge <branch>), or say in your "
+            "answer why it is left out.")
 
 
 def _deliver_and_audit(workspace: Workspace, round_no: int):
@@ -371,6 +382,15 @@ async def run_work(
             final = result.get("final") or ""
             verdict = council.parse_verdict(final)
             plan, lanes = next_round_plan(final)
+            left = await asyncio.to_thread(workspace.unmerged)
+            record["unmerged"] = left
+            if verdict.get("status") == "done" and left:
+                # A real chairman said done with a whole step left on the seats' branches.
+                kept = [await asyncio.to_thread(workspace.keep, who, round_no) for who in left]
+                refusal = await asyncio.to_thread(
+                    workspace.post, "all", "done-not-accepted", _not_done(round_no, kept), round_no)
+                record["delivered"].append(asdict(refusal))
+                record["notices"].append(asdict(Notice("all", _not_done(round_no, kept))))
             notices = [Notice(**n) for n in record["notices"]]
             record.update(head=head, verdict=verdict, status="error" if result.get("error") and not final else "done",
                           votes=[wait_vote(o.get("text", "")) for o in result["opinions"] if not o.get("error")])
@@ -382,7 +402,7 @@ async def run_work(
             budget_ok = await budget_check(record)
             is_waiting = bool(await waiting(record)) if waiting is not None else False
             reason = stop_reason(round_no=round_no, rounds=rounds, status=verdict.get("status"), answered=answered,
-                                 moved=moved, budget_ok=budget_ok, waiting=is_waiting, policy=policy,
+                                 moved=moved, unmerged=bool(left), budget_ok=budget_ok, waiting=is_waiting, policy=policy,
                                  votes=record["votes"])
             await round_emit({"type": "round", "status": "done", "head": head, "verdict": verdict, "stop": reason})
         except asyncio.CancelledError:

@@ -443,14 +443,14 @@ class Forgetful(Fakes):
     def _act(self, stage, round_no, cwd, env, model, messages):
         if stage == "opinions":
             who = env["GIT_AUTHOR_NAME"]
-            Path(cwd, "README.md").write_text(f"hello from {who}\n")
-            Path(cwd, f"{who}.txt").write_text("new file\n")
+            Path(cwd, "README.md").write_text("hello, fixed\n")
             Path(cwd, "__pycache__").mkdir(exist_ok=True)
             Path(cwd, "__pycache__", "mod.cpython-314.pyc").write_bytes(b"\x00bytecode")
             return "Changed: README.md. Commits: `fix: readme`. Test: ran it. Result: passed."
         if stage == "review":
             return super()._act(stage, round_no, cwd, env, model, messages)
-        Path(cwd, "README.md").write_text("hello, integrated\n")
+        # Typed again by hand rather than merged, as the real model did.
+        Path(cwd, "README.md").write_text("hello, fixed\n")
         return CHAIR_ANSWER.format(status="done")
 
 
@@ -458,7 +458,7 @@ class Forgetful(Fakes):
 def test_uncommitted_seat_work_is_committed_so_reviewers_see_the_patch(ws):
     _, saved, _ = _work(ws, Forgetful(ws), rounds=2)
     for opinion, who in zip(saved[0]["result"]["opinions"], ws.seat_names):
-        assert "Patch:" in opinion["attachment"] and f"hello from {who}" in opinion["attachment"]
+        assert "Patch:" in opinion["attachment"] and "hello, fixed" in opinion["attachment"]
         assert "Uncommitted changes" not in opinion["attachment"]
         assert _git(ws.workdir(who), "log", "-1", "--format=%an|%s").stdout.strip() == (
             f"{who}|{who}: work left uncommitted in round 1 (committed by Odysseus)")
@@ -470,7 +470,7 @@ def test_uncommitted_integration_is_committed_so_the_branch_holds_the_result(ws)
     result, saved, _ = _work(ws, Forgetful(ws), rounds=2)
     assert result.reason == "done"
     assert result.head != saved[0]["base"] and saved[0]["head"] == result.head
-    assert _git(ws.main, "show", f"{ws.branch}:README.md").stdout == "hello, integrated\n"
+    assert _git(ws.main, "show", f"{ws.branch}:README.md").stdout == "hello, fixed\n"
     assert _git(ws.main, "log", "-1", "--format=%an|%s").stdout.strip() == (
         "chair|chair: work left uncommitted in round 1 (committed by Odysseus)")
     assert _git(ws.main, "status", "--porcelain").stdout == ""
@@ -507,3 +507,43 @@ def test_a_misplaced_message_is_delivered_and_kept_out_of_the_branch(ws):
 def test_the_work_prompt_does_not_give_a_relative_outbox_path():
     assert "messages/outbox/<your name>" not in cwk.work_system("stop")
     assert "outbox folder named below" in cwk.work_system("stop")
+
+
+# ---------------------------------------------------------------------------
+# "done" while seat work is not in the main copy
+# ---------------------------------------------------------------------------
+
+def test_done_is_not_accepted_while_seat_work_is_unmerged():
+    assert _stop(status="done", unmerged=True) is None
+    assert _stop(status="done", unmerged=False) == "done"
+    # The round limit still ends the run.
+    assert _stop(status="done", unmerged=True, round_no=5) == "max_rounds"
+
+
+@needs_git
+def test_a_done_verdict_with_unmerged_seat_work_keeps_the_run_going_and_keeps_the_work(ws):
+    # Seats commit every round; the chairman merges nothing and says done.
+    result, saved, _ = _work(ws, Fakes(ws, statuses=("done",), merge=False), rounds=2)
+    # Nothing reached main in two rounds, so the run ends as stalled, not as done.
+    assert result.reason == "stalled" and result.rounds == 2
+    assert saved[0]["unmerged"] == ["seat-1", "seat-2"]
+    # The seats are reset for round 2, so their round-1 work is kept on branches of its own.
+    assert _git(ws.main, "show", "kept/round-1/seat-1:seat-1-r1.txt").stdout == "seat-1 round 1\n"
+    assert _git(ws.main, "show", "kept/round-1/seat-2:seat-2-r1.txt").stdout == "seat-2 round 1\n"
+    notice = [m for m in saved[0]["delivered"] if m["slug"] == "done-not-accepted"]
+    assert len(notice) == 1 and notice[0]["sender"] == "odysseus" and notice[0]["to"] == "all"
+    assert "kept/round-1/seat-1" in notice[0]["text"] and "kept/round-1/seat-2" in notice[0]["text"]
+    # Round 2's brief tells everyone why the run went on.
+    assert "kept/round-1/seat-1" in saved[1]["question"]
+
+
+@needs_git
+def test_a_done_verdict_is_accepted_when_the_chairman_merged_the_seats(ws):
+    result, saved, _ = _work(ws, Fakes(ws, statuses=("done",)), rounds=3)
+    assert result.reason == "done" and result.rounds == 1 and saved[0]["unmerged"] == []
+
+
+@needs_git
+def test_a_change_the_chairman_typed_again_by_hand_counts_as_merged(ws):
+    result, saved, _ = _work(ws, Forgetful(ws), rounds=3)
+    assert result.reason == "done" and result.rounds == 1 and saved[0]["unmerged"] == []

@@ -223,6 +223,28 @@ class Workspace:
              "commit", "--quiet", "--message", message], cwd)
         return True
 
+    def unmerged(self) -> List[str]:
+        """Seats whose branch holds changes that main does not contain.
+
+        Judged by content, not history: a seat counts as merged when merging
+        its branch would leave main's files as they are, so a change the
+        chairman typed again by hand counts too. A branch that would conflict
+        is unmerged.
+        """
+        tree = git(["rev-parse", "HEAD^{tree}"], self.main).stdout.strip()
+        left = []
+        for who in self.seat_names:
+            merged = git(["merge-tree", "--write-tree", "HEAD", who], self.main, check=False)
+            if merged.returncode != 0 or merged.stdout.split()[:1] != [tree]:
+                left.append(who)
+        return left
+
+    def keep(self, who: str, round_no: int) -> str:
+        """Save ``who``'s branch as ``kept/round-N/<who>`` (the next round resets the seat); returns that name."""
+        name = f"kept/round-{round_no}/{who}"
+        git(["branch", "--force", name, who], self.main)
+        return name
+
     def diff_attachment(self, who: str, base: str, limit: int = DIFF_CHARS) -> str:
         """What ``who`` committed since ``base``: commits, a stat and the patch clipped to ``limit``.
 
