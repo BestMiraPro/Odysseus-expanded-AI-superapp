@@ -368,3 +368,32 @@ def test_odysseus_posts_through_a_function_and_its_messages_are_audited(run):
     Path(msg.path).write_text("forged brief")
     assert run.audit()
     assert Path(msg.path).read_text() == msg.text
+
+
+def test_commit_pending_commits_edits_and_new_files_as_the_seat(source, tmp_path):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    seat = ws.workdir("seat-1")
+    (seat / "README.md").write_text("changed\n")
+    (seat / "new.txt").write_text("new\n")
+    assert ws.commit_pending("seat-1", "seat-1: left over") is True
+    assert _git(seat, "status", "--porcelain").stdout == ""
+    assert _git(seat, "log", "-1", "--format=%an <%ae>|%s").stdout.strip() == (
+        "seat-1 <seat-1@odysseus.invalid>|seat-1: left over")
+    assert _git(seat, "show", "--stat", "--format=", "HEAD").stdout.count("|") == 2
+
+
+def test_commit_pending_does_nothing_on_a_clean_tree(source, tmp_path):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    before = ws.head()
+    assert ws.commit_pending("chair", "chair: left over") is False
+    assert ws.head() == before
+
+
+def test_commit_pending_leaves_interpreter_caches_out(source, tmp_path):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    seat = ws.workdir("seat-1")
+    (seat / "__pycache__").mkdir()
+    (seat / "__pycache__" / "m.pyc").write_bytes(b"\x00")
+    (seat / ".pytest_cache").mkdir()
+    (seat / ".pytest_cache" / "v").write_text("x")
+    assert ws.commit_pending("seat-1", "seat-1: left over") is False

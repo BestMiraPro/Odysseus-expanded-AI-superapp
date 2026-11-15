@@ -208,6 +208,21 @@ class Workspace:
             git(["clean", "--quiet", "-f", "-d"], cwd)
         return base
 
+    def commit_pending(self, who: str, message: str) -> bool:
+        """Commit whatever ``who`` left uncommitted in its working copy; True if there was any.
+
+        A model often reports a commit it never made. Without this its work is
+        in no commit: reviewers see no patch, the chairman cannot merge it,
+        and the run's branch ends without the result.
+        """
+        cwd = self.workdir(who)
+        git(["add", "--all"], cwd)
+        if git(["diff", "--cached", "--quiet"], cwd, check=False).returncode == 0:
+            return False
+        git(["-c", f"user.name={who}", "-c", f"user.email={who}@odysseus.invalid",
+             "commit", "--quiet", "--message", message], cwd)
+        return True
+
     def diff_attachment(self, who: str, base: str, limit: int = DIFF_CHARS) -> str:
         """What ``who`` committed since ``base``: commits, a stat and the patch clipped to ``limit``.
 
@@ -411,6 +426,10 @@ def create_run(source: Union[str, Path], runs_root: Union[str, Path], goal: str,
                  ["config", "user.name", "odysseus-run"],
                  ["config", "user.email", "run@odysseus.invalid"]):
         git(args, ws.main)
+    # Interpreter caches the seats' test runs leave behind are not work
+    # (info/exclude is shared by the seat worktrees).
+    with open(ws.main / ".git" / "info" / "exclude", "a", encoding="utf-8") as fh:
+        fh.write("__pycache__/\n*.pyc\n.pytest_cache/\n")
     for who in ws.seat_names:
         git(["worktree", "add", "--quiet", "-B", who, str(ws.workdir(who)), "HEAD"], ws.main)
     ws._ensure_dirs()

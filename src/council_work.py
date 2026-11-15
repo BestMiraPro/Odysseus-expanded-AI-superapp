@@ -260,6 +260,11 @@ def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.Stream
     return fn
 
 
+def _leftover(who: str, round_no: int) -> str:
+    """Commit message for work ``who`` left uncommitted (see ``Workspace.commit_pending``)."""
+    return f"{who}: work left uncommitted in round {round_no} (committed by Odysseus)"
+
+
 def _deliver_and_audit(workspace: Workspace, round_no: int):
     """Deliver the outboxes, audit the folder and post each notice; returns (messages, notices)."""
     delivered, notices = workspace.deliver(round_no)
@@ -338,8 +343,9 @@ async def run_work(
             record["notices"] += [asdict(n) for n in found]
             if stage == "opinions":
                 for op in result["opinions"]:
-                    op["attachment"] = await asyncio.to_thread(
-                        workspace.diff_attachment, _who(op["member"]), record["base"])
+                    who = _who(op["member"])
+                    await asyncio.to_thread(workspace.commit_pending, who, _leftover(who, record["round"]))
+                    op["attachment"] = await asyncio.to_thread(workspace.diff_attachment, who, record["base"])
 
         try:
             base = await asyncio.to_thread(workspace.start_round)
@@ -357,6 +363,7 @@ async def run_work(
                 history=history, emit=round_emit, stream_fn=stream_fn, rng=rng, state=record["result"],
                 prompts=prompts, personalize=_personalizer(workspace, lanes, base), between_stages=between,
                 hard_timeout=SEAT_HARD_TIMEOUT, context=context)
+            await asyncio.to_thread(workspace.commit_pending, "chair", _leftover("chair", round_no))
             head = await asyncio.to_thread(workspace.head)
 
             final = result.get("final") or ""

@@ -431,3 +431,53 @@ def test_tampering_found_after_a_stage_reaches_everyone_and_the_next_brief(ws):
 def test_seats_and_workspace_must_match(ws):
     with pytest.raises(council.CouncilError):
         _work(ws, Fakes(ws), members=[_member("a")])
+
+
+# ---------------------------------------------------------------------------
+# seats that never commit (what a real small model did)
+# ---------------------------------------------------------------------------
+
+class Forgetful(Fakes):
+    """Seats and chairman that edit files and report a commit they never made."""
+
+    def _act(self, stage, round_no, cwd, env, model, messages):
+        if stage == "opinions":
+            who = env["GIT_AUTHOR_NAME"]
+            Path(cwd, "README.md").write_text(f"hello from {who}\n")
+            Path(cwd, f"{who}.txt").write_text("new file\n")
+            Path(cwd, "__pycache__").mkdir(exist_ok=True)
+            Path(cwd, "__pycache__", "mod.cpython-314.pyc").write_bytes(b"\x00bytecode")
+            return "Changed: README.md. Commits: `fix: readme`. Test: ran it. Result: passed."
+        if stage == "review":
+            return super()._act(stage, round_no, cwd, env, model, messages)
+        Path(cwd, "README.md").write_text("hello, integrated\n")
+        return CHAIR_ANSWER.format(status="done")
+
+
+@needs_git
+def test_uncommitted_seat_work_is_committed_so_reviewers_see_the_patch(ws):
+    _, saved, _ = _work(ws, Forgetful(ws), rounds=2)
+    for opinion, who in zip(saved[0]["result"]["opinions"], ws.seat_names):
+        assert "Patch:" in opinion["attachment"] and f"hello from {who}" in opinion["attachment"]
+        assert "Uncommitted changes" not in opinion["attachment"]
+        assert _git(ws.workdir(who), "log", "-1", "--format=%an|%s").stdout.strip() == (
+            f"{who}|{who}: work left uncommitted in round 1 (committed by Odysseus)")
+        assert "__pycache__" not in _git(ws.workdir(who), "ls-files").stdout
+
+
+@needs_git
+def test_uncommitted_integration_is_committed_so_the_branch_holds_the_result(ws):
+    result, saved, _ = _work(ws, Forgetful(ws), rounds=2)
+    assert result.reason == "done"
+    assert result.head != saved[0]["base"] and saved[0]["head"] == result.head
+    assert _git(ws.main, "show", f"{ws.branch}:README.md").stdout == "hello, integrated\n"
+    assert _git(ws.main, "log", "-1", "--format=%an|%s").stdout.strip() == (
+        "chair|chair: work left uncommitted in round 1 (committed by Odysseus)")
+    assert _git(ws.main, "status", "--porcelain").stdout == ""
+
+
+@needs_git
+def test_a_seat_that_committed_everything_gets_no_extra_commit(ws):
+    _work(ws, Fakes(ws, statuses=("done",)), rounds=1)
+    for who in ws.seat_names:
+        assert _git(ws.workdir(who), "log", "-1", "--format=%s").stdout.strip() == f"{who} round 1"
