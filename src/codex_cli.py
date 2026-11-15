@@ -59,6 +59,7 @@ class CodexRun:
     web_search: bool = True
     mcp_servers: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> {command, args, env}
     extra_config: List[str] = field(default_factory=list)
+    env: Dict[str, Optional[str]] = field(default_factory=dict)  # process env overrides; None removes
 
 
 def find_cli() -> Optional[str]:
@@ -372,6 +373,8 @@ async def stream(run: CodexRun, *, timeout: Optional[float] = None) -> AsyncIter
             cwd = scratch
         args = build_args(cli, run, cwd)
         env = _env(home)
+        if run.env:
+            env = {k: v for k, v in {**env, **run.env}.items() if v is not None}
     except Exception:
         shutil.rmtree(home, ignore_errors=True)
         raise

@@ -33,7 +33,7 @@ import os
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
@@ -74,6 +74,10 @@ class ToolSettings:
     mode: str = TOOLS_RESEARCH
     owner: Optional[str] = None
     workspace: Optional[str] = None      # vetted directory, or None
+    # Environment overrides for every tool-running seat's processes: the
+    # Claude Code / Codex CLI (and so their tools) or the agent loop's shell
+    # and Python. A value of None removes the variable.
+    env: Dict[str, Optional[str]] = field(default_factory=dict)
 
     @property
     def enabled(self) -> bool:
@@ -87,6 +91,40 @@ class ToolSettings:
 def normalize_mode(value: Any) -> str:
     value = str(value or "").strip().lower()
     return value if value in TOOL_MODES else TOOLS_RESEARCH
+
+
+# ── Credentials ──
+
+def credential_free_git_env(config_dir: str) -> Dict[str, Optional[str]]:
+    """Environment overrides that keep git and gh off the owner's logins.
+
+    Drops gh's token variables and the SSH agent, points gh at an empty config
+    folder (so it finds no stored login) and git at a global config in
+    ``config_dir`` that resets ``credential.helper`` to none, skips the system
+    config (osxkeychain and the like) and turns off prompts.
+
+    This stops accidental and habitual use of the owner's GitHub and SSH
+    credentials (``git push``, ``gh pr merge``). It is not a sandbox: a seat
+    with an unconfined shell can undo any of it.
+    """
+    gitconfig = os.path.join(config_dir, "gitconfig")
+    with open(gitconfig, "w", encoding="utf-8") as fh:
+        fh.write("[credential]\n\thelper =\n")
+    return {
+        "GH_TOKEN": None,
+        "GITHUB_TOKEN": None,
+        "GH_ENTERPRISE_TOKEN": None,
+        "GITHUB_ENTERPRISE_TOKEN": None,
+        "SSH_AUTH_SOCK": None,
+        "GH_CONFIG_DIR": os.path.join(config_dir, "gh"),
+        "GIT_CONFIG_GLOBAL": gitconfig,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        # Offers no key (no agent, no ~/.ssh/config IdentityFile, no default
+        # key files) and never prompts.
+        "GIT_SSH_COMMAND": "ssh -F /dev/null -o IdentitiesOnly=yes -o IdentityFile=/dev/null "
+                           "-o IdentityAgent=none -o BatchMode=yes",
+    }
 
 
 # ── Prompt ──
@@ -159,7 +197,8 @@ def claude_native_tools(settings: ToolSettings):
         builtin = [t for t in builtin if t not in ("Read", "Glob", "Grep")]
     allowed = builtin + [f"mcp__{MCP_NAME}__{t}" for t in MCP_TOOLS]
     config = json.dumps({"mcpServers": {MCP_NAME: mcp_server_spec(settings.owner)}})
-    return NativeTools(builtin=builtin, allowed=allowed, mcp_config=config, cwd=settings.workspace)
+    return NativeTools(builtin=builtin, allowed=allowed, mcp_config=config, cwd=settings.workspace,
+                       env=settings.env)
 
 
 # ── Engines ──
@@ -203,6 +242,7 @@ async def _codex_stream(url, model, messages, headers, settings: ToolSettings, t
         effort=effort,
         mcp_servers={MCP_NAME: mcp_server_spec(settings.owner)},
         extra_config=[f"features.{name}=false" for name in features_off],
+        env=settings.env,
     )
     async for chunk in codex_cli.stream(run, timeout=timeout):
         yield chunk
@@ -211,6 +251,7 @@ async def _codex_stream(url, model, messages, headers, settings: ToolSettings, t
 async def _agent_stream(url, model, messages, headers, settings: ToolSettings, workload) -> AsyncIterator[str]:
     """Odysseus agent loop limited to the council's tools."""
     from src.agent_loop import stream_agent_loop
+    from src.tool_execution import subprocess_env_overrides
     from src.tool_policy import ToolPolicy, known_tool_names
 
     allowed = set(AGENT_FULL_TOOLS if settings.full else AGENT_RESEARCH_TOOLS)
@@ -228,23 +269,24 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
     # The agent loop bills each model call to the budget ledger itself.
     yield f"data: {json.dumps({'type': 'self_billed'})}\n\n"
     try:
-        async for chunk in stream_agent_loop(
-            endpoint_url=url,
-            model=model,
-            messages=messages,
-            headers=headers,
-            max_rounds=AGENT_MAX_ROUNDS,
-            # No output cap, as for the tool-less seats: a reasoning model
-            # would otherwise spend 4096 tokens thinking and never answer.
-            max_tokens=0,
-            owner=settings.owner,
-            relevant_tools=allowed,
-            tool_policy=policy,
-            workspace=settings.workspace or scratch,
-            workload=workload,
-            gated_actions=gated,
-        ):
-            yield _approval_refused(chunk, settings.owner)
+        with subprocess_env_overrides(settings.env):
+            async for chunk in stream_agent_loop(
+                endpoint_url=url,
+                model=model,
+                messages=messages,
+                headers=headers,
+                max_rounds=AGENT_MAX_ROUNDS,
+                # No output cap, as for the tool-less seats: a reasoning model
+                # would otherwise spend 4096 tokens thinking and never answer.
+                max_tokens=0,
+                owner=settings.owner,
+                relevant_tools=allowed,
+                tool_policy=policy,
+                workspace=settings.workspace or scratch,
+                workload=workload,
+                gated_actions=gated,
+            ):
+                yield _approval_refused(chunk, settings.owner)
     finally:
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)
@@ -288,16 +330,24 @@ def stream_fn_for(settings: ToolSettings):
                                           workload=workload):
                 yield chunk
             return
+        from src.constants import DATA_DIR
+
         msgs = with_tools_brief(messages, settings, stage)
         provider = _detect_provider(url)
-        if provider == "claude-subscription":
-            source = _claude_stream(url, model, msgs, headers, settings, timeout)
-        elif provider == "chatgpt-subscription":
-            source = _codex_stream(url, model, msgs, headers, settings, timeout)
-        else:
-            source = _agent_stream(url, model, msgs, headers, settings, workload)
-        async for chunk in source:
-            yield chunk
+        # Nobody watches a seat, so it runs without the owner's GitHub and SSH
+        # logins (see credential_free_git_env), with a throwaway git/gh config
+        # of its own that is removed when this seat's run ends.
+        with tempfile.TemporaryDirectory(prefix="council-seat-", dir=DATA_DIR,
+                                         ignore_cleanup_errors=True) as config_dir:
+            seat = replace(settings, env={**credential_free_git_env(config_dir), **settings.env})
+            if provider == "claude-subscription":
+                source = _claude_stream(url, model, msgs, headers, seat, timeout)
+            elif provider == "chatgpt-subscription":
+                source = _codex_stream(url, model, msgs, headers, seat, timeout)
+            else:
+                source = _agent_stream(url, model, msgs, headers, seat, workload)
+            async for chunk in source:
+                yield chunk
 
     fn.accepts_stage = True
     return fn

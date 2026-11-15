@@ -338,13 +338,15 @@ class NativeTools:
     to ``--allowedTools`` with ``--permission-mode dontAsk``, so anything not
     listed is refused instead of waiting for a prompt nobody can answer.
     ``cwd`` is the workspace the file tools may touch (None: a private empty
-    directory).
+    directory). ``env`` overrides the CLI's environment, and so its tools'
+    (a value of None removes the variable).
     """
 
     builtin: List[str] = field(default_factory=list)
     allowed: List[str] = field(default_factory=list)
     mcp_config: Optional[str] = None
     cwd: Optional[str] = None
+    env: Dict[str, Optional[str]] = field(default_factory=dict)
 
 
 def cli_args(cli: str, model: str, system_file: str, effort: Optional[str] = None,
@@ -694,6 +696,8 @@ class _Invocation:
         self.stop_tools = None if tools else text_tool_names(system)
         self.args = cli_args(cli, model, system_file, effort, tools)
         self.env = cli_env(mode, token)
+        if tools and tools.env:
+            self.env = {k: v for k, v in {**self.env, **tools.env}.items() if v is not None}
         self.stdin = prompt.encode("utf-8")
         self.cwd = (tools.cwd if tools and tools.cwd else None) or _workdir()
 
