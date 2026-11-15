@@ -788,6 +788,9 @@ from routes.claude_subscription_routes import setup_claude_subscription_routes
 app.include_router(setup_claude_subscription_routes())
 from routes.council_routes import setup_council_routes
 app.include_router(setup_council_routes(chat_processor=chat_processor))
+# Council work runs: rounds of work on a copy of a repository (Docker only).
+from routes.council_work_routes import setup_council_work_routes
+app.include_router(setup_council_work_routes())
 # Each user's shared memory repository (read-only, from GitHub).
 from routes.shared_memory_routes import setup_shared_memory_routes
 app.include_router(setup_shared_memory_routes())

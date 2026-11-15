@@ -47,6 +47,9 @@ const S = {
   tools: 'research',     // off | research | full: what members may do
   workspace: '',         // folder for their file tools (admin)
   memory: true,          // members see the person's shared and saved memories
+  work: false,           // work run: the seats work on a goal in a copy of the workspace repository
+  rounds: 5,             // rounds of a work run (1-20)
+  whileWaiting: 'stop',  // what a work run does while it waits for the owner: stop | continue | vote
   expanded: new Set(),   // keys of long messages / tool rows the user opened
   history: { open: false, stats: null, busy: false, msg: '', err: false, query: '', results: null, reader: null },
 };
@@ -56,6 +59,23 @@ const TOOL_MODES = [
   ['research', 'Research', 'Web search, your files in the workspace, and your claude.ai / ChatGPT / Claude Code / Codex history.'],
   ['full', 'Full', 'Research plus shell commands, Python and file edits in the workspace, like Claude Code or Codex.'],
 ];
+
+const MAX_ROUNDS = 20;
+const WHILE_WAITING = [
+  ['stop', 'Stop the run', 'The run ends when it needs your input.'],
+  ['continue', 'Keep working', 'The seats keep working on what does not need your input.'],
+  ['vote', 'Let the seats vote', 'Each seat votes in its report; a tie or no votes means stop.'],
+];
+const STOP_REASONS = {
+  done: 'the chairman said the goal is met',
+  max_rounds: 'it reached the round limit',
+  budget: 'the budget would not cover another round',
+  cancelled: 'you stopped it',
+  stalled: 'nothing changed for two rounds',
+  failed: 'two rounds in a row produced no answer',
+  waiting: 'it is waiting for your input',
+  error: 'it failed',
+};
 
 // ---------------------------------------------------------------------------
 // utils
@@ -696,10 +716,16 @@ function applyConfig(cfg) {
   if (S.tools === 'full' && !isAdmin()) S.tools = 'research';
   S.workspace = typeof cfg?.workspace === 'string' ? cfg.workspace : '';
   S.memory = cfg?.memory !== false;
+  S.rounds = Number.isInteger(cfg?.rounds) && cfg.rounds >= 1 && cfg.rounds <= MAX_ROUNDS ? cfg.rounds : 5;
+  S.whileWaiting = WHILE_WAITING.some(([id]) => id === cfg?.while_waiting) ? cfg.while_waiting : 'stop';
   if (!S.members.length) S.members = defaultSeats();
 }
 
 function isAdmin() { return !!S.roster?.can_connect; }
+
+// A work run needs full tools and a workspace (the repository it copies).
+function workAvailable() { return S.tools === 'full' && isAdmin() && !!S.workspace.trim(); }
+function workActive() { return S.work && workAvailable(); }
 
 function defaultSeats() {
   // First model of each subscription, then fill with API models: a useful
@@ -772,7 +798,8 @@ async function deleteSession(id) {
 }
 
 function currentConfig() {
-  return { members: S.members, chairman: S.chairman, mode: S.mode, tools: S.tools, workspace: S.workspace, memory: S.memory };
+  return { members: S.members, chairman: S.chairman, mode: S.mode, tools: S.tools, workspace: S.workspace, memory: S.memory,
+    rounds: S.rounds, while_waiting: S.whileWaiting };
 }
 
 let _saveTimer = null;
@@ -971,6 +998,21 @@ function renderSeats() {
         <button data-memory-mode="off" class="${!S.memory ? 'on' : ''}" role="radio" aria-checked="${!S.memory}">Off</button>
       </span>
     </div>
+    ${workAvailable() ? `<div class="council-seat-row council-toolbar">
+      <span class="council-seat-label">Work</span>
+      <span class="council-mode" role="radiogroup" aria-label="Work run"
+        title="The seats work on your goal for several rounds in a copy of the workspace repository, without you. Your folder is only read.">
+        <button data-work-mode="off" class="${!S.work ? 'on' : ''}" role="radio" aria-checked="${!S.work}">Off</button>
+        <button data-work-mode="on" class="${S.work ? 'on' : ''}" role="radio" aria-checked="${S.work}">On</button>
+      </span>
+      ${S.work ? `<span class="council-seat-label" style="margin-left:10px">Rounds</span>
+        <input class="council-ws" id="council-rounds" type="number" min="1" max="${MAX_ROUNDS}" step="1" value="${S.rounds}"
+          aria-label="Rounds" title="The run stops sooner when the chairman says the goal is met." style="flex:0 0 64px">
+        <span class="council-seat-label" style="margin-left:10px">While waiting for me</span>
+        <select class="council-select" id="council-while-waiting" aria-label="While waiting for me">
+          ${WHILE_WAITING.map(([id, label, title]) => `<option value="${id}" title="${esc(title)}" ${S.whileWaiting === id ? 'selected' : ''}>${esc(label)}</option>`).join('')}
+        </select>` : ''}
+    </div>` : ''}
     ${S.picker ? renderPicker() : ''}`;
 }
 
@@ -1040,12 +1082,17 @@ function renderComposer() {
   const running = !!S.live || (S.session?.turns || []).some(t => t.status === 'running');
   const ready = S.members.length > 0 && chairmanSeat() && S.members.every(m => seatInfo(m).available)
     && seatInfo(chairmanSeat()).available;
+  const work = workActive();
   btn.disabled = running || !ready;
-  btn.textContent = running ? 'Deliberating…' : 'Convene';
-  if (input) input.disabled = false;
+  btn.textContent = running ? (S.live?.work || work ? 'Working…' : 'Deliberating…') : work ? 'Start work' : 'Convene';
+  if (input) {
+    input.disabled = false;
+    input.placeholder = work ? 'Goal for the work run…' : 'Ask the council…';
+  }
   if (hint) {
     hint.textContent = !S.members.length ? 'Seat at least one member first.'
       : !ready ? 'A seat points at a model that is no longer available — remove or replace it.'
+      : work ? `${S.members.length} member${S.members.length === 1 ? '' : 's'} · work run: up to ${S.rounds} round${S.rounds === 1 ? '' : 's'} on a copy of ${S.workspace} · Enter to start, Shift+Enter for a new line`
       : `${S.members.length} member${S.members.length === 1 ? '' : 's'} · ${S.mode === 'full' ? 'opinions → blind review → synthesis' : 'opinions → synthesis'} · tools: ${S.tools} · Enter to convene, Shift+Enter for a new line`;
   }
   scheduleEstimate();
@@ -1123,7 +1170,10 @@ function renderEstimate() {
   if (!est.metered) parts.push('No metered cost: plan and local seats only');
   else if (est.total_usd == null) parts.push(`Cost unknown: ${est.unpriced_calls} unpriced call${est.unpriced_calls === 1 ? '' : 's'}`);
   else {
-    parts.push(`≈ ${money(est.total_usd)} this turn`);
+    // A work run's tool calls cost more than this estimate of a plain turn;
+    // the server checks the whole run (per round x rounds) before it starts.
+    parts.push(workActive() ? `≈ ${money(est.total_usd)} per round, ${money(est.total_usd * S.rounds)} for ${S.rounds}`
+      : `≈ ${money(est.total_usd)} this turn`);
     if (est.unpriced_calls) parts.push(`+ ${est.unpriced_calls} unpriced`);
   }
   if (b.monthly_cap_usd > 0) parts.push(`${money(b.spent_usd)} of ${money(b.monthly_cap_usd)} this month`);
@@ -1162,7 +1212,7 @@ function stageState(turn, stage) {
 
 function statusText(turn) {
   switch (turn.status) {
-    case 'running': return 'Deliberating…';
+    case 'running': return turn.work ? 'Working…' : 'Deliberating…';
     case 'done': return turn.error ? turn.error : '';
     case 'cancelled': return 'Stopped';
     case 'interrupted': return 'Interrupted (Odysseus restarted)';
@@ -1212,10 +1262,22 @@ function cardBody(key, entry) {
   return `<div ${clampAttrs(key).replace('class="', 'class="council-card-b ' + (!text && !err ? 'pending ' : ''))}>${err ? `<div class="council-errtext">${esc(err)}</div>` : md(text)}</div>${moreButton(key)}`;
 }
 
+// The file summary of a work-run seat's diff (attached by Odysseus, not written by the seat).
+function diffStat(attachment) {
+  const text = String(attachment || '');
+  if (!text) return '';
+  const files = (text.split('\n\nPatch:\n')[0].split('Files:\n')[1] || '');
+  const total = files.match(/\d+ files? changed[^\n]*/);
+  const stat = total ? total[0].trim() : text.startsWith('No committed changes') ? 'no committed changes'
+    : files.trim() ? 'files changed (list clipped)' : '';
+  return text.includes('Uncommitted changes (in no commit') ? `${stat || 'diff'} · uncommitted changes left out` : stat;
+}
+
 function memberCard(stage, seat, idx, entry, label, turnId = '') {
   const err = entry?.error;
   const key = `${turnId}:${stage}:${idx}`;
   const state = cardState(entry, seat);
+  const stat = stage === 'opinions' ? diffStat(entry?.attachment) : '';
   return `<div class="council-card ${err ? 'err' : ''}" data-stage="${stage}" data-member="${idx}">
     <div class="council-card-h">
       ${label ? `<span class="label" title="Anonymous label used in peer review">${esc(label)}</span>` : ''}
@@ -1223,6 +1285,7 @@ function memberCard(stage, seat, idx, entry, label, turnId = '') {
       <span class="ep">${esc(seat?.endpoint_name || '')}${seat?.effort ? ` · ${esc(effortLabel(seat.effort))} effort` : ''}</span>
       <span class="state">${esc(state)}</span>
     </div>
+    ${stat ? `<div class="council-usage" style="padding:4px 10px 0" title="What this seat committed this round, from git (the reviewers saw the full diff)">diff: ${esc(stat)}</div>` : ''}
     <div class="council-card-t">${toolsBlock(entry?.tools, key, !!entry?.streaming)}</div>
     <div class="council-card-bw">${cardBody(key, entry)}</div>
   </div>`;
@@ -1266,7 +1329,43 @@ function rankingSummary(ranking, seats) {
   return `top: Response ${esc(ranking[0].label)} (${esc(seats.members[ranking[0].member]?.model || '?')})`;
 }
 
-function renderTurn(turn, live = false) {
+// The messages the seats (and Odysseus) delivered in one work-run round.
+function messagesList(turn) {
+  const messages = turn.work?.messages || [];
+  const items = messages.map((m, i) => {
+    const key = `msg:${turn.id}:${i}`;
+    return `<div class="council-card">
+      <div class="council-card-h"><span class="name">${esc(m.from || '?')} → ${esc(m.to || '?')}</span><span class="ep" title="${esc(m.name || '')}">${esc(m.name || '')}</span></div>
+      <div ${clampAttrs(key).replace('class="', 'class="council-card-b ')}>${md(m.text || '')}</div>${moreButton(key)}
+    </div>`;
+  }).join('');
+  return `<details class="council-section" data-sec="messages">
+    <summary>Messages <span class="sub">${messages.length ? `${messages.length} delivered this round` : 'none yet'}</span></summary>
+    ${items ? `<div style="display:flex;flex-direction:column;gap:8px;padding:0 10px 10px">${items}</div>` : ''}
+  </details>`;
+}
+
+function shellArg(s) {
+  const text = String(s ?? '');
+  return /^[\w@%+=:,./-]+$/.test(text) ? text : `'${text.replace(/'/g, `'\\''`)}'`;
+}
+
+// Why a work run ended and how to bring its branch into the owner's repository.
+function workEnd(turn) {
+  const w = turn.work || {};
+  const line = `git fetch ${shellArg(w.main)} ${shellArg(w.branch)}`;
+  return `<div class="council-section" data-work-end style="padding:8px 12px;font-size:12.5px;line-height:1.5">
+    The work run ended after round ${esc(w.round)} of ${esc(w.rounds)}: ${esc(STOP_REASONS[w.stop_reason] || w.stop_reason || 'unknown')}.
+    Its work is on branch <code>${esc(w.branch)}</code>. To bring it into your repository, run this there:
+    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:6px">
+      <code style="overflow-wrap:anywhere">${esc(line)}</code>
+      <button class="council-btn small ghost" data-copy-text="${esc(line)}">Copy</button>
+    </div>
+    <div class="council-usage" style="white-space:normal">The folder is the path inside Odysseus; with Docker, /app/data is your Odysseus data folder on the host (./data by default).</div>
+  </div>`;
+}
+
+function renderTurn(turn, live = false, lastOfRun = {}) {
   const seats = seatsOfTurn(turn);
   const memberLabel = {};
   for (const [label, idx] of Object.entries(turn.labels || {})) memberLabel[idx] = label;
@@ -1326,17 +1425,20 @@ function renderTurn(turn, live = false) {
   const toolsMode = turn.config?.tools || seats.tools;
   const toolsNote = toolsMode && toolsMode !== 'off'
     ? `<span class="council-usage" title="${esc((TOOL_MODES.find(([id]) => id === toolsMode) || [])[2] || '')}${turn.config?.workspace ? ` Workspace: ${turn.config.workspace}` : ''}">tools: ${esc(toolsMode)}</span>` : '';
+  const w = turn.work;
+  const roundBadge = w ? `<span class="council-badge" title="${esc(`Work run on branch ${w.branch || ''}`)}">Round ${esc(w.round)}/${esc(w.rounds)}</span>` : '';
+  const ended = w && w.run_status === 'finished' && lastOfRun[w.run_id] === turn.id;
   return `<article class="council-turn" data-turn="${esc(turn.id)}">
     <div class="council-q-wrap"><div ${clampAttrs(qKey).replace('class="', 'class="council-q ')}>${esc(turn.question)}</div>${moreButton(qKey)}</div>
-    <div class="council-strip">${strip}
+    <div class="council-strip">${roundBadge}${strip}
       <span class="status ${statusErr ? 'err' : ''}">${esc(status)}</span>
       ${toolsNote}
       ${turn.config?.memory ? '<span class="council-usage" title="Members saw your shared and saved memories">memory</span>' : ''}
       ${turnUsage(turn)}
-      ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}" ${String(turn.id).startsWith('live-') ? 'disabled title="Starting…"' : ''}>Stop</button>` : ''}
+      ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}" ${String(turn.id).startsWith('live-') ? 'disabled title="Starting…"' : w ? 'title="Stop the whole work run; finished rounds stay"' : ''}>Stop</button>` : ''}
       ${!running ? `<button class="council-btn small ghost" data-del-turn="${esc(turn.id)}" title="Delete this question">Delete</button>` : ''}
     </div>
-    ${opinions}${review}${final}
+    ${opinions}${review}${final}${w ? messagesList(turn) : ''}${ended ? workEnd(turn) : ''}
   </article>`;
 }
 
@@ -1347,7 +1449,10 @@ function renderTurns() {
   // A live run belongs to the thread it was asked in, not whichever is open.
   const live = S.live && S.live.sessionId === S.session?.id ? S.live : null;
   if (live && !turns.some(t => t.id === live.id)) turns.push(live);
-  const html = turns.map(t => renderTurn(live && t.id === live.id ? live : t, !!(live && t.id === live.id))).join('');
+  // A work run says why it ended on its last round only.
+  const lastOfRun = {};
+  for (const t of turns) if (t.work?.run_id) lastOfRun[t.work.run_id] = t.id;
+  const html = turns.map(t => renderTurn(live && t.id === live.id ? live : t, !!(live && t.id === live.id), lastOfRun)).join('');
   if (!html) {
     box.innerHTML = `<div class="council-empty">
       <h3>Convene a council</h3>
@@ -1431,12 +1536,32 @@ function liveEntry(stage, member) {
   return entry;
 }
 
+// Reload the open council (a work run's finished round) without touching the live round.
+async function refreshSessionTurns() {
+  const id = S.session?.id;
+  if (!id) return;
+  try {
+    const data = await jget(`/api/council/sessions/${encodeURIComponent(id)}`);
+    if (S.session?.id === id) { S.session = data; renderTurns(); }
+  } catch { /* the end of the run reloads it */ }
+}
+
 function onEvent(ev) {
   const live = S.live;
   if (!live) return;
   switch (ev.type) {
     case 'turn':
+      if (ev.work && !String(live.id).startsWith('live-') && live.id !== ev.turn_id) {
+        // The next round of a work run: the last one is saved, so reload it and follow this one live.
+        Object.assign(live, {
+          opinions: [], reviews: [], ranking: [], labels: {}, final: '', error: null, chairError: null,
+          chairTools: [], usage: null, stages: { opinions: 'running', review: 'pending', synthesis: 'pending' },
+        });
+        refreshSessionTurns();
+      }
       live.id = ev.turn_id;
+      if (ev.question) live.question = ev.question;
+      if (ev.work) live.work = ev.work;
       live.config = { members: ev.members, chairman: ev.chairman, mode: ev.mode, tools: ev.tools, workspace: ev.workspace, memory: ev.memory };
       renderTurns();
       scrollToEnd();
@@ -1501,6 +1626,9 @@ function onEvent(ev) {
       if (typeof ev.final === 'string' && ev.final) live.final = ev.final;
       live.error = ev.error || null;
       if (ev.usage) live.usage = ev.usage;
+      if (live.work && ev.reason) live.work = { ...live.work, run_status: 'finished', stop_reason: ev.reason };
+      // A run that failed before saving a round has no turn to show the error on.
+      if (live.work && ev.status === 'error' && ev.error) toast(ev.error);
       break;
     default:
       break;
@@ -1522,11 +1650,14 @@ async function convene() {
     } catch (e) { toast(e.message); return; }
   }
   S.picker = false;
+  // A work run: the question box holds the goal, and every round arrives as a turn of its own.
+  const work = workActive();
   S.live = {
     id: `live-${Date.now()}`, sessionId: S.session.id, question, status: 'running',
-    config: { members: [], chairman: null, mode: S.mode, tools: S.tools, workspace: S.workspace, memory: S.memory },
+    config: { members: [], chairman: null, mode: work ? 'full' : S.mode, tools: work ? 'full' : S.tools, workspace: S.workspace, memory: S.memory },
     opinions: [], reviews: [], ranking: [], labels: {}, final: '', error: null, chairTools: [],
     stages: { opinions: 'running', review: 'pending', synthesis: 'pending' }, reader: null,
+    work: work ? { round: 1, rounds: S.rounds, run_status: 'running', messages: [] } : null,
   };
   // Show the seats immediately, before the server's first event.
   S.live.config.members = S.members.map((m, i) => ({ index: i, model: m.model, endpoint_name: seatInfo(m).endpoint, effort: m.effort }));
@@ -1540,21 +1671,26 @@ async function convene() {
   const sessionId = S.session.id;
   const members = S.members.slice();
   const mode = S.mode;
-  const send = (budgetConfirmed) => fetch(`/api/council/sessions/${encodeURIComponent(sessionId)}/ask`, {
+  const url = work ? `/api/council/sessions/${encodeURIComponent(sessionId)}/work`
+    : `/api/council/sessions/${encodeURIComponent(sessionId)}/ask`;
+  const payload = work
+    ? { goal: question, members, chairman: chair, rounds: S.rounds, while_waiting: S.whileWaiting,
+      workspace: S.workspace, memory: S.memory }
+    : { question, members, chairman: chair, mode, tools: S.tools, workspace: S.tools !== 'off' ? S.workspace : '', memory: S.memory };
+  const send = (budgetConfirmed) => fetch(url, {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, members, chairman: chair, mode, budget_confirmed: budgetConfirmed,
-      tools: S.tools, workspace: S.tools !== 'off' ? S.workspace : '', memory: S.memory }),
+    body: JSON.stringify({ ...payload, budget_confirmed: budgetConfirmed }),
   });
   try {
     let res = await send(false);
     if (res.status === 402) {
-      // Budget: a turn above the single-action limit asks first; the
-      // monthly cap (block mode) refuses outright.
+      // Budget: a turn (or a whole work run) above the single-action limit
+      // asks first; the monthly cap (block mode) refuses outright.
       let detail = null;
       try { detail = (await res.json()).detail; } catch { /* not json */ }
-      if (detail?.code === 'budget_confirm' && window.confirm(`${detail.message}\n\nConvene the council anyway?`)) {
+      if (detail?.code === 'budget_confirm' && window.confirm(`${detail.message}\n\n${work ? 'Start the work run anyway?' : 'Convene the council anyway?'}`)) {
         res = await send(true);
       } else {
         const err = new Error(detail?.code === 'budget_confirm'
@@ -1955,6 +2091,18 @@ async function onPaneClick(e) {
     saveConfigSoon(); renderSeats(); renderComposer();
     return;
   }
+  const workMode = t.closest('[data-work-mode]');
+  if (workMode) {
+    S.work = workMode.dataset.workMode === 'on';
+    renderSeats(); renderComposer(); renderEstimate();
+    return;
+  }
+  const copyText = t.closest('[data-copy-text]');
+  if (copyText) {
+    try { await navigator.clipboard.writeText(copyText.dataset.copyText); toast('Copied'); }
+    catch { toast('Could not copy'); }
+    return;
+  }
   const toolsMode = t.closest('[data-tools-mode]');
   if (toolsMode && !toolsMode.disabled) {
     S.tools = toolsMode.dataset.toolsMode;
@@ -2009,6 +2157,20 @@ async function onPaneClick(e) {
 function onPaneChange(e) {
   if (e.target.id === 'council-workspace') {
     S.workspace = e.target.value.trim();
+    saveConfigSoon();
+    renderSeats();  // the Work toggle needs a workspace
+    renderComposer();
+    return;
+  }
+  if (e.target.id === 'council-rounds') {
+    const n = Math.round(Number(e.target.value));
+    S.rounds = Number.isFinite(n) ? Math.min(MAX_ROUNDS, Math.max(1, n)) : 5;
+    e.target.value = String(S.rounds);
+    saveConfigSoon(); renderComposer(); renderEstimate();
+    return;
+  }
+  if (e.target.id === 'council-while-waiting') {
+    S.whileWaiting = WHILE_WAITING.some(([id]) => id === e.target.value) ? e.target.value : 'stop';
     saveConfigSoon();
     return;
   }

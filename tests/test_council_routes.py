@@ -236,6 +236,24 @@ def test_delete_turn_and_session(client, db):
     assert client.get(f"/api/council/sessions/{sid}").status_code == 404
 
 
+def test_a_turn_keeps_its_work_data_and_each_opinions_attachment_apart_from_the_text(client, db):
+    sid = client.post("/api/council/sessions", json={}).json()["id"]
+    s = db()
+    s.add_all([CouncilTurn(id="t-plain", session_id=sid, owner="alice", question="q", status="done"),
+               CouncilTurn(id="t-work", session_id=sid, owner="alice", question="round brief", status="running")])
+    s.commit()
+    s.close()
+    work = {"run_id": "r1", "round": 2, "rounds": 5, "branch": "odysseus/x-r1", "messages": []}
+    result = {"opinions": [{"member": 0, "text": "Changed: x", "attachment": "Work on branch seat-1\ndiff --git a/x"}],
+              "final": "merged"}
+    cr._save_turn("t-work", status="done", work=work, **cr._result_fields(result))
+    turns = {t["id"]: t for t in client.get(f"/api/council/sessions/{sid}").json()["turns"]}
+    assert turns["t-plain"]["work"] is None
+    assert turns["t-work"]["work"] == work
+    (op,) = turns["t-work"]["opinions"]
+    assert op["text"] == "Changed: x" and op["attachment"].startswith("Work on branch seat-1")
+
+
 def test_orphaned_running_turn_reads_as_interrupted(client, db):
     sid = client.post("/api/council/sessions", json={}).json()["id"]
     s = db()

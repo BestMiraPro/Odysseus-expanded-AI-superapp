@@ -310,6 +310,9 @@ class Limits:
     history: int = _room(FALLBACK_CONTEXT_TOKENS) // 4
     answer: int = MAX_ANSWER_CHARS
     review: int = MAX_REVIEW_CHARS
+    # Room for what Odysseus attaches to each answer; None when none was
+    # planned for, and then an attachment is clipped like its answer.
+    attachment: Optional[int] = None
 
 
 def plan_limits(
@@ -319,6 +322,7 @@ def plan_limits(
     question: str,
     history: List[Dict[str, str]],
     context: str = "",
+    attachment_chars: int = 0,
 ) -> Limits:
     """Budgets that keep the chairman's prompt, the largest, inside the smallest window.
 
@@ -326,19 +330,29 @@ def plan_limits(
     and room for every answer and review at their default size, but never
     less than a quarter of the room. Whatever the history does not use goes
     to the answers and reviews.
+
+    ``attachment_chars`` is the size of the largest attachment (a work run's
+    diff, see ``run_council``). Each answer gets that much room for one before
+    the answers and reviews are sized; when the window is too small for that,
+    the attachments share what is left above the answers' and reviews' floors.
     """
     room = prompt_room([*members, chairman])
     n = max(1, len(members))
     reviews = mode == MODE_FULL and len(members) >= 2
     fixed = len(question or "") + len(context or "") + PROMPT_OVERHEAD_CHARS
-    payload = n * (MAX_ANSWER_CHARS + (MAX_REVIEW_CHARS if reviews else 0))
+    floor = MAX_ANSWER_CHARS + (MAX_REVIEW_CHARS if reviews else 0)
+    payload = n * (floor + attachment_chars)
     history_chars = max(room // 4, room - fixed - payload)
     used = sum(len(m["content"]) for m in history_messages(history, history_chars))
     free = room - fixed - used
+    attachment = None
+    if attachment_chars:
+        attachment = max(0, min(attachment_chars, (free - n * floor) // n))
+        free -= n * attachment
     if reviews:
         return Limits(history_chars, max(MAX_ANSWER_CHARS, free * 2 // (3 * n)),
-                      max(MAX_REVIEW_CHARS, free // (3 * n)))
-    return Limits(history_chars, max(MAX_ANSWER_CHARS, free // n), MAX_REVIEW_CHARS)
+                      max(MAX_REVIEW_CHARS, free // (3 * n)), attachment)
+    return Limits(history_chars, max(MAX_ANSWER_CHARS, free // n), MAX_REVIEW_CHARS, attachment)
 
 
 def with_context(messages: List[Dict[str, str]], context: str) -> List[Dict[str, str]]:
@@ -456,7 +470,8 @@ def opinion_messages(question: str, history: List[Dict[str, str]],
 
 def _answers_block(labels: Dict[str, int], opinions: Dict[int, str], limit: int,
                    names: Optional[Dict[int, str]] = None,
-                   attachments: Optional[Dict[int, str]] = None) -> str:
+                   attachments: Optional[Dict[int, str]] = None,
+                   attachment_limit: Optional[int] = None) -> str:
     parts = []
     for label, member in labels.items():
         title = f"Response {label}"
@@ -467,8 +482,9 @@ def _answers_block(labels: Dict[str, int], opinions: Dict[int, str], limit: int,
         if attachment:
             # Facts Odysseus gathered (a work run's diff), kept apart from what
             # the member wrote so a reader can tell claim from evidence.
+            cap = limit if attachment_limit is None else attachment_limit
             part += (f"\n\n#### Attached to Response {label} by Odysseus (not written by the member)\n"
-                     f"{_clip_middle(attachment, limit, 'attachment')}")
+                     f"{_clip_middle(attachment, cap, 'attachment')}")
         parts.append(part)
     return "\n\n".join(parts)
 
@@ -485,7 +501,8 @@ def review_messages(
     limits = limits or Limits()
     label_list = ", ".join(f"Response {label}" for label in labels)
     example = "\n".join(f"{i}. Response {label}" for i, label in enumerate(labels, start=1))
-    block = _answers_block(labels, opinions, limits.answer, attachments=attachments)
+    block = _answers_block(labels, opinions, limits.answer, attachments=attachments,
+                           attachment_limit=limits.attachment)
     user = (
         f"Question:\n{question}\n\n"
         f"Anonymous answers ({label_list}):\n\n{block}\n\n"
@@ -513,7 +530,8 @@ def chair_messages(
 ) -> List[Dict[str, str]]:
     limits = limits or Limits()
     sections = [f"Question:\n{question}",
-                f"Council answers:\n\n{_answers_block(labels, opinions, limits.answer, names, attachments)}"]
+                f"Council answers:\n\n"
+                f"{_answers_block(labels, opinions, limits.answer, names, attachments, limits.attachment)}"]
     member_label = {member: label for label, member in labels.items()}
     review_parts = []
     for review in reviews:
@@ -887,6 +905,11 @@ async def run_council(
         result["error"] = "No council member produced an answer."
         return result
     attachments = {i: result["opinions"][i]["attachment"] for i in ok if result["opinions"][i].get("attachment")}
+    if attachments:
+        # Attachments are only known now: the later stages make room for them
+        # out of what the answers, reviews and history would otherwise get.
+        limits = plan_limits(members, chairman, mode, question, history, context,
+                             attachment_chars=max(len(a) for a in attachments.values()))
 
     labels = assign_labels(sorted(ok), rng)
     result["labels"] = labels
@@ -955,15 +978,24 @@ def _tool_lines(steps: Any) -> List[str]:
     return lines
 
 
+def _fenced(text: str) -> List[str]:
+    """``text`` in a code fence longer than any run of backticks inside it."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return [fence, text.rstrip("\n"), fence]
+
+
 def turn_markdown(turn: Dict[str, Any]) -> str:
     """One saved turn (the JSON the API returns) as a markdown document.
 
     Written for a reader outside the Council page, another agent included: it
     carries the answer with its verdict, the run's settings and cost, and
-    every opinion and review.
+    every opinion and review. A work run's round adds its round, branch, stop
+    reason, each seat's diff and the messages delivered that round.
     """
     config = turn.get("config") or {}
     seats = config.get("members") or []
+    work = turn.get("work") or {}
 
     def seat_name(seat: Any) -> str:
         seat = seat or {}
@@ -981,6 +1013,11 @@ def turn_markdown(turn: Dict[str, Any]) -> str:
         out.append(f"- Tools: {config['tools']}")
     if config.get("workspace"):
         out.append(f"- Workspace: {config['workspace']}")
+    if work:
+        out.append(f"- Work run: round {work.get('round')} of {work.get('rounds')} (run {work.get('run_id')})")
+        out.append(f"- Branch: {work.get('branch')}")
+        if work.get("stop_reason"):
+            out.append(f"- Stop reason: {work['stop_reason']}")
     if turn.get("created_at"):
         out.append(f"- Asked: {turn['created_at']}")
     if turn.get("status") and turn["status"] != "done":
@@ -1002,9 +1039,12 @@ def turn_markdown(turn: Dict[str, Any]) -> str:
     for opinion in sorted(turn.get("opinions") or [], key=lambda o: label_of.get(o.get("member"), "~")):
         label = label_of.get(opinion.get("member"))
         used = _tool_lines(opinion.get("tools"))
+        attachment = opinion.get("attachment")
         out += [f"### {f'Response {label} — ' if label else ''}{name(opinion.get('member'))}", "",
                 *(["Tools used:", *used, ""] if used else []),
-                f"_{opinion['error']}_" if opinion.get("error") else (opinion.get("text") or ""), ""]
+                f"_{opinion['error']}_" if opinion.get("error") else (opinion.get("text") or ""), "",
+                *(["Diff attached by Odysseus (not written by the member):", "", *_fenced(attachment), ""]
+                  if attachment else [])]
     ranking = [r for r in turn.get("ranking") or [] if r.get("avg_rank") is not None]
     if ranking:
         out += ["## Peer ranking (blind, self-votes excluded)", "",
@@ -1017,6 +1057,11 @@ def turn_markdown(turn: Dict[str, Any]) -> str:
         for review in turn["reviews"]:
             out += [f"### Review by {name(review.get('member'))}", "",
                     f"_{review['error']}_" if review.get("error") else (review.get("text") or ""), ""]
+    if work.get("messages"):
+        out += ["## Messages", ""]
+        for message in work["messages"]:
+            out += [f"### {message.get('from') or '?'} → {message.get('to') or '?'}", "",
+                    message.get("text") or "", ""]
     return "\n".join(out)
 
 

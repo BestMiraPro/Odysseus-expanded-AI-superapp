@@ -289,6 +289,9 @@ async def run_work(
     policy: str = WAIT_STOP,
     waiting: Optional[Callable[[Dict[str, Any]], Awaitable[bool]]] = None,
     rng=None,
+    begin_round: Optional[Callable[[Dict[str, Any]],
+                                   Awaitable[Optional[Tuple[List[council.Member], council.Member]]]]] = None,
+    context: str = "",
 ) -> WorkResult:
     """Run rounds until a stop reason; returns it with the rounds finished.
 
@@ -300,6 +303,12 @@ async def run_work(
     decides what that means). Cancelling the task saves the unfinished round
     as cancelled and returns ``cancelled``; finished rounds stay saved.
     Workspace (git) errors propagate.
+
+    ``begin_round(record)`` is awaited once the round's question is set,
+    before its council runs; it may return the ``(members, chairman)`` to use
+    from this round on (the routes resolve the seats again each round, so
+    their credentials stay fresh). ``context`` joins every stage's system
+    prompt, as in ``council.run_council``.
     """
     rounds = validate_rounds(rounds)
     policy = validate_policy(policy)
@@ -338,12 +347,16 @@ async def run_work(
             record.update(base=base, question=question)
             brief = await asyncio.to_thread(workspace.post, "all", f"round-{round_no}-brief", question, round_no)
             record["delivered"].append(asdict(brief))
+            if begin_round is not None:
+                seats = await begin_round(record)
+                if seats is not None:
+                    members, chairman = seats
             await round_emit({"type": "round", "status": "start", "rounds": rounds, "base": base})
             result = await council.run_council(
                 question=question, members=members, chairman=chairman, mode=council.MODE_FULL,
                 history=history, emit=round_emit, stream_fn=stream_fn, rng=rng, state=record["result"],
                 prompts=prompts, personalize=_personalizer(workspace, lanes, base), between_stages=between,
-                hard_timeout=SEAT_HARD_TIMEOUT)
+                hard_timeout=SEAT_HARD_TIMEOUT, context=context)
             head = await asyncio.to_thread(workspace.head)
 
             final = result.get("final") or ""
