@@ -223,7 +223,9 @@ def aggregate_rankings(
 
 _VERDICT_HEADER_RE = re.compile(r"^#{1,6}[ \t]*Verdict[ \t]*$", re.IGNORECASE | re.MULTILINE)
 _VERDICT_FIELDS = {"decision": "decision", "confidence": "confidence", "dissent": "dissent",
-                   "would change it": "would_change", "next test": "next_test"}
+                   "would change it": "would_change", "next test": "next_test", "status": "status"}
+# Only work runs ask for a Status line (see src.council_work); other values are dropped.
+VERDICT_STATUSES = ("continue", "done")
 _VERDICT_FIELD_RE = re.compile(
     r"^[ \t]*[-*][ \t]+\**[ \t]*(" + "|".join(_VERDICT_FIELDS) + r")[ \t]*\**[ \t]*:[ \t]*\**[ \t]*(.+)$",
     re.IGNORECASE | re.MULTILINE)
@@ -240,8 +242,13 @@ def parse_verdict(text: str) -> Dict[str, str]:
     start = _verdict_start(text)
     if start < 0:
         return {}
-    return {_VERDICT_FIELDS[label.lower()]: value.strip()
-            for label, value in _VERDICT_FIELD_RE.findall(text[start:])}
+    verdict = {_VERDICT_FIELDS[label.lower()]: value.strip()
+               for label, value in _VERDICT_FIELD_RE.findall(text[start:])}
+    if "status" in verdict:
+        status = verdict.pop("status").strip("*`. \t").lower()
+        if status in VERDICT_STATUSES:
+            verdict["status"] = status
+    return verdict
 
 
 # ---------------------------------------------------------------------------
@@ -441,20 +448,28 @@ def history_messages(history: List[Dict[str, str]], budget: Optional[int] = None
 
 
 def opinion_messages(question: str, history: List[Dict[str, str]],
-                     limits: Optional[Limits] = None) -> List[Dict[str, str]]:
+                     limits: Optional[Limits] = None, system: str = OPINION_SYSTEM) -> List[Dict[str, str]]:
     limits = limits or Limits()
-    return [{"role": "system", "content": OPINION_SYSTEM}, *history_messages(history, limits.history),
+    return [{"role": "system", "content": system}, *history_messages(history, limits.history),
             {"role": "user", "content": question}]
 
 
 def _answers_block(labels: Dict[str, int], opinions: Dict[int, str], limit: int,
-                   names: Optional[Dict[int, str]] = None) -> str:
+                   names: Optional[Dict[int, str]] = None,
+                   attachments: Optional[Dict[int, str]] = None) -> str:
     parts = []
     for label, member in labels.items():
         title = f"Response {label}"
         if names:
             title += f" ({names[member]})"
-        parts.append(f"### {title}\n{_clip_middle(opinions.get(member, ''), limit, 'answer')}")
+        part = f"### {title}\n{_clip_middle(opinions.get(member, ''), limit, 'answer')}"
+        attachment = (attachments or {}).get(member)
+        if attachment:
+            # Facts Odysseus gathered (a work run's diff), kept apart from what
+            # the member wrote so a reader can tell claim from evidence.
+            part += (f"\n\n#### Attached to Response {label} by Odysseus (not written by the member)\n"
+                     f"{_clip_middle(attachment, limit, 'attachment')}")
+        parts.append(part)
     return "\n\n".join(parts)
 
 
@@ -464,20 +479,23 @@ def review_messages(
     opinions: Dict[int, str],
     history: Optional[List[Dict[str, str]]] = None,
     limits: Optional[Limits] = None,
+    system: str = REVIEW_SYSTEM,
+    attachments: Optional[Dict[int, str]] = None,
 ) -> List[Dict[str, str]]:
     limits = limits or Limits()
     label_list = ", ".join(f"Response {label}" for label in labels)
     example = "\n".join(f"{i}. Response {label}" for i, label in enumerate(labels, start=1))
+    block = _answers_block(labels, opinions, limits.answer, attachments=attachments)
     user = (
         f"Question:\n{question}\n\n"
-        f"Anonymous answers ({label_list}):\n\n{_answers_block(labels, opinions, limits.answer)}\n\n"
+        f"Anonymous answers ({label_list}):\n\n{block}\n\n"
         "Review each answer in turn: what it gets right, what it gets wrong or misses. "
         "Be brief and concrete.\n\n"
         "Then end with a line that says exactly FINAL RANKING: followed by a numbered list "
         "of every response from best to worst, one per line, and nothing after it. Format:\n"
         f"FINAL RANKING:\n{example}"
     )
-    return [{"role": "system", "content": REVIEW_SYSTEM}, *history_messages(history or [], limits.history),
+    return [{"role": "system", "content": system}, *history_messages(history or [], limits.history),
             {"role": "user", "content": user}]
 
 
@@ -490,10 +508,12 @@ def chair_messages(
     reviews: List[Dict[str, Any]],
     ranking: List[Dict[str, Any]],
     limits: Optional[Limits] = None,
+    system: str = CHAIR_SYSTEM,
+    attachments: Optional[Dict[int, str]] = None,
 ) -> List[Dict[str, str]]:
     limits = limits or Limits()
     sections = [f"Question:\n{question}",
-                f"Council answers:\n\n{_answers_block(labels, opinions, limits.answer, names)}"]
+                f"Council answers:\n\n{_answers_block(labels, opinions, limits.answer, names, attachments)}"]
     member_label = {member: label for label, member in labels.items()}
     review_parts = []
     for review in reviews:
@@ -510,7 +530,7 @@ def chair_messages(
                  for i, r in enumerate(ranked, start=1)]
         sections.append("Aggregate peer ranking (self-votes excluded):\n" + "\n".join(lines))
     sections.append("Write the council's final answer to the question now.")
-    return [{"role": "system", "content": CHAIR_SYSTEM}, *history_messages(history, limits.history),
+    return [{"role": "system", "content": system}, *history_messages(history, limits.history),
             {"role": "user", "content": "\n\n".join(sections)}]
 
 
@@ -553,6 +573,37 @@ Emit = Callable[[Dict[str, Any]], Awaitable[None]]
 StreamFn = Callable[..., AsyncIterator[str]]
 
 
+async def _until(source: AsyncIterator[str], seconds: float, expired: Dict[str, bool]) -> AsyncIterator[str]:
+    """``source`` cut off ``seconds`` after it started, whatever it is doing.
+
+    The ``timeout`` a stream function gets fires only when the model goes
+    silent; a seat that keeps calling tools would otherwise run on forever.
+    Sets ``expired["hit"]`` when the limit ended the stream.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    try:
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                expired["hit"] = True
+                return
+            try:
+                chunk = await asyncio.wait_for(source.__anext__(), remaining)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                if loop.time() < deadline:
+                    raise           # the stream's own timeout, not ours
+                expired["hit"] = True
+                return
+            yield chunk
+    finally:
+        aclose = getattr(source, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
 async def run_member(
     stream_fn: StreamFn,
     member: Member,
@@ -563,11 +614,14 @@ async def run_member(
     emit: Emit,
     timeout: int,
     sink: Optional[Dict[str, Any]] = None,
+    hard_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Stream one member's reply, emitting deltas; returns {text, error, ms, usage, cost_usd}.
 
     ``sink`` (when given) is updated in place as text arrives and when the call
     ends, so a run that is stopped midway still has what was written.
+    ``hard_timeout`` (seconds, wall clock) ends the call wherever it is; the
+    text written so far is kept as the answer and ``timed_out`` is set.
     """
     started = time.monotonic()
     parts: List[str] = []           # text since the last tool call: the answer so far
@@ -585,14 +639,22 @@ async def run_member(
     if sink is not None:
         sink.update({"text": "", "error": None, "ms": None, "pending": True, "input_estimate": input_estimate})
     extra = {"stage": stage} if getattr(stream_fn, "accepts_stage", False) else {}
+    if getattr(stream_fn, "accepts_seat", False):
+        # Same convention as accepts_stage: a work run gives each seat its own
+        # working directory, so its stream function needs to know the seat.
+        extra["seat"] = index
+    expired: Dict[str, bool] = {}
 
     def _publish_steps() -> None:
         if sink is not None:
             sink["tools"] = steps
 
     try:
-        async for chunk in stream_fn(member.url, member.model, messages, headers=member.headers,
-                                     timeout=timeout, workload="foreground", **extra):
+        source = stream_fn(member.url, member.model, messages, headers=member.headers,
+                           timeout=timeout, workload="foreground", **extra)
+        if hard_timeout:
+            source = _until(source, hard_timeout, expired)
+        async for chunk in source:
             for event, payload in iter_sse(chunk):
                 if event == "error":
                     error = _error_text(payload)
@@ -699,9 +761,10 @@ async def run_member(
         # Some models finish with their answer before a last bookkeeping tool
         # call; fall back to the last note rather than reporting nothing.
         text = next((st["text"] for st in reversed(steps) if st.get("kind") == "note"), "")
+    timed_out = bool(expired)
     for st in steps:
         if st.get("status") == "running":
-            st["status"] = "error" if error else "done"
+            st["status"] = "error" if error or timed_out else "done"
     try:
         from src.text_helpers import strip_think
 
@@ -709,11 +772,14 @@ async def run_member(
     except Exception:
         pass
     if not error and not text:
-        error = "The model returned an empty answer."
+        error = (f"Stopped at the time limit ({hard_timeout:g} s) before writing an answer." if timed_out
+                 else "The model returned an empty answer.")
     ms = int((time.monotonic() - started) * 1000)
     cost = member.cost_usd(usage)
     outcome = {"text": text, "error": error, "ms": ms, "usage": usage, "cost_usd": cost,
                "input_estimate": input_estimate}
+    if timed_out:
+        outcome["timed_out"] = True
     if steps:
         outcome["tools"] = steps
     if self_billed:
@@ -751,6 +817,10 @@ async def run_council(
     checkpoint: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
     state: Optional[Dict[str, Any]] = None,
     context: str = "",
+    prompts: Optional[Dict[str, str]] = None,
+    personalize: Optional[Callable[[str, Any, List[Dict[str, str]]], List[Dict[str, str]]]] = None,
+    between_stages: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None,
+    hard_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run all stages, emitting progress events; returns the turn's results.
 
@@ -764,10 +834,22 @@ async def run_council(
     ``checkpoint`` receives it after each completed stage.
     ``context`` (the user's shared and saved memories) joins every stage's
     system prompt.
+
+    The rest exist for work runs (src.council_work) and default to the plain
+    council:
+    ``prompts`` replaces the system prompt per stage ("opinions", "review",
+    "synthesis"). ``personalize(stage, index, messages)`` returns the messages
+    for one call (index is the seat number or "chair"), so each seat can be
+    told its own name and folder. ``between_stages(stage, result)`` is awaited
+    after each stage that ran; after "opinions" it may set ``attachment`` on
+    entries of ``result["opinions"]``, which reviewers and the chairman then
+    see next to that answer (it is never part of the answer text).
+    ``hard_timeout`` is a wall-clock limit per call (see ``run_member``).
     """
     result: Dict[str, Any] = state if state is not None else {}
     result.update({"opinions": [], "reviews": [], "ranking": [], "labels": {},
                    "final": "", "error": None})
+    prompts = prompts or {}
 
     async def _checkpoint() -> None:
         if checkpoint is not None:
@@ -776,6 +858,13 @@ async def run_council(
             except Exception as exc:
                 logger.warning("council checkpoint failed error_type=%s", type(exc).__name__)
 
+    def _for(stage: str, index: Any, msgs: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        return personalize(stage, index, msgs) if personalize is not None else msgs
+
+    async def _between(stage: str) -> None:
+        if between_stages is not None:
+            await between_stages(stage, result)
+
     if stream_fn is None:
         from src.llm_core import stream_llm as stream_fn  # noqa: N806
 
@@ -783,18 +872,21 @@ async def run_council(
 
     # Stage 1 - opinions
     await emit({"type": "stage", "stage": "opinions", "status": "start"})
-    base = with_context(opinion_messages(question, history, limits), context)
+    base = with_context(opinion_messages(question, history, limits,
+                                         prompts.get("opinions", OPINION_SYSTEM)), context)
     result["opinions"] = [{"member": i} for i in range(len(members))]
     outcomes = await run_parallel([
-        run_member(stream_fn, m, base, stage="opinions", index=i, emit=emit, timeout=MEMBER_TIMEOUT,
-                   sink=result["opinions"][i])
+        run_member(stream_fn, m, _for("opinions", i, base), stage="opinions", index=i, emit=emit,
+                   timeout=MEMBER_TIMEOUT, sink=result["opinions"][i], hard_timeout=hard_timeout)
         for i, m in enumerate(members)
     ])
     await emit({"type": "stage", "stage": "opinions", "status": "done"})
+    await _between("opinions")
     ok = {i: o["text"] for i, o in enumerate(outcomes) if not o["error"]}
     if not ok:
         result["error"] = "No council member produced an answer."
         return result
+    attachments = {i: result["opinions"][i]["attachment"] for i in ok if result["opinions"][i].get("attachment")}
 
     labels = assign_labels(sorted(ok), rng)
     result["labels"] = labels
@@ -804,12 +896,13 @@ async def run_council(
     # Stage 2 - blind peer review
     if mode == MODE_FULL and len(ok) >= 2:
         await emit({"type": "stage", "stage": "review", "status": "start", "labels": labels})
-        msgs = with_context(review_messages(question, labels, ok, history, limits), context)
+        msgs = with_context(review_messages(question, labels, ok, history, limits,
+                                            prompts.get("review", REVIEW_SYSTEM), attachments), context)
         reviewer_ids = sorted(ok)
         result["reviews"] = [{"member": i} for i in reviewer_ids]
         await run_parallel([
-            run_member(stream_fn, members[i], msgs, stage="review", index=i, emit=emit, timeout=MEMBER_TIMEOUT,
-                       sink=sink)
+            run_member(stream_fn, members[i], _for("review", i, msgs), stage="review", index=i, emit=emit,
+                       timeout=MEMBER_TIMEOUT, sink=sink, hard_timeout=hard_timeout)
             for i, sink in zip(reviewer_ids, result["reviews"])
         ])
         valid = list(labels)
@@ -818,16 +911,19 @@ async def run_council(
         result["ranking"] = aggregate_rankings([r for r in result["reviews"] if not r.get("error")], labels)
         await emit({"type": "ranking", "ranking": result["ranking"], "labels": labels})
         await emit({"type": "stage", "stage": "review", "status": "done"})
+        await _between("review")
         await _checkpoint()
 
     # Stage 3 - chairman synthesis
     await emit({"type": "stage", "stage": "synthesis", "status": "start"})
     msgs = with_context(chair_messages(question, history, labels, ok, names,
                                        [r for r in result["reviews"] if not r.get("error")],
-                                       result["ranking"], limits), context)
+                                       result["ranking"], limits, prompts.get("synthesis", CHAIR_SYSTEM),
+                                       attachments), context)
     result["chair"] = {"member": "chair"}
-    chair = await run_member(stream_fn, chairman, msgs, stage="synthesis", index="chair",
-                             emit=emit, timeout=CHAIR_TIMEOUT, sink=result["chair"])
+    chair = await run_member(stream_fn, chairman, _for("synthesis", "chair", msgs), stage="synthesis",
+                             index="chair", emit=emit, timeout=CHAIR_TIMEOUT, sink=result["chair"],
+                             hard_timeout=hard_timeout)
     await emit({"type": "stage", "stage": "synthesis", "status": "done"})
     if chair["error"]:
         result["error"] = f"Chairman failed: {chair['error']}"
@@ -840,6 +936,7 @@ async def run_council(
     else:
         result["final"] = chair["text"]
     result["chair_ms"] = chair["ms"]
+    await _between("synthesis")
     return result
 
 
