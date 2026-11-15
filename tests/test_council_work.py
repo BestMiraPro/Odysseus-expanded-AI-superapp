@@ -481,3 +481,29 @@ def test_a_seat_that_committed_everything_gets_no_extra_commit(ws):
     _work(ws, Fakes(ws, statuses=("done",)), rounds=1)
     for who in ws.seat_names:
         assert _git(ws.workdir(who), "log", "-1", "--format=%s").stdout.strip() == f"{who} round 1"
+
+
+class Misplacing(Forgetful):
+    """A seat that writes its message under its own worktree, as a real model did."""
+
+    def _act(self, stage, round_no, cwd, env, model, messages):
+        if stage == "opinions":
+            who = env["GIT_AUTHOR_NAME"]
+            box = Path(cwd, "messages", "outbox", who)
+            box.mkdir(parents=True, exist_ok=True)
+            (box / "all__note.md").write_text(f"{who} says hello")
+        return super()._act(stage, round_no, cwd, env, model, messages)
+
+
+@needs_git
+def test_a_misplaced_message_is_delivered_and_kept_out_of_the_branch(ws):
+    _, saved, _ = _work(ws, Misplacing(ws), rounds=1)
+    senders = sorted(m["sender"] for m in saved[0]["delivered"] if m["sender"] != "odysseus")
+    assert senders == ["seat-1", "seat-2"]
+    for who in ws.seat_names:
+        assert "messages/" not in _git(ws.workdir(who), "ls-files").stdout
+
+
+def test_the_work_prompt_does_not_give_a_relative_outbox_path():
+    assert "messages/outbox/<your name>" not in cwk.work_system("stop")
+    assert "outbox folder named below" in cwk.work_system("stop")

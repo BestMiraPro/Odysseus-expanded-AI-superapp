@@ -268,6 +268,21 @@ class Workspace:
         os.rename(path, target)
         return target
 
+    def collect_misplaced(self, who: str) -> None:
+        """Move messages ``who`` wrote under its own working copy into its real outbox.
+
+        A model given the path ``messages/outbox/<name>/`` tends to create it
+        where it stands. Left there the message reaches nobody and ends up
+        committed to the branch. Only the seat's own folder is taken: the
+        sender is the outbox's name.
+        """
+        stray = self.workdir(who) / "messages" / "outbox" / who
+        if not _real_dir(stray):
+            return
+        for path in sorted(stray.iterdir()):
+            if path.is_file() and not path.is_symlink():
+                self._move(path, self.messages / "outbox" / who, path.name)
+
     def _reject(self, path: Path, origin: str) -> Path:
         return self._move(path, self.messages / "rejected",
                           f"{_stamp(time.time_ns() // 1000)}__{origin}__{path.name}")

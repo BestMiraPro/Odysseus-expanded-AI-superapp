@@ -397,3 +397,20 @@ def test_commit_pending_leaves_interpreter_caches_out(source, tmp_path):
     (seat / ".pytest_cache").mkdir()
     (seat / ".pytest_cache" / "v").write_text("x")
     assert ws.commit_pending("seat-1", "seat-1: left over") is False
+
+
+def test_a_message_written_inside_the_worktree_is_moved_to_the_real_outbox(source, tmp_path):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=2)
+    stray = ws.workdir("seat-1") / "messages" / "outbox" / "seat-1"
+    stray.mkdir(parents=True)
+    (stray / "all__found-it.md").write_text("the bug is in split\n")
+    other = ws.workdir("seat-1") / "messages" / "outbox" / "seat-2"
+    other.mkdir(parents=True)
+    (other / "all__forged.md").write_text("not mine\n")
+    ws.collect_misplaced("seat-1")
+    assert (ws.messages / "outbox" / "seat-1" / "all__found-it.md").read_text() == "the bug is in split\n"
+    assert not (stray / "all__found-it.md").exists()
+    # Only the seat's own outbox is adopted: the sender is the folder name.
+    assert (other / "all__forged.md").exists()
+    delivered, _ = ws.deliver(1)
+    assert [(m.sender, m.to) for m in delivered] == [("seat-1", "all")]

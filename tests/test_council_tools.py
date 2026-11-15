@@ -585,3 +585,19 @@ def test_full_tools_and_workspace_need_admin(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as exc:
         _tool_settings(_Req(), "dinis", _ask(tools="research", workspace="/"))
     assert exc.value.status_code == 400
+
+
+def test_an_api_seat_runs_as_many_agent_rounds_as_its_settings_allow(monkeypatch, tmp_path):
+    seen = []
+
+    async def fake_loop(**kwargs):
+        seen.append(kwargs["max_rounds"])
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: "openai")
+    for settings in (_settings("full", str(tmp_path)),
+                     council_tools.ToolSettings(mode="full", workspace=str(tmp_path), max_rounds=40)):
+        _collect(council_tools.stream_fn_for(settings)("https://api.example.com/v1/chat/completions", "m",
+                                                       [{"role": "user", "content": "q"}]))
+    assert seen == [council_tools.AGENT_MAX_ROUNDS, 40]

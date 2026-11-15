@@ -608,3 +608,12 @@ def test_schema_reconciliation_also_adds_the_work_column(tmp_path):
     _old_council_turns(engine)
     assert "council_turns.work" in dbmod.reconcile_schema_with_models(engine)
     assert "work" in _columns(engine)
+
+
+def test_work_seats_get_more_agent_rounds_than_a_question_does(monkeypatch):
+    from routes import council_work_routes as cwr
+
+    settings = []
+    monkeypatch.setattr(council_tools, "stream_fn_for", lambda s: settings.append(s))
+    cwr._WorkRun.stream_for(type("R", (), {"owner": "alice"})(), "full", "/tmp/x", {})
+    assert settings[0].max_rounds == cwr.WORK_AGENT_ROUNDS > council_tools.AGENT_MAX_ROUNDS

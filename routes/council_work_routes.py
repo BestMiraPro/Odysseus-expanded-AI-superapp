@@ -76,6 +76,12 @@ def unauthenticated_access() -> Optional[str]:
     return None
 
 
+# Model calls an API/local seat may make in one stage of a work run. A real
+# run showed a question's 12 spent on reading, editing and testing with none
+# left to write the report, which made the seat's answer empty.
+WORK_AGENT_ROUNDS = 40
+
+
 class WorkRequest(BaseModel):
     goal: str = Field(..., max_length=council.MAX_QUESTION_CHARS)
     members: List[cr.Seat] = Field(..., max_length=council.MAX_MEMBERS)
@@ -247,7 +253,8 @@ class _WorkRun:
 
     def stream_for(self, level: str, cwd: str, env: Dict[str, Optional[str]]):
         return council_tools.stream_fn_for(
-            council_tools.ToolSettings(mode=level, owner=self.owner, workspace=cwd, env=env))
+            council_tools.ToolSettings(mode=level, owner=self.owner, workspace=cwd, env=env,
+                                       max_rounds=WORK_AGENT_ROUNDS))
 
     async def begin_round(self, record: Dict[str, Any]) -> Tuple[List[council.Member], council.Member]:
         work = self.work(record)
