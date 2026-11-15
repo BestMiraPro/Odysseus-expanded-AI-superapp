@@ -29,6 +29,8 @@ ALLOWED_SCOPES = {
     "study:read",
     "cookbook:read",
     "cookbook:launch",
+    # Run councils (create sessions, ask, stop) for the token's owner. Spends model budget.
+    "council",
 }
 TOKEN_PROFILES = {
     "chat": ["chat"],
