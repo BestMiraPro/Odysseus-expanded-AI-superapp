@@ -271,17 +271,32 @@ class Workspace:
     def collect_misplaced(self, who: str) -> None:
         """Move messages ``who`` wrote under its own working copy into its real outbox.
 
-        A model given the path ``messages/outbox/<name>/`` tends to create it
+        A model told about a ``messages/outbox`` folder tends to create one
         where it stands. Left there the message reaches nobody and ends up
-        committed to the branch. Only the seat's own folder is taken: the
-        sender is the outbox's name.
+        committed to the branch. Every new file under that folder is taken,
+        whatever subfolder it is in: the working copy is ``who``'s, so the
+        message is too. Files the repository already tracks there are the
+        project's own and stay.
         """
-        stray = self.workdir(who) / "messages" / "outbox" / who
-        if not _real_dir(stray):
-            return
-        for path in sorted(stray.iterdir()):
+        cwd = self.workdir(who)
+        listed = git(["ls-files", "--others", "--exclude-standard", "-z", "--", "messages/outbox"], cwd).stdout
+        for rel in filter(None, listed.split("\0")):
+            path = cwd / rel
             if path.is_file() and not path.is_symlink():
                 self._move(path, self.messages / "outbox" / who, path.name)
+
+    def _address(self, name: str) -> Tuple[str, str]:
+        """(recipient, slug) for an outbox file called ``name``.
+
+        ``<to>__<slug>.md`` is read as written. Any other name goes to
+        everyone under a slug made from the name: a message that reaches all
+        seats is worth more than a naming rule a small model does not follow.
+        """
+        match = OUTBOX_NAME_RE.match(name)
+        if match and match.group(1) in self.recipients:
+            return match.group(1), match.group(2)
+        stem = re.sub(r"\.md$", "", name, flags=re.IGNORECASE)
+        return "all", slugify(stem, 48) if re.search(r"[a-z0-9]", stem.lower()) else "message"
 
     def _reject(self, path: Path, origin: str) -> Path:
         return self._move(path, self.messages / "rejected",
@@ -307,10 +322,6 @@ class Workspace:
         st = os.lstat(path)
         if not stat.S_ISREG(st.st_mode):
             return "it is not a plain file", st, ""
-        match = OUTBOX_NAME_RE.match(path.name)
-        if not match or match.group(1) not in self.recipients:
-            return (f"its name must be <to>__<slug>.md, with <to> one of {', '.join(self.recipients)} "
-                    "and <slug> 1 to 48 characters of a-z, 0-9 and -"), st, ""
         if st.st_size > MAX_MESSAGE_BYTES:
             return f"it is over the {MAX_MESSAGE_BYTES // 1024} KB limit", st, ""
         try:
@@ -323,10 +334,11 @@ class Workspace:
 
         ``messages/outbox/<me>/<to>__<slug>.md`` becomes
         ``messages/<stamp>__<me>__<to>__<slug>.md``, stamped with the file's
-        mtime (UTC) and headed with sender, recipient and round. The sender is
-        the outbox folder's name, never anything in the file. The original
-        moves to ``messages/sent/``. Files that break the rules move to
-        ``messages/rejected/`` with a notice to the sender.
+        mtime (UTC) and headed with sender, recipient and round; a file named
+        any other way goes to all (see ``_address``). The sender is the outbox
+        folder's name, never anything in the file. The original moves to
+        ``messages/sent/``. Files that are too large, not UTF-8 or not plain
+        files move to ``messages/rejected/`` with a notice to the sender.
         """
         notices: List[Notice] = []
         ready = []
@@ -339,7 +351,7 @@ class Workspace:
                 for path in sorted(folder.iterdir()):
                     problem, st, body = self._problem(path)
                     if problem is None:
-                        to, slug = OUTBOX_NAME_RE.match(path.name).groups()
+                        to, slug = self._address(path.name)
                         ready.append((st.st_mtime_ns, sender, path.name, path, to, slug, body))
                         continue
                     moved = self._reject(path, sender)

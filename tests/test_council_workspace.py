@@ -296,22 +296,39 @@ def _rejected_names(run):
     return sorted(p.name for p in (run.messages / "rejected").iterdir())
 
 
-def test_bad_outbox_files_are_moved_to_rejected_with_a_notice_to_the_sender(run):
+def test_unreadable_outbox_files_are_moved_to_rejected_with_a_notice_to_the_sender(run):
     _outbox(run, "seat-1", "all__ok.md", "fine")
-    _outbox(run, "seat-1", "All__Bad Name.md")
-    _outbox(run, "seat-1", "seat-9__nobody.md")                        # no such seat
-    _outbox(run, "seat-1", "all__" + "x" * 49 + ".md")                # slug too long
     _outbox(run, "seat-2", "all__big.md", "x" * (20 * 1024 + 1))
     _outbox(run, "seat-2", "all__latin1.md", "caf\xe9".encode("latin-1"))
     delivered, notices = run.deliver(1)
 
     assert [d.slug for d in delivered] == ["ok"]
-    assert len(_rejected_names(run)) == 5
-    to = sorted(n.to for n in notices)
-    assert to == ["seat-1", "seat-1", "seat-1", "seat-2", "seat-2"]
+    assert len(_rejected_names(run)) == 2
+    assert sorted(n.to for n in notices) == ["seat-2", "seat-2"]
     text = " ".join(n.text for n in notices)
     assert "20 KB" in text and "UTF-8" in text and "rejected/" in text
     assert not list((run.messages / "outbox").rglob("*.md"))
+
+
+def test_a_loosely_named_message_goes_to_everyone_under_a_slug_made_from_its_name(run):
+    # What a real small model wrote: no recipient, wrong case, no extension, an unknown seat.
+    _outbox(run, "seat-1", "final_report.md", "tests pass")
+    _outbox(run, "seat-1", "R1 Summary.MD", "summary")
+    _outbox(run, "seat-2", "r1-done", "done")
+    _outbox(run, "seat-2", "seat-9__nobody.md", "hello?")
+    _outbox(run, "chair", "all__" + "x" * 60 + ".md", "long")
+    delivered, notices = run.deliver(1)
+
+    assert notices == [] and _rejected_names(run) == []
+    assert sorted((d.sender, d.to, d.slug) for d in delivered) == [
+        ("chair", "all", "all-" + "x" * 44),
+        ("seat-1", "all", "final-report"),
+        ("seat-1", "all", "r1-summary"),
+        ("seat-2", "all", "r1-done"),
+        ("seat-2", "all", "seat-9-nobody"),
+    ]
+    assert all(cw.DELIVERED_NAME_RE.match(Path(d.path).name) for d in delivered)
+    assert [d.text.endswith("tests pass") for d in delivered if d.slug == "final-report"] == [True]
 
 
 def test_reserved_and_unknown_outboxes_are_rejected(run):
@@ -399,18 +416,25 @@ def test_commit_pending_leaves_interpreter_caches_out(source, tmp_path):
     assert ws.commit_pending("seat-1", "seat-1: left over") is False
 
 
-def test_a_message_written_inside_the_worktree_is_moved_to_the_real_outbox(source, tmp_path):
+def test_messages_written_inside_the_worktree_are_delivered_as_that_seats_own(source, tmp_path):
     ws = cw.create_run(source, tmp_path / "runs", "goal", seats=2)
-    stray = ws.workdir("seat-1") / "messages" / "outbox" / "seat-1"
-    stray.mkdir(parents=True)
-    (stray / "all__found-it.md").write_text("the bug is in split\n")
-    other = ws.workdir("seat-1") / "messages" / "outbox" / "seat-2"
-    other.mkdir(parents=True)
-    (other / "all__forged.md").write_text("not mine\n")
+    seat = ws.workdir("seat-1")
+    for rel, text in (("messages/outbox/seat-1/all__found-it.md", "the bug is in split\n"),
+                      ("messages/outbox/all/seat-1/r2-summary.md", "round 2 done\n"),
+                      ("messages/outbox/seat-2/all__not-from-seat-2.md", "written by seat-1\n")):
+        (seat / rel).parent.mkdir(parents=True, exist_ok=True)
+        (seat / rel).write_text(text)
     ws.collect_misplaced("seat-1")
-    assert (ws.messages / "outbox" / "seat-1" / "all__found-it.md").read_text() == "the bug is in split\n"
-    assert not (stray / "all__found-it.md").exists()
-    # Only the seat's own outbox is adopted: the sender is the folder name.
-    assert (other / "all__forged.md").exists()
-    delivered, _ = ws.deliver(1)
-    assert [(m.sender, m.to) for m in delivered] == [("seat-1", "all")]
+    assert not [p for p in (seat / "messages").rglob("*") if p.is_file()]
+    delivered, notices = ws.deliver(1)
+    # Whatever the path said, the sender is the seat whose working copy held the file.
+    assert notices == [] and sorted((m.sender, m.to, m.slug) for m in delivered) == [
+        ("seat-1", "all", "found-it"), ("seat-1", "all", "not-from-seat-2"), ("seat-1", "all", "r2-summary")]
+
+
+def test_a_repository_that_tracks_its_own_messages_outbox_keeps_it(source, tmp_path):
+    _commit(source, "messages/outbox/README.md", "this project has a folder with this name\n")
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    ws.collect_misplaced("seat-1")
+    assert (ws.workdir("seat-1") / "messages" / "outbox" / "README.md").exists()
+    assert ws.deliver(1) == ([], [])
