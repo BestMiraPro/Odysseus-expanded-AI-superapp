@@ -78,6 +78,9 @@ class ToolSettings:
     # Claude Code / Codex CLI (and so their tools) or the agent loop's shell
     # and Python. A value of None removes the variable.
     env: Dict[str, Optional[str]] = field(default_factory=dict)
+    # Model calls one API/local seat may make in a stage (each tool call costs
+    # one). The Claude Code and Codex CLIs pace themselves.
+    max_rounds: int = AGENT_MAX_ROUNDS
 
     @property
     def enabled(self) -> bool:
@@ -275,7 +278,7 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
                 model=model,
                 messages=messages,
                 headers=headers,
-                max_rounds=AGENT_MAX_ROUNDS,
+                max_rounds=settings.max_rounds,
                 # No output cap, as for the tool-less seats: a reasoning model
                 # would otherwise spend 4096 tokens thinking and never answer.
                 max_tokens=0,

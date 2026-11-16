@@ -293,6 +293,8 @@ def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
         "error": turn.error,
         "usage": _loads(turn.usage, {}),
         "chair": _loads(getattr(turn, "chair", None), None),
+        # A work run's round (routes/council_work_routes.py); None for an ordinary turn.
+        "work": _loads(getattr(turn, "work", None), {}) or None,
         "created_at": turn.created_at.isoformat() if turn.created_at else None,
     }
 
@@ -321,7 +323,7 @@ def _save_turn(turn_id: str, **fields) -> None:
         for key, value in fields.items():
             if key in ("opinions", "reviews", "ranking", "labels", "config", "usage") and not isinstance(value, str):
                 value = json.dumps(value)
-            elif key == "chair" and value is not None and not isinstance(value, str):
+            elif key in ("chair", "work") and value is not None and not isinstance(value, str):
                 value = json.dumps(value)
             setattr(turn, key, value)
         db.commit()
@@ -432,10 +434,11 @@ def _memory_context(owner: Optional[str], question: str, history: List[Dict[str,
     return "\n\n".join(parts)
 
 
-def _budget_gate(owner: Optional[str], estimate: Dict[str, Any], confirmed: bool) -> None:
+def _budget_gate(owner: Optional[str], estimate: Dict[str, Any], confirmed: bool,
+                 what: str = "This council turn") -> None:
     """Refuse a turn the monthly cap forbids; ask first above the action limit."""
     decision = budget.check(owner, estimate.get("total_usd"), metered=estimate.get("metered", False),
-                            what="This council turn")
+                            what=what)
     if not decision.allowed:
         raise HTTPException(402, {"code": "budget_blocked", "message": decision.reason,
                                   "estimate": estimate, "budget": decision.to_dict()})
@@ -480,6 +483,15 @@ def _tool_settings(request: Request, owner: Optional[str], body: AskRequest) -> 
     return council_tools.ToolSettings(mode=mode, owner=owner, workspace=workspace)
 
 
+def _seat_config(s: Seat) -> Dict[str, str]:
+    """A seat as the session config remembers it."""
+    seat = {"endpoint_id": s.endpoint_id, "model": s.model}
+    level = reasoning_effort.normalize(s.effort)
+    if level:
+        seat["effort"] = level
+    return seat
+
+
 def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: str, body: AskRequest,
                   tools: Optional[council_tools.ToolSettings] = None):
     """Validate the seats, record a running turn, and return what the run needs.
@@ -506,14 +518,6 @@ def _prepare_turn(owner: Optional[str], session_id: str, question: str, mode: st
         _budget_gate(owner, estimate, body.budget_confirmed)
         tools_mode = tools.mode if tools else council_tools.TOOLS_OFF
         workspace = tools.workspace if tools else None
-
-        def _seat_config(s: Seat) -> Dict[str, str]:
-            seat = {"endpoint_id": s.endpoint_id, "model": s.model}
-            level = reasoning_effort.normalize(s.effort)
-            if level:
-                seat["effort"] = level
-            return seat
-
         config = {
             "members": [_seat_config(s) for s in body.members],
             "chairman": _seat_config(body.chairman),

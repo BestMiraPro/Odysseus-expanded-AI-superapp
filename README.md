@@ -214,6 +214,35 @@ Odysseus out. A run that outlives the token fails with a sign-in error; run it a
 In Docker the workspace must be a folder the container can see (mount it, e.g. with
 `docker-compose.code.yml`).
 
+### Work runs
+
+With **Full** tools and a workspace that is the top level of a git repository, **Work → On**
+turns the question box into a goal. The seats then work on it for several **rounds** (1 to 20,
+5 by default) without you:
+
+1. Each seat works and commits in its own worktree of a private copy of the repository.
+   Odysseus attaches each seat's real diff to its report.
+2. The seats review each other's reports and diffs blind, with read-only tools.
+3. The chairman merges the best work into the run's branch, runs the tests, gives each seat a
+   lane for the next round, and says whether the goal is met.
+
+Each round is saved as a turn in the thread (**Round n/N**), with the diff stat on every
+opinion and the **Messages** the seats sent each other through the run's `messages/` folder.
+The run stops when the chairman says the goal is met, at the round limit, when the budget
+would not cover another round, when you press **Stop** (finished rounds stay), when nothing
+changed for two rounds, or after two rounds without an answer. **While waiting for me** says
+what the seats do when they need your input: stop, keep working, or vote.
+
+Your folder is only read. The copy lives in `council-runs/` under the data folder and is kept
+when the run ends; the last round shows the `git fetch <copy> <branch>` line that brings the
+branch into your repository. The whole run (one round's estimate times the rounds) goes
+through the budget check before it starts, and that total is its ceiling.
+
+Work runs only start when Odysseus runs in its Docker container with login on for everyone
+(`AUTH_ENABLED=true`, `LOCALHOST_BYPASS=false`), and only for an admin: a seat's shell is not
+sandboxed. Mount the repository read-only: the copy cannot push back to it, but a seat could
+still write to your folder by its path.
+
 ### History
 
 **Your history** in the Council sidebar imports your conversations from outside Odysseus so

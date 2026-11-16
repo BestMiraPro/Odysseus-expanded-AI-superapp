@@ -581,3 +581,256 @@ def test_turn_markdown_of_a_failed_turn_says_so():
     assert "- Status: error (No council member produced an answer.)" in text
     assert "_No answer_" in text
     assert "## Reviews" not in text and "## Peer ranking" not in text and "- Usage:" not in text
+
+
+WORK = {"run_id": "abc123def456", "round": 2, "rounds": 5, "goal": "Make the parser 2x faster",
+        "source": "/repo/parser", "branch": "odysseus/make-the-parser-2x-faster-abc123",
+        "main": "/app/data/council-runs/abc123def456/main", "base_sha": "a" * 40, "head_sha": "b" * 40,
+        "messages": [{"name": "20261115T100000.000000Z__seat-1__all__progress.md", "from": "seat-1",
+                      "to": "all", "text": "seat-1 committed the tokenizer"},
+                     {"name": "20261115T100001.000000Z__odysseus__all__notice.md", "from": "odysseus",
+                      "to": "all", "text": "messages/x.md was deleted after delivery; restored."}],
+        "notices": [], "run_status": "finished", "stop_reason": "done", "while_waiting": "stop"}
+DIFF = "Work on branch seat-1 since a1.\n\nPatch:\ndiff --git a/x b/x\n+```python\n+x = 1\n"
+
+
+def test_turn_markdown_of_a_work_round_has_the_round_branch_stop_reason_and_messages():
+    text = council.turn_markdown(_turn(work=WORK, opinions=[{"member": 0, "text": "Changed: x", "attachment": DIFF},
+                                                            {"member": 1, "text": "replay first"}]))
+    assert "- Work run: round 2 of 5" in text
+    assert "- Branch: odysseus/make-the-parser-2x-faster-abc123" in text
+    assert "- Stop reason: done" in text
+    messages = text.split("## Messages", 1)[1]
+    assert "### seat-1 → all" in messages and "seat-1 committed the tokenizer" in messages
+    assert "### odysseus → all" in messages and "was deleted after delivery; restored." in messages
+
+
+def test_turn_markdown_shows_the_diff_apart_from_the_answer_text():
+    text = council.turn_markdown(_turn(work=WORK, opinions=[{"member": 0, "text": "Changed: x", "attachment": DIFF}]))
+    section = text.split("### Response B — claude-opus (Claude)", 1)[1]
+    assert section.index("Changed: x") < section.index("Diff attached by Odysseus")
+    # The fence is longer than any run of backticks inside the diff, so the diff cannot close it.
+    assert "\n````\n" + DIFF.rstrip("\n") + "\n````\n" in section
+
+
+def test_turn_markdown_of_a_running_work_round_has_no_stop_reason_and_a_plain_turn_no_work_lines():
+    running = council.turn_markdown(_turn(work={**WORK, "run_status": "running", "stop_reason": None}))
+    assert "- Work run: round 2 of 5" in running and "Stop reason" not in running
+    plain = council.turn_markdown(_turn())
+    assert "Work run" not in plain and "## Messages" not in plain and "Diff attached" not in plain
+
+
+# ---------------------------------------------------------------------------
+# hooks for work runs (all optional; without them the council is unchanged)
+# ---------------------------------------------------------------------------
+
+def test_parse_verdict_reads_status_continue_or_done_only():
+    base = "Answer.\n\n## Verdict\n- Decision: merge seat-1\n"
+    assert council.parse_verdict(base + "- Status: done")["status"] == "done"
+    assert council.parse_verdict(base + "- **Status:** Continue.")["status"] == "continue"
+    assert "status" not in council.parse_verdict(base + "- Status: maybe later")
+    assert "status" not in council.parse_verdict(base)
+
+
+def test_ordinary_chair_prompt_does_not_ask_for_a_status():
+    assert "Status" not in council.CHAIR_SYSTEM
+
+
+def _recording_stream(text_for):
+    """Stream that answers ``text_for(stage, messages)`` and records every call."""
+    calls = []
+
+    async def stream(url, model, messages, **kwargs):
+        stage = kwargs.get("stage")
+        calls.append({"stage": stage, "model": model, "messages": messages, "kwargs": kwargs})
+        yield f"data: {json.dumps({'delta': text_for(stage, messages)})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    stream.accepts_stage = True
+    stream.calls = calls
+    return stream
+
+
+def _ranked(stage, messages):
+    if stage == "review":
+        labels = sorted(set(council._RESPONSE_LABEL_RE.findall(messages[-1]["content"])))
+        return "ok\nFINAL RANKING:\n" + "\n".join(f"{i}. Response {l}" for i, l in enumerate(labels, 1))
+    return f"{stage} text"
+
+
+def test_stage_prompts_replace_the_system_prompts():
+    stream = _recording_stream(_ranked)
+    prompts = {"opinions": "WORK PROMPT", "review": "REVIEW PROMPT", "synthesis": "INTEGRATE PROMPT"}
+    _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full",
+         stream_fn=stream, prompts=prompts)
+    systems = {c["stage"]: c["messages"][0]["content"] for c in stream.calls}
+    assert systems == prompts
+
+
+def test_personalize_gives_each_seat_its_own_prompt():
+    stream = _recording_stream(_ranked)
+    seen = []
+
+    def personalize(stage, index, messages):
+        seen.append((stage, index))
+        return [{**messages[0], "content": messages[0]["content"] + f"\nYOU ARE {index}"}, *messages[1:]]
+
+    _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full",
+         stream_fn=stream, personalize=personalize)
+    assert sorted(seen, key=str) == sorted([("opinions", 0), ("opinions", 1), ("review", 0), ("review", 1),
+                                            ("synthesis", "chair")], key=str)
+    for call in stream.calls:
+        idx = "chair" if call["stage"] == "synthesis" else int(call["model"] == "b")
+        assert call["messages"][0]["content"].endswith(f"YOU ARE {idx}")
+
+
+def test_a_seat_aware_stream_is_told_its_seat():
+    stream = _recording_stream(_ranked)
+    stream.accepts_seat = True
+    _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full", stream_fn=stream)
+    seats = sorted(((c["stage"], c["kwargs"]["seat"]) for c in stream.calls), key=str)
+    assert seats == sorted([("opinions", 0), ("opinions", 1), ("review", 0), ("review", 1),
+                            ("synthesis", "chair")], key=str)
+    # A stream without the flag is called exactly as before.
+    plain = _recording_stream(_ranked)
+    _run(question="Q?", members=[_member("a")], chairman=_member("a"), mode="quick", stream_fn=plain)
+    assert all("seat" not in c["kwargs"] for c in plain.calls)
+
+
+def test_between_stages_runs_after_each_stage_and_can_attach_to_opinions():
+    stream = _recording_stream(_ranked)
+    order = []
+
+    async def between(stage, result):
+        order.append((stage, [o.get("text") for o in result["opinions"]], len(result["reviews"]),
+                      result.get("final")))
+        if stage == "opinions":
+            for op in result["opinions"]:
+                op["attachment"] = f"DIFF OF SEAT {op['member']}"
+
+    result, _ = _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full",
+                     stream_fn=stream, between_stages=between)
+    assert [o[0] for o in order] == ["opinions", "review", "synthesis"]
+    assert order[0][1] == ["opinions text", "opinions text"] and order[0][2] == 0
+    assert order[1][2] == 2
+    assert order[2][3] == "synthesis text"
+
+    by_stage = {}
+    for call in stream.calls:
+        by_stage.setdefault(call["stage"], []).append(call["messages"][-1]["content"])
+    for body in by_stage["review"] + by_stage["synthesis"]:
+        assert "DIFF OF SEAT 0" in body and "DIFF OF SEAT 1" in body
+    assert all("DIFF OF SEAT" not in body for body in by_stage["opinions"])
+    # Shown alongside the answer, never saved as the answer text.
+    assert all("DIFF" not in o["text"] for o in result["opinions"])
+    assert result["opinions"][0]["attachment"] == "DIFF OF SEAT 0"
+    assert "DIFF" not in result["final"]
+
+
+def _attaching(size):
+    async def between(stage, result):
+        if stage == "opinions":
+            for op in result["opinions"]:
+                op["attachment"] = _long(f"diff{op['member']}", size)
+
+    return between
+
+
+def _prompt_chars(messages):
+    return sum(len(m["content"]) for m in messages)
+
+
+def test_attachments_get_room_so_the_chairman_prompt_still_fits_the_smallest_window():
+    window = 100_000
+    members, chair = [_sized("a", window), _sized("b", window)], _sized("a", window)
+    stream = _fake_stream(answers={"a": _long("a", 90_000), "b": _long("b", 90_000)},
+                          reviews={"a": _long("ra", 60_000), "b": _long("rb", 60_000)})
+    result, _ = _run(question="Q?", members=members, chairman=chair, mode="full", stream_fn=stream,
+                     between_stages=_attaching(12_000))
+    assert result["final"] == "FINAL ANSWER"
+    room = council.prompt_room([*members, chair])
+    by_stage = {}
+    for stage, _model, messages in stream.calls:
+        by_stage.setdefault(stage, []).append(messages)
+    for stage in (council.REVIEW_SYSTEM.split(".")[0], council.CHAIR_SYSTEM.split(".")[0]):
+        for messages in by_stage[stage]:
+            assert _prompt_chars(messages) <= room, stage
+    # The window has room for both diffs whole: they are not what gives way.
+    (chair_prompt,) = by_stage[council.CHAIR_SYSTEM.split(".")[0]]
+    body = chair_prompt[-1]["content"]
+    assert _long("diff0", 12_000) in body and _long("diff1", 12_000) in body
+
+
+def test_plan_limits_reserves_room_for_attachments():
+    members, chair = [_sized("a", 100_000), _sized("b", 100_000)], _sized("a", 100_000)
+    plain = council.plan_limits(members, chair, "full", "Q", [])
+    with_diffs = council.plan_limits(members, chair, "full", "Q", [], attachment_chars=12_000)
+    assert with_diffs.attachment == 12_000
+    assert 2 * (with_diffs.answer + with_diffs.review + with_diffs.attachment) <= 2 * (plain.answer + plain.review)
+    # In a window too small for whole diffs, the diffs give way instead of overflowing it.
+    small = [_sized("a", 30_000), _sized("b", 30_000)]
+    tight = council.plan_limits(small, small[0], "full", "Q", [], attachment_chars=12_000)
+    assert tight.attachment < 12_000
+    assert plain.attachment is None
+
+
+def test_between_stages_still_runs_when_no_seat_answered():
+    stages = []
+
+    async def between(stage, result):
+        stages.append(stage)
+
+    result, _ = _run(question="Q?", members=[_member("a")], chairman=_member("a"), mode="full",
+                     stream_fn=_fake_stream(fail={"a"}), between_stages=between)
+    assert result["error"] == "No council member produced an answer."
+    assert stages == ["opinions"]
+
+
+def _slow_stream():
+    async def slow(url, model, messages, **kwargs):
+        yield 'data: {"delta": "half a "}\n\n'
+        yield 'data: {"delta": "report"}\n\n'
+        await asyncio.sleep(30)
+        yield 'data: {"delta": " never sent"}\n\n'
+
+    return slow
+
+
+def test_hard_timeout_keeps_the_text_written_so_far():
+    async def emit(ev):
+        pass
+
+    out = asyncio.run(council.run_member(_slow_stream(), _member("m"), [{"role": "user", "content": "q"}],
+                                         stage="opinions", index=0, emit=emit, timeout=600, hard_timeout=0.2))
+    assert out["text"] == "half a report"
+    assert out["error"] is None and out["timed_out"] is True
+
+
+def test_hard_timeout_before_any_text_is_an_error():
+    async def silent(url, model, messages, **kwargs):
+        await asyncio.sleep(30)
+        yield 'data: {"delta": "late"}\n\n'
+
+    async def emit(ev):
+        pass
+
+    out = asyncio.run(council.run_member(silent, _member("m"), [{"role": "user", "content": "q"}],
+                                         stage="opinions", index=0, emit=emit, timeout=600, hard_timeout=0.1))
+    assert out["text"] == "" and out["timed_out"] is True
+    assert "time limit" in out["error"]
+
+
+def test_run_council_passes_the_hard_timeout_to_every_call():
+    stream = _recording_stream(_ranked)
+    slow = _slow_stream()
+
+    async def mixed(url, model, messages, **kwargs):
+        source = slow if (kwargs.get("stage") == "opinions" and model == "b") else stream
+        async for chunk in source(url, model, messages, **kwargs):
+            yield chunk
+
+    mixed.accepts_stage = True
+    result, _ = _run(question="Q?", members=[_member("a"), _member("b")], chairman=_member("a"), mode="full",
+                     stream_fn=mixed, hard_timeout=0.3)
+    assert result["opinions"][1]["text"] == "half a report" and result["opinions"][1]["timed_out"]
+    assert len(result["labels"]) == 2          # the timed-out seat is still reviewed
