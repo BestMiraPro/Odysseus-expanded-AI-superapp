@@ -126,6 +126,15 @@ def _refuse_unsafe(request: Request) -> None:
                                  "then call Odysseus, approvals included, without credentials.")
 
 
+def _owner_in_person(request: Request) -> str:
+    """The owner, signed in to the Odysseus page. Requests gate what agents may do
+    on GitHub and agents can hold API tokens, so a token never lists or decides them."""
+    if getattr(request.state, "api_token", False):
+        raise HTTPException(403, "Only the owner, signed in to Odysseus, can see and decide agents' requests; "
+                                 "API tokens cannot.")
+    return cr._owner(request)
+
+
 def _source_repo(raw: str) -> str:
     """The vetted top level of the owner's git repository."""
     from src.tool_execution import vet_workspace
@@ -715,19 +724,19 @@ def setup_council_work_routes() -> APIRouter:
     @router.get("/requests")
     async def list_requests(request: Request,
                             status: Optional[Literal["pending", "approving", "approved", "denied", "failed"]] = None):
-        owner = cr._owner(request)
+        owner = _owner_in_person(request)
         return {"requests": await asyncio.to_thread(_list_requests, owner, status)}
 
     @router.post("/requests/{request_id}/approve")
     async def approve_request(request_id: str, request: Request):
         """Carry out one request now, at the owner's click; 404 when not theirs, 409 once decided."""
-        owner = cr._owner(request)
+        owner = _owner_in_person(request)
         # Shielded: a dropped connection must not leave a request half carried out.
         return await asyncio.shield(asyncio.ensure_future(_approve(owner, request_id)))
 
     @router.post("/requests/{request_id}/deny")
     async def deny_request(request_id: str, request: Request):
-        owner = cr._owner(request)
+        owner = _owner_in_person(request)
         _turn_id, denied, work = await asyncio.to_thread(_claim, owner, request_id, council_requests.DENIED)
         _tell_run(work.get("run_id"), denied)
         return {"request": denied}
