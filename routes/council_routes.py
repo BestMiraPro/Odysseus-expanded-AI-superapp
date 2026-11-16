@@ -84,6 +84,14 @@ class SessionCreate(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _owner(request: Request) -> Optional[str]:
+    # An API token with the council scope acts for the token's owner.
+    if getattr(request.state, "api_token", False):
+        if "council" not in set(getattr(request.state, "api_token_scopes", []) or []):
+            raise HTTPException(403, "API token missing required scope: council")
+        owner = getattr(request.state, "api_token_owner", None)
+        if not owner:
+            raise HTTPException(403, "API token has no owner")
+        return owner
     require_user(request)
     return get_current_user(request) or None
 
