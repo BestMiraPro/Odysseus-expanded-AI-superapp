@@ -1238,37 +1238,6 @@ function turnUsage(turn) {
   return `<span class="council-usage" title="${esc(title)}">${fmtTokens(u.input_tokens + u.output_tokens)} tokens${cost}</span>`;
 }
 
-function turnMarkdown(turn) {
-  const seats = seatsOfTurn(turn);
-  const memberLabel = {};
-  for (const [label, idx] of Object.entries(turn.labels || {})) memberLabel[idx] = label;
-  const name = (i) => { const s = seats.members[i] || {}; return `${s.model || '?'}${s.endpoint_name ? ` (${s.endpoint_name})` : ''}`; };
-  const out = [`# ${turn.question}`, '', `*AI Council · ${seats.mode} mode · chairman ${seats.chairman?.model || '?'}*`, '',
-    '## Council answer', '', turn.final || '_No answer_', '', '## Opinions', ''];
-  // Response A, B, C… in order; seats that failed (no label) go last.
-  const opinions = [...(turn.opinions || [])].sort((x, y) =>
-    (memberLabel[x.member] || '~').localeCompare(memberLabel[y.member] || '~'));
-  const toolLines = (steps) => (steps || []).filter(st => st.kind === 'tool')
-    .map(st => `- ${st.status === 'error' ? '✗' : '✓'} \`${st.tool}\`${st.command ? ` ${st.command.replace(/\n/g, ' ')}` : ''}`);
-  for (const o of opinions) {
-    const used = toolLines(o.tools);
-    out.push(`### ${memberLabel[o.member] ? `Response ${memberLabel[o.member]} — ` : ''}${name(o.member)}`, '',
-      ...(used.length ? ['Tools used:', ...used, ''] : []),
-      o.error ? `_${o.error}_` : (o.text || ''), '');
-  }
-  const ranking = (turn.ranking || []).filter(r => r.avg_rank != null);
-  if (ranking.length) {
-    out.push('## Peer ranking (blind, self-votes excluded)', '', '| # | Answer | Model | Avg rank | 1st-place votes |', '|---|---|---|---|---|');
-    ranking.forEach((r, i) => out.push(`| ${i + 1} | Response ${r.label} | ${name(r.member)} | ${r.avg_rank} | ${r.first_votes} |`));
-    out.push('');
-  }
-  if ((turn.reviews || []).length) {
-    out.push('## Reviews', '');
-    for (const r of turn.reviews) out.push(`### Review by ${name(r.member)}`, '', r.error ? `_${r.error}_` : (r.text || ''), '');
-  }
-  return out.join('\n');
-}
-
 function downloadText(filename, text) {
   const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -1347,7 +1316,7 @@ function renderTurn(turn, live = false) {
     <div class="council-final-h">${ICON}<span class="t">Council answer</span>
       <span class="ep">chairman ${esc(chair.model || '')}${chair.endpoint_name ? ` · ${esc(chair.endpoint_name)}` : ''}</span>
       <span class="tools">${finalText ? `<button class="council-btn small ghost" data-copy-final="${esc(turn.id)}">Copy</button>
-        <button class="council-btn small ghost" data-export-turn="${esc(turn.id)}" title="Download the question, every opinion, the reviews, the ranking and the answer as Markdown">Export .md</button>` : ''}</span>
+        <button class="council-btn small ghost" data-export-turn="${esc(turn.id)}" title="Download the question, the answer with its verdict, the run settings and cost, every opinion, the reviews and the ranking as Markdown">Export .md</button>` : ''}</span>
     </div>
     <div class="council-final-t">${toolsBlock(chairTools, `${turn.id}:synthesis:chair`, live && turn.stages?.synthesis === 'running')}</div>
     <div class="council-final-b ${!finalText ? 'pending' : ''}">${finalErr ? `<div class="council-errtext" style="margin-bottom:8px">${esc(finalErr)} Showing the top-ranked answer instead.</div>` : ''}${md(finalText)}</div>
@@ -1935,7 +1904,11 @@ async function onPaneClick(e) {
     const turn = (S.session?.turns || []).find(x => x.id === exp.dataset.exportTurn);
     if (turn) {
       const slug = (turn.question || 'council').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'council';
-      downloadText(`council-${slug}.md`, turnMarkdown(turn));
+      try {
+        const res = await fetch(`/api/council/sessions/${encodeURIComponent(S.session.id)}/turns/${encodeURIComponent(turn.id)}/export.md`, { credentials: 'same-origin' });
+        if (!res.ok) throw new Error('Could not export this turn');
+        downloadText(`council-${slug}.md`, await res.text());
+      } catch (err) { toast(err.message); }
     }
     return;
   }

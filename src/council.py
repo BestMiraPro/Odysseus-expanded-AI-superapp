@@ -80,7 +80,15 @@ CHAIR_SYSTEM = (
     "view you adopt and why.\n"
     "- Address the user directly. Start with the answer itself: no title, no heading "
     "like 'Final Answer', no preamble. Do not narrate the council process or refer to "
-    "'Response A' etc. unless a disagreement needs it."
+    "'Response A' etc. unless a disagreement needs it.\n"
+    "- End with this block, exactly these five fields, each on one line:\n"
+    "## Verdict\n"
+    "- Decision: what to do or conclude, in one sentence\n"
+    "- Confidence: low, medium or high, and the main reason\n"
+    "- Dissent: which model disagreed and on what, or none\n"
+    "- Would change it: the evidence that would reverse the decision\n"
+    "- Next test: the cheapest check that would settle the main doubt, with the result "
+    "that decides it, or none"
 )
 
 
@@ -207,6 +215,33 @@ def aggregate_rankings(
         })
     rows.sort(key=lambda r: (r["avg_rank"] is None, r["avg_rank"] or 0, -r["first_votes"], r["label"]))
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Verdict
+# ---------------------------------------------------------------------------
+
+_VERDICT_HEADER_RE = re.compile(r"^#{1,6}[ \t]*Verdict[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_VERDICT_FIELDS = {"decision": "decision", "confidence": "confidence", "dissent": "dissent",
+                   "would change it": "would_change", "next test": "next_test"}
+_VERDICT_FIELD_RE = re.compile(
+    r"^[ \t]*[-*][ \t]+\**[ \t]*(" + "|".join(_VERDICT_FIELDS) + r")[ \t]*\**[ \t]*:[ \t]*\**[ \t]*(.+)$",
+    re.IGNORECASE | re.MULTILINE)
+
+
+def _verdict_start(text: str) -> int:
+    """Where the answer's closing Verdict block starts, or -1 when it has none."""
+    matches = list(_VERDICT_HEADER_RE.finditer(text or ""))
+    return matches[-1].start() if matches else -1
+
+
+def parse_verdict(text: str) -> Dict[str, str]:
+    """The fields of the chairman's closing Verdict block; empty when the answer has none."""
+    start = _verdict_start(text)
+    if start < 0:
+        return {}
+    return {_VERDICT_FIELDS[label.lower()]: value.strip()
+            for label, value in _VERDICT_FIELD_RE.findall(text[start:])}
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +387,23 @@ def _allot(sizes: List[int], protected: set, budget: int) -> List[int]:
     return out
 
 
+def _clip_answer(text: str, limit: int) -> str:
+    """An earlier council answer cut to ``limit``, keeping its Verdict block whole when it fits.
+
+    The verdict holds the decision and the dissent, which the next round needs
+    more than the middle of the answer.
+    """
+    what = "earlier council answer"
+    start = _verdict_start(text)
+    if len(text) <= limit or start < 0:
+        return _clip_middle(text, limit, what)
+    verdict = text[start:].strip()
+    room = limit - len(verdict) - 2
+    if room < CLIP_NOTE_CHARS:
+        return _clip_middle(text, limit, what)
+    return f"{_clip_middle(text[:start], room, what)}\n\n{verdict}"
+
+
 def history_messages(history: List[Dict[str, str]], budget: Optional[int] = None) -> List[Dict[str, str]]:
     """Earlier council turns as chat history (question -> council answer).
 
@@ -379,7 +431,8 @@ def history_messages(history: List[Dict[str, str]], budget: Optional[int] = None
     msgs: List[Dict[str, str]] = []
     for k, (text, cap) in enumerate(zip(texts, allowed)):
         user = k % 2 == 0
-        content = _clip_middle(text, cap, "earlier question" if user else "earlier council answer")
+        content = (_clip_middle(text, cap, "earlier question") if user
+                   else _clip_answer(text, cap))
         if k == 2 and skipped:
             rounds = "1 earlier round is" if skipped == 1 else f"{skipped} earlier rounds are"
             content = f"[NOTE: {rounds} not replayed here.]\n\n{content}"
@@ -788,6 +841,86 @@ async def run_council(
         result["final"] = chair["text"]
     result["chair_ms"] = chair["ms"]
     return result
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def _tool_lines(steps: Any) -> List[str]:
+    lines = []
+    for step in steps or []:
+        if step.get("kind") != "tool":
+            continue
+        mark = "✗" if step.get("status") == "error" else "✓"
+        command = str(step.get("command") or "").replace("\n", " ")
+        lines.append(f"- {mark} `{step.get('tool')}`" + (f" {command}" if command else ""))
+    return lines
+
+
+def turn_markdown(turn: Dict[str, Any]) -> str:
+    """One saved turn (the JSON the API returns) as a markdown document.
+
+    Written for a reader outside the Council page, another agent included: it
+    carries the answer with its verdict, the run's settings and cost, and
+    every opinion and review.
+    """
+    config = turn.get("config") or {}
+    seats = config.get("members") or []
+
+    def seat_name(seat: Any) -> str:
+        seat = seat or {}
+        name = seat.get("model") or "?"
+        return f"{name} ({seat['endpoint_name']})" if seat.get("endpoint_name") else name
+
+    def name(index: Any) -> str:
+        return seat_name(seats[index] if isinstance(index, int) and 0 <= index < len(seats) else None)
+
+    label_of = {member: label for label, member in (turn.get("labels") or {}).items()}
+    out = [f"# {turn.get('question') or ''}", "",
+           f"- Mode: {config.get('mode') or MODE_FULL}",
+           f"- Chairman: {seat_name(config.get('chairman'))}"]
+    if config.get("tools"):
+        out.append(f"- Tools: {config['tools']}")
+    if config.get("workspace"):
+        out.append(f"- Workspace: {config['workspace']}")
+    if turn.get("created_at"):
+        out.append(f"- Asked: {turn['created_at']}")
+    if turn.get("status") and turn["status"] != "done":
+        out.append(f"- Status: {turn['status']}" + (f" ({turn['error']})" if turn.get("error") else ""))
+    usage = turn.get("usage") or {}
+    if usage.get("input_tokens") or usage.get("output_tokens"):
+        line = f"- Usage: {usage.get('input_tokens') or 0} input + {usage.get('output_tokens') or 0} output tokens"
+        if usage.get("cost_usd") is not None:
+            line += f", metered cost ${usage['cost_usd']:.4f}"
+        if usage.get("unpriced_calls"):
+            line += f" ({usage['unpriced_calls']} calls not priced)"
+        out.append(line)
+    out += ["", "## Council answer", "", turn.get("final") or "_No answer_", ""]
+    chair_tools = _tool_lines((turn.get("chair") or {}).get("tools"))
+    if chair_tools:
+        out += ["Chairman tools used:", *chair_tools, ""]
+    out += ["## Opinions", ""]
+    # Response A, B, C... in order; seats that failed (no label) go last.
+    for opinion in sorted(turn.get("opinions") or [], key=lambda o: label_of.get(o.get("member"), "~")):
+        label = label_of.get(opinion.get("member"))
+        used = _tool_lines(opinion.get("tools"))
+        out += [f"### {f'Response {label} — ' if label else ''}{name(opinion.get('member'))}", "",
+                *(["Tools used:", *used, ""] if used else []),
+                f"_{opinion['error']}_" if opinion.get("error") else (opinion.get("text") or ""), ""]
+    ranking = [r for r in turn.get("ranking") or [] if r.get("avg_rank") is not None]
+    if ranking:
+        out += ["## Peer ranking (blind, self-votes excluded)", "",
+                "| # | Answer | Model | Avg rank | 1st-place votes |", "|---|---|---|---|---|"]
+        out += [f"| {i} | Response {r['label']} | {name(r['member'])} | {r['avg_rank']} | {r['first_votes']} |"
+                for i, r in enumerate(ranking, start=1)]
+        out.append("")
+    if turn.get("reviews"):
+        out += ["## Reviews", ""]
+        for review in turn["reviews"]:
+            out += [f"### Review by {name(review.get('member'))}", "",
+                    f"_{review['error']}_" if review.get("error") else (review.get("text") or ""), ""]
+    return "\n".join(out)
 
 
 def usage_totals(result: Dict[str, Any]) -> Dict[str, Any]:
