@@ -45,9 +45,9 @@ def as_seat(script, *args, env=None, cwd="/tmp", stdin=None):
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
-def denied(rc, out, secret=""):
+def denied(rc, out, marker=""):
     return rc != 0 and ("Permission denied" in out or "Operation not permitted" in out) and \
-        (not secret or secret not in out)
+        (not marker or marker not in out)
 
 
 def attempt(fn):
@@ -92,21 +92,21 @@ check("the launcher starts it as odysseus-seat, in its own group only, with no c
       and "NoNewPrivs:\t1" in out and "CapEff:\t0000000000000000" in out and "0002" in out, out)
 
 print("\n== Odysseus's files")
-secrets = {}
+planted = {}
 for name in ("sessions.json", "github_access.json", ".app_key", "app.db", "auth.json"):
     path = os.path.join(DATA, name)
     if not os.path.exists(path):
         with open(path, "w") as fh:
             fh.write(f"PROOF-SECRET-{name}\n")
-    secrets[path] = f"PROOF-SECRET-{name}"
+    planted[path] = f"PROOF-SECRET-{name}"
 log = os.path.join(LOGS, "proof.log")
 with open(log, "a") as fh:
     fh.write("PROOF-SECRET-log\n")
-secrets[log] = "PROOF-SECRET-log"
-for path, secret in secrets.items():
+planted[log] = "PROOF-SECRET-log"
+for path, marker in planted.items():
     rc, out = as_seat('cat -- "$1"', path)
     # The output is not printed when the check fails because the placeholder leaked.
-    leaked = secret in out
+    leaked = marker in out
     check(f"reading {path} is denied", denied(rc, out) and not leaked,
           "<output withheld: it holds the placeholder>" if leaked else out)
 for path in (DATA, LOGS, "/app", "/app/.ssh", "/app/src"):
