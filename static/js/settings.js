@@ -5606,10 +5606,8 @@ async function initUnifiedIntegrations() {
         const base = name;
         while (existingNames.has(name)) { name = `${base} ${n++}`; }
       }
-      // Minimum scope on creation so the token isn't effectively saved
-      // with everything granted before the user has clicked Save. The
-      // UI toggles below are pre-checked as a preview of what *will*
-      // be granted; nothing else is persisted server-side until Save.
+      // Minimum scope on creation; extra scopes are granted only when the
+      // user switches them on and clicks Save.
       const fd = new FormData();
       fd.append('name', name);
       fd.append('scopes', 'chat');
@@ -5625,10 +5623,10 @@ async function initUnifiedIntegrations() {
         if (setupBtn) setupBtn.dataset.token = d.token || '';
         const setupCode = el('uf-codex-setup-code');
         if (setupCode) setupCode.textContent = setupForToken(d.token || '');
-        // Populate inline scope toggles for the just-created token with
-        // ALL scopes pre-checked as a UI preview — the underlying token
-        // still only has 'chat' until the user clicks Save below.
-        const uiToken = { id: d.id, scopes: ['chat'].concat(toolScopes.map(s => s.key)) };
+        // Toggles start at the scopes the server actually granted. Save
+        // sends exactly the checked set, so a pre-checked toggle would be
+        // granted without the user ever switching it on.
+        const uiToken = { id: d.id, scopes: d.scopes };
         const inlineEl = el('uf-codex-inline-scopes');
         if (inlineEl) {
           inlineEl.innerHTML = `
