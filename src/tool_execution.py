@@ -18,6 +18,7 @@ import re
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 
@@ -264,6 +265,30 @@ _active_workspace: contextvars.ContextVar = contextvars.ContextVar(
 def get_active_workspace() -> Optional[str]:
     """The folder the agent is confined to this turn, or None."""
     return _active_workspace.get()
+
+
+# Environment overrides for the bash/python subprocesses of a whole agent run,
+# set by a caller that runs the loop unattended (a council seat): {name: value},
+# where None removes the variable. Context-local like the workspace above, and
+# inherited by the tasks the run creates.
+_subprocess_env_overrides: contextvars.ContextVar = contextvars.ContextVar(
+    "agent_subprocess_env_overrides", default=None
+)
+
+
+@contextmanager
+def subprocess_env_overrides(overrides: Optional[Dict[str, Optional[str]]]):
+    """Apply ``overrides`` to the shell and Python tools run inside."""
+    token = _subprocess_env_overrides.set(dict(overrides) if overrides else None)
+    try:
+        yield
+    finally:
+        try:
+            _subprocess_env_overrides.reset(token)
+        except ValueError:
+            # An abandoned async generator closed from another context; the
+            # value stays only in the task that ran it.
+            pass
 
 
 def vet_workspace(raw: str) -> Optional[str]:
@@ -548,6 +573,9 @@ async def _direct_fallback(
         "LINES": "40",
         "HOME": _AGENT_WORKDIR,
     }
+    overrides = _subprocess_env_overrides.get()
+    if overrides:
+        _subproc_env = {k: v for k, v in {**_subproc_env, **overrides}.items() if v is not None}
 
     try:
         ctx = {

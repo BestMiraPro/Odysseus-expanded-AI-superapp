@@ -1,11 +1,20 @@
 """Council tools: engine choice per seat, event translation, tool timelines."""
 import asyncio
 import json
+import os
 
 import pytest
 
 from src import codex_cli, council, council_tools
 from src.claude_subscription import NativeTools, StreamTranslator, cli_args
+
+
+@pytest.fixture(autouse=True)
+def data_dir(monkeypatch, tmp_path_factory):
+    # Tool-running seats keep a throwaway git/gh config under the app's data folder.
+    path = tmp_path_factory.mktemp("data")
+    monkeypatch.setattr("src.constants.DATA_DIR", str(path))
+    return path
 
 
 def _sse(payload):
@@ -160,6 +169,175 @@ def test_tools_off_uses_plain_streaming(monkeypatch):
     fn = council_tools.stream_fn_for(_settings("off"))
     _collect(fn("u", "m", [{"role": "system", "content": "SYS"}]))
     assert calls[0][0]["content"] == "SYS"
+
+
+# ── Seat credentials: no ambient GitHub or SSH login ──
+
+OVERRIDES = {"GH_TOKEN": None, "SSH_AUTH_SOCK": None, "GH_CONFIG_DIR": "/seat/gh"}
+
+
+def _ambient_credentials(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "ghp_ambient")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/owner-agent.sock")
+
+
+def _without_credentials(env):
+    return "GH_TOKEN" not in env and "SSH_AUTH_SOCK" not in env and env["GH_CONFIG_DIR"] == "/seat/gh"
+
+
+def test_claude_cli_starts_with_the_seat_env_overrides(monkeypatch):
+    from src import claude_subscription as cs
+
+    _ambient_credentials(monkeypatch)
+    monkeypatch.setattr(cs, "find_cli", lambda: "/usr/local/bin/claude")
+    started = []
+    monkeypatch.setattr(cs.subprocess, "Popen", lambda args, **kw: started.append(kw["env"]))
+
+    def popen_env(tools):
+        inv = cs._Invocation("https://claude-subscription.invalid/a", "claude-opus-5-5",
+                             [{"role": "user", "content": "q"}], credentials=(cs.AUTH_MODE_HOST, None),
+                             tools=tools)
+        try:
+            cs._popen(inv)
+        finally:
+            inv.cleanup()
+        return started.pop()
+
+    assert _without_credentials(popen_env(NativeTools(env=OVERRIDES)))
+    # No overrides: exactly the environment the CLI always got.
+    assert popen_env(NativeTools()) == cs.cli_env(cs.AUTH_MODE_HOST, None)
+    assert popen_env(None) == cs.cli_env(cs.AUTH_MODE_HOST, None)
+
+
+def test_codex_cli_starts_with_the_seat_env_overrides(monkeypatch):
+    _ambient_credentials(monkeypatch)
+    monkeypatch.setattr(codex_cli, "find_cli", lambda: "/usr/local/bin/codex")
+    started = []
+
+    def fake_popen(args, **kw):
+        started.append(kw["env"])
+        raise OSError("not started in tests")
+
+    monkeypatch.setattr(codex_cli.subprocess, "Popen", fake_popen)
+
+    def popen_env(**kw):
+        _collect(codex_cli.stream(codex_cli.CodexRun(model="m", prompt="p", access_token="t", **kw)))
+        return started.pop()
+
+    assert _without_credentials(popen_env(env=OVERRIDES))
+    plain = popen_env()
+    assert plain == codex_cli._env(plain["CODEX_HOME"])
+
+
+def test_agent_loop_shell_starts_with_the_seat_env_overrides(monkeypatch):
+    from src import agent_tools, tool_execution
+
+    _ambient_credentials(monkeypatch)
+    built = []
+
+    async def fake_bash(content, ctx):
+        built.append(ctx["subproc_env"])
+        return {"output": "", "exit_code": 0}
+
+    async def fake_loop(**kwargs):
+        # The real loop runs each tool call in a task of its own.
+        await asyncio.create_task(tool_execution._direct_fallback("bash", "git push"))
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setitem(agent_tools.TOOL_HANDLERS, "bash", fake_bash)
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    seat = council_tools.ToolSettings(mode="full", owner="dinis", env=OVERRIDES)
+    _collect(council_tools._agent_stream("u", "m", [], None, seat, "foreground"))
+    assert _without_credentials(built.pop())
+    # No overrides, in or outside a council run: exactly what the shell always got.
+    plain = {**os.environ, "TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40",
+             "HOME": tool_execution._AGENT_WORKDIR}
+    _collect(council_tools._agent_stream("u", "m", [], None, _settings("full"), "foreground"))
+    assert built.pop() == plain
+    asyncio.run(tool_execution._direct_fallback("bash", "ls"))
+    assert built.pop() == plain
+
+
+def test_credential_free_git_env_covers_gh_git_and_ssh(tmp_path):
+    env = council_tools.credential_free_git_env(str(tmp_path))
+    for key in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "SSH_AUTH_SOCK"):
+        assert key in env and env[key] is None
+    assert os.path.dirname(env["GH_CONFIG_DIR"]) == str(tmp_path)
+    assert os.path.dirname(env["GIT_CONFIG_GLOBAL"]) == str(tmp_path)
+    assert os.path.isfile(env["GIT_CONFIG_GLOBAL"])
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1" and env["GIT_TERMINAL_PROMPT"] == "0"
+    ssh = env["GIT_SSH_COMMAND"].split()
+    assert ssh[0] == "ssh" and ssh[ssh.index("-F") + 1] == "/dev/null"
+    assert {"IdentitiesOnly=yes", "IdentityFile=/dev/null", "IdentityAgent=none", "BatchMode=yes"} <= set(ssh)
+
+
+def test_real_git_sees_no_credential_helper(tmp_path):
+    import shutil
+    import subprocess
+
+    if not shutil.which("git"):
+        pytest.skip("git is not installed")
+    overrides = council_tools.credential_free_git_env(str(tmp_path))
+    env = {k: v for k, v in {**os.environ, **overrides}.items() if v is not None}
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True, capture_output=True)
+    out = subprocess.run(["git", "config", "--get-all", "credential.helper"], cwd=repo, env=env,
+                         capture_output=True, text=True)
+    # Only the empty value that resets the helper list; no system, Xcode or
+    # user-level helper (osxkeychain, gh auth git-credential, ...) is read.
+    assert [helper for helper in out.stdout.splitlines() if helper.strip()] == []
+
+
+@pytest.mark.parametrize("mode", ["research", "full"])
+@pytest.mark.parametrize("provider", ["claude-subscription", "chatgpt-subscription", "openai"])
+def test_tool_turns_run_without_the_owners_git_credentials(monkeypatch, data_dir, provider, mode):
+    from src import tool_execution
+
+    seen = {}
+    made = []
+    real = council_tools.credential_free_git_env
+    monkeypatch.setattr(council_tools, "credential_free_git_env", lambda d: made.append(real(d)) or made[-1])
+
+    def record(env):
+        seen.update(env=env, dirs=os.listdir(data_dir))
+
+    async def fake_stream_chat(url, model, messages, *, timeout=None, effort=None, credentials=None, tools=None):
+        record(tools.env)
+        yield _sse({"delta": "ok"})
+
+    async def fake_codex(run, *, timeout=None):
+        record(run.env)
+        yield _sse({"delta": "ok"})
+
+    async def fake_loop(**kwargs):
+        record(tool_execution._subprocess_env_overrides.get())
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setattr("src.claude_subscription.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(codex_cli, "stream", fake_codex)
+    monkeypatch.setattr(codex_cli, "sandbox_works", lambda: True)
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: provider)
+    fn = council_tools.stream_fn_for(_settings(mode))
+    _collect(fn("u", "m", [{"role": "user", "content": "q"}], headers={"Authorization": "Bearer t"}))
+    assert seen["env"] == made[0]
+    # One throwaway folder under the data folder for the run, gone once it ends.
+    assert len(seen["dirs"]) == 1
+    assert made[0]["GIT_CONFIG_GLOBAL"].startswith(os.path.join(str(data_dir), seen["dirs"][0]))
+    assert os.listdir(data_dir) == []
+
+
+def test_tools_off_turns_get_no_credential_overrides(monkeypatch, data_dir):
+    calls = []
+
+    async def fake_stream_llm(url, model, messages, **kw):
+        calls.append(kw)
+        yield _sse({"delta": "plain"})
+
+    monkeypatch.setattr("src.llm_core.stream_llm", fake_stream_llm)
+    _collect(council_tools.stream_fn_for(_settings("off"))("u", "m", [{"role": "user", "content": "q"}]))
+    assert calls == [{"headers": None, "timeout": 600, "workload": "foreground"}]
+    assert os.listdir(data_dir) == []
 
 
 def test_agent_approval_requests_are_refused(monkeypatch):
