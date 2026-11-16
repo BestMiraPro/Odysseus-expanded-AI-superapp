@@ -14,7 +14,8 @@ In the Docker image (Dockerfile, docker/entrypoint.sh):
 - The app user is also in the ``odysseus-seat`` group, which is how the two
   share files: a run folder lives under ``RUNS_ROOT`` (/council-runs, outside
   /app), whose setgid bit gives everything in it that group, and both sides
-  create group-writable files (the launcher's umask 002 and the entrypoint's).
+  create group-writable files there (the launcher's umask 002; Odysseus's own
+  file tools hand over what they write, see src/agent_tools/filesystem_tools.py).
   /council-runs is a Docker volume, not a folder mounted from the host, so its
   permissions hold on Docker Desktop too: they keep the seats out of the parts
   of a run folder Odysseus itself works in (src/council_workspace.py).

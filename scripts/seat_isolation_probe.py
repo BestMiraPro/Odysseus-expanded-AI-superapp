@@ -22,7 +22,6 @@ import time
 
 sys.path.insert(0, "/app")
 os.chdir("/app")
-os.umask(0o002)            # the entrypoint's, which the app inherits
 
 from src import council_tools, council_workspace as cw, github_access, seat_user  # noqa: E402
 
@@ -184,14 +183,38 @@ with seat_user.folder() as home1, seat_user.folder() as home_chair:
     # Odysseus's side: read, audit, deliver, commit, diff, all from the run folder.
     with open(ws.workdir("seat-1") / "feature.txt") as fh:
         check("Odysseus reads what the seat wrote", fh.read() == "seat work\n")
-    with open(ws.workdir("seat-1") / "notes.txt", "w") as fh:     # as the agent loop's in-process file tools do
-        fh.write("written by Odysseus\n")
-    rc, out = as_seat('echo "and by the seat" >> notes.txt && cat notes.txt', env=env1, cwd=str(ws.workdir("seat-1")))
-    check("the seat edits a file Odysseus's own file tools wrote", rc == 0 and "and by the seat" in out, out)
+    # As the agent loop's in-process file tools do: with the seat active they
+    # hand over what they write, and Odysseus's umask is not touched.
+    from src import tool_execution
+    from src.agent_tools import filesystem_tools
+
+    notes = str(ws.workdir("seat-1") / "pkg" / "notes.txt")
+    with tool_execution.subprocess_env_overrides({}, seat=seat_user.Seat(str(ws.root))):
+        filesystem_tools.make_parent_dirs(notes)
+        with open(notes, "w") as fh:
+            fh.write("written by Odysseus\n")
+        filesystem_tools.share_with_seat(notes)
+    rc, out = as_seat('echo "and by the seat" >> pkg/notes.txt && cat pkg/notes.txt && touch pkg/new-by-seat.txt',
+                      env=env1, cwd=str(ws.workdir("seat-1")))
+    check("the seat edits a file Odysseus's own file tools wrote, and adds one in the folder they made",
+          rc == 0 and "and by the seat" in out, out)
+    current = os.umask(0)
+    os.umask(current)
+    own = tempfile.NamedTemporaryFile("w", prefix="probe-own-", delete=False)
+    own.write("x\n")
+    own.close()
+    plain = "probe-own-plain"
+    with open(os.path.join(os.path.dirname(own.name), plain), "w") as fh:
+        fh.write("x\n")
+    mode = os.stat(fh.name).st_mode & 0o777
+    os.remove(fh.name)
+    os.remove(own.name)
+    check("a file Odysseus writes for itself is not group-writable (its umask is unchanged)",
+          current & 0o020 == 0o020 and mode & 0o020 == 0, f"umask {current:03o}, mode {mode:03o}")
     check("Odysseus commits what was left uncommitted (its git runs as the seat)",
           ws.commit_pending("seat-1", "seat-1: left over"))
     attachment = ws.diff_attachment("seat-1", base)
-    check("Odysseus attaches the seat's diff", "feature.txt" in attachment and "notes.txt" in attachment,
+    check("Odysseus attaches the seat's diff", "feature.txt" in attachment and "pkg/notes.txt" in attachment,
           attachment[:400])
     head = ws.head()
     direct = subprocess.run(["git", "-C", str(ws.main), "rev-parse", "HEAD"], capture_output=True, text=True,

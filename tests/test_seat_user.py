@@ -167,9 +167,77 @@ def test_the_image_installs_the_launcher_for_the_launch_group_only():
     assert "chmod 0750 /app" in dockerfile
     entrypoint = (root / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
     assert 'usermod -aG odysseus-seat,odysseus-launch "$ODY_USER"' in entrypoint
-    assert entrypoint.index("umask 002") < entrypoint.index('"$GOSU_BIN" "$ODY_USER" "$PYTHON_BIN" /app/setup.py')
+    # The app keeps its usual umask: only what it writes into a seat's
+    # workspace is made group-writable, file by file (filesystem_tools).
+    assert "umask" not in entrypoint
     for name in ("docker-compose.yml", "docker-compose.gpu-nvidia.yml", "docker-compose.gpu-amd.yml"):
         compose = yaml.safe_load((root / name).read_text(encoding="utf-8"))
         # A volume, where permissions hold on every platform, not a host folder.
         assert "council-runs:/council-runs" in compose["services"]["odysseus"]["volumes"], name
         assert "council-runs" in compose["volumes"], name
+
+
+# ---------------------------------------------------------------------------
+# files the app's own file tools write for a seat
+# ---------------------------------------------------------------------------
+
+def _mode(path):
+    import stat
+
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_what_the_file_tools_write_for_a_seat_is_group_writable(tmp_path):
+    from src import tool_execution
+    from src.agent_tools import filesystem_tools as fst
+
+    old = os.umask(0o022)
+    try:
+        with tool_execution.subprocess_env_overrides({}, seat=seat_user.Seat(str(tmp_path))):
+            target = tmp_path / "pkg" / "sub" / "mod.py"
+            fst.make_parent_dirs(str(target))
+            target.write_text("x = 1\n")
+            fst.share_with_seat(str(target))
+        assert _mode(target) & 0o060 == 0o060
+        for folder in (tmp_path / "pkg", tmp_path / "pkg" / "sub"):
+            assert _mode(folder) & 0o2070 == 0o2070       # group rwx and setgid
+    finally:
+        os.umask(old)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_without_a_seat_the_file_tools_leave_modes_to_the_umask(tmp_path):
+    from src.agent_tools import filesystem_tools as fst
+
+    old = os.umask(0o022)
+    try:
+        target = tmp_path / "pkg" / "mod.py"
+        fst.make_parent_dirs(str(target))
+        target.write_text("x = 1\n")
+        fst.share_with_seat(str(target))
+        assert _mode(target) == 0o644 and _mode(tmp_path / "pkg") == 0o755
+    finally:
+        os.umask(old)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_sharing_with_a_seat_does_not_follow_a_link_put_in_its_place(tmp_path):
+    from src import tool_execution
+    from src.agent_tools import filesystem_tools as fst
+
+    secret = tmp_path / "secret"
+    secret.write_text("keep out\n")
+    os.chmod(secret, 0o600)
+    link = tmp_path / "written.txt"
+    link.symlink_to(secret)
+    with tool_execution.subprocess_env_overrides({}, seat=seat_user.Seat(str(tmp_path))):
+        fst.share_with_seat(str(link))
+    assert _mode(secret) == 0o600
+
+
+def test_the_three_file_tools_share_what_they_write():
+    source = (Path(__file__).resolve().parents[1] / "src" / "agent_tools" / "filesystem_tools.py").read_text()
+    # edit_file, write_file and apply_patch each hand over what they wrote.
+    assert source.count("share_with_seat(path)") == 3
+    assert source.count("make_parent_dirs(path)") == 2 and source.count("os.makedirs(") == 1

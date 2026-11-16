@@ -9,6 +9,57 @@ from typing import Optional, Dict, Any, Tuple, List
 
 from src.constants import MAX_READ_CHARS, MAX_DIFF_LINES, MAX_OUTPUT_CHARS
 
+
+# ── Files written for a council seat ──
+#
+# A seat's shell runs as a separate OS user that shares its workspace with
+# Odysseus through a group (src/seat_user.py). These tools run in Odysseus's
+# own process, so what they create there would be read-only for that shell.
+# With a seat active they hand over what they wrote, file by file; the
+# process's umask, and so every other file Odysseus writes, stays as it is.
+
+def _seat_active() -> bool:
+    from src.tool_execution import _subprocess_seat
+
+    return _subprocess_seat.get() is not None
+
+
+def _add_mode(path: str, bits: int, directory: bool) -> None:
+    """Add permission ``bits`` to ``path`` itself, never to what a link put in its place points at."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | (getattr(os, "O_DIRECTORY", 0) if directory else 0)
+    try:
+        fd = os.open(path, flags | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return
+    try:
+        os.fchmod(fd, (os.fstat(fd).st_mode & 0o7777) | bits)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def make_parent_dirs(path: str) -> None:
+    """Create the folders above ``path``; with a seat active the new ones are the seat group's to write in."""
+    directory = os.path.dirname(path)
+    if not directory:
+        return
+    missing = []
+    probe = directory
+    while probe and not os.path.isdir(probe):
+        missing.append(probe)
+        probe = os.path.dirname(probe)
+    os.makedirs(directory, exist_ok=True)
+    if _seat_active():
+        for made in missing:
+            _add_mode(made, 0o2070, directory=True)
+
+
+def share_with_seat(path: str) -> None:
+    """With a seat active, let the seat group change the file these tools just wrote."""
+    if _seat_active():
+        _add_mode(path, 0o060, directory=False)
+
 _CODENAV_SKIP_DIRS = frozenset({
     ".git", ".hg", ".svn", "node_modules", "venv", ".venv", "__pycache__",
     ".mypy_cache", ".pytest_cache", ".ruff_cache", "dist", "build",
@@ -191,6 +242,7 @@ class EditFileTool:
             updated = original.replace(old, new) if replace_all else original.replace(old, new, 1)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(updated)
+            share_with_seat(path)
             return original, updated, "ok"
 
         try:
@@ -300,11 +352,10 @@ class WriteFileTool:
                         old = f.read()
                 except (FileNotFoundError, IsADirectoryError, UnicodeDecodeError, OSError):
                     old = ""
-                d = os.path.dirname(path)
-                if d:
-                    os.makedirs(d, exist_ok=True)
+                make_parent_dirs(path)
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(body)
+                share_with_seat(path)
                 return old, len(body)
             old_content, size = await asyncio.to_thread(_write)
         except PermissionError:
@@ -372,11 +423,10 @@ class ApplyPatchTool:
                 if kind == "delete":
                     os.remove(path)
                 else:
-                    directory = os.path.dirname(path)
-                    if directory:
-                        os.makedirs(directory, exist_ok=True)
+                    make_parent_dirs(path)
                     with open(path, "w", encoding="utf-8") as f:
                         f.write(new)
+                    share_with_seat(path)
                 diff = _unified_diff(old, new, path)
                 if diff:
                     diffs.append(diff)

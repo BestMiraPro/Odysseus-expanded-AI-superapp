@@ -111,12 +111,6 @@ fi
 chown "$PUID:odysseus-seat" /council-runs 2>/dev/null || true
 chmod 2710 /council-runs 2>/dev/null || true
 
-# Files the app creates are group-writable, so the seat user can edit what
-# Odysseus's own file tools write into a run folder, and the other way round
-# (in those folders the group is odysseus-seat; elsewhere it is PGID, which
-# holds only the app user here). Other users keep read access, as before.
-umask 002
-
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or
 # symlink /usr/local/cuda. vllm 0.22+ then crashes during engine init
