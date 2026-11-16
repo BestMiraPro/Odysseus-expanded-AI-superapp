@@ -106,7 +106,8 @@ with open(log, "a") as fh:
 secrets[log] = "PROOF-SECRET-log"
 for path, secret in secrets.items():
     rc, out = as_seat('cat -- "$1"', path)
-    check(f"reading {path} is denied", denied(rc, out, secret), out)
+    # The placeholder is not printed even when the check fails and it leaked.
+    check(f"reading {path} is denied", denied(rc, out, secret), out.replace(secret, "<the placeholder secret>"))
 for path in (DATA, LOGS, "/app", "/app/.ssh", "/app/src"):
     rc, out = as_seat('ls -- "$1"', path)
     check(f"listing {path} is denied", denied(rc, out), out)
