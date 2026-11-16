@@ -339,7 +339,9 @@ class NativeTools:
     listed is refused instead of waiting for a prompt nobody can answer.
     ``cwd`` is the workspace the file tools may touch (None: a private empty
     directory). ``env`` overrides the CLI's environment, and so its tools'
-    (a value of None removes the variable).
+    (a value of None removes the variable). With ``seat`` (src/seat_user.py)
+    the CLI runs as the seat user, with the seat's environment (an allowlist,
+    its home, then ``env``) and the seat's folder for a working directory.
     """
 
     builtin: List[str] = field(default_factory=list)
@@ -347,6 +349,7 @@ class NativeTools:
     mcp_config: Optional[str] = None
     cwd: Optional[str] = None
     env: Dict[str, Optional[str]] = field(default_factory=dict)
+    seat: Any = None
 
 
 def cli_args(cli: str, model: str, system_file: str, effort: Optional[str] = None,
@@ -680,26 +683,41 @@ class _Invocation:
                 "The Claude Code CLI is not installed on the Odysseus host. Install it "
                 "(npm install -g @anthropic-ai/claude-code) and reconnect.", 503)
         mode, token = credentials or load_credentials(auth_id_from_url(url))
+        seat = tools.seat if tools else None
+        if seat is not None and mode != AUTH_MODE_TOKEN:
+            raise ClaudeSubscriptionError(
+                "This Claude Subscription uses the Claude login of the machine running Odysseus, which a council "
+                "seat cannot use here: seats run as a separate user that cannot read Odysseus's files. Reconnect "
+                "it with a token from `claude setup-token`.", 400)
         system, prompt = build_prompt(messages)
         # Without a system prompt the CLI uses its own coding-agent prompt.
         system = system or DEFAULT_SYSTEM_PROMPT
         if not prompt:
             raise ClaudeSubscriptionError("Nothing to send: the conversation has no user message.")
         # Large Odysseus system prompts would overflow argv (32 KB on Windows),
-        # so the prompt goes through a private file instead.
-        self._tmpdir = tempfile.mkdtemp(prefix="ody-claude-")
+        # so the prompt goes through a private file instead (in the seat's
+        # folder, readable by the seat group, when the CLI runs as the seat).
+        self._tmpdir = tempfile.mkdtemp(prefix="ody-claude-", dir=seat.home if seat else None)
+        if seat:
+            os.chmod(self._tmpdir, 0o2750)       # setgid: the file below gets the seat group
         system_file = os.path.join(self._tmpdir, "system.md")
-        fd = os.open(system_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd = os.open(system_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640 if seat else 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(system)
         self.native_tools = tools is not None
         self.stop_tools = None if tools else text_tool_names(system)
         self.args = cli_args(cli, model, system_file, effort, tools)
-        self.env = cli_env(mode, token)
-        if tools and tools.env:
-            self.env = {k: v for k, v in {**self.env, **tools.env}.items() if v is not None}
+        if seat is not None:
+            # Only the seat's own credential, never Odysseus's environment.
+            self.args = seat.argv(self.args)
+            self.env = seat.env({"CLAUDE_CODE_OAUTH_TOKEN": token, "DISABLE_AUTOUPDATER": "1",
+                                 "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", **tools.env})
+        else:
+            self.env = cli_env(mode, token)
+            if tools and tools.env:
+                self.env = {k: v for k, v in {**self.env, **tools.env}.items() if v is not None}
         self.stdin = prompt.encode("utf-8")
-        self.cwd = (tools.cwd if tools and tools.cwd else None) or _workdir()
+        self.cwd = (tools.cwd if tools and tools.cwd else None) or (seat.home if seat else _workdir())
 
     def cleanup(self) -> None:
         if self._tmpdir:
@@ -731,6 +749,11 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         else:
             proc.kill()
+    except PermissionError:
+        # A council seat's CLI runs as the seat user, which only that user may signal.
+        from src import seat_user
+
+        seat_user.kill(proc.pid)
     except Exception:
         try:
             proc.kill()

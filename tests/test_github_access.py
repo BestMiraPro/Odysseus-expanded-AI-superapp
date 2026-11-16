@@ -560,3 +560,23 @@ def test_reads_only_build_api_github_com_paths_from_valid_input(monkeypatch, cal
     with pytest.raises(ga.GitHubError):
         call()
     assert seen == []
+
+
+def test_with_seat_isolation_the_working_copy_is_asked_as_the_seat_user(monkeypatch):
+    # The run's working copy is writable by council seats, so its git config
+    # is theirs: Odysseus does not run git inside it as itself.
+    from src import seat_user
+
+    _connect(monkeypatch)
+    monkeypatch.setattr(seat_user, "available", lambda: True)
+    monkeypatch.setenv("SOME_ODYSSEUS_SECRET", "do-not-pass")
+    git = _Git()
+    ga.push_branch("alice", "BestMiraPro/x", "/work", "odysseus/feat", run_git=git)
+    queries = [c for c in git.calls if "rev-parse" in c["argv"]]
+    assert len(queries) == 2
+    for call in queries:
+        assert call["argv"][:4] == [seat_user.LAUNCHER, "git", "-c", "safe.directory=*"] and call["cwd"] == "/work"
+        assert "SOME_ODYSSEUS_SECRET" not in call["env"] and "HOME" not in call["env"]
+    others = [c for c in git.calls if "rev-parse" not in c["argv"]]
+    # The push itself stays Odysseus's, in its own clean folder.
+    assert others and all(c["argv"][0] == "git" for c in others)

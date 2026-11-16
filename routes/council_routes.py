@@ -488,6 +488,14 @@ def _tool_settings(request: Request, owner: Optional[str], body: AskRequest) -> 
         if workspace is None:
             raise HTTPException(400, "That workspace folder can't be used: it must be an existing, "
                                      "non-sensitive folder that is not a filesystem root.")
+        from src import seat_user
+
+        full = mode == council_tools.TOOLS_FULL
+        if seat_user.available() and not seat_user.reaches(workspace, write=full):
+            raise HTTPException(400, f"Council seats run here as a separate seat user, which cannot "
+                                     f"{'write to' if full else 'read'} {workspace}. Folders inside /app, "
+                                     "Odysseus's own folder, are closed to it: choose a project folder "
+                                     "mounted outside /app that it may use.")
     return council_tools.ToolSettings(mode=mode, owner=owner, workspace=workspace)
 
 

@@ -320,6 +320,24 @@ def _git_env(**extra: str) -> Dict[str, str]:
     return env
 
 
+def _ask_working_copy(run_git, argv, workdir):
+    """Run a read-only git question in the working copy at ``workdir``.
+
+    A council run's working copy is writable by the seats, so its git config
+    is theirs. With seat isolation (src/seat_user.py) the question is put as
+    the seat user, with none of Odysseus's environment, so nothing a seat
+    wrote there runs as Odysseus.
+    """
+    from src import seat_user
+
+    plain = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
+             "GIT_ASKPASS": ""}
+    if seat_user.available():
+        return run_git(seat_user.argv([argv[0], "-c", "safe.directory=*", *argv[1:]]), workdir,
+                       seat_user.environment(plain))
+    return run_git(argv, workdir, _git_env())
+
+
 def _scrub(text: str, *secrets: str) -> str:
     for secret in secrets:
         if secret:
@@ -347,13 +365,13 @@ def push_branch(owner_user: Optional[str], repo: str, workdir: str, branch: str,
         raise GitHubError(f"{branch} is the default branch of {repo}; Odysseus never pushes to it.", 403)
 
     plain = _git_env()
-    code, out, _err = run_git(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"],
-                              workdir, plain)
+    code, out, _err = _ask_working_copy(
+        run_git, ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], workdir)
     sha = out.strip()
     if code != 0 or not _SHA_RE.match(sha):
         raise GitHubError(f"The working copy has no branch {branch}.")
-    code, out, _err = run_git(["git", "rev-parse", "--path-format=absolute", "--git-path", "objects"],
-                              workdir, plain)
+    code, out, _err = _ask_working_copy(
+        run_git, ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects"], workdir)
     objects = out.strip()
     if code != 0 or not objects:
         raise GitHubError("That folder is not a git working copy.")

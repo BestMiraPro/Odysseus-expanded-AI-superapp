@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
 import pytest
 
 from src import council_workspace as cw
+from src import seat_user
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 
@@ -468,6 +470,135 @@ def test_keep_saves_a_seats_branch_under_a_name_that_survives_the_reset(source, 
     assert not (ws.workdir("seat-1") / "a.txt").exists()
     assert _git(ws.main, "show", "kept/round-2/seat-1:a.txt").stdout == "work\n"
 
+
+# ---------------------------------------------------------------------------
+# seat isolation (the launcher is faked: see tests/test_seat_user.py)
+# ---------------------------------------------------------------------------
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="the seat user exists only in the Linux image")
+
+
+@pytest.fixture
+def isolated(monkeypatch, tmp_path):
+    """Seat isolation as in the container; the fake launcher logs each command and runs it as this user."""
+    log = tmp_path / "launched"
+    launcher = tmp_path / "odysseus-seat"
+    launcher.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {log}\nexec "$@"\n')
+    launcher.chmod(0o755)
+    monkeypatch.setattr(seat_user, "LAUNCHER", str(launcher))
+    monkeypatch.setattr(seat_user, "_probed", [None])
+    monkeypatch.setattr(seat_user, "_seat_gid", lambda: os.getgid())
+    return log
+
+
+@posix_only
+def test_with_isolation_odysseus_runs_its_git_in_the_run_as_the_seat_user(source, tmp_path, isolated):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    # Setting the run up, before any seat ran, is Odysseus's own work.
+    assert not isolated.exists()
+    base = ws.start_round()
+    (ws.workdir("seat-1") / "a.txt").write_text("a\n")
+    assert ws.commit_pending("seat-1", "seat-1: left over")
+    ws.collect_misplaced("seat-1")
+    assert "a.txt" in ws.diff_attachment("seat-1", base)
+    assert ws.unmerged() == ["seat-1"] and ws.head() == base
+    ws.keep("seat-1", 1)
+    launched = isolated.read_text().splitlines()
+    prefix = f"git -c safe.directory=* -c core.hooksPath={os.devnull} "
+    assert launched and all(line.startswith(prefix) for line in launched)
+
+    def command(line):
+        words = line[len(prefix):].split()
+        while words[0] == "-c":           # commit's own -c user.name=... options
+            words = words[2:]
+        return words[0]
+
+    done = {command(line) for line in launched}
+    assert done == {"checkout", "reset", "clean", "add", "diff", "commit", "ls-files", "rev-parse", "status", "log",
+                    "merge-tree", "branch"}
+
+
+def test_without_isolation_odysseus_runs_git_itself(run):
+    assert not seat_user.available()
+    run.start_round()
+    assert run.unmerged() == []
+
+
+@posix_only
+def test_with_isolation_seats_trust_the_runs_own_repositories_only(source, tmp_path, isolated, monkeypatch):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=2)
+    env = ws.env("seat-1")
+    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert [env[f"GIT_CONFIG_KEY_{i}"] for i in range(3)] == ["safe.directory"] * 3
+    assert [env[f"GIT_CONFIG_VALUE_{i}"] for i in range(3)] == [str(ws.main), str(ws.workdir("seat-1")),
+                                                                str(ws.workdir("seat-2"))]
+    monkeypatch.setattr(seat_user, "_probed", ["not in the container"])
+    assert "GIT_CONFIG_COUNT" not in ws.env("seat-1")
+
+
+def _mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode) & 0o777
+
+
+@posix_only
+def test_with_isolation_seats_may_write_only_their_worktrees_and_their_outboxes(source, tmp_path, isolated):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=2)
+    # Folders whose entries a seat could otherwise swap for a link into Odysseus's data.
+    fixed = (ws.root, ws.root / "seats", ws.messages, ws.messages / "outbox", ws.messages / "sent",
+             ws.messages / "rejected")
+    for path in fixed:
+        assert _mode(path) == 0o750, path
+        assert os.stat(path).st_gid == os.getgid()
+    for who in ws.senders:
+        assert _mode(ws.messages / "outbox" / who) == 0o770
+    for path in (ws.main, ws.workdir("seat-1")):
+        assert _mode(path) & 0o070 == 0o070
+    # Every round and every audit puts it back.
+    os.chmod(ws.messages, 0o770)
+    ws.start_round()
+    assert _mode(ws.messages) == 0o750
+
+
+@posix_only
+def test_without_isolation_the_run_folder_modes_are_left_alone(run):
+    assert _mode(run.messages / "outbox" / "seat-1") == _mode(run.messages)
+
+
+@posix_only
+def test_an_outbox_file_swapped_for_a_link_after_its_check_is_not_read(run, tmp_path, monkeypatch):
+    secret = tmp_path / "sessions.json"
+    secret.write_text("live-session-token")
+    link = run.messages / "outbox" / "seat-1" / "all__x.md"
+    link.symlink_to(secret)
+    regular, real_lstat = os.lstat(secret), os.lstat
+    # The check sees a plain file: the seat swapped the link in just after it.
+    monkeypatch.setattr(cw.os, "lstat", lambda p, *a, **k: regular if str(p) == str(link) else real_lstat(p, *a, **k))
+    delivered, notices = run.deliver(1)
+    assert delivered == [] and "not a plain file" in notices[0].text
+    assert not any("live-session-token" in path.read_text() for path in run.messages.glob("*.md"))
+
+
+@posix_only
+def test_a_misplaced_message_reached_through_a_linked_folder_is_left_where_it_is(source, tmp_path, monkeypatch):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    outside = tmp_path / "app-data"
+    outside.mkdir()
+    (outside / "sessions.json").write_text("token")
+    seat = ws.workdir("seat-1")
+    (seat / "messages").mkdir()
+    (seat / "messages" / "outbox").symlink_to(outside)
+    real_git = cw.git
+
+    def raced_git(args, cwd, **kw):
+        # git listed a real file there; the seat swapped the folder for a link afterwards.
+        if args[0] == "ls-files":
+            return subprocess.CompletedProcess(args, 0, "messages/outbox/sessions.json\0", "")
+        return real_git(args, cwd, **kw)
+
+    monkeypatch.setattr(cw, "git", raced_git)
+    ws.collect_misplaced("seat-1")
+    assert (outside / "sessions.json").read_text() == "token"
+    assert os.listdir(ws.messages / "outbox" / "seat-1") == []
 
 def test_a_message_written_with_windows_line_endings_is_delivered_with_plain_ones(run):
     # A seat on Windows, or a tool that writes CRLF, must not change what a

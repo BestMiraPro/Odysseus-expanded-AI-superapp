@@ -274,17 +274,25 @@ def get_active_workspace() -> Optional[str]:
 _subprocess_env_overrides: contextvars.ContextVar = contextvars.ContextVar(
     "agent_subprocess_env_overrides", default=None
 )
+# The council seat (src/seat_user.Seat) those subprocesses run as, or None.
+_subprocess_seat: contextvars.ContextVar = contextvars.ContextVar("agent_subprocess_seat", default=None)
 
 
 @contextmanager
-def subprocess_env_overrides(overrides: Optional[Dict[str, Optional[str]]]):
-    """Apply ``overrides`` to the shell and Python tools run inside."""
-    token = _subprocess_env_overrides.set(dict(overrides) if overrides else None)
+def subprocess_env_overrides(overrides: Optional[Dict[str, Optional[str]]], seat=None):
+    """Apply ``overrides`` to the shell and Python tools run inside.
+
+    With ``seat`` they run as the seat user instead, with the seat's
+    environment: an allowlist, the seat's home, then ``overrides``.
+    """
+    tokens = (_subprocess_env_overrides.set(dict(overrides) if overrides else None),
+              _subprocess_seat.set(seat))
     try:
         yield
     finally:
         try:
-            _subprocess_env_overrides.reset(token)
+            _subprocess_env_overrides.reset(tokens[0])
+            _subprocess_seat.reset(tokens[1])
         except ValueError:
             # An abandoned async generator closed from another context; the
             # value stays only in the task that ran it.
@@ -566,16 +574,15 @@ async def _direct_fallback(
     session_id: Optional[str] = None,
     owner: Optional[str] = None,
 ) -> Optional[Dict]:
-    _subproc_env = {
-        **os.environ,
-        "TERM": "xterm-256color",
-        "COLUMNS": "120",
-        "LINES": "40",
-        "HOME": _AGENT_WORKDIR,
-    }
+    terminal = {"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40"}
     overrides = _subprocess_env_overrides.get()
-    if overrides:
-        _subproc_env = {k: v for k, v in {**_subproc_env, **overrides}.items() if v is not None}
+    seat = _subprocess_seat.get()
+    if seat is not None:
+        _subproc_env = seat.env({**terminal, **(overrides or {})})
+    else:
+        _subproc_env = {**os.environ, **terminal, "HOME": _AGENT_WORKDIR}
+        if overrides:
+            _subproc_env = {k: v for k, v in {**_subproc_env, **overrides}.items() if v is not None}
 
     try:
         ctx = {
@@ -583,6 +590,7 @@ async def _direct_fallback(
             "subproc_env": _subproc_env,
             "session_id": session_id,
             "owner": owner,
+            "seat": seat,
         }
 
         from src.agent_tools import TOOL_HANDLERS

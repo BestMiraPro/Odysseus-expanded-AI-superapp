@@ -184,6 +184,19 @@ async def _run_tmux_bash(
         await asyncio.sleep(0.5)
 
 
+def _kill(proc) -> None:
+    try:
+        proc.kill()
+    except PermissionError:
+        # A council seat's process runs as the seat user, which only that
+        # user may signal (src/seat_user.py).
+        from src import seat_user
+
+        seat_user.kill(proc.pid)
+    except Exception:
+        pass
+
+
 def _clean_tmux_command_output(text: str, wrapped_command: str) -> str:
     lines = text.splitlines()
     wrapped_lines = {ln.rstrip() for ln in wrapped_command.splitlines() if ln.strip()}
@@ -252,19 +265,13 @@ async def _run_subprocess_streaming(
         await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         timed_out = True
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _kill(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=2)
         except Exception:
             pass
     except asyncio.CancelledError:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        _kill(proc)
         try:
             await asyncio.wait_for(proc.wait(), timeout=2)
         except Exception:
@@ -302,10 +309,14 @@ class BashTool:
         progress_cb = ctx.get("progress_cb")
         _subproc_env = ctx.get("subproc_env")
         session_id = ctx.get("session_id")
+        # A council seat's command runs as the seat user (src/seat_user.py),
+        # in a process group of its own so a stop can take its children.
+        seat = ctx.get("seat")
         # tmux is a POSIX persistence path. A stray MSYS/Cygwin tmux.exe on
         # native Windows must not bypass the Git Bash launcher below: the tmux
         # setup hard-codes /bin/bash and cannot safely consume a native cwd.
-        if session_id and not IS_WINDOWS and shutil.which("tmux"):
+        # Nor may a seat's command: the tmux server runs as Odysseus's user.
+        if session_id and seat is None and not IS_WINDOWS and shutil.which("tmux"):
             stdout, stderr, rc, timed_out = await _run_tmux_bash(
                 content,
                 session_id=str(session_id),
@@ -333,13 +344,23 @@ class BashTool:
             }
 
         try:
-            proc = await _create_bash_subprocess(
-                content,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_subproc_env,
-                cwd=agent_cwd(),
-            )
+            if seat is None:
+                proc = await _create_bash_subprocess(
+                    content,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_subproc_env,
+                    cwd=agent_cwd(),
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *seat.argv(["/bin/sh", "-c", content]),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=_subproc_env,
+                    cwd=agent_cwd(),
+                    start_new_session=True,
+                )
         except RuntimeError as e:
             return {"error": f"bash: {e}", "exit_code": 1}
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
@@ -361,12 +382,15 @@ class PythonTool:
         from src.tool_execution import agent_cwd, _truncate
         progress_cb = ctx.get("progress_cb")
         _subproc_env = ctx.get("subproc_env")
+        seat = ctx.get("seat")
+        argv = [(sys.executable or "python"), "-I", "-c", content]
         proc = await asyncio.create_subprocess_exec(
-            (sys.executable or "python"), "-I", "-c", content,
+            *(argv if seat is None else seat.argv(argv)),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_subproc_env,
             cwd=agent_cwd(),
+            start_new_session=seat is not None,
         )
         stdout, stderr, rc, timed_out = await _run_subprocess_streaming(
             proc,

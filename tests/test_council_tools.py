@@ -2,10 +2,11 @@
 import asyncio
 import json
 import os
+import stat
 
 import pytest
 
-from src import codex_cli, council, council_tools
+from src import codex_cli, council, council_tools, seat_user
 from src.claude_subscription import NativeTools, StreamTranslator, cli_args
 
 
@@ -646,3 +647,283 @@ def test_an_api_seat_runs_as_many_agent_rounds_as_its_settings_allow(monkeypatch
         _collect(council_tools.stream_fn_for(settings)("https://api.example.com/v1/chat/completions", "m",
                                                        [{"role": "user", "content": "q"}]))
     assert seen == [council_tools.AGENT_MAX_ROUNDS, 40]
+
+
+# ── Seat isolation: each engine's tool-running process starts as the seat user ──
+#
+# The launcher is faked (see tests/test_seat_user.py); the real one is proved
+# in the container by scripts/check_seat_isolation.sh.
+
+posix_only = pytest.mark.skipif(os.name == "nt", reason="the seat user exists only in the Linux image")
+
+
+def _passthrough():
+    return {k: os.environ[k] for k in seat_user.ENV_PASSTHROUGH if k in os.environ}
+
+
+@pytest.fixture
+def isolated(monkeypatch, tmp_path):
+    """Seat isolation as in the container, with a launcher that runs its arguments as this same user."""
+    launcher = tmp_path / "odysseus-seat"
+    launcher.write_text('#!/bin/sh\nexec "$@"\n')
+    launcher.chmod(0o755)
+    monkeypatch.setattr(seat_user, "LAUNCHER", str(launcher))
+    monkeypatch.setattr(seat_user, "_probed", [None])
+    monkeypatch.setattr(seat_user, "_seat_gid", lambda: os.getgid())
+    return str(launcher)
+
+
+@posix_only
+def test_claude_cli_runs_as_the_seat_user_with_its_token_and_the_seat_overrides_only(monkeypatch, tmp_path):
+    from src import claude_subscription as cs
+
+    _ambient_credentials(monkeypatch)
+    monkeypatch.setenv("DATABASE_URL", "postgres://odysseus:secret@db/odysseus")
+    monkeypatch.setattr(cs, "find_cli", lambda: "/usr/local/bin/claude")
+    started = []
+    monkeypatch.setattr(cs.subprocess, "Popen", lambda args, **kw: started.append((args, kw)))
+    seat = seat_user.Seat(str(tmp_path))
+    inv = cs._Invocation("https://claude-subscription.invalid/a", "claude-opus-5-5",
+                         [{"role": "user", "content": "q"}], credentials=(cs.AUTH_MODE_TOKEN, "sk-ant-oat01-seat"),
+                         tools=NativeTools(env=OVERRIDES, seat=seat))
+    try:
+        cs._popen(inv)
+        system = inv.args[inv.args.index("--system-prompt-file") + 1]
+        # The seat user reads its system prompt through the seat group.
+        assert system.startswith(str(tmp_path)) and stat.S_IMODE(os.stat(system).st_mode) == 0o640
+    finally:
+        inv.cleanup()
+    (args, kw), = started
+    assert args[:2] == [seat_user.LAUNCHER, "/usr/local/bin/claude"]
+    assert kw["env"] == {**_passthrough(), "HOME": str(tmp_path), "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-seat",
+                         "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+                         "GH_CONFIG_DIR": "/seat/gh"}
+    # Without a workspace it starts in the seat's own folder, not Odysseus's private one.
+    assert kw["cwd"] == str(tmp_path) and kw["start_new_session"] is True
+
+
+def test_a_claude_seat_cannot_use_the_hosts_own_claude_login(monkeypatch, tmp_path):
+    from src import claude_subscription as cs
+
+    monkeypatch.setattr(cs, "find_cli", lambda: "/usr/local/bin/claude")
+    with pytest.raises(cs.ClaudeSubscriptionError, match="setup-token"):
+        cs._Invocation("https://claude-subscription.invalid/a", "claude-opus-5-5", [{"role": "user", "content": "q"}],
+                       credentials=(cs.AUTH_MODE_HOST, None), tools=NativeTools(seat=seat_user.Seat(str(tmp_path))))
+
+
+@posix_only
+def test_codex_runs_as_the_seat_user_with_its_own_home_and_the_seat_overrides_only(monkeypatch, tmp_path):
+    _ambient_credentials(monkeypatch)
+    monkeypatch.setattr(codex_cli, "find_cli", lambda: "/usr/local/bin/codex")
+    started = []
+
+    def fake_popen(args, **kw):
+        home = kw["env"]["CODEX_HOME"]
+        started.append((args, kw, os.listdir(home), stat.S_IMODE(os.stat(os.path.join(home, "auth.json")).st_mode)))
+        raise OSError("not started in tests")
+
+    monkeypatch.setattr(codex_cli.subprocess, "Popen", fake_popen)
+    seat = seat_user.Seat(str(tmp_path))
+    _collect(codex_cli.stream(codex_cli.CodexRun(model="m", prompt="p", access_token="t", env=OVERRIDES, seat=seat)))
+    (args, kw, files, mode), = started
+    assert args[:2] == [seat_user.LAUNCHER, "/usr/local/bin/codex"]
+    home = kw["env"]["CODEX_HOME"]
+    assert os.path.dirname(home) == str(tmp_path) and files == ["auth.json"] and mode == 0o640
+    assert kw["env"] == {**_passthrough(), "HOME": str(tmp_path), "CODEX_HOME": home, "GH_CONFIG_DIR": "/seat/gh"}
+    assert kw["cwd"] == str(tmp_path) and kw["start_new_session"] is True
+
+
+def test_agent_shell_and_python_run_as_the_seat_user(monkeypatch, tmp_path):
+    import sys
+
+    from src.agent_tools import subprocess_tools as st
+
+    started = []
+
+    async def fake_exec(*args, **kw):
+        started.append((args, kw))
+        return object()
+
+    async def fake_stream(proc, **kw):
+        return "ok", "", 0, False
+
+    async def no_shell(*args, **kw):
+        pytest.fail("a seat's command started without the launcher")
+
+    monkeypatch.setattr(st.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(st.asyncio, "create_subprocess_shell", no_shell)
+    monkeypatch.setattr(st, "_run_subprocess_streaming", fake_stream)
+    monkeypatch.setattr(st.shutil, "which", lambda name: "/usr/bin/" + name)    # tmux "installed"
+    seat = seat_user.Seat(str(tmp_path))
+    env = seat.env({"TERM": "xterm-256color"})
+    # A session id would send bash to a tmux session run by Odysseus's own user.
+    ctx = {"subproc_env": env, "seat": seat, "session_id": "s1"}
+    assert asyncio.run(st.BashTool().execute("ls -la", ctx))["output"] == "ok"
+    assert asyncio.run(st.PythonTool().execute("print(1)", ctx))["output"] == "ok"
+    (bash_args, bash_kw), (py_args, py_kw) = started
+    assert bash_args == (seat_user.LAUNCHER, "/bin/sh", "-c", "ls -la")
+    assert py_args == (seat_user.LAUNCHER, sys.executable, "-I", "-c", "print(1)")
+    for kw in (bash_kw, py_kw):
+        assert kw["env"] is env and kw["start_new_session"] is True
+
+
+def test_agent_loop_tools_get_exactly_the_seat_environment(monkeypatch, tmp_path):
+    from src import agent_tools, tool_execution
+
+    _ambient_credentials(monkeypatch)
+    built = []
+
+    async def fake_bash(content, ctx):
+        built.append((ctx["subproc_env"], ctx["seat"]))
+        return {"output": "", "exit_code": 0}
+
+    async def fake_loop(**kwargs):
+        built.append(kwargs["workspace"])
+        await asyncio.create_task(tool_execution._direct_fallback("bash", "ls"))
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setitem(agent_tools.TOOL_HANDLERS, "bash", fake_bash)
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    seat = seat_user.Seat(str(tmp_path))
+    settings = council_tools.ToolSettings(mode="full", owner="dinis", env=OVERRIDES, seat=seat)
+    _collect(council_tools._agent_stream("u", "m", [], None, settings, "foreground"))
+    workspace, (env, got) = built
+    assert got is seat
+    assert env == {**_passthrough(), "HOME": str(tmp_path), "TERM": "xterm-256color", "COLUMNS": "120",
+                   "LINES": "40", "GH_CONFIG_DIR": "/seat/gh"}
+    # No workspace: shell and Python work in the seat's folder, which outlives the loop.
+    assert workspace == str(tmp_path) and tmp_path.is_dir()
+
+
+def _fake_bridge(bridged):
+    import subprocess
+
+    def start(sock, spec):
+        bridged.append((sock, spec))
+        open(sock, "w").close()
+        return subprocess.Popen(["sleep", "30"], start_new_session=True, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return start
+
+
+@posix_only
+@pytest.mark.parametrize("provider", ["claude-subscription", "chatgpt-subscription", "openai"])
+def test_with_isolation_every_engine_gets_a_seat_whose_folder_is_removed(monkeypatch, data_dir, isolated, provider):
+    from src import tool_execution
+
+    seen = {}
+
+    def record(seat, env):
+        seen.update(seat=seat, existed=seat is not None and os.path.isdir(seat.home), env=env)
+
+    async def fake_stream_chat(url, model, messages, *, timeout=None, effort=None, credentials=None, tools=None):
+        record(tools.seat, tools.env)
+        yield _sse({"delta": "ok"})
+
+    async def fake_codex(run, *, timeout=None):
+        record(run.seat, run.env)
+        yield _sse({"delta": "ok"})
+
+    async def fake_loop(**kwargs):
+        record(tool_execution._subprocess_seat.get(), tool_execution._subprocess_env_overrides.get())
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setattr("src.claude_subscription.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(codex_cli, "stream", fake_codex)
+    monkeypatch.setattr(codex_cli, "sandbox_works", lambda: True)
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    monkeypatch.setattr(council_tools, "_start_history_bridge", _fake_bridge([]))
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: provider)
+    _collect(council_tools.stream_fn_for(_settings("full"))("u", "m", [{"role": "user", "content": "q"}],
+                                                            headers={"Authorization": "Bearer t"}))
+    seat = seen["seat"]
+    assert seen["existed"] and not seat.home.startswith(str(data_dir))
+    # The throwaway git config lives in the seat's folder, where the seat user can read it.
+    assert os.path.dirname(seen["env"]["GIT_CONFIG_GLOBAL"]) == seat.home
+    assert not os.path.exists(seat.home) and os.listdir(data_dir) == []
+
+
+@posix_only
+@pytest.mark.parametrize("provider", ["claude-subscription", "chatgpt-subscription"])
+def test_isolated_cli_seats_reach_history_through_a_socket_and_never_hold_the_database_url(monkeypatch, isolated,
+                                                                                         provider):
+    seen = {}
+
+    async def fake_stream_chat(url, model, messages, *, timeout=None, effort=None, credentials=None, tools=None):
+        seen.update(spec=json.loads(tools.mcp_config)["mcpServers"]["odysseus"], home=tools.seat.home)
+        yield _sse({"delta": "ok"})
+
+    async def fake_codex(run, *, timeout=None):
+        seen.update(spec=run.mcp_servers["odysseus"], home=run.seat.home)
+        yield _sse({"delta": "ok"})
+
+    bridged = []
+    monkeypatch.setattr("src.claude_subscription.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(codex_cli, "stream", fake_codex)
+    monkeypatch.setattr(codex_cli, "sandbox_works", lambda: True)
+    monkeypatch.setattr(council_tools, "_start_history_bridge", _fake_bridge(bridged))
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: provider)
+    _collect(council_tools.stream_fn_for(_settings())("u", "m", [{"role": "user", "content": "q"}],
+                                                      headers={"Authorization": "Bearer t"}))
+    (sock, served), = bridged
+    # The server itself runs as Odysseus with the database URL; the seat only gets the socket.
+    assert served == council_tools.mcp_server_spec("dinis") and "DATABASE_URL" in served["env"]
+    assert os.path.dirname(sock) == seen["home"]
+    assert seen["spec"] == {"command": "socat", "args": ["STDIO", f"UNIX-CONNECT:{sock}"]}
+
+
+def test_without_isolation_cli_seats_start_the_history_server_themselves(monkeypatch):
+    monkeypatch.setattr(seat_user, "_probed", ["not in the container"])
+    monkeypatch.setattr(council_tools, "_start_history_bridge", lambda *a: pytest.fail("bridge started"))
+    tools = council_tools.claude_native_tools(_settings())
+    assert tools.seat is None
+    assert json.loads(tools.mcp_config)["mcpServers"]["odysseus"] == council_tools.mcp_server_spec("dinis")
+
+
+@posix_only
+@pytest.mark.parametrize("module", ["src.claude_subscription", "src.codex_cli", "src.agent_tools.subprocess_tools"])
+def test_a_seat_process_odysseus_may_not_signal_is_killed_as_the_seat_user(monkeypatch, module):
+    import importlib
+
+    mod = importlib.import_module(module)
+    killed = []
+
+    def refuse(*args):
+        raise PermissionError(1, "Operation not permitted")
+
+    class Proc:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return None
+
+        kill = refuse
+
+    monkeypatch.setattr(mod.os, "killpg", refuse)
+    monkeypatch.setattr(seat_user, "kill", killed.append)
+    mod._kill(Proc())
+    assert killed == [4242]
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_with_isolation_a_workspace_the_seat_user_cannot_reach_is_refused(monkeypatch, isolated, tmp_path, full):
+    from fastapi import HTTPException
+    from routes.council_routes import _tool_settings
+
+    asked = []
+    monkeypatch.setattr("src.tool_security.owner_is_admin_or_single_user", lambda user: True)
+    monkeypatch.setattr(seat_user, "reaches", lambda path, write=False: asked.append((path, write)) or False)
+    mode = "full" if full else "research"
+    with pytest.raises(HTTPException) as exc:
+        _tool_settings(_Req(), "dinis", _ask(tools=mode, workspace=str(tmp_path)))
+    assert exc.value.status_code == 400 and "seat user" in exc.value.detail
+    assert asked == [(str(tmp_path.resolve()), full)]
+    monkeypatch.setattr(seat_user, "reaches", lambda path, write=False: True)
+    assert _tool_settings(_Req(), "dinis", _ask(tools=mode, workspace=str(tmp_path))).workspace == str(tmp_path.resolve())
+    # Without a workspace, or without isolation, nothing is asked.
+    monkeypatch.setattr(seat_user, "reaches", lambda *a, **k: pytest.fail("asked"))
+    assert _tool_settings(_Req(), "dinis", _ask(tools=mode)).workspace is None
+    monkeypatch.setattr(seat_user, "_probed", ["not in the container"])
+    assert _tool_settings(_Req(), "dinis", _ask(tools=mode, workspace=str(tmp_path))).workspace

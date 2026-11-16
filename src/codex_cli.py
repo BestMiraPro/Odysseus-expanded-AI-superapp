@@ -60,6 +60,9 @@ class CodexRun:
     mcp_servers: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # name -> {command, args, env}
     extra_config: List[str] = field(default_factory=list)
     env: Dict[str, Optional[str]] = field(default_factory=dict)  # process env overrides; None removes
+    # A council seat (src/seat_user.py): Codex then runs as the seat user, with
+    # the seat's environment (an allowlist, its home, CODEX_HOME, then ``env``).
+    seat: Any = None
 
 
 def find_cli() -> Optional[str]:
@@ -332,6 +335,11 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         else:
             proc.kill()
+    except PermissionError:
+        # A council seat's Codex runs as the seat user, which only that user may signal.
+        from src import seat_user
+
+        seat_user.kill(proc.pid)
     except Exception:
         try:
             proc.kill()
@@ -361,20 +369,33 @@ async def stream(run: CodexRun, *, timeout: Optional[float] = None) -> AsyncIter
     if not run.access_token:
         yield _error_chunk(401, "ChatGPT Subscription is not connected.")
         return
-    home = tempfile.mkdtemp(prefix="ody-codex-")
+    seat = run.seat
+    # A seat's Codex home lives in the seat's folder, where the seat user
+    # (through the seat group) can read the auth file and write its state.
+    home = tempfile.mkdtemp(prefix="ody-codex-", dir=seat.home if seat else None)
     scratch = None
     try:
-        fd = os.open(os.path.join(home, "auth.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        if seat:
+            os.chmod(home, 0o2770)
+        fd = os.open(os.path.join(home, "auth.json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                     0o640 if seat else 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(auth_json(run.access_token), fh)
         cwd = run.cwd
         if not cwd:
-            scratch = tempfile.mkdtemp(prefix="ody-codex-work-")
-            cwd = scratch
+            if seat:
+                cwd = seat.home
+            else:
+                scratch = tempfile.mkdtemp(prefix="ody-codex-work-")
+                cwd = scratch
         args = build_args(cli, run, cwd)
-        env = _env(home)
-        if run.env:
-            env = {k: v for k, v in {**env, **run.env}.items() if v is not None}
+        if seat:
+            args = seat.argv(args)
+            env = seat.env({"CODEX_HOME": home, **run.env})
+        else:
+            env = _env(home)
+            if run.env:
+                env = {k: v for k, v in {**env, **run.env}.items() if v is not None}
     except Exception:
         shutil.rmtree(home, ignore_errors=True)
         raise
