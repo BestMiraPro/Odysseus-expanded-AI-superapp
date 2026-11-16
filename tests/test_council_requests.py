@@ -296,8 +296,8 @@ def test_the_runs_repository_comes_from_the_owners_origin(github, client, db, re
         assert any("action: open_pr" in s for s in systems)
         assert github.git.shas() == [work["head_sha"]]
     else:
-        assert "github.com" in work["github_off"]
-        assert "no GitHub features" in turn["question"] and "github.com" in turn["question"]
+        assert work["github_off"] == "the repository's origin is not on github.com"
+        assert "no GitHub features" in turn["question"] and work["github_off"] in turn["question"]
         assert not any("action: open_pr" in s for s in systems)
         assert github.git.pushes == [] and github.seen == []
 
