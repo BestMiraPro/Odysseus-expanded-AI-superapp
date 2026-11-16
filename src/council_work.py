@@ -276,6 +276,14 @@ def _not_done(round_no: int, kept: Sequence[str]) -> str:
             "answer why it is left out.")
 
 
+def _not_merged(round_no: int, kept: Sequence[str]) -> str:
+    """Seat work a round left out of the main copy, and where it now is."""
+    return (f"Work the seats committed in round {round_no} is not in the main copy. The seats start the next "
+            f"round from the main copy, so that work is kept on these branches of it: {', '.join(kept)}. "
+            "Chairman: merge what is right (git merge <branch>) and run the tests, or say in your answer why "
+            "it is left out. Saying it was integrated does not put it in the main copy.")
+
+
 def _deliver_and_audit(workspace: Workspace, round_no: int):
     """Deliver the outboxes, audit the folder and post each notice; returns (messages, notices)."""
     delivered, notices = workspace.deliver(round_no)
@@ -411,13 +419,17 @@ async def run_work(
             plan, lanes = next_round_plan(final)
             left = await asyncio.to_thread(workspace.unmerged)
             record["unmerged"] = left
-            if verdict.get("status") == "done" and left:
-                # A real chairman said done with a whole step left on the seats' branches.
+            if left:
+                # Real chairmen have said done with a whole step left on the seats'
+                # branches, and reported an integration they never made. The next
+                # round resets the seats, so their work is kept and named either way.
                 kept = [await asyncio.to_thread(workspace.keep, who, round_no) for who in left]
-                refusal = await asyncio.to_thread(
-                    workspace.post, "all", "done-not-accepted", _not_done(round_no, kept), round_no)
-                record["delivered"].append(asdict(refusal))
-                record["notices"].append(asdict(Notice("all", _not_done(round_no, kept))))
+                done = verdict.get("status") == "done"
+                text = _not_done(round_no, kept) if done else _not_merged(round_no, kept)
+                told = await asyncio.to_thread(
+                    workspace.post, "all", "done-not-accepted" if done else "work-not-merged", text, round_no)
+                record["delivered"].append(asdict(told))
+                record["notices"].append(asdict(Notice("all", text)))
             if after_round is not None:
                 record["head"] = head
                 await _tell(workspace, record, await after_round(record))
