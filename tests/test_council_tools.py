@@ -320,11 +320,56 @@ def test_tool_turns_run_without_the_owners_git_credentials(monkeypatch, data_dir
     monkeypatch.setattr("src.llm_core._detect_provider", lambda url: provider)
     fn = council_tools.stream_fn_for(_settings(mode))
     _collect(fn("u", "m", [{"role": "user", "content": "q"}], headers={"Authorization": "Bearer t"}))
-    assert seen["env"] == made[0]
+    assert seen["env"] == {**made[0], **dict.fromkeys(council_tools.ODYSSEUS_API_ENV)}
     # One throwaway folder under the data folder for the run, gone once it ends.
     assert len(seen["dirs"]) == 1
     assert made[0]["GIT_CONFIG_GLOBAL"].startswith(os.path.join(str(data_dir), seen["dirs"][0]))
     assert os.listdir(data_dir) == []
+
+
+def _effective(overrides):
+    """The environment a CLI seat starts with: Odysseus's own, with the seat's overrides (None removes)."""
+    return {k: v for k, v in {**os.environ, **overrides}.items() if v is not None}
+
+
+@pytest.mark.parametrize("provider", ["claude-subscription", "chatgpt-subscription", "openai"])
+def test_seats_get_no_credential_for_odysseus_own_api(monkeypatch, provider):
+    # A seat holding either could call Odysseus as the owner, approvals included.
+    from src import agent_tools, tool_execution
+
+    monkeypatch.setenv("ODYSSEUS_INTERNAL_TOKEN", "internal-secret")
+    monkeypatch.setenv("ODYSSEUS_API_TOKEN", "ody_secret")
+    envs = []
+
+    async def fake_stream_chat(url, model, messages, *, timeout=None, effort=None, credentials=None, tools=None):
+        envs.append(_effective(tools.env))
+        yield _sse({"delta": "ok"})
+
+    async def fake_codex(run, *, timeout=None):
+        envs.append(_effective(run.env))
+        yield _sse({"delta": "ok"})
+
+    async def fake_bash(content, ctx):
+        envs.append(ctx["subproc_env"])
+        return {"output": "", "exit_code": 0}
+
+    async def fake_loop(**kwargs):
+        await asyncio.create_task(tool_execution._direct_fallback("bash", "curl http://127.0.0.1:7000/api"))
+        yield _sse({"delta": "ok"})
+
+    monkeypatch.setattr("src.claude_subscription.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(codex_cli, "stream", fake_codex)
+    monkeypatch.setattr(codex_cli, "sandbox_works", lambda: True)
+    monkeypatch.setitem(agent_tools.TOOL_HANDLERS, "bash", fake_bash)
+    monkeypatch.setattr("src.agent_loop.stream_agent_loop", fake_loop)
+    monkeypatch.setattr("src.llm_core._detect_provider", lambda url: provider)
+    # Not even a caller's own overrides can hand one back.
+    settings = council_tools.ToolSettings(mode="full", owner="dinis", env={"ODYSSEUS_API_TOKEN": "ody_from_caller"})
+    _collect(council_tools.stream_fn_for(settings)("u", "m", [{"role": "user", "content": "q"}],
+                                                   headers={"Authorization": "Bearer t"}))
+    (env,) = envs
+    assert "ODYSSEUS_INTERNAL_TOKEN" not in env and "ODYSSEUS_API_TOKEN" not in env
+    assert not {"internal-secret", "ody_secret", "ody_from_caller"} & set(env.values())
 
 
 def test_tools_off_turns_get_no_credential_overrides(monkeypatch, data_dir):

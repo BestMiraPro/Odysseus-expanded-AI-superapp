@@ -467,3 +467,11 @@ def test_keep_saves_a_seats_branch_under_a_name_that_survives_the_reset(source, 
     ws.start_round()
     assert not (ws.workdir("seat-1") / "a.txt").exists()
     assert _git(ws.main, "show", "kept/round-2/seat-1:a.txt").stdout == "work\n"
+
+
+def test_a_message_written_with_windows_line_endings_is_delivered_with_plain_ones(run):
+    # A seat on Windows, or a tool that writes CRLF, must not change what a
+    # message says: a request to Odysseus is parsed line by line.
+    _outbox(run, "seat-1", "odysseus__ask.md", b"---\r\naction: open_pr\r\ntitle: Fix it\r\n---\r\nbody\r\n")
+    (msg,), _ = run.deliver(1)
+    assert msg.text.endswith("---\naction: open_pr\ntitle: Fix it\n---\nbody\n") and "\r" not in msg.text

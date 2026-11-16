@@ -243,6 +243,35 @@ Work runs only start when Odysseus runs in its Docker container with login on fo
 sandboxed. Mount the repository read-only: the copy cannot push back to it, but a seat could
 still write to your folder by its path.
 
+#### GitHub
+
+Connect a token under **GitHub** in the Council sidebar. A run gets GitHub features when your
+folder's `origin` is a github.com repository (https or ssh) and a token is connected; otherwise
+the seats are told once that the run has none.
+
+- **Pushed automatically:** after each round that changes the run's branch (`odysseus/...`),
+  Odysseus pushes it to that repository. Never the default branch, never forced. A refused
+  push is recorded on the round, the seats are told, and the run goes on without GitHub. Each
+  round shows what it pushed.
+- **Needs your approval, every time:** opening a pull request and merging one. A seat or the
+  chairman asks with a message to Odysseus; the request shows on the round that made it (who
+  asked, title, description, branch and base, the commit) with **Approve** and **Deny**, and
+  in **Waiting for you** at the top. There is no approve-all and no auto-merge. A merge is
+  for exactly the commit the agents asked about: if the branch has moved since, Odysseus
+  refuses and the agents must ask again. A decision is final. Requests are saved with the
+  round, so you can still answer them after the run ends or Odysseus restarts, and a pending
+  request counts as waiting for you (**While waiting for me**).
+- **Your repositories only:** before every push, pull request and merge Odysseus asks GitHub
+  who owns the repository, and refuses unless it is the token's own personal account.
+  Organisation repositories (your employer's included) and other people's are refused in code,
+  whatever the token itself allows.
+
+Recommended token: a **fine-grained** personal access token with your personal account as the
+resource owner, **only select repositories**, repository permissions **Contents: read and
+write**, **Pull requests: read and write** and **Metadata: read**, no **Workflows**
+permission, and a short expiry. Classic tokens are refused. The token is stored encrypted and
+used only by Odysseus itself: seats never get it, nor any credential for Odysseus's own API.
+
 ### History
 
 **Your history** in the Council sidebar imports your conversations from outside Odysseus so

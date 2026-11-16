@@ -98,6 +98,13 @@ def normalize_mode(value: Any) -> str:
 
 # ── Credentials ──
 
+# Credentials for Odysseus's own API that a deployment may put in Odysseus's
+# environment: the internal-tool token (loopback calls as any user, approvals
+# included) and an integration's API token. Seats never inherit them, so a
+# seat cannot approve its own request.
+ODYSSEUS_API_ENV = ("ODYSSEUS_INTERNAL_TOKEN", "ODYSSEUS_API_TOKEN")
+
+
 def credential_free_git_env(config_dir: str) -> Dict[str, Optional[str]]:
     """Environment overrides that keep git and gh off the owner's logins.
 
@@ -339,10 +346,12 @@ def stream_fn_for(settings: ToolSettings):
         provider = _detect_provider(url)
         # Nobody watches a seat, so it runs without the owner's GitHub and SSH
         # logins (see credential_free_git_env), with a throwaway git/gh config
-        # of its own that is removed when this seat's run ends.
+        # of its own that is removed when this seat's run ends, and without
+        # any credential for Odysseus's own API (last, so nothing re-adds one).
         with tempfile.TemporaryDirectory(prefix="council-seat-", dir=DATA_DIR,
                                          ignore_cleanup_errors=True) as config_dir:
-            seat = replace(settings, env={**credential_free_git_env(config_dir), **settings.env})
+            seat = replace(settings, env={**credential_free_git_env(config_dir), **settings.env,
+                                          **dict.fromkeys(ODYSSEUS_API_ENV)})
             if provider == "claude-subscription":
                 source = _claude_stream(url, model, msgs, headers, seat, timeout)
             elif provider == "chatgpt-subscription":

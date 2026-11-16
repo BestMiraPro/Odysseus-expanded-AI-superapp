@@ -347,7 +347,9 @@ class Workspace:
         if st.st_size > MAX_MESSAGE_BYTES:
             return f"it is over the {MAX_MESSAGE_BYTES // 1024} KB limit", st, ""
         try:
-            return None, st, path.read_bytes().decode("utf-8")
+            # Line endings are normalised: a request to Odysseus is parsed
+            # line by line, and a tool that writes CRLF must not change it.
+            return None, st, path.read_bytes().decode("utf-8").replace("\r\n", "\n")
         except UnicodeDecodeError:
             return "it is not UTF-8 text", st, ""
 

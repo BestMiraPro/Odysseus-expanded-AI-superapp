@@ -284,6 +284,14 @@ def _deliver_and_audit(workspace: Workspace, round_no: int):
     return delivered, notices
 
 
+async def _tell(workspace: Workspace, record: Dict[str, Any], notices: Sequence[Notice]) -> None:
+    """Post Odysseus's own notices to their recipients and keep them for the next round's brief."""
+    for notice in notices:
+        msg = await asyncio.to_thread(workspace.post, notice.to, "notice", notice.text, record["round"])
+        record["delivered"].append(asdict(msg))
+        record["notices"].append(asdict(notice))
+
+
 @dataclass
 class WorkResult:
     reason: str        # one of the STOP_* values
@@ -308,6 +316,10 @@ async def run_work(
     begin_round: Optional[Callable[[Dict[str, Any]],
                                    Awaitable[Optional[Tuple[List[council.Member], council.Member]]]]] = None,
     context: str = "",
+    inbox: Optional[Callable[[Dict[str, Any], List[Dict[str, Any]]], Awaitable[Sequence[Notice]]]] = None,
+    after_round: Optional[Callable[[Dict[str, Any]], Awaitable[Sequence[Notice]]]] = None,
+    requests_help: str = "",
+    notices: Sequence[Notice] = (),
 ) -> WorkResult:
     """Run rounds until a stop reason; returns it with the rounds finished.
 
@@ -325,16 +337,25 @@ async def run_work(
     from this round on (the routes resolve the seats again each round, so
     their credentials stay fresh). ``context`` joins every stage's system
     prompt, as in ``council.run_council``.
+
+    Odysseus's own side of a round (the routes use it for GitHub):
+    ``inbox(record, messages)`` is awaited after each stage with that stage's
+    new messages addressed to odysseus; ``after_round(record)`` once main's
+    head is in ``record["head"]``, before the round is saved. Each returns
+    notices, which are posted to their recipients and reach the next round's
+    brief. ``requests_help`` joins the work and integration prompts (how to
+    ask Odysseus for something); ``notices`` open the first round's brief.
     """
     rounds = validate_rounds(rounds)
     policy = validate_policy(policy)
     if workspace.seats != len(members):
         raise council.CouncilError(f"The run's folder has {workspace.seats} seats for {len(members)} members.")
     stream_fn = _stage_stream(stream_for, workspace)
-    prompts = {"opinions": work_system(policy), "review": REVIEW_WORK_SYSTEM, "synthesis": INTEGRATE_SYSTEM}
+    prompts = {"opinions": work_system(policy) + requests_help, "review": REVIEW_WORK_SYSTEM,
+               "synthesis": INTEGRATE_SYSTEM + requests_help}
     history: List[Dict[str, str]] = []
     verdict: Dict[str, str] = {}
-    plan, lanes, notices = "", {}, []
+    plan, lanes, notices = "", {}, list(notices)
     answered: List[bool] = []
     moved: List[bool] = []
     finished = 0
@@ -354,6 +375,12 @@ async def run_work(
             new, found = await asyncio.to_thread(_deliver_and_audit, workspace, record["round"])
             record["delivered"] += [asdict(m) for m in new]
             record["notices"] += [asdict(n) for n in found]
+            if inbox is not None:
+                if stage == "synthesis":
+                    # A request reads main's head, so the chairman's work is committed first.
+                    await asyncio.to_thread(workspace.commit_pending, "chair", _leftover("chair", record["round"]))
+                asks = [asdict(m) for m in new if m.to == "odysseus" and m.sender != "odysseus"]
+                await _tell(workspace, record, await inbox(record, asks))
             if stage == "opinions":
                 for op in result["opinions"]:
                     who = _who(op["member"])
@@ -391,6 +418,9 @@ async def run_work(
                     workspace.post, "all", "done-not-accepted", _not_done(round_no, kept), round_no)
                 record["delivered"].append(asdict(refusal))
                 record["notices"].append(asdict(Notice("all", _not_done(round_no, kept))))
+            if after_round is not None:
+                record["head"] = head
+                await _tell(workspace, record, await after_round(record))
             notices = [Notice(**n) for n in record["notices"]]
             record.update(head=head, verdict=verdict, status="error" if result.get("error") and not final else "done",
                           votes=[wait_vote(o.get("text", "")) for o in result["opinions"] if not o.get("error")])

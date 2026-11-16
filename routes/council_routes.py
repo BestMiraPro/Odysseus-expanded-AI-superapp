@@ -19,7 +19,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from core.database import CouncilSession, CouncilTurn, ModelEndpoint, SessionLocal, utcnow_naive
-from src import budget, council, council_tools, model_roster, reasoning_effort
+from src import budget, council, council_requests, council_tools, model_roster, reasoning_effort
 from src.auth_helpers import get_current_user, owner_filter, require_user
 
 logger = logging.getLogger(__name__)
@@ -275,6 +275,14 @@ def _get_session(db, owner: Optional[str], session_id: str) -> CouncilSession:
     return row
 
 
+def _work_json(raw) -> Optional[Dict[str, Any]]:
+    """A round's work data, its requests as they stand (one a restart cut off shows as failed)."""
+    work = _loads(raw, {}) or None
+    if work and work.get("requests"):
+        work["requests"] = [council_requests.effective(r) for r in work["requests"]]
+    return work
+
+
 def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
     status = turn.status
     if status == "running" and turn.id not in _RUNNING:
@@ -294,7 +302,7 @@ def _turn_json(turn: CouncilTurn) -> Dict[str, Any]:
         "usage": _loads(turn.usage, {}),
         "chair": _loads(getattr(turn, "chair", None), None),
         # A work run's round (routes/council_work_routes.py); None for an ordinary turn.
-        "work": _loads(getattr(turn, "work", None), {}) or None,
+        "work": _work_json(getattr(turn, "work", None)),
         "created_at": turn.created_at.isoformat() if turn.created_at else None,
     }
 
