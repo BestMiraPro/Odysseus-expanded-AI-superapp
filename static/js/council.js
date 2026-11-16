@@ -1382,6 +1382,10 @@ function shellArg(s) {
 function workEnd(turn) {
   const w = turn.work || {};
   const line = `git fetch ${shellArg(w.main)} ${shellArg(w.branch)}`;
+  // Runs whose seats ran as the seat user live in the council-runs volume, which is not a host folder.
+  const where = String(w.main || '').startsWith('/council-runs/')
+    ? `With Docker the folder is in the council-runs volume, not on the host: copy it out first (docker compose cp odysseus:${shellArg(w.main)} ./run-copy) and fetch from the copy.`
+    : 'The folder is the path inside Odysseus; with Docker, /app/data is your Odysseus data folder on the host (./data by default).';
   return `<div class="council-section" data-work-end style="padding:8px 12px;font-size:12.5px;line-height:1.5">
     The work run ended after round ${esc(w.round)} of ${esc(w.rounds)}: ${esc(STOP_REASONS[w.stop_reason] || w.stop_reason || 'unknown')}.
     Its work is on branch <code>${esc(w.branch)}</code>. To bring it into your repository, run this there:
@@ -1389,7 +1393,7 @@ function workEnd(turn) {
       <code style="overflow-wrap:anywhere">${esc(line)}</code>
       <button class="council-btn small ghost" data-copy-text="${esc(line)}">Copy</button>
     </div>
-    <div class="council-usage" style="white-space:normal">The folder is the path inside Odysseus; with Docker, /app/data is your Odysseus data folder on the host (./data by default).</div>
+    <div class="council-usage" style="white-space:normal">${esc(where)}</div>
   </div>`;
 }
 

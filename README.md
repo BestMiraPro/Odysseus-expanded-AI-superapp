@@ -233,15 +233,19 @@ would not cover another round, when you press **Stop** (finished rounds stay), w
 changed for two rounds, or after two rounds without an answer. **While waiting for me** says
 what the seats do when they need your input: stop, keep working, or vote.
 
-Your folder is only read. The copy lives in `council-runs/` under the data folder and is kept
-when the run ends; the last round shows the `git fetch <copy> <branch>` line that brings the
-branch into your repository. The whole run (one round's estimate times the rounds) goes
-through the budget check before it starts, and that total is its ceiling.
+Your folder is only read. The copy lives in `/council-runs` in the container (the
+`council-runs` Docker volume) and is kept when the run ends; the last round shows the
+`git fetch <copy> <branch>` line that brings the branch into your repository (copy the folder
+out of the container first with `docker compose cp`). The whole run (one round's estimate times
+the rounds) goes through the budget check before it starts, and that total is its ceiling.
 
 Work runs only start when Odysseus runs in its Docker container with login on for everyone
-(`AUTH_ENABLED=true`, `LOCALHOST_BYPASS=false`), and only for an admin: a seat's shell is not
-sandboxed. Mount the repository read-only: the copy cannot push back to it, but a seat could
-still write to your folder by its path.
+(`AUTH_ENABLED=true`, `LOCALHOST_BYPASS=false`), only for an admin, and only when every seat
+runs as the separate `odysseus-seat` user, which cannot read Odysseus's data, logs or keys (see
+[THREAT_MODEL.md](THREAT_MODEL.md)). A seat's shell is otherwise not sandboxed. Mount the
+repository read-only: the copy cannot push back to it, but a seat could still write to your
+folder by its path when its permissions (or Docker Desktop's folder mounts, which do not
+enforce them) allow it.
 
 #### GitHub
 

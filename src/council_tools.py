@@ -22,6 +22,11 @@ The engine follows the seat:
 
 Every engine yields Odysseus SSE chunks, including ``tool_start`` /
 ``tool_output`` events, so ``council.run_member`` treats them alike.
+
+With seat isolation (the Docker image, src/seat_user.py) each engine's
+tool-running process starts as the separate seat user: the Claude Code CLI,
+``codex exec``, and the agent loop's shell and Python. The agent loop's file
+tools stay in Odysseus's process, confined to the workspace.
 """
 
 from __future__ import annotations
@@ -31,11 +36,16 @@ import json
 import logging
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
+
+from src import seat_user
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +91,9 @@ class ToolSettings:
     # Model calls one API/local seat may make in a stage (each tool call costs
     # one). The Claude Code and Codex CLIs pace themselves.
     max_rounds: int = AGENT_MAX_ROUNDS
+    # Set by stream_fn_for when seat isolation is available: every process
+    # that runs the seat's tools starts as the seat user (src/seat_user.py).
+    seat: Optional[seat_user.Seat] = None
 
     @property
     def enabled(self) -> bool:
@@ -118,7 +131,9 @@ def credential_free_git_env(config_dir: str) -> Dict[str, Optional[str]]:
     with an unconfined shell can undo any of it.
     """
     gitconfig = os.path.join(config_dir, "gitconfig")
-    with open(gitconfig, "w", encoding="utf-8") as fh:
+    # Created, never opened through a name someone else made: with seat
+    # isolation the seat user can write in ``config_dir`` too.
+    with open(gitconfig, "x", encoding="utf-8") as fh:
         fh.write("[credential]\n\thelper =\n")
     return {
         "GH_TOKEN": None,
@@ -197,7 +212,48 @@ def mcp_server_spec(owner: Optional[str]) -> Dict[str, Any]:
     return {"command": sys.executable, "args": [str(CONTEXT_SERVER)], "env": env}
 
 
-def claude_native_tools(settings: ToolSettings):
+def _start_history_bridge(sock: str, spec: Dict[str, Any]) -> subprocess.Popen:
+    """Serve the history MCP server, as Odysseus, to whoever connects to the socket ``sock``."""
+    server = " ".join([spec["command"], *spec["args"]])
+    return subprocess.Popen(["socat", f"UNIX-LISTEN:{sock},fork,perm=0660", f"EXEC:{server}"],
+                            env={**spec["env"], "PATH": os.environ.get("PATH", os.defpath)}, cwd=str(APP_ROOT),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+
+
+@asynccontextmanager
+async def _history_server(settings: ToolSettings):
+    """The history MCP server spec for a CLI seat's config.
+
+    The server reads the database. A seat running as the seat user can do
+    neither that nor hold the database URL, so the server runs as Odysseus
+    behind a socket in the seat's folder (group odysseus-seat), and the seat's
+    CLI reaches it through socat.
+    """
+    spec = mcp_server_spec(settings.owner)
+    if settings.seat is None:
+        yield spec
+        return
+    sock = os.path.join(settings.seat.home, "odysseus-history.sock")
+    bridge = _start_history_bridge(sock, spec)
+    try:
+        for _ in range(100):
+            if os.path.exists(sock) or bridge.poll() is not None:
+                break
+            await asyncio.sleep(0.02)
+        yield {"command": "socat", "args": ["STDIO", f"UNIX-CONNECT:{sock}"]}
+    finally:
+        try:
+            os.killpg(bridge.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            bridge.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            bridge.kill()
+
+
+def claude_native_tools(settings: ToolSettings, history: Optional[Dict[str, Any]] = None):
     from src.claude_subscription import NativeTools
 
     builtin = list(CLAUDE_FULL_TOOLS if settings.full else CLAUDE_RESEARCH_TOOLS)
@@ -206,9 +262,9 @@ def claude_native_tools(settings: ToolSettings):
         # seat could read anything on the host (the API seats get no file tools).
         builtin = [t for t in builtin if t not in ("Read", "Glob", "Grep")]
     allowed = builtin + [f"mcp__{MCP_NAME}__{t}" for t in MCP_TOOLS]
-    config = json.dumps({"mcpServers": {MCP_NAME: mcp_server_spec(settings.owner)}})
+    config = json.dumps({"mcpServers": {MCP_NAME: history or mcp_server_spec(settings.owner)}})
     return NativeTools(builtin=builtin, allowed=allowed, mcp_config=config, cwd=settings.workspace,
-                       env=settings.env)
+                       env=settings.env, seat=settings.seat)
 
 
 # ── Engines ──
@@ -226,9 +282,10 @@ async def _claude_stream(url, model, messages, headers, settings: ToolSettings, 
     from src.llm_core import _sanitize_llm_messages
 
     effort, _ = reasoning_effort.resolve("claude-subscription", url, model, headers)
-    async for chunk in stream_chat(url, model, _sanitize_llm_messages(messages), timeout=timeout,
-                                   effort=effort, tools=claude_native_tools(settings)):
-        yield chunk
+    async with _history_server(settings) as history:
+        async for chunk in stream_chat(url, model, _sanitize_llm_messages(messages), timeout=timeout,
+                                       effort=effort, tools=claude_native_tools(settings, history)):
+            yield chunk
 
 
 async def _codex_stream(url, model, messages, headers, settings: ToolSettings, timeout) -> AsyncIterator[str]:
@@ -243,19 +300,21 @@ async def _codex_stream(url, model, messages, headers, settings: ToolSettings, t
         # Research runs shell commands in Codex's read-only sandbox, which
         # cannot start here (e.g. inside Docker): every command would fail.
         features_off.append("shell_tool")
-    run = codex_cli.CodexRun(
-        model=model,
-        prompt=full_prompt,
-        access_token=_bearer(headers),
-        sandbox=codex_cli.SANDBOX_FULL if settings.full else codex_cli.SANDBOX_READ_ONLY,
-        cwd=settings.workspace,
-        effort=effort,
-        mcp_servers={MCP_NAME: mcp_server_spec(settings.owner)},
-        extra_config=[f"features.{name}=false" for name in features_off],
-        env=settings.env,
-    )
-    async for chunk in codex_cli.stream(run, timeout=timeout):
-        yield chunk
+    async with _history_server(settings) as history:
+        run = codex_cli.CodexRun(
+            model=model,
+            prompt=full_prompt,
+            access_token=_bearer(headers),
+            sandbox=codex_cli.SANDBOX_FULL if settings.full else codex_cli.SANDBOX_READ_ONLY,
+            cwd=settings.workspace,
+            effort=effort,
+            mcp_servers={MCP_NAME: history},
+            extra_config=[f"features.{name}=false" for name in features_off],
+            env=settings.env,
+            seat=settings.seat,
+        )
+        async for chunk in codex_cli.stream(run, timeout=timeout):
+            yield chunk
 
 
 async def _agent_stream(url, model, messages, headers, settings: ToolSettings, workload) -> AsyncIterator[str]:
@@ -274,12 +333,15 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
     # Codex seats; the policy above already limits research to research tools.
     gated = "allow"
     # Shell and Python start in the workspace, else in a scratch folder of
-    # their own rather than the app's data folder.
-    scratch = None if settings.workspace or not settings.full else tempfile.mkdtemp(prefix="ody-council-")
+    # their own rather than the app's data folder: the seat's own folder when
+    # they run as the seat user (it is removed with the seat).
+    scratch = None
+    if settings.full and not settings.workspace:
+        scratch = settings.seat.home if settings.seat else tempfile.mkdtemp(prefix="ody-council-")
     # The agent loop bills each model call to the budget ledger itself.
     yield f"data: {json.dumps({'type': 'self_billed'})}\n\n"
     try:
-        with subprocess_env_overrides(settings.env):
+        with subprocess_env_overrides(settings.env, seat=settings.seat):
             async for chunk in stream_agent_loop(
                 endpoint_url=url,
                 model=model,
@@ -298,7 +360,7 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
             ):
                 yield _approval_refused(chunk, settings.owner)
     finally:
-        if scratch:
+        if scratch and settings.seat is None:
             shutil.rmtree(scratch, ignore_errors=True)
 
 
@@ -348,10 +410,15 @@ def stream_fn_for(settings: ToolSettings):
         # logins (see credential_free_git_env), with a throwaway git/gh config
         # of its own that is removed when this seat's run ends, and without
         # any credential for Odysseus's own API (last, so nothing re-adds one).
-        with tempfile.TemporaryDirectory(prefix="council-seat-", dir=DATA_DIR,
-                                         ignore_cleanup_errors=True) as config_dir:
+        # With seat isolation its processes run as the seat user, and that
+        # folder, outside the data folder, is also the seat's home.
+        isolated = seat_user.available()
+        with (seat_user.folder() if isolated else
+              tempfile.TemporaryDirectory(prefix="council-seat-", dir=DATA_DIR,
+                                          ignore_cleanup_errors=True)) as config_dir:
             seat = replace(settings, env={**credential_free_git_env(config_dir), **settings.env,
-                                          **dict.fromkeys(ODYSSEUS_API_ENV)})
+                                          **dict.fromkeys(ODYSSEUS_API_ENV)},
+                           seat=seat_user.Seat(config_dir) if isolated else None)
             if provider == "claude-subscription":
                 source = _claude_stream(url, model, msgs, headers, seat, timeout)
             elif provider == "chatgpt-subscription":

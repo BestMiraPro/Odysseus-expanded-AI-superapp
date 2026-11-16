@@ -186,6 +186,25 @@ RUN set -eu; \
 # Create data directory (mount a volume here for persistence)
 RUN mkdir -p data logs services/cache/search
 
+# Council seats run their tools as odysseus-seat, a user that cannot enter
+# /app and so cannot reach Odysseus's data, logs, keys or code
+# (src/seat_user.py, THREAT_MODEL.md). Fixed ids, outside the range a host
+# PUID/PGID usually takes; the seat user is in its own group only and has no
+# home or login shell. Members of odysseus-launch may run the setuid launcher
+# (docker/seat-launch.c); the entrypoint adds the app user and nobody else.
+# A seat's run folder lives in /council-runs, outside /app (a volume in
+# docker-compose.yml).
+RUN groupadd --system --gid 61000 odysseus-seat \
+    && useradd --system --uid 61000 --gid odysseus-seat --no-create-home --home-dir /nonexistent \
+       --shell /usr/sbin/nologin odysseus-seat \
+    && groupadd --system --gid 61001 odysseus-launch \
+    && gcc -O2 -Wall -Werror -static -DSEAT_UID=61000 -DSEAT_GID=61000 \
+       -o /usr/local/bin/odysseus-seat docker/seat-launch.c \
+    && chown root:odysseus-launch /usr/local/bin/odysseus-seat \
+    && chmod 4750 /usr/local/bin/odysseus-seat \
+    && mkdir -p /council-runs \
+    && chmod 0750 /app
+
 # Entrypoint that drops to PUID/PGID (default 1000:1000) and repairs
 # ownership on the bind-mounted /app/data and /app/logs. Without this,
 # the container runs as root and writes root-owned files into host

@@ -57,8 +57,9 @@ def db(monkeypatch):
 
 @pytest.fixture
 def allowed(monkeypatch, tmp_path):
-    """Everything a work run needs: Docker, login on for everyone, alice an admin."""
+    """Everything a work run needs: Docker, seat isolation, login on for everyone, alice an admin."""
     monkeypatch.setattr(cwr, "in_docker", lambda: True)
+    monkeypatch.setattr(cwr, "seats_not_isolated", lambda: None)
     monkeypatch.delenv("AUTH_ENABLED", raising=False)
     monkeypatch.delenv("LOCALHOST_BYPASS", raising=False)
     monkeypatch.setattr("src.tool_security.owner_is_admin_or_single_user", lambda owner: owner == "alice")
@@ -261,6 +262,30 @@ def test_a_work_run_is_refused_when_an_unauthenticated_caller_could_get_in(clien
     resp = _start(client, _session(client), repo)
     assert resp.status_code == 403 and words in resp.json()["detail"] and "login" in resp.json()["detail"]
     assert _no_turns(db)
+
+
+@needs_git
+def test_a_work_run_is_refused_when_seats_cannot_run_as_the_seat_user(client, db, repo, monkeypatch, tmp_path):
+    _seats(monkeypatch)
+    monkeypatch.setattr(cwr, "seats_not_isolated",
+                        lambda: "the seat launcher /usr/local/bin/odysseus-seat is missing")
+    resp = _start(client, _session(client), repo)
+    detail = resp.json()["detail"]
+    assert resp.status_code == 403 and "seat user" in detail and "odysseus-seat is missing" in detail
+    assert _no_turns(db) and not (tmp_path / "runs").exists()
+
+
+def test_seat_isolation_is_what_the_seat_launcher_probe_says(monkeypatch):
+    from src import seat_user
+
+    monkeypatch.setattr(seat_user, "_probed", ["Odysseus is not running in its Docker container"])
+    assert cwr.seats_not_isolated() == "Odysseus is not running in its Docker container"
+    monkeypatch.setattr(seat_user, "_probed", [None])
+    assert cwr.seats_not_isolated() is None
+    # Isolated runs live outside /app, where the seat user can reach them.
+    assert cwr.runs_root() == Path(seat_user.RUNS_ROOT)
+    monkeypatch.setattr(seat_user, "_probed", ["no"])
+    assert cwr.runs_root().name == "council-runs" and cwr.runs_root() != Path(seat_user.RUNS_ROOT)
 
 
 def test_docker_is_detected_from_the_marker_docker_creates(monkeypatch):

@@ -30,6 +30,11 @@ services:
       # land under /app/.local for the odysseus user. Persist them so a
       # container recreate does not silently remove installed serve engines.
       - ${APP_DATA_DIR:-./data}/local:/app/.local:z
+      # Council work runs, outside /app, which the seat user cannot enter. A
+      # volume rather than a folder of ./data: file permissions are what keep
+      # the seats inside their part of a run, and Docker Desktop's folder
+      # mounts do not enforce them.
+      - council-runs:/council-runs
     extra_hosts:
       # Lets the container reach local services on the Docker host, including
       # Ollama at http://host.docker.internal:11434.
@@ -194,3 +199,4 @@ volumes:
   searxng-data:
   chromadb-data:
   ntfy-cache:
+  council-runs:

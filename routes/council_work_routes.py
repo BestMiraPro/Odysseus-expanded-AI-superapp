@@ -9,7 +9,9 @@ Stop button on that round stops the whole run; finished rounds stay saved.
 
 Each seat gets a full shell that is not sandboxed, so a work run only starts
 when Odysseus runs in its Docker container (the container keeps the shell off
-the host) and login is required for every caller (so the shell cannot call
+the host), every seat process runs as the separate seat user (src/seat_user.py:
+it cannot read Odysseus's sessions, GitHub token, keys or database, nor its
+environment) and login is required for every caller (so the shell cannot call
 Odysseus, approvals included, without credentials).
 
 GitHub: when the owner's folder has a github.com ``origin`` and the owner has
@@ -61,10 +63,16 @@ _WORK_LOCK = threading.Lock()
 
 
 def runs_root() -> Path:
-    """Where run folders live, under the data folder; they are kept when a run ends."""
+    """Where run folders live; they are kept when a run ends.
+
+    With seat isolation that is /council-runs, outside /app where the seat user
+    cannot go (a volume in docker-compose.yml); otherwise council-runs/ under
+    the data folder.
+    """
+    from src import seat_user
     from src.constants import DATA_DIR
 
-    return Path(DATA_DIR) / RUNS_DIRNAME
+    return Path(seat_user.RUNS_ROOT) if seat_user.available() else Path(DATA_DIR) / RUNS_DIRNAME
 
 
 def in_docker() -> bool:
@@ -78,6 +86,13 @@ def in_docker() -> bool:
     from src.host_docker_access import running_in_container
 
     return running_in_container()
+
+
+def seats_not_isolated() -> Optional[str]:
+    """Why the seats' processes cannot run as the separate seat user here, or None when they can."""
+    from src import seat_user
+
+    return seat_user.unavailable()
 
 
 def unauthenticated_access() -> Optional[str]:
@@ -120,6 +135,10 @@ def _refuse_unsafe(request: Request) -> None:
     if not in_docker():
         raise HTTPException(403, "Work runs only start when Odysseus runs in its Docker container: every seat "
                                  "gets a shell that is not sandboxed, and the container keeps it off this machine.")
+    why = seats_not_isolated()
+    if why:
+        raise HTTPException(403, f"Work runs only start when every seat runs as the separate seat user, which "
+                                 f"cannot read Odysseus's sessions, GitHub token or database, and here {why}.")
     why = unauthenticated_access()
     if why:
         raise HTTPException(403, f"Work runs need login on for every caller, and {why}: a seat's shell could "
@@ -259,7 +278,7 @@ def _branch_head(main: str, branch: str) -> Optional[str]:
     if not main or not Path(main).is_dir():
         return None
     proc = council_workspace.git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], main,
-                                 check=False)
+                                 check=False, seat=True)
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
