@@ -11,6 +11,14 @@ Each seat gets a full shell that is not sandboxed, so a work run only starts
 when Odysseus runs in its Docker container (the container keeps the shell off
 the host) and login is required for every caller (so the shell cannot call
 Odysseus, approvals included, without credentials).
+
+GitHub: when the owner's folder has a github.com ``origin`` and the owner has
+connected a token, Odysseus pushes the run's branch after each round that
+moves it. Agents ask for a pull request or a merge with a message to
+odysseus (src/council_requests.py); the request is saved with its round's
+work data, so it stays answerable after the run and after a restart, and
+nothing reaches GitHub until the owner approves it here, one request at a
+time. Every write goes through src/github_access.py and its allowlist.
 """
 
 from __future__ import annotations
@@ -19,9 +27,10 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -29,8 +38,10 @@ from pydantic import BaseModel, Field
 
 from core.database import CouncilTurn, SessionLocal, utcnow_naive
 from routes import council_routes as cr
-from src import budget, council, council_tools, council_work, council_workspace, reasoning_effort
+from src import (budget, council, council_requests, council_tools, council_work, council_workspace, github_access,
+                 reasoning_effort)
 from src.auth_helpers import get_current_user
+from src.council_workspace import Notice
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +53,11 @@ STOP_ERROR = "error"
 # Running work-run tasks. The event loop only keeps weak references to tasks,
 # and _RUNNING holds a run only once its first round has a turn.
 _TASKS: set = set()
+# Runs still going, by run id, so the owner's decisions reach their seats.
+_LIVE: Dict[str, "_WorkRun"] = {}
+# One writer at a time for a turn's work data: the run saving its rounds and
+# the owner deciding on its requests both read, change and write it back.
+_WORK_LOCK = threading.Lock()
 
 
 def runs_root() -> Path:
@@ -122,6 +138,207 @@ def _source_repo(raw: str) -> str:
     if top.returncode != 0 or Path(top.stdout.strip()).resolve() != Path(path).resolve():
         raise HTTPException(400, f"A work run needs the top level of a git repository, and {path} is not one.")
     return path
+
+
+def _origin_repo(source: str) -> Optional[str]:
+    """``owner/name`` of the owner's folder's ``origin`` when it is on github.com, else None (only read)."""
+    proc = council_workspace.git(["remote", "get-url", "origin"], source, check=False)
+    return council_requests.github_repo(proc.stdout.strip()) if proc.returncode == 0 else None
+
+
+# ── work data and the requests in it ──
+
+def _update_work(turn_id: str, change: Callable[[Dict[str, Any]], Any]) -> Any:
+    """Apply ``change`` to a turn's saved work data and save it; returns what ``change`` returned."""
+    with _WORK_LOCK:
+        db = SessionLocal()
+        try:
+            turn = db.query(CouncilTurn).filter(CouncilTurn.id == turn_id).first()
+            if turn is None:
+                return None
+            work = cr._loads(turn.work, {})
+            result = change(work)
+            turn.work = json.dumps(work)
+            db.commit()
+            return result
+        finally:
+            db.close()
+
+
+def _save_work(turn_id: str, work: Dict[str, Any]) -> None:
+    """Save the run's own view of a round's work data; its requests stay as saved (the owner decides those)."""
+    def change(saved: Dict[str, Any]) -> None:
+        requests = saved.get("requests") or []
+        saved.clear()
+        saved.update(work, requests=requests)
+
+    _update_work(turn_id, change)
+
+
+def _add_request(turn_id: str, request: Dict[str, Any]) -> None:
+    _update_work(turn_id, lambda work: work.setdefault("requests", []).append(request))
+
+
+def _open_requests(turn_ids: List[str]) -> bool:
+    """Whether any of these turns holds a request still waiting for the owner (or being carried out)."""
+    db = SessionLocal()
+    try:
+        rows = db.query(CouncilTurn.work).filter(CouncilTurn.id.in_(turn_ids)).all()
+    finally:
+        db.close()
+    return any(council_requests.effective(r).get("status") in (council_requests.PENDING, council_requests.APPROVING)
+               for (raw,) in rows for r in cr._loads(raw, {}).get("requests") or [])
+
+
+def _work_turns(db, owner: Optional[str]) -> List[CouncilTurn]:
+    return (db.query(CouncilTurn).filter(CouncilTurn.owner == owner, CouncilTurn.work.isnot(None))
+            .order_by(CouncilTurn.created_at.asc()).all())
+
+
+def _list_requests(owner: Optional[str], status: Optional[str]) -> List[Dict[str, Any]]:
+    """``owner``'s requests across all their work runs, oldest first, with where each was made."""
+    db = SessionLocal()
+    try:
+        found = []
+        for turn in _work_turns(db, owner):
+            work = cr._loads(turn.work, {})
+            for request in work.get("requests") or []:
+                request = council_requests.effective(request)
+                if status in (None, request.get("status")):
+                    found.append({**request, "turn_id": turn.id, "session_id": turn.session_id,
+                                  "run_id": work.get("run_id"), "goal": work.get("goal")})
+        return found
+    finally:
+        db.close()
+
+
+def _claim(owner: Optional[str], request_id: str, status: str) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """Move ``owner``'s pending request to ``status`` (approving or denied); (turn id, request, work data).
+
+    404 for a request that is not ``owner``'s, 409 for one already decided:
+    a decision is final, and claiming it under the lock means two clicks
+    cannot both carry it out.
+    """
+    with _WORK_LOCK:
+        db = SessionLocal()
+        try:
+            for turn in _work_turns(db, owner):
+                work = cr._loads(turn.work, {})
+                for request in work.get("requests") or []:
+                    if request.get("id") != request_id:
+                        continue
+                    current = council_requests.effective(request).get("status")
+                    if current != council_requests.PENDING:
+                        raise HTTPException(409, f"This request is already {current}: a decision is final.")
+                    if status == council_requests.APPROVING:
+                        request["status"] = status
+                        council_requests.EXECUTING.add(request_id)
+                    else:
+                        council_requests.decided(request, status=status)
+                    turn.work = json.dumps(work)
+                    db.commit()
+                    return turn.id, dict(request), work
+            raise HTTPException(404, "Request not found")
+        finally:
+            db.close()
+
+
+def _settle(turn_id: str, request_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Save how carrying out an approved request ended; the request as saved."""
+    def change(work: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        for request in work.get("requests") or []:
+            if request.get("id") == request_id:
+                return dict(council_requests.decided(request, **fields))
+        return None
+
+    return _update_work(turn_id, change)
+
+
+def _branch_head(main: str, branch: str) -> Optional[str]:
+    """The commit of ``branch`` in the run's main copy, or None when the copy or the branch is gone."""
+    if not main or not Path(main).is_dir():
+        return None
+    proc = council_workspace.git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], main,
+                                 check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def _moved(branch: str, asked: str, now: Optional[str], where: str) -> str:
+    return (f"The run's branch {branch} has moved since the request was made: it was at {asked[:10]}, and {where} "
+            f"it is at {str(now)[:10]}. The owner's approval covers only the commit the agents asked about, so "
+            "nothing was done; the agents must ask again.")
+
+
+def _carry_out(owner: Optional[str], request: Dict[str, Any], work: Dict[str, Any]) -> Dict[str, Any]:
+    """Do on GitHub what the owner approved; the fields to save on the request, or GitHubError.
+
+    Everything is checked again now, through github_access: the token, the
+    allowlist, and that the run's branch is still at the recorded commit.
+    """
+    repo, branch, sha = request["repo"], request["branch"], request["head_sha"]
+    info = github_access.check_writable(owner, repo)
+    if request["action"] == council_requests.OPEN_PR:
+        main = work.get("main") or ""
+        local = _branch_head(main, branch)
+        if local is None:
+            raise github_access.GitHubError(f"The run's copy {main} or its branch {branch} is gone, so Odysseus "
+                                            "cannot push it.", 409)
+        if local != sha:
+            raise github_access.GitHubError(_moved(branch, sha, local, "in the run's copy"), 409)
+        # GitHub must hold exactly the requested commit on the run's branch;
+        # a no-op when the automatic push already put it there.
+        pushed = github_access.push_branch(owner, repo, main, branch)
+        if pushed["sha"] != sha:
+            raise github_access.GitHubError(_moved(branch, sha, pushed["sha"], "in the run's copy"), 409)
+        base = request.get("base") or info.get("default_branch") or ""
+        pr = github_access.open_pull_request(owner, repo, branch, base, request["title"], request.get("body") or "")
+        return {"pr_number": pr.get("number"), "pr_url": pr.get("html_url"), "base": base}
+
+    number = request["number"]
+    pr = github_access.pull_request(owner, repo, number)
+    head, base_repo = pr["head"], str(pr["base"].get("repo") or "")
+    if (head.get("ref") != branch or str(head.get("repo") or "").lower() != repo.lower()
+            or base_repo.lower() != repo.lower()):
+        raise github_access.GitHubError(
+            f"Pull request #{number} is not from this run's branch {branch} in {repo} (its head is "
+            f"{head.get('repo')}:{head.get('ref')}), so Odysseus does not merge it.", 409)
+    if head.get("sha") != sha:
+        raise github_access.GitHubError(_moved(branch, sha, head.get("sha"), f"on GitHub (pull request #{number})"),
+                                        409)
+    result = github_access.merge_pull_request(owner, repo, number, sha)
+    if not result.get("merged"):
+        raise github_access.GitHubError(f"GitHub did not merge pull request #{number}: "
+                                        f"{result.get('message') or 'no reason given'}", 409)
+    return {"merge_sha": result.get("sha"), "pr_url": pr.get("html_url")}
+
+
+def _tell_run(run_id: Optional[str], request: Dict[str, Any]) -> None:
+    """If the request's run is still going, its seats hear the owner's decision after the current stage."""
+    run = _LIVE.get(run_id or "")
+    if run is not None:
+        run.outcomes.append(Notice("all", council_requests.outcome(request)))
+
+
+async def _approve(owner: Optional[str], request_id: str) -> Dict[str, Any]:
+    turn_id, request, work = await asyncio.to_thread(_claim, owner, request_id, council_requests.APPROVING)
+    try:
+        failure = None
+        try:
+            fields = await asyncio.to_thread(_carry_out, owner, request, work)
+            fields["status"] = council_requests.APPROVED
+        except github_access.GitHubError as exc:
+            fields, failure = {"status": council_requests.FAILED, "error": str(exc)}, exc.status
+        except Exception:
+            logger.exception("council request: carrying out an approved request failed")
+            fields, failure = {"status": council_requests.FAILED,
+                               "error": "Carrying out the request failed unexpectedly."}, 500
+        saved = await asyncio.to_thread(_settle, turn_id, request_id, fields) or {**request, **fields}
+    finally:
+        council_requests.EXECUTING.discard(request_id)
+    _tell_run(work.get("run_id"), saved)
+    if failure is not None:
+        raise HTTPException(failure, {"message": saved["error"], "request": saved})
+    return {"request": saved}
 
 
 def _prepare_run(owner: Optional[str], session_id: str, body: WorkRequest, goal: str, source: str):
@@ -220,11 +437,14 @@ class _WorkRun:
     """One running work run: the callbacks ``run_work`` calls, and the turns its rounds saved."""
 
     def __init__(self, owner, session_id, body: WorkRequest, goal, source, workspace, members, chairman,
-                 context, estimate, stream):
+                 context, estimate, stream, repo: Optional[str] = None, github_off: Optional[str] = None):
         self.owner, self.session_id, self.body, self.goal, self.source = owner, session_id, body, goal, source
         self.ws = workspace
         self.members, self.chairman = members, chairman      # the current round's seats
         self.context, self.estimate, self.stream = context, estimate, stream
+        self.repo = repo                                     # owner/name of the GitHub origin, or None
+        self.github_off = github_off                         # why the run has no GitHub features, or None
+        self.outcomes: List[Notice] = []                     # the owner's decisions, for the seats
         self.turns: Dict[int, str] = {}                      # round -> turn id
         self.works: Dict[str, Dict[str, Any]] = {}           # turn id -> its work data as last saved
         self.saved: set = set()                              # turn ids whose round reached save_round
@@ -249,7 +469,69 @@ class _WorkRun:
             "notices": list(record.get("notices") or []),
             "run_status": "running",
             "while_waiting": self.body.while_waiting,
+            "repo": self.repo,
+            "github_off": self.github_off,
+            "pushed": record.get("pushed"),
+            "push_error": record.get("push_error"),
         }
+
+    def first_notices(self) -> List[Notice]:
+        if not self.github_off:
+            return []
+        return [Notice("all", f"This run has no GitHub features: {self.github_off}. Odysseus does not push its "
+                              "branch, and a message to odysseus asking for a pull request or a merge is answered "
+                              "with a notice.")]
+
+    async def inbox(self, record: Dict[str, Any], messages: List[Dict[str, Any]]) -> List[Notice]:
+        """Odysseus's answers after a stage: one to each message sent to it, then the owner's decisions."""
+        replies = [await self._take_request(record, message) for message in messages]
+        replies, self.outcomes = replies + self.outcomes, []
+        return replies
+
+    async def _take_request(self, record: Dict[str, Any], message: Dict[str, Any]) -> Notice:
+        """Record a request as pending (no GitHub call), or say why it was not."""
+        sender, name = message["sender"], Path(message["path"]).name
+        if self.github_off:
+            return Notice(sender, f"Your message {name} to odysseus was not taken as a request: this run has no "
+                                  f"GitHub features ({self.github_off}).")
+        try:
+            parsed = council_requests.parse(council_requests.message_body(message["text"]))
+        except council_requests.RequestError as exc:
+            return Notice(sender, council_requests.malformed(name, str(exc)))
+        head = await asyncio.to_thread(self.ws.head)
+        request = council_requests.new_request(parsed, sender=sender, round_no=record["round"],
+                                               branch=self.ws.branch, head_sha=head, repo=self.repo)
+        turn_id = self.turns[record["round"]]
+        await asyncio.to_thread(_add_request, turn_id, request)
+        await self.stream.emit({"type": "request", "turn_id": turn_id, "request": request})
+        return Notice(sender, f"Your {council_requests.summary(request)} is recorded and waits for the owner. Only "
+                              "the owner can approve it, in the Odysseus page; Odysseus tells you when they decide.")
+
+    async def after_round(self, record: Dict[str, Any]) -> List[Notice]:
+        """Push the run's branch when this round moved main. A refusal turns GitHub off for the rest of the run."""
+        if self.github_off or record.get("head") == record.get("base"):
+            return []
+        try:
+            pushed = await asyncio.to_thread(github_access.push_branch, self.owner, self.repo, str(self.ws.main),
+                                             self.ws.branch)
+        except github_access.GitHubError as exc:
+            record["push_error"] = str(exc)
+            if exc.status >= 500:
+                return []          # git or GitHub failed: the next round that moves main tries again
+            self.github_off = f"GitHub refused the push of the run's branch in round {record['round']}"
+            return [Notice("all", "Odysseus did not push the run's branch to GitHub, and the run goes on without "
+                                  "GitHub: nothing more is pushed, and requests to open or merge a pull request are "
+                                  "not taken. The reason:\n" + council_requests.guarded("GitHub", str(exc)))]
+        except Exception as exc:
+            logger.warning("council work: push failed error_type=%s", type(exc).__name__)
+            record["push_error"] = "The push to GitHub failed unexpectedly."
+            return []
+        record["pushed"] = {"branch": pushed["branch"], "sha": pushed["sha"]}
+        return []
+
+    async def waiting(self, record: Dict[str, Any]) -> bool:
+        """Whether a request of this run waits for the owner (the run's while_waiting policy then applies)."""
+        return await asyncio.to_thread(_open_requests, list(self.turns.values()))
 
     def stream_for(self, level: str, cwd: str, env: Dict[str, Optional[str]]):
         return council_tools.stream_fn_for(
@@ -287,8 +569,8 @@ class _WorkRun:
         work = self.work(record)
         self.works[turn_id] = work
         self.saved.add(turn_id)
-        await asyncio.to_thread(cr._save_turn, turn_id, status=status, error=error, work=work,
-                                **cr._result_fields(result))
+        await asyncio.to_thread(cr._save_turn, turn_id, status=status, error=error, **cr._result_fields(result))
+        await asyncio.to_thread(_save_work, turn_id, work)
         await self._bill(result)
 
     async def _bill(self, result: Dict[str, Any]) -> None:
@@ -312,13 +594,16 @@ class _WorkRun:
 
     async def run(self) -> None:
         reason, error, rounds = None, None, 0
+        _LIVE[self.ws.run_id] = self
         try:
             with reasoning_effort.for_owner(self.owner):
                 result = await council_work.run_work(
                     goal=self.goal, members=self.members, chairman=self.chairman, rounds=self.body.rounds,
                     workspace=self.ws, stream_for=self.stream_for, emit=self.stream.emit,
                     save_round=self.save_round, budget_check=self.budget_check, policy=self.body.while_waiting,
-                    begin_round=self.begin_round, context=self.context)
+                    waiting=self.waiting, begin_round=self.begin_round, context=self.context,
+                    inbox=self.inbox, after_round=self.after_round,
+                    requests_help="" if self.github_off else council_requests.HELP, notices=self.first_notices())
             reason, rounds = result.reason, result.rounds
         except asyncio.CancelledError:
             reason = council_work.STOP_CANCELLED
@@ -329,6 +614,7 @@ class _WorkRun:
                      else str(exc.detail) if isinstance(exc, HTTPException)
                      else "The work run failed unexpectedly.")
         finally:
+            _LIVE.pop(self.ws.run_id, None)
             cr._RUNNING.pop(self.current, None)
             try:
                 await self._finish(reason, error)
@@ -354,8 +640,7 @@ class _WorkRun:
                 error=error or "Stopped before the council finished.", **cr._result_fields(result))
             await self._bill(result)
         for turn_id, work in self.works.items():
-            await asyncio.to_thread(cr._save_turn, turn_id,
-                                    work={**work, "run_status": "finished", "stop_reason": reason})
+            await asyncio.to_thread(_save_work, turn_id, {**work, "run_status": "finished", "stop_reason": reason})
 
 
 def setup_council_work_routes() -> APIRouter:
@@ -371,6 +656,13 @@ def setup_council_work_routes() -> APIRouter:
             raise HTTPException(400, "Seat at least one council member.")
         _refuse_unsafe(request)
         source = await asyncio.to_thread(_source_repo, body.workspace)
+        repo = await asyncio.to_thread(_origin_repo, source)
+        if repo is None:
+            github_off = "the repository's origin is not on github.com"
+        elif not (await asyncio.to_thread(github_access.connection, owner))["connected"]:
+            github_off = "no GitHub token is connected in Odysseus"
+        else:
+            github_off = None
 
         if session_id in cr._ACTIVE_SESSIONS:
             raise HTTPException(409, "This council is still deliberating. Stop it or wait.")
@@ -392,7 +684,7 @@ def setup_council_work_routes() -> APIRouter:
 
         stream = cr._Broadcast()
         run = _WorkRun(owner, session_id, body, goal, source, workspace, members, chairman, context,
-                       estimate, stream)
+                       estimate, stream, repo=repo, github_off=github_off)
         task = asyncio.create_task(run.run(), name=f"council-work-{workspace.run_id}")
         _TASKS.add(task)
         task.add_done_callback(_TASKS.discard)
@@ -417,5 +709,27 @@ def setup_council_work_routes() -> APIRouter:
 
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    # ── the owner's side of the agents' requests ──
+
+    @router.get("/requests")
+    async def list_requests(request: Request,
+                            status: Optional[Literal["pending", "approving", "approved", "denied", "failed"]] = None):
+        owner = cr._owner(request)
+        return {"requests": await asyncio.to_thread(_list_requests, owner, status)}
+
+    @router.post("/requests/{request_id}/approve")
+    async def approve_request(request_id: str, request: Request):
+        """Carry out one request now, at the owner's click; 404 when not theirs, 409 once decided."""
+        owner = cr._owner(request)
+        # Shielded: a dropped connection must not leave a request half carried out.
+        return await asyncio.shield(asyncio.ensure_future(_approve(owner, request_id)))
+
+    @router.post("/requests/{request_id}/deny")
+    async def deny_request(request_id: str, request: Request):
+        owner = cr._owner(request)
+        _turn_id, denied, work = await asyncio.to_thread(_claim, owner, request_id, council_requests.DENIED)
+        _tell_run(work.get("run_id"), denied)
+        return {"request": denied}
 
     return router

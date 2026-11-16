@@ -214,7 +214,7 @@ class Fakes:
         return CHAIR_ANSWER.format(status=status)
 
 
-def _work(ws, fakes, *, rounds=3, budget=lambda record: True, policy="stop", waiting=None, members=None):
+def _work(ws, fakes, *, rounds=3, budget=lambda record: True, policy="stop", waiting=None, members=None, **hooks):
     events, saved = [], []
 
     async def emit(ev):
@@ -231,7 +231,7 @@ def _work(ws, fakes, *, rounds=3, budget=lambda record: True, policy="stop", wai
             goal="Make the parser 2x faster", members=members or [_member("a"), _member("b")],
             chairman=_member("a"), rounds=rounds, workspace=ws, stream_for=fakes, emit=emit,
             save_round=save_round, budget_check=budget_check, policy=policy, waiting=waiting,
-            rng=random.Random(3))
+            rng=random.Random(3), **hooks)
 
     return asyncio.run(go()), saved, events
 
@@ -364,6 +364,92 @@ def test_waiting_for_the_owner_follows_the_policy(ws, policy, votes, reason, rou
     assert result.reason == reason and len(saved) == rounds_run
     if votes:
         assert sorted(saved[0]["votes"]) == sorted(votes.values())
+
+
+# ---------------------------------------------------------------------------
+# Odysseus's own side of a round: messages to odysseus, notices after the round
+# ---------------------------------------------------------------------------
+
+MERGE_ASK = "---\naction: merge_pr\nnumber: 3\n---\n"
+
+
+class Asking(Fakes):
+    """Seat-1 also writes a message to odysseus in round 1."""
+
+    def _act(self, stage, round_no, cwd, env, model, messages):
+        if stage == "opinions" and round_no == 1 and env["GIT_AUTHOR_NAME"] == "seat-1":
+            (self.ws.messages / "outbox" / "seat-1" / "odysseus__ask.md").write_text(MERGE_ASK)
+        return super()._act(stage, round_no, cwd, env, model, messages)
+
+
+@needs_git
+def test_messages_to_odysseus_reach_the_inbox_and_its_replies_reach_the_sender_and_the_next_brief(ws):
+    calls = []
+
+    async def inbox(record, messages):
+        calls.append((record["round"], [(m["sender"], m["to"], m["text"].endswith(MERGE_ASK)) for m in messages]))
+        return [cws.Notice(m["sender"], f"Got {m['slug']}.") for m in messages]
+
+    _, saved, _ = _work(ws, Asking(ws, statuses=("continue", "done")), inbox=inbox)
+    # After every stage, with only the messages addressed to odysseus.
+    assert [round_no for round_no, _ in calls] == [1, 1, 1, 2, 2, 2]
+    assert calls[0][1] == [("seat-1", "odysseus", True)] and not any(found for _, found in calls[1:])
+    (reply,) = [d for d in saved[0]["delivered"] if d["sender"] == "odysseus" and d["to"] == "seat-1"]
+    assert reply["text"].endswith("Got ask.")
+    assert {"to": "seat-1", "text": "Got ask."} in saved[0]["notices"]
+    assert "Got ask." in saved[1]["question"]
+
+
+@needs_git
+def test_after_round_sees_mains_head_and_its_notices_reach_everyone(ws):
+    seen = []
+
+    async def after_round(record):
+        seen.append((record["round"], record["base"], record["head"]))
+        record["pushed"] = {"sha": record["head"]}
+        return [cws.Notice("all", f"Pushed round {record['round']}.")]
+
+    _, saved, _ = _work(ws, Fakes(ws, statuses=("continue", "done")), after_round=after_round)
+    assert seen == [(r["round"], r["base"], r["head"]) for r in saved]
+    assert saved[0]["pushed"] == {"sha": saved[0]["head"]}
+    assert any(d["to"] == "all" and d["text"].endswith("Pushed round 1.") for d in saved[0]["delivered"])
+    assert "Pushed round 1." in saved[1]["question"]
+
+
+@needs_git
+def test_request_help_joins_the_work_and_integration_prompts_and_first_notices_open_the_first_brief(ws):
+    fakes = Fakes(ws, statuses=("continue", "done"))
+    _, saved, _ = _work(ws, fakes, requests_help="\nASK LIKE THIS", notices=[cws.Notice("all", "No GitHub here.")])
+    systems = {stage: [c[4][0]["content"] for c in fakes.calls if c[0] == stage]
+               for stage in ("opinions", "review", "synthesis")}
+    assert all("ASK LIKE THIS" in s for s in systems["opinions"] + systems["synthesis"])
+    assert not any("ASK LIKE THIS" in s for s in systems["review"])
+    assert "No GitHub here." in saved[0]["question"] and "No GitHub here." not in saved[1]["question"]
+
+
+class LeavesWork(Fakes):
+    """A chairman that leaves a file uncommitted and then asks Odysseus for something."""
+
+    def _act(self, stage, round_no, cwd, env, model, messages):
+        text = super()._act(stage, round_no, cwd, env, model, messages)
+        if stage == "synthesis":
+            Path(cwd, "notes.txt").write_text("left uncommitted\n")
+            (self.ws.messages / "outbox" / "chair" / "odysseus__merge.md").write_text(MERGE_ASK)
+        return text
+
+
+@needs_git
+def test_the_chairmans_work_is_committed_before_odysseus_reads_its_messages(ws):
+    heads = []
+
+    async def inbox(record, messages):
+        if messages:
+            heads.append(ws.head())
+        return []
+
+    _, saved, _ = _work(ws, LeavesWork(ws, statuses=("done",)), rounds=1, inbox=inbox)
+    assert heads == [saved[0]["head"]]
+    assert "notes.txt" in _git(ws.main, "show", "--stat", "--format=", "HEAD").stdout
 
 
 @needs_git

@@ -120,6 +120,14 @@ def test_single_user_install_can_connect(monkeypatch):
     assert client.delete("/api/github/connection").json() == {"deleted": True}
 
 
+def test_the_app_registers_the_github_routes():
+    from pathlib import Path
+
+    app_source = (Path(__file__).resolve().parent.parent / "app.py").read_text(encoding="utf-8")
+    assert "from routes.github_routes import setup_github_routes" in app_source
+    assert "app.include_router(setup_github_routes())" in app_source
+
+
 def test_api_tokens_cannot_reach_the_connection_routes(monkeypatch):
     from routes.github_routes import setup_github_routes
 

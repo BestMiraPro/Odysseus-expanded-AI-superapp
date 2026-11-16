@@ -94,5 +94,44 @@ def test_the_diff_stat_is_read_from_the_file_list_of_the_attachment():
                                          "no committed changes · uncommitted changes left out", ""]
 
 
+def test_the_connect_panel_has_a_github_row():
+    connect = _function("renderConnect")
+    assert "GitHub" in connect and "Connected as" in connect and "github_pat_" in connect
+    assert 'data-act="github-token"' in connect and 'data-act="github-disconnect"' in connect
+    assert "jget('/api/github/connection')" in _function("loadGitHub")
+    save = _function("connectGitHub")
+    assert "'/api/github/connection'" in save and "method: 'PUT'" in save and "token" in save
+    assert "jdel('/api/github/connection')" in _function("disconnectGitHub")
+    click = _function("onPaneClick")
+    assert "'github-token'" in click and "'github-disconnect'" in click
+    assert "loadGitHub()" in _function("init")
+
+
+def test_the_pending_requests_feed_the_waiting_indicator():
+    assert "jget('/api/council/requests?status=pending')" in _function("loadRequests")
+    assert "Waiting for you" in _function("renderWaiting")
+    assert 'id="council-waiting"' in _JS
+    assert "loadRequests()" in _function("init")
+    on_event = _function("onEvent")
+    assert "case 'request':" in on_event and "renderWaiting()" in on_event
+
+
+def test_a_round_shows_its_requests_with_approve_and_deny():
+    cards = _function("requestsList")
+    assert "data-req-approve" in cards and "data-req-deny" in cards and "head_sha" in cards and "branch" in cards
+    assert "esc(r.body)" in cards and "md(" not in cards                 # agents' text stays plain text
+    assert "requestsList(turn)" in _function("renderTurn")
+    decide = _function("decideRequest")
+    assert "jpost(`/api/council/requests/${encodeURIComponent(id)}/${verb}`" in decide
+    click = _function("onPaneClick")
+    assert "data-req-approve" in click and "'approve'" in click and "'deny'" in click
+    assert "pr_url" in _function("requestOutcome")
+
+
+def test_a_round_shows_what_was_pushed():
+    assert "w.pushed" in _function("pushNote") and "w.push_error" in _function("pushNote")
+    assert "pushNote(w)" in _function("renderTurn")
+
+
 def test_no_emoji_were_added():
     assert not re.search("[\U0001F300-\U0001FAFF]", _JS)

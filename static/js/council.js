@@ -52,6 +52,8 @@ const S = {
   whileWaiting: 'stop',  // what a work run does while it waits for the owner: stop | continue | vote
   expanded: new Set(),   // keys of long messages / tool rows the user opened
   history: { open: false, stats: null, busy: false, msg: '', err: false, query: '', results: null, reader: null },
+  github: { connected: false, login: null, busy: false, msg: '', err: false, tokenDraft: '' },  // /api/github/connection
+  requests: [],          // work-run requests waiting for the owner, across all councils
 };
 
 const TOOL_MODES = [
@@ -537,6 +539,7 @@ export function openPanel() {
     <div class="council-header">
       <button class="council-x council-side-toggle" id="council-side-toggle" aria-expanded="false" aria-controls="council-side" title="Councils and connections">☰</button>
       <span class="council-title">${ICON} Council</span>
+      <button class="council-btn small primary" id="council-waiting" data-act="open-waiting" hidden></button>
       <span class="council-header-spacer"></span>
       <button class="council-x" id="council-min-btn" title="Minimize" aria-label="Minimize Council">–</button>
       <button class="council-x" id="council-close-btn" title="Close (Esc)" aria-label="Close Council">✕</button>
@@ -601,6 +604,7 @@ export function openPanel() {
   _pane.addEventListener('input', (e) => {
     if (e.target.id === 'council-picker-filter') applyPickerFilter(e.target.value);
     if (e.target.id === 'council-claude-token') S.connect.claude.tokenDraft = e.target.value;
+    if (e.target.id === 'council-github-token') S.github.tokenDraft = e.target.value;
     if (e.target.id === 'council-history-q') S.history.query = e.target.value;
   });
   _pane.addEventListener('keydown', (e) => {
@@ -691,7 +695,7 @@ const $ = (sel) => _pane?.querySelector(sel);
 // ---------------------------------------------------------------------------
 
 async function init() {
-  await Promise.all([loadRoster(), loadSessions(), loadHistoryStats()]);
+  await Promise.all([loadRoster(), loadSessions(), loadHistoryStats(), loadGitHub(), loadRequests()]);
   const last = storeGet();
   const target = S.sessions.find(s => s.id === last) || S.sessions[0];
   if (target) await openSession(target.id);
@@ -761,7 +765,7 @@ async function openSession(id) {
 }
 
 async function refreshCurrent() {
-  await loadRoster();
+  await Promise.all([loadRoster(), loadGitHub(), loadRequests()]);
   if (S.session && !S.live) {
     try { S.session = await jget(`/api/council/sessions/${encodeURIComponent(S.session.id)}`); } catch { /* keep */ }
   }
@@ -825,6 +829,7 @@ function maybePoll() {
       S.session = await jget(`/api/council/sessions/${encodeURIComponent(S.session.id)}`);
       renderTurns();
     } catch { /* retry next tick */ }
+    await loadRequests();
     maybePoll();
   }, 4000);
 }
@@ -842,6 +847,7 @@ function renderAll() {
   renderSessions();
   renderHistory();
   renderConnect();
+  renderWaiting();
   renderSeats();
   renderTurns();
   renderComposer();
@@ -907,6 +913,23 @@ function renderConnect() {
   }
   if (gs.msg) gptBody += `<div class="council-conn-msg ${gs.err ? 'err' : ''}">${esc(gs.msg)}</div>`;
 
+  // GitHub: the token Odysseus pushes work-run branches with, and opens or merges pull requests with once you approve.
+  const gh = S.github;
+  let ghBody = '';
+  if (gh.connected) {
+    ghBody = `<p>Connected as ${esc(gh.login || '?')}. Work runs push their branch to your own repositories; opening or merging a pull request waits for your approval.</p>
+      ${canConnect ? '<button class="council-btn small ghost" data-act="github-disconnect">Disconnect</button>' : ''}`;
+  } else if (!canConnect) {
+    ghBody = '<p>Ask an admin to connect GitHub.</p>';
+  } else {
+    ghBody = `<p>Paste a fine-grained personal access token for your own repositories (Contents and Pull requests: read and write).</p>
+      <input class="council-input" id="council-github-token" type="password" autocomplete="off" placeholder="github_pat_..." aria-label="GitHub fine-grained token" value="${esc(gh.tokenDraft || '')}">
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="council-btn small primary" data-act="github-token" ${gh.busy ? 'disabled' : ''}>Connect</button>
+      </div>`;
+  }
+  if (gh.msg) ghBody += `<div class="council-conn-msg ${gh.err ? 'err' : ''}">${esc(gh.msg)}</div>`;
+
   box.innerHTML = `
     <div>
       <div class="council-conn-h">${providerLogo('claude') ? `<span class="council-logo">${providerLogo('claude')}</span>` : ''}Claude
@@ -917,6 +940,11 @@ function renderConnect() {
       <div class="council-conn-h">${providerLogo('gpt') ? `<span class="council-logo">${providerLogo('gpt')}</span>` : ''}ChatGPT
         <span class="state ${gpt.connected ? 'on' : ''}">${gpt.connected ? '● Connected' : '○ Not connected'}</span></div>
       <div class="council-conn-body">${gptBody}</div>
+    </div>
+    <div>
+      <div class="council-conn-h">GitHub
+        <span class="state ${gh.connected ? 'on' : ''}">${gh.connected ? '● Connected' : '○ Not connected'}</span></div>
+      <div class="council-conn-body">${ghBody}</div>
     </div>`;
 }
 
@@ -1365,6 +1393,66 @@ function workEnd(turn) {
   </div>`;
 }
 
+// What this round pushed to GitHub (Odysseus pushes the run's branch after a round that moved it).
+function pushNote(w) {
+  if (w.pushed) {
+    return `<span class="council-usage" title="${esc(`Odysseus pushed ${w.pushed.sha} to ${w.pushed.branch} in ${w.repo || ''}`)}">pushed ${esc(String(w.pushed.sha || '').slice(0, 10))}</span>`;
+  }
+  if (w.push_error) return `<span class="council-usage" title="${esc(w.push_error)}">push failed</span>`;
+  return '';
+}
+
+const REQUEST_STATES = {
+  pending: 'Waiting for you', approving: 'Being carried out', approved: 'Approved', denied: 'Denied', failed: 'Failed',
+};
+
+function requestAction(r) {
+  return r.action === 'merge_pr' ? `merge pull request #${r.number}` : `open a pull request: ${r.title || ''}`;
+}
+
+// The result of a decided request: what Odysseus did on GitHub, or why not.
+function requestOutcome(r) {
+  if (r.status === 'approved') {
+    const url = /^https:\/\/github\.com\//.test(r.pr_url || '') ? r.pr_url : '';
+    const what = r.action === 'merge_pr'
+      ? `Merged commit ${String(r.head_sha || '').slice(0, 10)}${r.merge_sha ? ` (merge commit ${String(r.merge_sha).slice(0, 10)})` : ''}.`
+      : `Opened pull request #${r.pr_number} into ${r.base || 'the default branch'}.`;
+    return `<span>${esc(what)}</span>${url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a>` : ''}`;
+  }
+  if (r.status === 'denied') return '<span>You denied it. Nothing was done on GitHub.</span>';
+  if (r.status === 'failed') return `<span class="council-errtext">${esc(r.error || 'It failed.')}</span>`;
+  if (r.status === 'approving') return '<span>Odysseus is carrying it out.</span>';
+  return '';
+}
+
+// The requests the agents made this round: what they ask, on which commit, and the owner's buttons.
+function requestsList(turn) {
+  const reqs = turn.work?.requests || [];
+  if (!reqs.length) return '';
+  const cards = reqs.map(r => {
+    const lines = r.action === 'merge_pr'
+      ? [`Pull request #${esc(r.number)} of branch ${esc(r.branch || '')}`]
+      : [`Title: ${esc(r.title || '')}`, `Branch: ${esc(r.branch || '')} → ${esc(r.base || 'the default branch')}`];
+    lines.push(`Commit: <code title="${esc(r.head_sha || '')}">${esc(String(r.head_sha || '').slice(0, 12))}</code> in ${esc(r.repo || '')}`);
+    if (r.body) lines.push('', esc(r.body));
+    return `<div class="council-card" data-request="${esc(r.id)}">
+      <div class="council-card-h"><span class="name">${esc(r.from || '?')} asks to ${esc(requestAction(r))}</span>
+        <span class="state">${esc(REQUEST_STATES[r.status] || r.status || '')}</span></div>
+      <div class="council-card-b" style="white-space:pre-wrap">${lines.join('\n')}</div>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:0 12px 10px;font-size:12px">
+        ${r.status === 'pending'
+          ? `<button class="council-btn small primary" data-req-approve="${esc(r.id)}">Approve</button>
+             <button class="council-btn small" data-req-deny="${esc(r.id)}">Deny</button>`
+          : requestOutcome(r)}
+      </div>
+    </div>`;
+  }).join('');
+  return `<details class="council-section" data-sec="requests" open>
+    <summary>Requests for you <span class="sub">${reqs.length} this round</span></summary>
+    <div style="display:flex;flex-direction:column;gap:8px;padding:0 10px 10px">${cards}</div>
+  </details>`;
+}
+
 function renderTurn(turn, live = false, lastOfRun = {}) {
   const seats = seatsOfTurn(turn);
   const memberLabel = {};
@@ -1432,13 +1520,13 @@ function renderTurn(turn, live = false, lastOfRun = {}) {
     <div class="council-q-wrap"><div ${clampAttrs(qKey).replace('class="', 'class="council-q ')}>${esc(turn.question)}</div>${moreButton(qKey)}</div>
     <div class="council-strip">${roundBadge}${strip}
       <span class="status ${statusErr ? 'err' : ''}">${esc(status)}</span>
-      ${toolsNote}
+      ${toolsNote}${w ? pushNote(w) : ''}
       ${turn.config?.memory ? '<span class="council-usage" title="Members saw your shared and saved memories">memory</span>' : ''}
       ${turnUsage(turn)}
       ${running ? `<button class="council-btn small" data-stop="${esc(turn.id)}" ${String(turn.id).startsWith('live-') ? 'disabled title="Starting…"' : w ? 'title="Stop the whole work run; finished rounds stay"' : ''}>Stop</button>` : ''}
       ${!running ? `<button class="council-btn small ghost" data-del-turn="${esc(turn.id)}" title="Delete this question">Delete</button>` : ''}
     </div>
-    ${opinions}${review}${final}${w ? messagesList(turn) : ''}${ended ? workEnd(turn) : ''}
+    ${opinions}${review}${final}${w ? requestsList(turn) : ''}${w ? messagesList(turn) : ''}${ended ? workEnd(turn) : ''}
   </article>`;
 }
 
@@ -1621,6 +1709,15 @@ function onEvent(ev) {
       live.labels = ev.labels || live.labels;
       renderTurns();
       break;
+    case 'request':
+      // An agent asked for a pull request or a merge: it waits for the owner.
+      if (live.work && live.id === ev.turn_id) live.work = { ...live.work, requests: [...(live.work.requests || []), ev.request] };
+      if (ev.request && !S.requests.some(r => r.id === ev.request.id)) {
+        S.requests.push({ ...ev.request, turn_id: ev.turn_id, session_id: live.sessionId });
+      }
+      renderWaiting();
+      renderTurns();
+      break;
     case 'done':
       live.status = ev.status || 'done';
       if (typeof ev.final === 'string' && ev.final) live.final = ev.final;
@@ -1743,6 +1840,7 @@ async function convene() {
     S.live = null;
     scheduleEstimate(true);
     window.budgetModule?.refreshBanner();
+    if (wasLive?.work) loadRequests();
     if (_open && S.session?.id === sessionId) {
       try { S.session = await jget(`/api/council/sessions/${encodeURIComponent(sessionId)}`); } catch { /* keep */ }
       const idx = S.sessions.findIndex(s => s.id === sessionId);
@@ -1986,6 +2084,107 @@ async function afterConnect(which, endpoint) {
   renderAll();
 }
 
+async function loadGitHub() {
+  try {
+    const c = await jget('/api/github/connection');
+    S.github.connected = !!c?.connected;
+    S.github.login = c?.login || null;
+  } catch {
+    S.github.connected = false;
+    S.github.login = null;
+  }
+}
+
+async function connectGitHub() {
+  const gh = S.github;
+  // A token copied from a wrapped terminal line carries line breaks; tokens never contain whitespace.
+  const token = ($('#council-github-token')?.value || '').replace(/\s+/g, '');
+  if (!token) { gh.msg = 'Paste a fine-grained token (it starts with github_pat_).'; gh.err = true; renderConnect(); return; }
+  gh.busy = true; gh.err = false; gh.msg = 'Checking the token with GitHub...';
+  renderConnect();
+  try {
+    const c = await jfetch('/api/github/connection', { method: 'PUT', body: JSON.stringify({ token }) });
+    gh.connected = !!c?.connected;
+    gh.login = c?.login || null;
+    gh.tokenDraft = '';
+    gh.msg = '';
+  } catch (e) {
+    gh.err = true; gh.msg = e.message;
+  } finally {
+    gh.busy = false;
+    renderConnect();
+  }
+}
+
+async function disconnectGitHub() {
+  if (!confirm('Disconnect GitHub? Work runs stop pushing, and approved requests cannot be carried out until you connect a token again.')) return;
+  try {
+    await jdel('/api/github/connection');
+    Object.assign(S.github, { connected: false, login: null, msg: 'Disconnected.', err: false });
+    renderConnect();
+  } catch (e) { toast(e.message); }
+}
+
+// ---------------------------------------------------------------------------
+// requests from work-run agents: open or merge a pull request, with the owner's approval
+// ---------------------------------------------------------------------------
+
+async function loadRequests() {
+  try { S.requests = (await jget('/api/council/requests?status=pending')).requests || []; }
+  catch { S.requests = []; }
+  renderWaiting();
+}
+
+function renderWaiting() {
+  const el = $('#council-waiting');
+  if (!el) return;
+  const n = S.requests.length;
+  el.hidden = !n;
+  el.textContent = n ? `Waiting for you: ${n} request${n === 1 ? '' : 's'}` : '';
+  el.title = S.requests.map(r => `${r.from}: ${requestAction(r)}`).join('\n');
+}
+
+// Open the council holding the oldest pending request and bring its card into view.
+async function openWaiting() {
+  const r = S.requests[0];
+  if (!r) return;
+  if (r.session_id && r.session_id !== S.session?.id) {
+    if (S.live) { toast('Wait for the council to finish, or stop it first'); return; }
+    await openSession(r.session_id);
+  }
+  $(`[data-request="${CSS.escape(r.id)}"]`)?.scrollIntoView({ block: 'center' });
+}
+
+// Show a request's new state wherever it is on screen: the live round or a saved one.
+function updateRequest(updated) {
+  const replace = (w) => (w?.requests ? { ...w, requests: w.requests.map(r => (r.id === updated.id ? { ...r, ...updated } : r)) } : w);
+  if (S.live?.work) S.live.work = replace(S.live.work);
+  for (const t of S.session?.turns || []) t.work = replace(t.work);
+  renderTurns();
+}
+
+async function decideRequest(id, verb) {
+  const r = [...(S.session?.turns || []), S.live].flatMap(t => t?.work?.requests || []).find(x => x.id === id)
+    || S.requests.find(x => x.id === id);
+  if (verb === 'approve') {
+    const question = !r ? 'Approve this request?'
+      : r.action === 'merge_pr'
+        ? `Merge pull request #${r.number} in ${r.repo}, exactly at commit ${String(r.head_sha || '').slice(0, 10)}?`
+        : `Open a pull request from ${r.branch} into ${r.base || 'the default branch'} in ${r.repo}?`;
+    if (!confirm(question)) return;
+  }
+  let result = null;
+  try {
+    result = (await jpost(`/api/council/requests/${encodeURIComponent(id)}/${verb}`, {})).request;
+    toast(verb === 'approve' ? 'Done on GitHub' : 'Denied');
+  } catch (e) {
+    result = e.detail?.request || null;
+    toast(e.message);
+  }
+  if (result) updateRequest(result);
+  await loadRequests();
+}
+
 // ---------------------------------------------------------------------------
 // events
 // ---------------------------------------------------------------------------
@@ -2097,6 +2296,14 @@ async function onPaneClick(e) {
     renderSeats(); renderComposer(); renderEstimate();
     return;
   }
+  const decide = t.closest('[data-req-approve], [data-req-deny]');
+  if (decide) {
+    decide.disabled = true;
+    const approve = decide.hasAttribute('data-req-approve');
+    await decideRequest(approve ? decide.dataset.reqApprove : decide.dataset.reqDeny, approve ? 'approve' : 'deny');
+    decide.disabled = false;
+    return;
+  }
   const copyText = t.closest('[data-copy-text]');
   if (copyText) {
     try { await navigator.clipboard.writeText(copyText.dataset.copyText); toast('Copied'); }
@@ -2151,6 +2358,9 @@ async function onPaneClick(e) {
   else if (act === 'claude-host') await connectClaude('host');
   else if (act === 'claude-disconnect') await disconnectClaude();
   else if (act === 'chatgpt-connect') await connectChatGPT();
+  else if (act === 'github-token') await connectGitHub();
+  else if (act === 'github-disconnect') await disconnectGitHub();
+  else if (act === 'open-waiting') await openWaiting();
   else if (act === 'refresh-roster') { await loadRoster(); renderAll(); }
 }
 
