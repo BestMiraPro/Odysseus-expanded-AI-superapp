@@ -490,3 +490,27 @@ def test_the_next_round_sees_the_previous_dissent(client, db, monkeypatch):
     monkeypatch.setattr("src.llm_core.stream_llm", recording)
     client.post(f"/api/council/sessions/{sid}/ask", json={"question": "And now?", **SEATS})
     assert seen and all(any("- Dissent: qwen3:8b wanted a retrain" in content for content in call) for call in seen)
+
+
+def _token_request(scopes, owner="alice"):
+    return SimpleNamespace(state=SimpleNamespace(current_user="api", api_token=True, api_token_owner=owner,
+                                                 api_token_scopes=scopes),
+                           app=SimpleNamespace(state=SimpleNamespace()), client=None)
+
+
+def test_council_scoped_token_acts_for_its_owner(db):
+    router = cr.setup_council_routes()
+    create = _handler(router, "POST", "/api/council/sessions")
+    listing = _handler(router, "GET", "/api/council/sessions")
+    sid = create(_token_request(["council"]), cr.SessionCreate(title="from a token"))["id"]
+    assert [s["id"] for s in listing(_request("alice"))["sessions"]] == [sid]
+    assert listing(_request("bob"))["sessions"] == []
+
+
+def test_token_without_council_scope_is_refused(db):
+    from fastapi import HTTPException
+
+    listing = _handler(cr.setup_council_routes(), "GET", "/api/council/sessions")
+    with pytest.raises(HTTPException) as exc:
+        listing(_token_request(["chat"]))
+    assert exc.value.status_code == 403
