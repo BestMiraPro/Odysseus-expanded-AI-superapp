@@ -633,3 +633,19 @@ def test_a_done_verdict_is_accepted_when_the_chairman_merged_the_seats(ws):
 def test_a_change_the_chairman_typed_again_by_hand_counts_as_merged(ws):
     result, saved, _ = _work(ws, Forgetful(ws), rounds=3)
     assert result.reason == "done" and result.rounds == 1 and saved[0]["unmerged"] == []
+
+
+@needs_git
+def test_seat_work_the_chairman_did_not_merge_is_kept_and_named_in_the_next_brief(ws):
+    # A real chairman reported an integration it never made, two rounds running:
+    # the seats were reset, their work was gone, and the run stalled with nothing.
+    result, saved, _ = _work(ws, Fakes(ws, statuses=("continue", "continue"), merge=False), rounds=2)
+    assert result.reason == "stalled"
+    assert saved[0]["unmerged"] == ["seat-1", "seat-2"]
+    assert _git(ws.main, "show", "kept/round-1/seat-1:seat-1-r1.txt").stdout == "seat-1 round 1\n"
+    assert _git(ws.main, "show", "kept/round-2/seat-2:seat-2-r2.txt").stdout == "seat-2 round 2\n"
+    (notice,) = [m for m in saved[0]["delivered"] if m["slug"] == "work-not-merged"]
+    assert notice["sender"] == "odysseus" and notice["to"] == "all"
+    assert "kept/round-1/seat-1" in notice["text"] and "kept/round-1/seat-2" in notice["text"]
+    assert "kept/round-1/seat-1" in saved[1]["question"]
+    assert not [m for m in saved[0]["delivered"] if m["slug"] == "done-not-accepted"]
