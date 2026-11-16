@@ -2163,16 +2163,22 @@ function updateRequest(updated) {
   renderTurns();
 }
 
-async function decideRequest(id, verb) {
-  const r = [...(S.session?.turns || []), S.live].flatMap(t => t?.work?.requests || []).find(x => x.id === id)
+function findRequest(id) {
+  return [...(S.session?.turns || []), S.live].flatMap(t => t?.work?.requests || []).find(x => x.id === id)
     || S.requests.find(x => x.id === id);
-  if (verb === 'approve') {
-    const question = !r ? 'Approve this request?'
-      : r.action === 'merge_pr'
-        ? `Merge pull request #${r.number} in ${r.repo}, exactly at commit ${String(r.head_sha || '').slice(0, 10)}?`
-        : `Open a pull request from ${r.branch} into ${r.base || 'the default branch'} in ${r.repo}?`;
-    if (!confirm(question)) return;
-  }
+}
+
+// What the Approve button reads after its first click. Approving takes two
+// clicks on the card instead of a confirm() dialog: embedded browsers and app
+// webviews suppress native dialogs, and there Approve silently did nothing.
+function approveLabel(id) {
+  const r = findRequest(id);
+  return r?.action === 'merge_pr'
+    ? `Confirm: merge #${r.number} at ${String(r.head_sha || '').slice(0, 10)}`
+    : 'Confirm: open the pull request';
+}
+
+async function decideRequest(id, verb) {
   let result = null;
   try {
     result = (await jpost(`/api/council/requests/${encodeURIComponent(id)}/${verb}`, {})).request;
@@ -2298,8 +2304,13 @@ async function onPaneClick(e) {
   }
   const decide = t.closest('[data-req-approve], [data-req-deny]');
   if (decide) {
-    decide.disabled = true;
     const approve = decide.hasAttribute('data-req-approve');
+    if (approve && !decide.dataset.armed) {
+      decide.dataset.armed = '1';
+      decide.textContent = approveLabel(decide.dataset.reqApprove);
+      return;
+    }
+    decide.disabled = true;
     await decideRequest(approve ? decide.dataset.reqApprove : decide.dataset.reqDeny, approve ? 'approve' : 'deny');
     decide.disabled = false;
     return;

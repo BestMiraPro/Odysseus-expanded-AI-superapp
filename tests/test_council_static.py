@@ -135,3 +135,13 @@ def test_a_round_shows_what_was_pushed():
 
 def test_no_emoji_were_added():
     assert not re.search("[\U0001F300-\U0001FAFF]", _JS)
+
+
+def test_approving_takes_two_clicks_on_the_card_and_no_browser_dialog():
+    # Embedded browsers and app webviews suppress confirm(): there the dialog
+    # never shows, confirm() returns false, and Approve silently does nothing.
+    assert "confirm(" not in _function("decideRequest")
+    click = _function("onPaneClick")
+    assert "dataset.armed" in click and "approveLabel(" in click
+    label = _function("approveLabel")
+    assert "Confirm: merge #" in label and "head_sha" in label and "Confirm: open the pull request" in label
