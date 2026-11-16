@@ -438,7 +438,9 @@ class Workspace:
         if len(data) > MAX_MESSAGE_BYTES:
             return too_big, st, ""
         try:
-            return None, st, data.decode("utf-8")
+            # Line endings are normalised: a request to Odysseus is parsed
+            # line by line, and a tool that writes CRLF must not change it.
+            return None, st, data.decode("utf-8").replace("\r\n", "\n")
         except UnicodeDecodeError:
             return "it is not UTF-8 text", st, ""
 
