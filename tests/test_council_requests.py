@@ -445,6 +445,33 @@ def test_approve_is_for_the_owner_only_and_runs_once(github, client, db, repo, m
 
 
 @needs_git
+@pytest.mark.parametrize("scopes", [["council"], ["chat", "council"], ["chat"]])
+def test_an_api_token_cannot_list_approve_or_deny_requests(github, client, db, repo, monkeypatch, scopes):
+    # Requests gate what agents may do on GitHub, and agents can hold API tokens,
+    # even ones with the council scope that act for the owner elsewhere.
+    _, _, (turn,), _ = _run(client, repo, github, monkeypatch, {(1, "chair"): [OPEN_PR]})
+    (req,) = turn["work"]["requests"]
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _token(request: Request, call_next):
+        request.state.current_user = "api"
+        request.state.api_token = True
+        request.state.api_token_owner = "alice"
+        request.state.api_token_scopes = scopes
+        return await call_next(request)
+
+    app.include_router(cr.setup_council_routes())
+    app.include_router(cwr.setup_council_work_routes())
+    agent = TestClient(app)
+    for response in (agent.get("/api/council/requests"), _approve(agent, req), _deny(agent, req)):
+        assert response.status_code == 403 and "API tokens cannot" in response.json()["detail"]
+    assert github.writes() == []
+    # The owner, signed in, still decides it.
+    assert _approve(client, req).json()["request"]["status"] == "approved"
+
+
+@needs_git
 def test_approving_open_pr_opens_one_pull_request_from_the_run_branch(github, client, db, repo, monkeypatch):
     sid, _, (turn,), _ = _run(client, repo, github, monkeypatch, {(1, "chair"): [OPEN_PR]})
     (req,) = turn["work"]["requests"]
