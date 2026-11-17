@@ -241,8 +241,15 @@ the rounds) goes through the budget check before it starts, and that total is it
 
 Work runs only start when Odysseus runs in its Docker container with login on for everyone
 (`AUTH_ENABLED=true`, `LOCALHOST_BYPASS=false`), only for an admin, and only when every seat
-runs as the separate `odysseus-seat` user, which cannot read Odysseus's data, logs or keys (see
-[THREAT_MODEL.md](THREAT_MODEL.md)). A seat's shell is otherwise not sandboxed. Mount the
+runs as a separate seat user of its own, which cannot read Odysseus's data, logs or keys or
+another seat's, and whose network is filtered (see [THREAT_MODEL.md](THREAT_MODEL.md)): a seat
+reaches the internet, not the services next to Odysseus or on your machine, and on localhost only
+ports 32768 and up, where its own test servers go. To let the seats reach one more service, for
+example a model server on your machine, list it in `ODYSSEUS_SEAT_NET_ALLOW`
+(`host.docker.internal:8090`, comma-separated) and restart the container. The filter needs the
+`NET_ADMIN` capability that `docker-compose.yml` gives the container. A seat keeps a home folder
+for the whole run, so what it installs in one round is there in the next. A seat's shell is
+otherwise not sandboxed. Mount the
 repository read-only: the copy cannot push back to it, but a seat could still write to your
 folder by its path when its permissions (or Docker Desktop's folder mounts, which do not
 enforce them) allow it.

@@ -228,6 +228,8 @@ def test_the_entrypoint_filters_the_seat_users_network_and_compose_lets_it():
     for name in ("docker-compose.yml", "docker-compose.gpu-nvidia.yml", "docker-compose.gpu-amd.yml"):
         compose = yaml.safe_load((root / name).read_text(encoding="utf-8"))
         assert compose["services"]["odysseus"]["cap_add"] == ["NET_ADMIN"], name
+        # Killed seat processes need someone to wait for them.
+        assert compose["services"]["odysseus"]["init"] is True, name
 
 
 def test_the_launcher_source_switches_only_to_the_compiled_in_seat_users():

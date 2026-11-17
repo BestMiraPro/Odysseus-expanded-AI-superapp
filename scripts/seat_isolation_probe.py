@@ -46,13 +46,15 @@ def as_seat(script, *args, seat=None, env=None, cwd="/tmp", stdin=None):
     return proc.returncode, (proc.stdout + proc.stderr).strip()
 
 
-def name(seat):
+def user_name(seat):
     return f"odysseus-seat-{seat.slot}"
 
 
 def running_as(seat):
-    out = subprocess.run(["ps", "-o", "pid=", "-u", str(seat_user.BASE_ID + seat.slot)], capture_output=True, text=True)
-    return out.stdout.split()
+    """The pids of the processes alive as ``seat``'s user (a killed one nobody waited for yet does not count)."""
+    out = subprocess.run(["ps", "-o", "pid=,stat=", "-u", str(seat_user.BASE_ID + seat.slot)], capture_output=True,
+                         text=True)
+    return [line.split()[0] for line in out.stdout.splitlines() if not line.split()[1].startswith("Z")]
 
 
 def denied(rc, out, marker=""):
@@ -100,7 +102,7 @@ GUEST = seat_user.lease()
 
 print("\n== who a seat process is")
 rc, out = as_seat('id; grep -E "^(Uid|Gid|Groups|CapPrm|CapEff|NoNewPrivs)" /proc/self/status; umask; env | sort')
-me = f"{seat_user.BASE_ID + GUEST.slot}({name(GUEST)})"
+me = f"{seat_user.BASE_ID + GUEST.slot}({user_name(GUEST)})"
 check("the launcher starts it as a seat user, in its own group only, with no capabilities and no_new_privs",
       rc == 0 and f"uid={me} gid={me} groups={me}" in out
       and "NoNewPrivs:\t1" in out and "CapEff:\t0000000000000000" in out and "0002" in out, out)
@@ -172,7 +174,7 @@ ws = cw.create_run(source, seat_user.RUNS_ROOT, "prove seat isolation", seats=2)
 base = ws.start_round()
 print(subprocess.run(["ls", "-lan", str(ws.root), str(ws.messages), str(ws.messages / "outbox"), str(ws.root / "seats"),
                       str(ws.root / "homes")], capture_output=True, text=True).stdout.strip())
-print(f"        the run's users: { {who: name(seat) for who, seat in ws.users.items()} }")
+print(f"        the run's users: { {who: user_name(seat) for who, seat in ws.users.items()} }")
 
 
 def call(who):
@@ -264,7 +266,7 @@ ws.diff_attachment("chair", base)
 with open(marker) as fh:
     ran_as = fh.read().strip()
 check("a core.fsmonitor a seat set in main/.git/config runs as the run's seat user, not as Odysseus",
-      rc == 0 and ran_as == name(ws.user), f"ran as {ran_as}")
+      rc == 0 and ran_as == user_name(ws.user), f"ran as {ran_as}")
 as_seat("git config --unset core.fsmonitor", **S1, cwd=str(ws.main))
 
 # The GitHub push: the token is in the environment of Odysseus's git.
@@ -409,7 +411,7 @@ home = seat.home
 
 
 def engine_env_ok(text):
-    return f"user={name(seat)}\n" in text.replace(" cwd=", "\n") and "PROOF-" not in text
+    return f"user={user_name(seat)}\n" in text.replace(" cwd=", "\n") and "PROOF-" not in text
 
 
 overrides = {**council_tools.credential_free_git_env(tempfile.mkdtemp(dir=seat.folder)), **ws.env("seat-1"),
@@ -451,7 +453,7 @@ async def agent_tools():
 
 bash, py = asyncio.run(agent_tools())
 check("agent loop bash: runs as the seat in the worktree, with the seat environment only",
-      bash["output"].startswith(f"{name(seat)}\n{ws.workdir('seat-1')}") and "PROOF-" not in bash["output"]
+      bash["output"].startswith(f"{user_name(seat)}\n{ws.workdir('seat-1')}") and "PROOF-" not in bash["output"]
       and "DATABASE_URL" not in bash["output"], bash["output"])
 check("agent loop python: runs as the seat in the worktree",
       py["output"].strip() == f"{seat_user.BASE_ID + seat.slot} {ws.workdir('seat-1')}", py["output"])

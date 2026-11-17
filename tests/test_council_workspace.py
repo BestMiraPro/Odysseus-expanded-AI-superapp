@@ -599,7 +599,8 @@ def test_a_run_that_cannot_be_set_up_gives_its_users_back(tmp_path, isolated, mo
     source = tmp_path / "src"
     source.mkdir()
     for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "x"]):
-        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=source, check=True)
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=source, check=True,
+                       capture_output=True)
     with pytest.raises(cw.WorkspaceError):
         cw.create_run(str(source), tmp_path / "runs", "goal", seats=1)
     assert seat_user._held == {}

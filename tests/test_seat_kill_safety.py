@@ -73,8 +73,8 @@ def test_the_stand_in_launcher_records_a_kill_and_runs_nothing(tmp_path, monkeyp
     seat.kill_all()
     marker = tmp_path / "ran"
     # Any command that mentions kill, however it is wrapped, and whatever body the launcher has.
-    subprocess.run([str(launcher), "0", "0", "/bin/sh", "-c", f"touch {marker}; : kill"], timeout=30)
-    subprocess.run([str(fake_launcher(tmp_path, f"touch {marker}")), "0", "0", "/nonexistent/pkill", "x"], timeout=30)
+    subprocess.run([str(launcher), "0", "0", "/bin/sh", "-c", f"touch {marker}; : kill"], capture_output=True, timeout=30)
+    subprocess.run([str(fake_launcher(tmp_path, f"touch {marker}")), "0", "0", "/nonexistent/pkill", "x"], capture_output=True, timeout=30)
     assert not marker.exists()
     recorded = kills(tmp_path)
     assert len(recorded) == 4
