@@ -147,6 +147,27 @@ def test_a_seat_user_is_cleared_of_processes_when_taken_and_when_given_back(monk
 
 
 @posix_only
+def test_taking_a_seat_user_closes_what_a_dead_holder_left_open_to_it(monkeypatch, tmp_path):
+    _in_container(monkeypatch, _launcher(tmp_path))
+    runs = tmp_path / "runs"
+    monkeypatch.setattr(seat_user, "RUNS_ROOT", str(runs))
+    monkeypatch.setattr(seat_user, "_gid", lambda slot: os.getgid() if slot == 0 else -5)
+    temp = tmp_path / "temp"
+    monkeypatch.setattr(seat_user.tempfile, "tempdir", str(temp))
+    stale_run, stale_call, other = runs / "crashed-run", temp / "council-seat-dead", temp / "someone-elses"
+    for path in (stale_run, stale_call, other):
+        path.mkdir(parents=True)
+        path.chmod(0o2750)
+    seat = seat_user.lease()
+    assert seat.slot == 0
+    # What Odysseus died without closing is shut to the user's next holder.
+    assert stat.S_IMODE(os.stat(stale_run).st_mode) == 0o700 and stat.S_IMODE(os.stat(stale_call).st_mode) == 0o700
+    # Nothing else in the temp folder is touched.
+    assert stat.S_IMODE(os.stat(other).st_mode) == 0o2750
+    seat_user.release(seat)
+
+
+@posix_only
 def test_reaches_asks_a_seat_user(monkeypatch, tmp_path):
     _in_container(monkeypatch, _launcher(tmp_path))
     folder = tmp_path / "ws"

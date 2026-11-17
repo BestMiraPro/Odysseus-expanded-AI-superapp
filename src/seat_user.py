@@ -46,6 +46,7 @@ from __future__ import annotations
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -76,6 +77,7 @@ SLOTS = 64
 # entrypoint makes the folder for the app user alone.
 SLOT_DIR = "/run/odysseus-seats"
 RUNS_ROOT = "/council-runs"
+FOLDER_PREFIX = "council-seat-"     # a seat's throwaway folder, in the temp folder
 # On localhost a seat reaches only this port and above (docker/entrypoint.sh).
 LOCAL_PORTS_FROM = 32768
 # The only variables of Odysseus's own environment a seat process inherits.
@@ -195,9 +197,33 @@ def lease() -> Seat:
         with _held_lock:
             _held[slot] = fd
         seat = Seat(slot)
-        seat.kill_all()         # what a holder that died without releasing left running
+        # What a holder that died without releasing left behind.
+        seat.kill_all()
+        _shut_leftovers(seat)
         return seat
     raise SeatsBusy(f"All {SLOTS} council seat users are in use; try again when a council has finished.")
+
+
+def _shut_leftovers(seat: Seat) -> None:
+    """Close the folders a past holder of this seat user left open to its group.
+
+    A run or a call that ended with Odysseus (a crash, a restart) never
+    closed its folder, and the next holder of the same user would be let in.
+    Nobody else holds the user now, so whatever is still open to it is stale.
+    """
+    for base, prefix in ((RUNS_ROOT, ""), (tempfile.gettempdir(), FOLDER_PREFIX)):
+        try:
+            entries = [entry for entry in os.scandir(base) if entry.name.startswith(prefix)]
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+                if (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and st.st_gid == seat.gid
+                        and st.st_mode & 0o077):
+                    os.chmod(entry.path, 0o700)
+            except OSError:
+                continue
 
 
 def release(seat: Seat) -> None:
@@ -220,10 +246,10 @@ def user() -> Iterator[Seat]:
 
 
 @contextmanager
-def seat(prefix: str = "council-seat-") -> Iterator[Seat]:
+def seat() -> Iterator[Seat]:
     """A seat user with a throwaway folder, outside the data folder, that only it and Odysseus can open."""
     with user() as leased:
-        path = tempfile.mkdtemp(prefix=prefix)
+        path = tempfile.mkdtemp(prefix=FOLDER_PREFIX)
         try:
             leased.share(path, 0o2770)
             yield replace(leased, folder=path)
