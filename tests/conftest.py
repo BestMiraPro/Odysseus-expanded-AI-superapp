@@ -189,15 +189,21 @@ def pytest_report_header(config):
 
 
 @pytest.fixture(autouse=True)
-def _seat_kills_disabled(monkeypatch):
+def _seat_kills_disabled():
     """Seat cleanup can never signal the processes of whoever runs the tests.
 
     It kills every process of "the seat user"; under test that user is the
     developer (see tests/test_seat_kill_safety.py). The kill program it would
     start does not exist here.
+
+    A patch of its own, not the ``monkeypatch`` fixture: asking for that one
+    here would set it up before every test's own fixtures and so undo the
+    test's environment changes after them.
     """
     from src import seat_user
 
-    monkeypatch.setattr(seat_user, "KILL", "/nonexistent/seat-kill-disabled-under-test")
-    # Seat users a test took and never gave back are not held against the next test.
-    monkeypatch.setattr(seat_user, "_held", {})
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(seat_user, "KILL", "/nonexistent/seat-kill-disabled-under-test")
+        # Seat users a test took and never gave back are not held against the next test.
+        patch.setattr(seat_user, "_held", {})
+        yield

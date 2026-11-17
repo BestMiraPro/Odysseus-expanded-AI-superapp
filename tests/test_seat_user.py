@@ -115,7 +115,7 @@ def test_a_work_runs_seat_keeps_its_home_and_gets_the_runs_group(monkeypatch):
     assert seat.argv(["id"]) == [seat_user.LAUNCHER, "7", "3", "id"]
     env = seat.env()
     # What the seat installed for itself in an earlier stage is on its PATH.
-    assert env["HOME"] == "/runs/r/homes/seat-1" and env["PATH"] == "/runs/r/homes/seat-1/.local/bin:/usr/bin"
+    assert env["HOME"] == "/runs/r/homes/seat-1" and env["PATH"] == f"/runs/r/homes/seat-1/.local/bin{os.pathsep}/usr/bin"
 
 
 def test_a_seat_user_with_no_folder_has_no_home():
