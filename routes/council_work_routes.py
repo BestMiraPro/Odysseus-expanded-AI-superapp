@@ -31,8 +31,9 @@ import logging
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -41,7 +42,7 @@ from pydantic import BaseModel, Field
 from core.database import CouncilTurn, SessionLocal, utcnow_naive
 from routes import council_routes as cr
 from src import (budget, council, council_requests, council_tools, council_work, council_workspace, github_access,
-                 reasoning_effort)
+                 reasoning_effort, seat_user)
 from src.auth_helpers import get_current_user
 from src.council_workspace import Notice
 
@@ -282,12 +283,27 @@ def _settle(turn_id: str, request_id: str, fields: Dict[str, Any]) -> Optional[D
     return _update_work(turn_id, change)
 
 
-def _branch_head(main: str, branch: str) -> Optional[str]:
+@contextmanager
+def _reader(run_id: Optional[str], main: str) -> Iterator[Optional[seat_user.Seat]]:
+    """The seat user to read a run's main copy as: git there obeys config the seats wrote.
+
+    The run's own user while it is going, a visitor to its closed folder
+    afterwards, None without seat isolation.
+    """
+    live = _LIVE.get(run_id or "")
+    if live is not None and live.ws.users:
+        yield live.ws.user
+    elif seat_user.available() and Path(seat_user.RUNS_ROOT) in Path(main).parents:
+        with seat_user.visitor(str(Path(main).parent)) as seat:
+            yield seat
+    else:
+        yield None
+
+
+def _branch_head(main: str, branch: str, seat: Optional[seat_user.Seat]) -> Optional[str]:
     """The commit of ``branch`` in the run's main copy, or None when the copy or the branch is gone."""
-    if not main or not Path(main).is_dir():
-        return None
     proc = council_workspace.git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], main,
-                                 check=False, seat=True)
+                                 check=False, seat=seat)
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
@@ -307,15 +323,19 @@ def _carry_out(owner: Optional[str], request: Dict[str, Any], work: Dict[str, An
     info = github_access.check_writable(owner, repo)
     if request["action"] == council_requests.OPEN_PR:
         main = work.get("main") or ""
-        local = _branch_head(main, branch)
-        if local is None:
-            raise github_access.GitHubError(f"The run's copy {main} or its branch {branch} is gone, so Odysseus "
-                                            "cannot push it.", 409)
-        if local != sha:
-            raise github_access.GitHubError(_moved(branch, sha, local, "in the run's copy"), 409)
-        # GitHub must hold exactly the requested commit on the run's branch;
-        # a no-op when the automatic push already put it there.
-        pushed = github_access.push_branch(owner, repo, main, branch)
+        gone = github_access.GitHubError(f"The run's copy {main} or its branch {branch} is gone, so Odysseus "
+                                         "cannot push it.", 409)
+        if not main or not Path(main).is_dir():
+            raise gone
+        with _reader(work.get("run_id"), main) as seat:
+            local = _branch_head(main, branch, seat)
+            if local is None:
+                raise gone
+            if local != sha:
+                raise github_access.GitHubError(_moved(branch, sha, local, "in the run's copy"), 409)
+            # GitHub must hold exactly the requested commit on the run's branch;
+            # a no-op when the automatic push already put it there.
+            pushed = github_access.push_branch(owner, repo, main, branch, seat=seat)
         if pushed["sha"] != sha:
             raise github_access.GitHubError(_moved(branch, sha, pushed["sha"], "in the run's copy"), 409)
         base = request.get("base") or info.get("default_branch") or ""
@@ -541,7 +561,7 @@ class _WorkRun:
             return []
         try:
             pushed = await asyncio.to_thread(github_access.push_branch, self.owner, self.repo, str(self.ws.main),
-                                             self.ws.branch)
+                                             self.ws.branch, seat=self.ws.user)
         except github_access.GitHubError as exc:
             record["push_error"] = str(exc)
             if exc.status >= 500:
@@ -561,10 +581,10 @@ class _WorkRun:
         """Whether a request of this run waits for the owner (the run's while_waiting policy then applies)."""
         return await asyncio.to_thread(_open_requests, list(self.turns.values()))
 
-    def stream_for(self, level: str, cwd: str, env: Dict[str, Optional[str]]):
+    def stream_for(self, level: str, cwd: str, env: Dict[str, Optional[str]], seat: Any = None):
         return council_tools.stream_fn_for(
             council_tools.ToolSettings(mode=level, owner=self.owner, workspace=cwd, env=env,
-                                       max_rounds=WORK_AGENT_ROUNDS))
+                                       max_rounds=WORK_AGENT_ROUNDS, seat=seat))
 
     async def begin_round(self, record: Dict[str, Any]) -> Tuple[List[council.Member], council.Member]:
         work = self.work(record)
@@ -648,6 +668,10 @@ class _WorkRun:
                 await self._finish(reason, error)
             except Exception as exc:
                 logger.warning("council work: finishing failed error_type=%s", type(exc).__name__)
+            try:
+                await asyncio.to_thread(self.ws.close)
+            except Exception as exc:
+                logger.warning("council work: closing the run folder failed error_type=%s", type(exc).__name__)
             cr._ACTIVE_SESSIONS.discard(self.session_id)
             status = ("cancelled" if reason == council_work.STOP_CANCELLED
                       else "error" if reason == STOP_ERROR else "done")

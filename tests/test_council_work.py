@@ -179,7 +179,7 @@ class Fakes:
         self.ws, self.statuses, self.merge, self.fail, self.votes, self.hold = ws, statuses, merge, fail, votes, hold
         self.calls = []        # (stage, level, cwd, model, messages)
 
-    def __call__(self, level, cwd, env):
+    def __call__(self, level, cwd, env, seat=None):
         async def stream(url, model, messages, *, stage="opinions", **kwargs):
             self.calls.append((stage, level, cwd, model, messages))
             round_no = int(re.search(r"round (\d+) of", messages[-1]["content"]).group(1))

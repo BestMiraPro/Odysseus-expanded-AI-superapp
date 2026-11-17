@@ -186,19 +186,22 @@ RUN set -eu; \
 # Create data directory (mount a volume here for persistence)
 RUN mkdir -p data logs services/cache/search
 
-# Council seats run their tools as odysseus-seat, a user that cannot enter
-# /app and so cannot reach Odysseus's data, logs, keys or code
-# (src/seat_user.py, THREAT_MODEL.md). Fixed ids, outside the range a host
-# PUID/PGID usually takes; the seat user is in its own group only and has no
-# home or login shell. Members of odysseus-launch may run the setuid launcher
+# Council seats run their tools as seat users, which cannot enter /app and so
+# cannot reach Odysseus's data, logs, keys or code, nor each other's files and
+# processes (src/seat_user.py, THREAT_MODEL.md). 64 of them, odysseus-seat-0
+# to -63, with fixed ids from 61100, outside the range a host PUID/PGID
+# usually takes; each is in its own group only and has no home or login
+# shell. Members of odysseus-launch may run the setuid launcher
 # (docker/seat-launch.c); the entrypoint adds the app user and nobody else.
-# A seat's run folder lives in /council-runs, outside /app (a volume in
+# A work run's folder lives in /council-runs, outside /app (a volume in
 # docker-compose.yml).
-RUN groupadd --system --gid 61000 odysseus-seat \
-    && useradd --system --uid 61000 --gid odysseus-seat --no-create-home --home-dir /nonexistent \
-       --shell /usr/sbin/nologin odysseus-seat \
+RUN for n in $(seq 0 63); do \
+        id=$((61100 + n)); \
+        echo "odysseus-seat-$n:x:$id:" >> /etc/group; \
+        echo "odysseus-seat-$n:x:$id:$id::/nonexistent:/usr/sbin/nologin" >> /etc/passwd; \
+    done \
     && groupadd --system --gid 61001 odysseus-launch \
-    && gcc -O2 -Wall -Werror -static -DSEAT_UID=61000 -DSEAT_GID=61000 \
+    && gcc -O2 -Wall -Werror -static -DSEAT_BASE=61100 -DSEAT_SLOTS=64 \
        -o /usr/local/bin/odysseus-seat docker/seat-launch.c \
     && chown root:odysseus-launch /usr/local/bin/odysseus-seat \
     && chmod 4750 /usr/local/bin/odysseus-seat \

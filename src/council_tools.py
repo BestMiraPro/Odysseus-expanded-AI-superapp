@@ -40,7 +40,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
@@ -91,8 +91,10 @@ class ToolSettings:
     # Model calls one API/local seat may make in a stage (each tool call costs
     # one). The Claude Code and Codex CLIs pace themselves.
     max_rounds: int = AGENT_MAX_ROUNDS
-    # Set by stream_fn_for when seat isolation is available: every process
-    # that runs the seat's tools starts as the seat user (src/seat_user.py).
+    # The seat user every process that runs the seat's tools starts as
+    # (src/seat_user.py). A work run passes its seat's own, kept for the whole
+    # run; otherwise stream_fn_for takes one per call when seat isolation is
+    # available.
     seat: Optional[seat_user.Seat] = None
 
     @property
@@ -227,14 +229,14 @@ async def _history_server(settings: ToolSettings):
 
     The server reads the database. A seat running as the seat user can do
     neither that nor hold the database URL, so the server runs as Odysseus
-    behind a socket in the seat's folder (group odysseus-seat), and the seat's
-    CLI reaches it through socat.
+    behind a socket in the seat's folder (its own group's, so no other seat
+    can connect), and the seat's CLI reaches it through socat.
     """
     spec = mcp_server_spec(settings.owner)
     if settings.seat is None:
         yield spec
         return
-    sock = os.path.join(settings.seat.home, "odysseus-history.sock")
+    sock = os.path.join(settings.seat.folder, "odysseus-history.sock")
     bridge = _start_history_bridge(sock, spec)
     try:
         for _ in range(100):
@@ -337,7 +339,7 @@ async def _agent_stream(url, model, messages, headers, settings: ToolSettings, w
     # they run as the seat user (it is removed with the seat).
     scratch = None
     if settings.full and not settings.workspace:
-        scratch = settings.seat.home if settings.seat else tempfile.mkdtemp(prefix="ody-council-")
+        scratch = settings.seat.folder if settings.seat else tempfile.mkdtemp(prefix="ody-council-")
     # The agent loop bills each model call to the budget ledger itself.
     yield f"data: {json.dumps({'type': 'self_billed'})}\n\n"
     try:
@@ -410,15 +412,26 @@ def stream_fn_for(settings: ToolSettings):
         # logins (see credential_free_git_env), with a throwaway git/gh config
         # of its own that is removed when this seat's run ends, and without
         # any credential for Odysseus's own API (last, so nothing re-adds one).
-        # With seat isolation its processes run as the seat user, and that
-        # folder, outside the data folder, is also the seat's home.
-        isolated = seat_user.available()
-        with (seat_user.folder() if isolated else
-              tempfile.TemporaryDirectory(prefix="council-seat-", dir=DATA_DIR,
-                                          ignore_cleanup_errors=True)) as config_dir:
+        # With seat isolation its processes run as a seat user of its own,
+        # and that folder, outside the data folder, is that user's alone. When
+        # the call ends everything still running as the user is killed.
+        with ExitStack() as stack:
+            user = settings.seat
+            if user is not None:
+                # A work run's seat: its user and home last the run, the folder this call.
+                config_dir = tempfile.mkdtemp(prefix="call-", dir=user.home)
+                stack.callback(user.remove, config_dir)
+                stack.callback(user.kill_all)
+                user.share(config_dir, 0o2770)
+                user = replace(user, folder=config_dir)
+            elif seat_user.available():
+                user = stack.enter_context(seat_user.seat())
+                config_dir = user.folder
+            else:
+                config_dir = stack.enter_context(tempfile.TemporaryDirectory(
+                    prefix="council-seat-", dir=DATA_DIR, ignore_cleanup_errors=True))
             seat = replace(settings, env={**credential_free_git_env(config_dir), **settings.env,
-                                          **dict.fromkeys(ODYSSEUS_API_ENV)},
-                           seat=seat_user.Seat(config_dir) if isolated else None)
+                                          **dict.fromkeys(ODYSSEUS_API_ENV)}, seat=user)
             if provider == "claude-subscription":
                 source = _claude_stream(url, model, msgs, headers, seat, timeout)
             elif provider == "chatgpt-subscription":

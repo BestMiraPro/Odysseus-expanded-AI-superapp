@@ -101,15 +101,15 @@ for dir in /app/data /app/logs /app/.ssh /app/.cache/huggingface /app/.local; do
 done
 
 # Council seat isolation (src/seat_user.py): the app user may run the seat
-# launcher (group odysseus-launch) and shares run folders with the seat user
-# through the odysseus-seat group. /council-runs holds those folders: the seat
-# user may pass through it but not list it, and folders made in it inherit
-# its group (setgid).
-if [ "$ODY_USER" != odysseus-seat ]; then
-    usermod -aG odysseus-seat,odysseus-launch "$ODY_USER" 2>/dev/null || true
-fi
-chown "$PUID:odysseus-seat" /council-runs 2>/dev/null || true
-chmod 2710 /council-runs 2>/dev/null || true
+# launcher (group odysseus-launch) and shares folders with each seat user
+# through that user's group. /run/odysseus-seats holds the locks that say
+# which seat users are taken. /council-runs holds the work runs' folders:
+# seat users pass through it to the run they belong to but cannot list it.
+SEAT_GROUPS="$(getent group | awk -F: '$1 ~ /^odysseus-seat-[0-9]+$/ { printf "%s,", $1 }')"
+usermod -aG "${SEAT_GROUPS}odysseus-launch" "$ODY_USER" 2>/dev/null || true
+install -d -o "$PUID" -g "$PGID" -m 0700 /run/odysseus-seats
+chown "$PUID:$PGID" /council-runs 2>/dev/null || true
+chmod 0711 /council-runs 2>/dev/null || true
 
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or

@@ -236,7 +236,7 @@ def _personalizer(workspace: Workspace, lanes: Dict[str, str], base: str):
     return personalize
 
 
-StreamFor = Callable[[str, str, Dict[str, Optional[str]]], council.StreamFn]
+StreamFor = Callable[[str, str, Dict[str, Optional[str]], Any], council.StreamFn]
 
 
 def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.StreamFn:
@@ -244,7 +244,8 @@ def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.Stream
 
     Review gets research tools in the run's folder (reading every worktree);
     work and integration get full tools in the seat's worktree or main.
-    ``stream_for(level, cwd, env)`` builds the caller's stream function.
+    ``stream_for(level, cwd, env, seat)`` builds the caller's stream function; ``seat`` is the seat
+    user the call's tools run as (``Workspace.seat``), None without seat isolation.
     """
     async def fn(url, model, messages, *, stage: str = "opinions", seat: Any = None, **kwargs):
         who = _who(seat)
@@ -252,7 +253,7 @@ def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.Stream
             level, cwd = TOOLS_RESEARCH, workspace.root
         else:
             level, cwd = TOOLS_FULL, workspace.workdir(who)
-        inner = stream_for(level, str(cwd), workspace.env(who))
+        inner = stream_for(level, str(cwd), workspace.env(who), workspace.seat(who))
         if getattr(inner, "accepts_stage", False):
             kwargs["stage"] = stage
         async for chunk in inner(url, model, messages, **kwargs):
