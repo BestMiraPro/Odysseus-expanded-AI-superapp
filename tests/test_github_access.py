@@ -568,14 +568,13 @@ def test_with_seat_isolation_the_working_copy_is_asked_as_the_seat_user(monkeypa
     from src import seat_user
 
     _connect(monkeypatch)
-    monkeypatch.setattr(seat_user, "available", lambda: True)
     monkeypatch.setenv("SOME_ODYSSEUS_SECRET", "do-not-pass")
     git = _Git()
-    ga.push_branch("alice", "BestMiraPro/x", "/work", "odysseus/feat", run_git=git)
+    ga.push_branch("alice", "BestMiraPro/x", "/work", "odysseus/feat", run_git=git, seat=seat_user.Seat(4))
     queries = [c for c in git.calls if "rev-parse" in c["argv"]]
     assert len(queries) == 2
     for call in queries:
-        assert call["argv"][:4] == [seat_user.LAUNCHER, "git", "-c", "safe.directory=*"] and call["cwd"] == "/work"
+        assert call["argv"][:6] == [seat_user.LAUNCHER, "4", "4", "git", "-c", "safe.directory=*"] and call["cwd"] == "/work"
         assert "SOME_ODYSSEUS_SECRET" not in call["env"] and "HOME" not in call["env"]
     others = [c for c in git.calls if "rev-parse" not in c["argv"]]
     # The push itself stays Odysseus's, in its own clean folder.

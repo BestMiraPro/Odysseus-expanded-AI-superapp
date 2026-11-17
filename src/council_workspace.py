@@ -7,26 +7,31 @@ Layout of ``<runs_root>/<run_id>/``:
 - ``seats/<n>/``  a worktree of ``main`` per seat on branch ``seat-<n>``, reset to
                   main's HEAD at the start of every round.
 - ``messages/``   how the seats talk to each other (see ``Workspace.deliver``).
+- ``homes/<who>/`` each seat's and the chairman's home for the whole run, so what
+                  one installs in a stage is still there in the next.
 
 A clone per run, rather than working in the owner's folder (it would edit
 their files) or in worktrees of their repository (those share its .git: hooks,
 config, refs). The owner's folder is only ever read.
 
-With seat isolation (src/seat_user.py, in the Docker image) the seats run as
-the seat user, and so does every git command Odysseus runs here once the run
-is set up: a seat can write the repository's config (``core.fsmonitor``,
-filters, merge drivers, ``include.path``, ...), so git run here as Odysseus's
-own user could be made to run a seat's program with Odysseus's rights. The
-seats may write only in their worktrees, main and their own outbox folder:
-the run folder, ``seats/`` and ``messages/`` are not theirs to change, so they
-cannot swap a folder Odysseus works in for a link into its data.
+With seat isolation (src/seat_user.py, in the Docker image) every seat and the
+chairman run as a seat user of their own for the whole run, and the run holds
+one more, which every git command Odysseus runs here uses once the run is set
+up: a seat can write the repository's config (``core.fsmonitor``, filters,
+merge drivers, ``include.path``, ...), so git run here as Odysseus's own user
+could be made to run a seat's program with Odysseus's rights. The run folder
+belongs to the run user's group, which the run's seats are in and no other
+run's are. The seats may write only in the worktrees, main, their own home and
+their own outbox folder: the run folder, ``seats/`` and ``messages/`` are not
+theirs to change, so they cannot swap a folder Odysseus works in for a link
+into its data. The seats of one run share its repository: one can write in
+another's worktree, which the diff Odysseus attaches would show.
 
 Messages limit: without seat isolation every seat runs as the same OS user as
 Odysseus, so nothing stops a seat from editing a delivered message or writing
 straight into ``messages/``; both are detected and repaired after each stage
-(``Workspace.audit``), not prevented. With it, neither is possible. Either
-way all seats share one OS user, so a seat writing into another seat's outbox
-is neither prevented nor detected.
+(``Workspace.audit``), not prevented, and a seat writing into another seat's
+outbox is neither prevented nor detected. With it, none of these is possible.
 """
 
 from __future__ import annotations
@@ -38,7 +43,7 @@ import stat
 import subprocess
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
@@ -71,29 +76,28 @@ class WorkspaceError(CouncilError):
 
 
 def git(args: Sequence[str], cwd: Union[str, Path], *, check: bool = True,
-        seat: bool = False) -> subprocess.CompletedProcess:
+        seat: Optional[seat_user.Seat] = None) -> subprocess.CompletedProcess:
     """Run git with an argv list, ignoring the owner's git configuration and hooks.
 
     Inherited GIT_* variables (GIT_DIR and friends) are dropped, system and
     global config are skipped and hooks are off, so only the repository's own
     config applies and nothing can prompt.
 
-    ``seat``: the repository is one the seats can write (a run folder). With
-    seat isolation git then runs as the seat user, in the seat environment,
-    trusting the repository although Odysseus's user owns its folders. Either
-    way, with seat isolation what git creates is group-writable, so the seat
-    user can work on what Odysseus set up.
+    ``seat``: a seat user to run git as, for a repository the seats can write
+    (a run folder; ``Workspace.user``), in the seat environment, trusting the
+    repository although Odysseus's user owns its folders. Either way, with
+    seat isolation what git creates is group-writable, so the seat users can
+    work on what Odysseus set up.
     """
     argv = ["git", "-c", f"core.hooksPath={os.devnull}", *args]
     plain = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0"}
-    isolated = seat_user.available()
-    if seat and isolated:
-        argv = seat_user.argv(["git", "-c", "safe.directory=*", *argv[1:]])
-        env = seat_user.environment(plain)
+    if seat is not None:
+        argv = seat.argv(["git", "-c", "safe.directory=*", *argv[1:]])
+        env = seat.env(plain)
     else:
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         env.update(plain)
-    proc = subprocess.run(argv, cwd=str(cwd), env=env, umask=0o002 if isolated else -1,
+    proc = subprocess.run(argv, cwd=str(cwd), env=env, umask=0o002 if seat_user.available() else -1,
                           stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8", errors="replace")
     if check and proc.returncode != 0:
         detail = (proc.stderr or proc.stdout).strip()[:500]
@@ -183,6 +187,36 @@ class Workspace:
     branch: str
     seats: int
     delivered: List[Delivered] = field(default_factory=list)
+    # With seat isolation: the seat user each of ``senders`` runs as, and
+    # under "run" the run's own, which Odysseus's git here runs as and whose
+    # group the run folder belongs to. Empty without isolation, and once the
+    # run is closed.
+    users: Dict[str, seat_user.Seat] = field(default_factory=dict)
+    closed: bool = False
+
+    @property
+    def user(self) -> Optional[seat_user.Seat]:
+        """The seat user Odysseus's own git runs as in this run's folder; None without seat isolation."""
+        if self.closed:
+            raise WorkspaceError("This work run has ended.", status=409)
+        return self.users.get("run")
+
+    def seat(self, who: str) -> Optional[seat_user.Seat]:
+        """The seat user ``who``'s tools run as, with its home in this run; None without seat isolation."""
+        self.workdir(who)
+        return self.users.get(who)
+
+    def close(self) -> None:
+        """End the run: close its folder to every seat user and give the run's seat users back.
+
+        Odysseus still reads the folder afterwards, for a push the owner
+        approves later, through ``seat_user.visitor``.
+        """
+        users, self.users, self.closed = self.users, {}, True
+        if users:
+            os.chmod(self.root, 0o700)
+        for seat in users.values():
+            seat_user.release(seat)
 
     @property
     def main(self) -> Path:
@@ -228,7 +262,7 @@ class Workspace:
                "GIT_COMMITTER_NAME": who, "GIT_COMMITTER_EMAIL": email,
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
                "GIT_DIR": None, "GIT_WORK_TREE": None, "GIT_INDEX_FILE": None}
-        if seat_user.available():
+        if self.users:
             trusted = [self.main, *(self.workdir(name) for name in self.seat_names)]
             env["GIT_CONFIG_COUNT"] = str(len(trusted))
             for i, path in enumerate(trusted):
@@ -239,7 +273,7 @@ class Workspace:
 
     def head(self) -> str:
         """Main's HEAD commit."""
-        return git(["rev-parse", "HEAD"], self.main, seat=True).stdout.strip()
+        return git(["rev-parse", "HEAD"], self.main, seat=self.user).stdout.strip()
 
     def start_round(self) -> str:
         """Reset every seat's worktree to main's HEAD; returns that commit, the round's base."""
@@ -249,9 +283,9 @@ class Workspace:
             cwd = self.workdir(who)
             # checkout -B first: a seat may have switched branch, and reset
             # --hard alone would move that branch instead of the seat's own.
-            git(["checkout", "--quiet", "--force", "-B", who, base], cwd, seat=True)
-            git(["reset", "--quiet", "--hard", base], cwd, seat=True)
-            git(["clean", "--quiet", "-f", "-d"], cwd, seat=True)
+            git(["checkout", "--quiet", "--force", "-B", who, base], cwd, seat=self.user)
+            git(["reset", "--quiet", "--hard", base], cwd, seat=self.user)
+            git(["clean", "--quiet", "-f", "-d"], cwd, seat=self.user)
         return base
 
     def commit_pending(self, who: str, message: str) -> bool:
@@ -262,11 +296,11 @@ class Workspace:
         and the run's branch ends without the result.
         """
         cwd = self.workdir(who)
-        git(["add", "--all"], cwd, seat=True)
-        if git(["diff", "--cached", "--quiet"], cwd, check=False, seat=True).returncode == 0:
+        git(["add", "--all"], cwd, seat=self.user)
+        if git(["diff", "--cached", "--quiet"], cwd, check=False, seat=self.user).returncode == 0:
             return False
         git(["-c", f"user.name={who}", "-c", f"user.email={who}@odysseus.invalid",
-             "commit", "--quiet", "--message", message], cwd, seat=True)
+             "commit", "--quiet", "--message", message], cwd, seat=self.user)
         return True
 
     def unmerged(self) -> List[str]:
@@ -277,18 +311,24 @@ class Workspace:
         chairman typed again by hand counts too. A branch that would conflict
         is unmerged.
         """
-        tree = git(["rev-parse", "HEAD^{tree}"], self.main, seat=True).stdout.strip()
+        tree = git(["rev-parse", "HEAD^{tree}"], self.main, seat=self.user).stdout.strip()
         left = []
         for who in self.seat_names:
-            merged = git(["merge-tree", "--write-tree", "HEAD", who], self.main, check=False, seat=True)
+            merged = git(["merge-tree", "--write-tree", "HEAD", who], self.main, check=False, seat=self.user)
             if merged.returncode != 0 or merged.stdout.split()[:1] != [tree]:
                 left.append(who)
         return left
 
+    def workflows(self) -> List[str]:
+        """The GitHub Actions workflow files in main's HEAD (a push of the branch could start them)."""
+        listed = git(["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", ".github/workflows"], self.main,
+                     seat=self.user).stdout
+        return [name for name in listed.split("\0") if name]
+
     def keep(self, who: str, round_no: int) -> str:
         """Save ``who``'s branch as ``kept/round-N/<who>`` (the next round resets the seat); returns that name."""
         name = f"kept/round-{round_no}/{who}"
-        git(["branch", "--force", name, who], self.main, seat=True)
+        git(["branch", "--force", name, who], self.main, seat=self.user)
         return name
 
     def diff_attachment(self, who: str, base: str, limit: int = DIFF_CHARS) -> str:
@@ -299,18 +339,18 @@ class Workspace:
         too: the chairman cannot merge them.
         """
         cwd = self.workdir(who)
-        head = git(["rev-parse", "HEAD"], cwd, seat=True).stdout.strip()
-        dirty = git(["status", "--porcelain", "--untracked-files=all"], cwd, seat=True).stdout.rstrip()
+        head = git(["rev-parse", "HEAD"], cwd, seat=self.user).stdout.strip()
+        dirty = git(["status", "--porcelain", "--untracked-files=all"], cwd, seat=self.user).stdout.rstrip()
         tail = ""
         if dirty:
             tail = ("\n\nUncommitted changes (in no commit, so they cannot be merged):\n"
                     + _clip_head(dirty, limit // 8, "list of uncommitted files"))
         stat_text = git(["diff", "--stat=120", "--no-color", "--no-ext-diff", base, head], cwd,
-                        seat=True).stdout.rstrip()
+                        seat=self.user).stdout.rstrip()
         if not stat_text:
             return f"No committed changes on branch {who} since the round started at {base[:10]}.{tail}"
-        commits = git(["log", "--oneline", "--no-decorate", f"{base}..{head}"], cwd, seat=True).stdout.rstrip()
-        patch = git(["diff", "--no-color", "--no-ext-diff", base, head], cwd, seat=True).stdout.rstrip()
+        commits = git(["log", "--oneline", "--no-decorate", f"{base}..{head}"], cwd, seat=self.user).stdout.rstrip()
+        patch = git(["diff", "--no-color", "--no-ext-diff", base, head], cwd, seat=self.user).stdout.rstrip()
         top = (f"Work on branch {who} since the round started at {base[:10]} "
                f"(git diff {base[:10]} {head[:10]}).\n\n"
                f"Commits:\n{_clip_head(commits, limit // 8, 'commit list')}\n\n"
@@ -326,13 +366,17 @@ class Workspace:
             (self.messages / sub).mkdir(parents=True, exist_ok=True)
         for who in self.senders:
             (self.messages / "outbox" / who).mkdir(parents=True, exist_ok=True)
-        if seat_user.available():
+            (self.root / "homes" / who).mkdir(parents=True, exist_ok=True)
+        if self.users:
             # Seats change nothing in the folders Odysseus itself works in.
-            for path in (self.root, self.root / "seats", self.messages, self.messages / "outbox",
-                         self.messages / "sent", self.messages / "rejected"):
+            for path in (self.root, self.root / "seats", self.root / "homes", self.messages,
+                         self.messages / "outbox", self.messages / "sent", self.messages / "rejected"):
                 os.chmod(path, 0o2750)
+            # A seat's outbox and home are its own group's: no other seat writes
+            # a message in its name or reads what it keeps at home.
             for who in self.senders:
-                os.chmod(self.messages / "outbox" / who, 0o2770)
+                self.users[who].share(str(self.messages / "outbox" / who), 0o2770)
+                self.users[who].share(str(self.root / "homes" / who), 0o2770)
 
     def _move(self, path: Union[str, Path], folder: Path, name: str, src_dir_fd: Optional[int] = None) -> Path:
         """Move ``path`` into ``folder`` without replacing anything there (agent files are never deleted)."""
@@ -361,7 +405,7 @@ class Workspace:
         cwd = self.workdir(who)
         outbox = self.messages / "outbox" / who
         listed = git(["ls-files", "--others", "--exclude-standard", "-z", "--", "messages/outbox"], cwd,
-                     seat=True).stdout
+                     seat=self.user).stdout
         for rel in filter(None, listed.split("\0")):
             if os.rename not in os.supports_dir_fd:        # Windows: no seat runs as another user there
                 path = cwd / rel
@@ -558,10 +602,31 @@ def create_run(source: Union[str, Path], runs_root: Union[str, Path], goal: str,
     run_id = uuid.uuid4().hex[:12]
     root = Path(runs_root).expanduser().resolve() / run_id
     root.mkdir(parents=True)
-    if seat_user.available():
-        # Shared with the seat user through its group; what is made inside inherits it.
-        seat_user.share(root, 0o2750)
     ws = Workspace(root=root, run_id=run_id, branch=f"odysseus/{slugify(goal)}-{run_id[:6]}", seats=seats)
+    try:
+        if seat_user.available():
+            _take_users(ws)
+        _set_up(ws, path)
+    except BaseException:
+        ws.close()
+        raise
+    return ws
+
+
+def _take_users(ws: Workspace) -> None:
+    """Lease the run's seat users: one for the run, whose group the folder gets, and one per seat and chairman."""
+    try:
+        run = ws.users["run"] = seat_user.lease()
+        for who in ws.senders:
+            ws.users[who] = replace(seat_user.lease(), home=str(ws.root / "homes" / who), group=run.slot)
+    except seat_user.SeatsBusy as exc:
+        raise WorkspaceError(str(exc), status=503)
+    # What is made inside inherits the run's group.
+    run.share(str(ws.root), 0o2750)
+
+
+def _set_up(ws: Workspace, path: Path) -> None:
+    root = ws.root
     git(["clone", "--no-hardlinks", "--quiet", str(path), str(ws.main)], root)
     # Repository config, so it also holds for the seats' own git commands.
     for args in (["checkout", "--quiet", "-b", ws.branch],
@@ -578,4 +643,3 @@ def create_run(source: Union[str, Path], runs_root: Union[str, Path], goal: str,
     for who in ws.seat_names:
         git(["worktree", "add", "--quiet", "-B", who, str(ws.workdir(who)), "HEAD"], ws.main)
     ws._ensure_dirs()
-    return ws

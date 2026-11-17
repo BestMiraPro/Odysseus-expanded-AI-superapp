@@ -5,6 +5,8 @@ import types
 import importlib.util
 from unittest.mock import MagicMock
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Importing core.database below runs init_db() at import time, and its default
@@ -184,3 +186,24 @@ def pytest_report_header(config):
         "touch them are running against mocks, not real behaviour. "
         "Install them with: pip install -r requirements-dev.txt"
     )
+
+
+@pytest.fixture(autouse=True)
+def _seat_kills_disabled():
+    """Seat cleanup can never signal the processes of whoever runs the tests.
+
+    It kills every process of "the seat user"; under test that user is the
+    developer (see tests/test_seat_kill_safety.py). The kill program it would
+    start does not exist here.
+
+    A patch of its own, not the ``monkeypatch`` fixture: asking for that one
+    here would set it up before every test's own fixtures and so undo the
+    test's environment changes after them.
+    """
+    from src import seat_user
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(seat_user, "KILL", "/nonexistent/seat-kill-disabled-under-test")
+        # Seat users a test took and never gave back are not held against the next test.
+        patch.setattr(seat_user, "_held", {})
+        yield

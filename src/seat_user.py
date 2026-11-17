@@ -1,54 +1,85 @@
-"""Council seats' processes run as ``odysseus-seat``, an OS user that cannot reach Odysseus's files.
+"""Council seats' processes run as OS users of their own, which cannot reach Odysseus's files or each other's.
 
 In the Docker image (Dockerfile, docker/entrypoint.sh):
 
-- ``odysseus-seat`` (uid and gid 61000) is in its own group only. ``/app``, which
-  holds Odysseus's code, data (sessions, the GitHub token and its key, the
-  database), logs and keys, is mode 0750 and owned by the app user, so the seat
-  user gets "permission denied" anywhere below it. The bind mounts below /app
-  need not enforce permissions themselves (Docker Desktop's do not): the seat
-  user cannot get past /app to reach them.
+- There are ``SLOTS`` seat users, ``odysseus-seat-<n>`` (uid and gid
+  ``BASE_ID + n``), each in its own group only. A seat holds one for as long
+  as it runs (``lease``), so no two seats running at the same time share a
+  user: a seat cannot read another seat's environment or memory (its model
+  credential), signal it, or open its folder.
+- ``/app``, which holds Odysseus's code, data (sessions, the GitHub token and
+  its key, the database), logs and keys, is mode 0750 and owned by the app
+  user, so a seat user gets "permission denied" anywhere below it. The bind
+  mounts below /app need not enforce permissions themselves (Docker Desktop's
+  do not): a seat user cannot get past /app to reach them.
 - ``LAUNCHER`` is a small setuid-root program (docker/seat-launch.c) that only
   the group ``odysseus-launch`` may run; the entrypoint puts the app user in
-  it. It runs one command as the seat user and as no one else.
-- The app user is also in the ``odysseus-seat`` group, which is how the two
-  share files: a run folder lives under ``RUNS_ROOT`` (/council-runs, outside
-  /app), whose setgid bit gives everything in it that group, and both sides
-  create group-writable files there (the launcher's umask 002; Odysseus's own
-  file tools hand over what they write, see src/agent_tools/filesystem_tools.py).
-  /council-runs is a Docker volume, not a folder mounted from the host, so its
-  permissions hold on Docker Desktop too: they keep the seats out of the parts
-  of a run folder Odysseus itself works in (src/council_workspace.py).
-- The seat user cannot read the app's process environment or memory, or
-  signal it, because it is another uid; the app cannot signal a seat's
-  processes either, so ``kill`` does it as the seat user.
+  it. It runs one command as one of the seat users and as no one else.
+- The app user is in every seat user's group, which is how it shares files
+  with each: a folder it makes for a seat gets that seat's group and the
+  setgid bit, and both sides create group-writable files there (the
+  launcher's umask 002; Odysseus's own file tools hand over what they write,
+  see src/agent_tools/filesystem_tools.py).
+- A work run (src/council_workspace.py) holds one more user for itself. Its
+  group owns the run folder under ``RUNS_ROOT`` (/council-runs, a Docker
+  volume, so its permissions hold on Docker Desktop too), and is the primary
+  group of the run's seats: they share the run's repository with each other
+  and with no other run. Each seat's home and outbox there belong to its own
+  group.
+- What a seat user sends on the network is filtered by rules the entrypoint
+  sets as root: the internet is open, private addresses (the Compose network,
+  the Docker host) are not, and on localhost only ports ``LOCAL_PORTS_FROM``
+  and up are, where a seat's own test servers get their ports. ``unfiltered()``
+  checks that by having a seat user try a port below that.
+- A seat user cannot read the app's process environment or memory, or signal
+  it, because it is another uid; the app cannot signal a seat's processes
+  either, so ``Seat.kill`` does it as the seat user. Giving a user back
+  (``release``) kills every process still running as it.
 
-``unavailable()`` checks all this once per process by starting a shell as the
-seat user and asking it to list the data folder. Outside the container it
-runs nothing and isolation is simply unavailable: seats then run as before.
+``unavailable()`` checks this once per process by starting a shell as a seat
+user and asking it to list the data folder. Outside the container it runs
+nothing and isolation is simply unavailable: seats then run as before.
 """
 
 from __future__ import annotations
 
 import os
 import shutil
+import socket
+import stat
 import subprocess
+import sys
 import tempfile
+import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence
 
 from src.constants import DATA_DIR
 from src.host_docker_access import HOST_DOCKER_SOCKET_PATH, running_in_container
 
 try:
-    import grp
-except ImportError:          # Windows: no seat user, ever
-    grp = None
+    import fcntl
+except ImportError:          # Windows: no seat users, ever
+    fcntl = None
 
 LAUNCHER = "/usr/local/bin/odysseus-seat"
-SEAT_GROUP = "odysseus-seat"
+KILL = "/bin/kill"
+# Run through the launcher: signals every process of the user it runs as, and
+# only when that user is the seat user it was meant for ($1). Whatever went
+# wrong with the switch, Odysseus never runs it against its own user.
+_KILL_ALL = '[ "$(id -u)" = "$1" ] && exec "$2" -KILL -- -1'
+# The seat users' ids are BASE_ID .. BASE_ID + SLOTS - 1 (the Dockerfile
+# creates them and compiles the same numbers into the launcher).
+BASE_ID = 61100
+SLOTS = 64
+# One lock file per seat user; whoever holds its lock holds the user. The
+# entrypoint makes the folder for the app user alone.
+SLOT_DIR = "/run/odysseus-seats"
 RUNS_ROOT = "/council-runs"
+FOLDER_PREFIX = "council-seat-"     # a seat's throwaway folder, in the temp folder
+# On localhost a seat reaches only this port and above (docker/entrypoint.sh).
+LOCAL_PORTS_FROM = 32768
 # The only variables of Odysseus's own environment a seat process inherits.
 # Everything else (tokens, the database URL, proxies with passwords, ...)
 # stays behind; callers add what the seat needs, its model credential included.
@@ -61,16 +92,191 @@ _PROBE = """\
 """
 _PROBE_TIMEOUT = 30
 
+_CONNECT = "import socket, sys; sys.exit(0 if socket.create_connection(('127.0.0.1', int(sys.argv[1])), 5) else 1)"
+
 _probed: Optional[List[Optional[str]]] = None       # [reason or None] once probed
+_filter_probed: Optional[List[Optional[str]]] = None
+_held: Dict[int, int] = {}                          # seat user -> the descriptor holding its lock
+_held_lock = threading.Lock()
+_visiting = threading.Lock()
 
 
-def _seat_gid() -> Optional[int]:
-    if grp is None:
-        return None
+class SeatsBusy(RuntimeError):
+    """Every seat user is taken."""
+
+
+def _gid(slot: int) -> int:
+    return BASE_ID + slot
+
+
+def environment(extra: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, str]:
+    """The whole environment of a seat process: ``ENV_PASSTHROUGH``, then ``extra`` (None removes)."""
+    env = {key: os.environ[key] for key in ENV_PASSTHROUGH if key in os.environ}
+    env.update(extra or {})
+    return {key: value for key, value in env.items() if value is not None}
+
+
+@dataclass(frozen=True)
+class Seat:
+    """One seat user, and how a seat's processes start as it.
+
+    ``folder`` is the seat's throwaway folder for one call (its config, the
+    history socket). ``home`` is its HOME when that outlives the call (a work
+    run's seats keep what they install between stages); otherwise the folder
+    is. ``group`` is the seat user whose group is the processes' primary
+    group (a work run's own user), with the seat's own group as a second one.
+    """
+
+    slot: int
+    folder: str = ""
+    home: Optional[str] = None
+    group: Optional[int] = None
+
+    @property
+    def gid(self) -> int:
+        return _gid(self.slot)
+
+    def argv(self, cmd: Sequence[str]) -> List[str]:
+        """``cmd`` started as this seat user."""
+        return [LAUNCHER, str(self.slot), str(self.slot if self.group is None else self.group), *cmd]
+
+    def env(self, extra: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, str]:
+        """``environment`` with this seat's HOME, and what it installed there on PATH."""
+        home = self.home or self.folder
+        own: Dict[str, Optional[str]] = {}
+        if home:
+            own = {"HOME": home, "PATH": f"{home}/.local/bin{os.pathsep}{os.environ.get('PATH', os.defpath)}"}
+        return environment({**own, **(extra or {})})
+
+    def _run(self, cmd: Sequence[str], timeout: float) -> Optional[subprocess.CompletedProcess]:
+        try:
+            return subprocess.run(self.argv(cmd), env=environment(), stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def kill(self, pid: int) -> None:
+        """SIGKILL the process group ``pid`` of this seat (Odysseus's own user may not signal it)."""
+        self._run([KILL, "-KILL", "--", f"-{pid}"], 10)
+
+    def kill_all(self) -> None:
+        """SIGKILL every process running as this seat user, whatever session or group it moved to."""
+        self._run(["/bin/sh", "-c", _KILL_ALL, "kill-all", str(BASE_ID + self.slot), KILL], 10)
+
+    def share(self, path: str, mode: int) -> None:
+        """Give the folder ``path`` (Odysseus's own) to this seat's group, with ``mode``, which should set setgid."""
+        os.chown(path, -1, self.gid)
+        os.chmod(path, mode)
+
+    def reaches(self, path: str, write: bool = False) -> bool:
+        """Whether this seat user can open (and with ``write``, change) the folder ``path``."""
+        test = '[ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]' + (' && [ -w "$1" ]' if write else "")
+        proc = self._run(["/bin/sh", "-c", test, "reaches", path], _PROBE_TIMEOUT)
+        return proc is not None and proc.returncode == 0
+
+    def remove(self, path: str) -> None:
+        """Delete a folder both users wrote into: the seat's own files first, as the seat user."""
+        self._run(["rm", "-rf", "--", path], 120)
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def lease() -> Seat:
+    """Take a seat user nobody holds; ``release`` gives it back. Raises SeatsBusy when all are taken.
+
+    The lock is a file lock, so it holds across Odysseus's worker processes
+    and goes away with a process that dies.
+    """
+    os.makedirs(SLOT_DIR, mode=0o700, exist_ok=True)
+    for slot in range(SLOTS):
+        fd = os.open(os.path.join(SLOT_DIR, str(slot)), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            os.close(fd)
+            continue
+        with _held_lock:
+            _held[slot] = fd
+        seat = Seat(slot)
+        # What a holder that died without releasing left behind.
+        seat.kill_all()
+        _shut_leftovers(seat)
+        return seat
+    raise SeatsBusy(f"All {SLOTS} council seat users are in use; try again when a council has finished.")
+
+
+def _shut_leftovers(seat: Seat) -> None:
+    """Close the folders a past holder of this seat user left open to its group.
+
+    A run or a call that ended with Odysseus (a crash, a restart) never
+    closed its folder, and the next holder of the same user would be let in.
+    Nobody else holds the user now, so whatever is still open to it is stale.
+    """
+    for base, prefix in ((RUNS_ROOT, ""), (tempfile.gettempdir(), FOLDER_PREFIX)):
+        try:
+            entries = [entry for entry in os.scandir(base) if entry.name.startswith(prefix)]
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                st = entry.stat(follow_symlinks=False)
+                if (stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and st.st_gid == seat.gid
+                        and st.st_mode & 0o077):
+                    os.chmod(entry.path, 0o700)
+            except OSError:
+                continue
+
+
+def release(seat: Seat) -> None:
+    """Give a leased seat user back, after killing every process still running as it."""
+    seat.kill_all()
+    with _held_lock:
+        fd = _held.pop(seat.slot, None)
+    if fd is not None:
+        os.close(fd)
+
+
+@contextmanager
+def user() -> Iterator[Seat]:
+    """A seat user for the duration, with no folder of its own."""
+    seat = lease()
     try:
-        return grp.getgrnam(SEAT_GROUP).gr_gid
-    except KeyError:
-        return None
+        yield seat
+    finally:
+        release(seat)
+
+
+@contextmanager
+def seat() -> Iterator[Seat]:
+    """A seat user with a throwaway folder, outside the data folder, that only it and Odysseus can open."""
+    with user() as leased:
+        path = tempfile.mkdtemp(prefix=FOLDER_PREFIX)
+        try:
+            leased.share(path, 0o2770)
+            yield replace(leased, folder=path)
+        finally:
+            leased.kill_all()
+            leased.remove(path)
+
+
+@contextmanager
+def visitor(root: str) -> Iterator[Seat]:
+    """A seat user that may read the finished work run in ``root`` for the duration.
+
+    A run's folder is closed to every seat user when the run ends
+    (Workspace.close). One visitor at a time: each takes the folder's group.
+    """
+    with _visiting, user() as leased:
+        leased.share(root, 0o2750)
+        try:
+            yield leased
+        finally:
+            os.chmod(root, 0o700)
+
+
+def reaches(path: str, write: bool = False) -> bool:
+    """Whether a seat user can open (and with ``write``, change) the folder ``path``."""
+    with user() as leased:
+        return leased.reaches(path, write)
 
 
 def _probe() -> Optional[str]:
@@ -78,24 +284,25 @@ def _probe() -> Optional[str]:
         return "Odysseus is not running in its Docker container"
     if not os.access(LAUNCHER, os.X_OK):
         return f"the seat launcher {LAUNCHER} is missing or this user may not run it (an image built before seat isolation?)"
-    gid = _seat_gid()
-    if gid is None or gid not in os.getgroups():
-        return f"Odysseus's user is not in the {SEAT_GROUP} group (the image's entrypoint adds it)"
+    groups = {*os.getgroups(), os.getegid()}
+    if any(_gid(slot) not in groups for slot in range(SLOTS)):
+        return "Odysseus's user is not in the seat users' groups (the image's entrypoint adds it)"
     try:
-        proc = subprocess.run(argv(["/bin/sh", "-c", _PROBE, "probe", str(os.getuid()), DATA_DIR,
-                                    HOST_DOCKER_SOCKET_PATH]),
-                              env=environment(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                              timeout=_PROBE_TIMEOUT)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        with user() as leased:
+            proc = subprocess.run(leased.argv(["/bin/sh", "-c", _PROBE, "probe", str(os.getuid()), DATA_DIR,
+                                               HOST_DOCKER_SOCKET_PATH]),
+                                  env=environment(), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                  timeout=_PROBE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired, SeatsBusy) as exc:
         return f"the seat launcher could not run: {exc}"
     if proc.returncode != 0:
         detail = (proc.stdout.strip() or proc.stderr.strip() or f"exit code {proc.returncode}")[:300]
-        return f"a process started as the seat user failed the check: {detail}"
+        return f"a process started as a seat user failed the check: {detail}"
     return None
 
 
 def unavailable() -> Optional[str]:
-    """Why seats cannot run as the seat user here, or None when they can (checked once per process)."""
+    """Why seats cannot run as seat users here, or None when they can (checked once per process)."""
     global _probed
     if _probed is None:
         _probed = [_probe()]
@@ -106,72 +313,38 @@ def available() -> bool:
     return unavailable() is None
 
 
-def argv(cmd: Sequence[str]) -> List[str]:
-    """``cmd`` started as the seat user."""
-    return [LAUNCHER, *cmd]
+def _probe_filter() -> Optional[str]:
+    why = unavailable()
+    if why:
+        return why
+    # A listener of Odysseus's own, on a port the filter keeps from seats.
+    for port in range(LOCAL_PORTS_FROM - 1, LOCAL_PORTS_FROM - 200, -1):
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", port))
+        except OSError:
+            listener.close()
+            continue
+        try:
+            listener.listen(1)
+            with user() as leased:
+                proc = subprocess.run(leased.argv([sys.executable, "-I", "-c", _CONNECT, str(port)]),
+                                      env=environment(), stdin=subprocess.DEVNULL, capture_output=True,
+                                      timeout=_PROBE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired, SeatsBusy) as exc:
+            return f"the check could not run: {exc}"
+        finally:
+            listener.close()
+        if proc.returncode == 0:
+            return ("a seat user connected to a port of Odysseus's own on localhost (the container needs the "
+                    "NET_ADMIN capability, which docker-compose.yml gives it, for the entrypoint to set the filter)")
+        return None
+    return "no free port to check with"
 
 
-def environment(extra: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, str]:
-    """The whole environment of a seat process: ``ENV_PASSTHROUGH``, then ``extra`` (None removes)."""
-    env = {key: os.environ[key] for key in ENV_PASSTHROUGH if key in os.environ}
-    env.update(extra or {})
-    return {key: value for key, value in env.items() if value is not None}
-
-
-def kill(pid: int) -> None:
-    """SIGKILL the process group ``pid`` of a seat process (Odysseus's own user may not signal it)."""
-    try:
-        subprocess.run(argv(["/bin/kill", "-KILL", "--", f"-{pid}"]), env=environment(),
-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-
-
-def reaches(path: str, write: bool = False) -> bool:
-    """Whether the seat user can open (and with ``write``, change) the folder ``path``."""
-    test = '[ -d "$1" ] && [ -r "$1" ] && [ -x "$1" ]' + (' && [ -w "$1" ]' if write else "")
-    try:
-        return subprocess.run(argv(["/bin/sh", "-c", test, "reaches", path]), env=environment(),
-                              stdin=subprocess.DEVNULL, capture_output=True, timeout=_PROBE_TIMEOUT).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
-def remove(path: str) -> None:
-    """Delete a folder both users wrote into: the seat's own files first, as the seat user."""
-    try:
-        subprocess.run(argv(["rm", "-rf", "--", path]), env=environment(), stdin=subprocess.DEVNULL,
-                       capture_output=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    shutil.rmtree(path, ignore_errors=True)
-
-
-def share(path: str, mode: int) -> None:
-    """Give the folder ``path`` (Odysseus's own) to the seat group, with ``mode``, which should set setgid."""
-    os.chown(path, -1, _seat_gid())
-    os.chmod(path, mode)
-
-
-@contextmanager
-def folder(prefix: str = "council-seat-") -> Iterator[str]:
-    """A throwaway folder for one seat's run, outside the data folder, that the seat user can write in."""
-    path = tempfile.mkdtemp(prefix=prefix)
-    try:
-        share(path, 0o2770)
-        yield path
-    finally:
-        remove(path)
-
-
-@dataclass(frozen=True)
-class Seat:
-    """How one seat's processes start: through the launcher, with ``home`` (a ``folder``) as HOME."""
-
-    home: str
-
-    def argv(self, cmd: Sequence[str]) -> List[str]:
-        return argv(cmd)
-
-    def env(self, extra: Optional[Mapping[str, Optional[str]]] = None) -> Dict[str, str]:
-        return environment({"HOME": self.home, **(extra or {})})
+def unfiltered() -> Optional[str]:
+    """Why a seat's network is not filtered here, or None when it is (checked once per process)."""
+    global _filter_probed
+    if _filter_probed is None:
+        _filter_probed = [_probe_filter()]
+    return _filter_probed[0]

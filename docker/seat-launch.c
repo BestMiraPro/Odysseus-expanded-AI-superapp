@@ -1,22 +1,25 @@
 /*
- * odysseus-seat: run one command as the Council seat user.
+ * odysseus-seat: run one command as one of the Council seat users.
  *
- *     odysseus-seat COMMAND [ARG...]
+ *     odysseus-seat SEAT GROUP COMMAND [ARG...]
  *
  * Installed setuid root, mode 4750, group odysseus-launch: only the users in
  * that group (the entrypoint adds Odysseus's own user, nobody else) can run it.
- * It takes no user argument. The seat user's ids are compiled in, so it can
- * start a process as the seat user and as no one else, root included.
+ * SEAT and GROUP are numbers from 0 to SEAT_SLOTS - 1. The command runs as the
+ * seat user SEAT_BASE + SEAT, with the group SEAT_BASE + GROUP as its primary
+ * group and its own group as the only other one. The range is compiled in, so
+ * it can start a process as a seat user and as no one else, root included.
  *
  * It keeps the caller's environment, working directory and standard streams:
  * Odysseus builds the environment from an allowlist (src/seat_user.py). It
  * replaces itself with COMMAND (same pid), after:
- *   - dropping every supplementary group and setting real, effective and saved
- *     ids to the seat user's, then checking that root cannot be regained;
+ *   - dropping every other supplementary group and setting real, effective
+ *     and saved ids to the seat user's, then checking that root cannot be
+ *     regained;
  *   - setting no_new_privs, so no setuid program can raise the seat again;
  *   - closing every file descriptor above 2;
- *   - setting umask 002, so the files the seat creates in a run folder stay
- *     writable for the odysseus-seat group that Odysseus's user is in.
+ *   - setting umask 002, so the files the seat creates stay writable for the
+ *     group of the folder they are in, which Odysseus's user is in.
  *
  * Built static (see the Dockerfile), so no dynamic loader or shared library
  * runs with root's privileges.
@@ -25,13 +28,14 @@
 #include <errno.h>
 #include <grp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#ifndef SEAT_UID
-#error "build with -DSEAT_UID=<uid> -DSEAT_GID=<gid>"
+#if !defined(SEAT_BASE) || !defined(SEAT_SLOTS)
+#error "build with -DSEAT_BASE=<first uid and gid> -DSEAT_SLOTS=<how many>"
 #endif
 
 static int fail(const char *what) {
@@ -39,19 +43,37 @@ static int fail(const char *what) {
     return 126;
 }
 
-int main(int argc, char **argv) {
-    const uid_t uid = SEAT_UID;
-    const gid_t gid = SEAT_GID;
+/* A whole number from 0 to SEAT_SLOTS - 1, or -1. */
+static long slot(const char *text) {
+    char *end;
+    long value;
 
-    if (argc < 2) {
-        fprintf(stderr, "usage: odysseus-seat COMMAND [ARG...]\n");
+    errno = 0;
+    value = strtol(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0' || value < 0 || value >= SEAT_SLOTS)
+        return -1;
+    return value;
+}
+
+int main(int argc, char **argv) {
+    long seat, group;
+    uid_t uid;
+    gid_t gid, groups[2];
+
+    if (argc < 4 || (seat = slot(argv[1])) < 0 || (group = slot(argv[2])) < 0) {
+        fprintf(stderr, "usage: odysseus-seat SEAT GROUP COMMAND [ARG...]  (SEAT, GROUP: 0 to %d)\n",
+                SEAT_SLOTS - 1);
         return 64;
     }
-    if (getuid() == uid) {
-        fprintf(stderr, "odysseus-seat: the seat user may not run this\n");
+    if (getuid() >= SEAT_BASE && getuid() < SEAT_BASE + SEAT_SLOTS) {
+        fprintf(stderr, "odysseus-seat: a seat user may not run this\n");
         return 126;
     }
-    if (setgroups(1, &gid) != 0)
+    uid = SEAT_BASE + seat;
+    gid = SEAT_BASE + group;
+    groups[0] = gid;
+    groups[1] = SEAT_BASE + seat;
+    if (setgroups(2, groups) != 0)
         return fail("cannot drop supplementary groups");
     if (setresgid(gid, gid, gid) != 0)
         return fail("cannot switch to the seat group");
@@ -66,7 +88,7 @@ int main(int argc, char **argv) {
     if (close_range(3, ~0U, 0) != 0)
         return fail("cannot close inherited file descriptors");
     umask(002);
-    execvp(argv[1], argv + 1);
-    fprintf(stderr, "odysseus-seat: cannot run %s: %s\n", argv[1], strerror(errno));
+    execvp(argv[3], argv + 3);
+    fprintf(stderr, "odysseus-seat: cannot run %s: %s\n", argv[3], strerror(errno));
     return errno == ENOENT ? 127 : 126;
 }

@@ -1,6 +1,15 @@
 services:
   odysseus:
     build: .
+    # An init process as PID 1, to reap what Council seats leave behind: a
+    # seat's leftover processes are killed when its call ends, and without
+    # an init nobody waits for the orphans among them.
+    init: true
+    # The entrypoint filters what Council seats can reach on the network
+    # (docker/entrypoint.sh, THREAT_MODEL.md), which takes NET_ADMIN. It is
+    # used as root before the app starts; the app's own user never holds it.
+    cap_add:
+      - NET_ADMIN
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
       # Omnigent's chat web UI, bridged from its in-container loopback port.
@@ -44,6 +53,9 @@ services:
       - DATABASE_URL=${DATABASE_URL:-sqlite:///./data/app.db}
       - AUTH_ENABLED=${AUTH_ENABLED:-true}
       - LOCALHOST_BYPASS=${LOCALHOST_BYPASS:-false}
+      # Services Council seats may reach besides the internet (host:port,
+      # comma-separated); see THREAT_MODEL.md.
+      - ODYSSEUS_SEAT_NET_ALLOW=${ODYSSEUS_SEAT_NET_ALLOW:-}
       - COMPANION_BASE_URL=${COMPANION_BASE_URL:-}
       - ODYSSEUS_ADMIN_USER=${ODYSSEUS_ADMIN_USER:-admin}
       - ODYSSEUS_ADMIN_PASSWORD=${ODYSSEUS_ADMIN_PASSWORD:-}

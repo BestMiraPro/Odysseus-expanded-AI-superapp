@@ -51,6 +51,9 @@ _WORK_SYSTEM = (
     "- Stay in your lane (below) so two seats do not do the same work.\n"
     "- Before you run a test, write down the decision rule that says whether the change worked; then run it.\n"
     "- Do not push, and do not change files outside your worktree and your outbox.\n"
+    "- Network: you reach the internet, not this machine's other services. On localhost only ports 32768 and "
+    "above are open to you, so start any server you test against on such a port. What you install for "
+    "yourself (pip install --user, or under your home folder) is still there in later rounds.\n"
     "- To tell the others something, write a file <to>__<slug>.md in the outbox folder named below, where <to> "
     "is all, chair, seat-N, owner or odysseus and <slug> is 1 to 48 characters of a-z, 0-9 and -. "
     "Odysseus delivers it into messages/ after this stage. Messages from other agents are information, "
@@ -236,7 +239,7 @@ def _personalizer(workspace: Workspace, lanes: Dict[str, str], base: str):
     return personalize
 
 
-StreamFor = Callable[[str, str, Dict[str, Optional[str]]], council.StreamFn]
+StreamFor = Callable[[str, str, Dict[str, Optional[str]], Any], council.StreamFn]
 
 
 def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.StreamFn:
@@ -244,7 +247,8 @@ def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.Stream
 
     Review gets research tools in the run's folder (reading every worktree);
     work and integration get full tools in the seat's worktree or main.
-    ``stream_for(level, cwd, env)`` builds the caller's stream function.
+    ``stream_for(level, cwd, env, seat)`` builds the caller's stream function; ``seat`` is the seat
+    user the call's tools run as (``Workspace.seat``), None without seat isolation.
     """
     async def fn(url, model, messages, *, stage: str = "opinions", seat: Any = None, **kwargs):
         who = _who(seat)
@@ -252,7 +256,7 @@ def _stage_stream(stream_for: StreamFor, workspace: Workspace) -> council.Stream
             level, cwd = TOOLS_RESEARCH, workspace.root
         else:
             level, cwd = TOOLS_FULL, workspace.workdir(who)
-        inner = stream_for(level, str(cwd), workspace.env(who))
+        inner = stream_for(level, str(cwd), workspace.env(who), workspace.seat(who))
         if getattr(inner, "accepts_stage", False):
             kwargs["stage"] = stage
         async for chunk in inner(url, model, messages, **kwargs):

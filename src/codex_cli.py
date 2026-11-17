@@ -327,7 +327,7 @@ def _parse(raw: bytes) -> Any:
         return None
 
 
-def _kill(proc: Optional[subprocess.Popen]) -> None:
+def _kill(proc: Optional[subprocess.Popen], seat: Any = None) -> None:
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -337,9 +337,8 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
             proc.kill()
     except PermissionError:
         # A council seat's Codex runs as the seat user, which only that user may signal.
-        from src import seat_user
-
-        seat_user.kill(proc.pid)
+        if seat is not None:
+            seat.kill(proc.pid)
     except Exception:
         try:
             proc.kill()
@@ -372,7 +371,7 @@ async def stream(run: CodexRun, *, timeout: Optional[float] = None) -> AsyncIter
     seat = run.seat
     # A seat's Codex home lives in the seat's folder, where the seat user
     # (through the seat group) can read the auth file and write its state.
-    home = tempfile.mkdtemp(prefix="ody-codex-", dir=seat.home if seat else None)
+    home = tempfile.mkdtemp(prefix="ody-codex-", dir=seat.folder if seat else None)
     scratch = None
     try:
         if seat:
@@ -384,7 +383,7 @@ async def stream(run: CodexRun, *, timeout: Optional[float] = None) -> AsyncIter
         cwd = run.cwd
         if not cwd:
             if seat:
-                cwd = seat.home
+                cwd = seat.folder
             else:
                 scratch = tempfile.mkdtemp(prefix="ody-codex-work-")
                 cwd = scratch
@@ -434,7 +433,7 @@ async def stream(run: CodexRun, *, timeout: Optional[float] = None) -> AsyncIter
             return
         box["proc"] = proc
         if stop.is_set():
-            _kill(proc)
+            _kill(proc, run.seat)
         err = threading.Thread(target=drain_stderr, args=(proc,), daemon=True)
         err.start()
         try:
@@ -453,7 +452,7 @@ async def stream(run: CodexRun, *, timeout: Optional[float] = None) -> AsyncIter
                     put(("obj", obj))
         finally:
             if stop.is_set():
-                _kill(proc)
+                _kill(proc, run.seat)
             rc = proc.wait()
             err.join(timeout=2)
             put(("exit", rc))
@@ -479,7 +478,7 @@ async def stream(run: CodexRun, *, timeout: Optional[float] = None) -> AsyncIter
                 return
     finally:
         stop.set()
-        _kill(box["proc"])
+        _kill(box["proc"], run.seat)
         shutil.rmtree(home, ignore_errors=True)
         if scratch:
             shutil.rmtree(scratch, ignore_errors=True)

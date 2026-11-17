@@ -31,8 +31,9 @@ import logging
 import os
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -41,7 +42,7 @@ from pydantic import BaseModel, Field
 from core.database import CouncilTurn, SessionLocal, utcnow_naive
 from routes import council_routes as cr
 from src import (budget, council, council_requests, council_tools, council_work, council_workspace, github_access,
-                 reasoning_effort)
+                 reasoning_effort, seat_user)
 from src.auth_helpers import get_current_user
 from src.council_workspace import Notice
 
@@ -62,6 +63,11 @@ _LIVE: Dict[str, "_WorkRun"] = {}
 _WORK_LOCK = threading.Lock()
 
 
+PUSH_HELD = ("Odysseus does not push this run's branch to GitHub after each round: the branch holds GitHub Actions "
+             "workflows (.github/workflows), and a push could run them on work the owner has not seen. The branch "
+             "is pushed when the owner approves a request to open a pull request.")
+
+
 def runs_root() -> Path:
     """Where run folders live; they are kept when a run ends.
 
@@ -69,7 +75,6 @@ def runs_root() -> Path:
     cannot go (a volume in docker-compose.yml); otherwise council-runs/ under
     the data folder.
     """
-    from src import seat_user
     from src.constants import DATA_DIR
 
     return Path(seat_user.RUNS_ROOT) if seat_user.available() else Path(DATA_DIR) / RUNS_DIRNAME
@@ -90,9 +95,12 @@ def in_docker() -> bool:
 
 def seats_not_isolated() -> Optional[str]:
     """Why the seats' processes cannot run as the separate seat user here, or None when they can."""
-    from src import seat_user
-
     return seat_user.unavailable()
+
+
+def seats_unfiltered() -> Optional[str]:
+    """Why the seats' network is not filtered here, or None when it is."""
+    return seat_user.unfiltered()
 
 
 def unauthenticated_access() -> Optional[str]:
@@ -139,6 +147,10 @@ def _refuse_unsafe(request: Request) -> None:
     if why:
         raise HTTPException(403, f"Work runs only start when every seat runs as the separate seat user, which "
                                  f"cannot read Odysseus's sessions, GitHub token or database, and here {why}.")
+    why = seats_unfiltered()
+    if why:
+        raise HTTPException(403, f"Work runs only start when the seats' network is filtered, so a seat's shell "
+                                 f"reaches the internet but not the services next to Odysseus, and here {why}.")
     why = unauthenticated_access()
     if why:
         raise HTTPException(403, f"Work runs need login on for every caller, and {why}: a seat's shell could "
@@ -282,12 +294,27 @@ def _settle(turn_id: str, request_id: str, fields: Dict[str, Any]) -> Optional[D
     return _update_work(turn_id, change)
 
 
-def _branch_head(main: str, branch: str) -> Optional[str]:
+@contextmanager
+def _reader(run_id: Optional[str], main: str) -> Iterator[Optional[seat_user.Seat]]:
+    """The seat user to read a run's main copy as: git there obeys config the seats wrote.
+
+    The run's own user while it is going, a visitor to its closed folder
+    afterwards, None without seat isolation.
+    """
+    live = _LIVE.get(run_id or "")
+    if live is not None and live.ws.users:
+        yield live.ws.user
+    elif seat_user.available() and Path(seat_user.RUNS_ROOT) in Path(main).parents:
+        with seat_user.visitor(str(Path(main).parent)) as seat:
+            yield seat
+    else:
+        yield None
+
+
+def _branch_head(main: str, branch: str, seat: Optional[seat_user.Seat]) -> Optional[str]:
     """The commit of ``branch`` in the run's main copy, or None when the copy or the branch is gone."""
-    if not main or not Path(main).is_dir():
-        return None
     proc = council_workspace.git(["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], main,
-                                 check=False, seat=True)
+                                 check=False, seat=seat)
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
@@ -307,15 +334,19 @@ def _carry_out(owner: Optional[str], request: Dict[str, Any], work: Dict[str, An
     info = github_access.check_writable(owner, repo)
     if request["action"] == council_requests.OPEN_PR:
         main = work.get("main") or ""
-        local = _branch_head(main, branch)
-        if local is None:
-            raise github_access.GitHubError(f"The run's copy {main} or its branch {branch} is gone, so Odysseus "
-                                            "cannot push it.", 409)
-        if local != sha:
-            raise github_access.GitHubError(_moved(branch, sha, local, "in the run's copy"), 409)
-        # GitHub must hold exactly the requested commit on the run's branch;
-        # a no-op when the automatic push already put it there.
-        pushed = github_access.push_branch(owner, repo, main, branch)
+        gone = github_access.GitHubError(f"The run's copy {main} or its branch {branch} is gone, so Odysseus "
+                                         "cannot push it.", 409)
+        if not main or not Path(main).is_dir():
+            raise gone
+        with _reader(work.get("run_id"), main) as seat:
+            local = _branch_head(main, branch, seat)
+            if local is None:
+                raise gone
+            if local != sha:
+                raise github_access.GitHubError(_moved(branch, sha, local, "in the run's copy"), 409)
+            # GitHub must hold exactly the requested commit on the run's branch;
+            # a no-op when the automatic push already put it there.
+            pushed = github_access.push_branch(owner, repo, main, branch, seat=seat)
         if pushed["sha"] != sha:
             raise github_access.GitHubError(_moved(branch, sha, pushed["sha"], "in the run's copy"), 409)
         base = request.get("base") or info.get("default_branch") or ""
@@ -473,6 +504,7 @@ class _WorkRun:
         self.repo = repo                                     # owner/name of the GitHub origin, or None
         self.github_off = github_off                         # why the run has no GitHub features, or None
         self.outcomes: List[Notice] = []                     # the owner's decisions, for the seats
+        self.push_held_told = False                          # the seats were told why rounds are not pushed
         self.turns: Dict[int, str] = {}                      # round -> turn id
         self.works: Dict[str, Dict[str, Any]] = {}           # turn id -> its work data as last saved
         self.saved: set = set()                              # turn ids whose round reached save_round
@@ -501,6 +533,7 @@ class _WorkRun:
             "github_off": self.github_off,
             "pushed": record.get("pushed"),
             "push_error": record.get("push_error"),
+            "push_held": record.get("push_held"),
         }
 
     def first_notices(self) -> List[Notice]:
@@ -536,12 +569,22 @@ class _WorkRun:
                               "the owner can approve it, in the Odysseus page; Odysseus tells you when they decide.")
 
     async def after_round(self, record: Dict[str, Any]) -> List[Notice]:
-        """Push the run's branch when this round moved main. A refusal turns GitHub off for the rest of the run."""
+        """Push the run's branch when this round moved main. A refusal turns GitHub off for the rest of the run.
+
+        Not when the branch holds GitHub Actions workflows: a push could start
+        them, running what the seats wrote with the repository's secrets
+        before the owner has seen it. The branch then reaches GitHub only
+        with a pull request the owner approves (``_carry_out`` pushes it).
+        """
         if self.github_off or record.get("head") == record.get("base"):
             return []
+        if await asyncio.to_thread(self.ws.workflows):
+            record["push_held"] = PUSH_HELD
+            told, self.push_held_told = self.push_held_told, True
+            return [] if told else [Notice("all", PUSH_HELD)]
         try:
             pushed = await asyncio.to_thread(github_access.push_branch, self.owner, self.repo, str(self.ws.main),
-                                             self.ws.branch)
+                                             self.ws.branch, seat=self.ws.user)
         except github_access.GitHubError as exc:
             record["push_error"] = str(exc)
             if exc.status >= 500:
@@ -561,10 +604,10 @@ class _WorkRun:
         """Whether a request of this run waits for the owner (the run's while_waiting policy then applies)."""
         return await asyncio.to_thread(_open_requests, list(self.turns.values()))
 
-    def stream_for(self, level: str, cwd: str, env: Dict[str, Optional[str]]):
+    def stream_for(self, level: str, cwd: str, env: Dict[str, Optional[str]], seat: Any = None):
         return council_tools.stream_fn_for(
             council_tools.ToolSettings(mode=level, owner=self.owner, workspace=cwd, env=env,
-                                       max_rounds=WORK_AGENT_ROUNDS))
+                                       max_rounds=WORK_AGENT_ROUNDS, seat=seat))
 
     async def begin_round(self, record: Dict[str, Any]) -> Tuple[List[council.Member], council.Member]:
         work = self.work(record)
@@ -648,6 +691,10 @@ class _WorkRun:
                 await self._finish(reason, error)
             except Exception as exc:
                 logger.warning("council work: finishing failed error_type=%s", type(exc).__name__)
+            try:
+                await asyncio.to_thread(self.ws.close)
+            except Exception as exc:
+                logger.warning("council work: closing the run folder failed error_type=%s", type(exc).__name__)
             cr._ACTIVE_SESSIONS.discard(self.session_id)
             status = ("cancelled" if reason == council_work.STOP_CANCELLED
                       else "error" if reason == STOP_ERROR else "done")

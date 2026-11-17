@@ -683,7 +683,7 @@ class _Invocation:
                 "The Claude Code CLI is not installed on the Odysseus host. Install it "
                 "(npm install -g @anthropic-ai/claude-code) and reconnect.", 503)
         mode, token = credentials or load_credentials(auth_id_from_url(url))
-        seat = tools.seat if tools else None
+        seat = self.seat = tools.seat if tools else None
         if seat is not None and mode != AUTH_MODE_TOKEN:
             raise ClaudeSubscriptionError(
                 "This Claude Subscription uses the Claude login of the machine running Odysseus, which a council "
@@ -697,7 +697,7 @@ class _Invocation:
         # Large Odysseus system prompts would overflow argv (32 KB on Windows),
         # so the prompt goes through a private file instead (in the seat's
         # folder, readable by the seat group, when the CLI runs as the seat).
-        self._tmpdir = tempfile.mkdtemp(prefix="ody-claude-", dir=seat.home if seat else None)
+        self._tmpdir = tempfile.mkdtemp(prefix="ody-claude-", dir=seat.folder if seat else None)
         if seat:
             os.chmod(self._tmpdir, 0o2750)       # setgid: the file below gets the seat group
         system_file = os.path.join(self._tmpdir, "system.md")
@@ -717,7 +717,7 @@ class _Invocation:
             if tools and tools.env:
                 self.env = {k: v for k, v in {**self.env, **tools.env}.items() if v is not None}
         self.stdin = prompt.encode("utf-8")
-        self.cwd = (tools.cwd if tools and tools.cwd else None) or (seat.home if seat else _workdir())
+        self.cwd = (tools.cwd if tools and tools.cwd else None) or (seat.folder if seat else _workdir())
 
     def cleanup(self) -> None:
         if self._tmpdir:
@@ -737,7 +737,7 @@ def _popen(inv: _Invocation) -> subprocess.Popen:
     )
 
 
-def _kill(proc: Optional[subprocess.Popen]) -> None:
+def _kill(proc: Optional[subprocess.Popen], seat: Any = None) -> None:
     if proc is None or proc.poll() is not None:
         return
     try:
@@ -751,9 +751,8 @@ def _kill(proc: Optional[subprocess.Popen]) -> None:
             proc.kill()
     except PermissionError:
         # A council seat's CLI runs as the seat user, which only that user may signal.
-        from src import seat_user
-
-        seat_user.kill(proc.pid)
+        if seat is not None:
+            seat.kill(proc.pid)
     except Exception:
         try:
             proc.kill()
@@ -835,7 +834,7 @@ async def stream_chat(
                 return
             proc_box["proc"] = proc
             if stop.is_set():
-                _kill(proc)
+                _kill(proc, inv.seat)
             err_thread = threading.Thread(target=_drain_stderr, args=(proc, stderr_sink), daemon=True)
             err_thread.start()
             threading.Thread(target=_write_stdin, args=(proc, inv.stdin), daemon=True).start()
@@ -850,7 +849,7 @@ async def stream_chat(
                         _put(("obj", obj))
             finally:
                 if stop.is_set():
-                    _kill(proc)
+                    _kill(proc, inv.seat)
                 rc = proc.wait()
                 err_thread.join(timeout=2)
                 _put(("exit", rc))
@@ -877,7 +876,7 @@ async def stream_chat(
                 return
     finally:
         stop.set()
-        _kill(proc_box["proc"])
+        _kill(proc_box["proc"], inv.seat)
         inv.cleanup()
 
 
@@ -892,7 +891,7 @@ def run_chat_sync(url: str, model: str, messages: List[Dict], *, timeout: Option
         try:
             out, err = proc.communicate(inv.stdin, timeout=float(timeout or _DEFAULT_TIMEOUT))
         except subprocess.TimeoutExpired:
-            _kill(proc)
+            _kill(proc, inv.seat)
             proc.communicate()
             raise ClaudeSubscriptionError("Claude Subscription timed out.", 504)
     finally:

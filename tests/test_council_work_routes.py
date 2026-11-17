@@ -60,6 +60,7 @@ def allowed(monkeypatch, tmp_path):
     """Everything a work run needs: Docker, seat isolation, login on for everyone, alice an admin."""
     monkeypatch.setattr(cwr, "in_docker", lambda: True)
     monkeypatch.setattr(cwr, "seats_not_isolated", lambda: None)
+    monkeypatch.setattr(cwr, "seats_unfiltered", lambda: None)
     monkeypatch.delenv("AUTH_ENABLED", raising=False)
     monkeypatch.delenv("LOCALHOST_BYPASS", raising=False)
     monkeypatch.setattr("src.tool_security.owner_is_admin_or_single_user", lambda owner: owner == "alice")
@@ -261,6 +262,15 @@ def test_a_work_run_is_refused_when_an_unauthenticated_caller_could_get_in(clien
         monkeypatch.setenv(key, value)
     resp = _start(client, _session(client), repo)
     assert resp.status_code == 403 and words in resp.json()["detail"] and "login" in resp.json()["detail"]
+    assert _no_turns(db)
+
+
+@needs_git
+def test_a_work_run_is_refused_when_the_seats_network_is_not_filtered(client, db, repo, monkeypatch):
+    monkeypatch.setattr(cwr, "seats_unfiltered", lambda: "a seat user connected to a port of Odysseus's own")
+    resp = _start(client, _session(client), repo)
+    detail = resp.json()["detail"]
+    assert resp.status_code == 403 and "network is filtered" in detail and "connected to a port" in detail
     assert _no_turns(db)
 
 
@@ -642,3 +652,48 @@ def test_work_seats_get_more_agent_rounds_than_a_question_does(monkeypatch):
     monkeypatch.setattr(council_tools, "stream_fn_for", lambda s: settings.append(s))
     cwr._WorkRun.stream_for(type("R", (), {"owner": "alice"})(), "full", "/tmp/x", {})
     assert settings[0].max_rounds == cwr.WORK_AGENT_ROUNDS > council_tools.AGENT_MAX_ROUNDS
+
+
+def test_a_runs_copy_is_read_as_its_own_user_while_it_goes_and_as_a_visitor_afterwards(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+
+    from src import seat_user
+
+    runs = tmp_path / "council-runs"
+    main = runs / "abc" / "main"
+    main.mkdir(parents=True)
+    monkeypatch.setattr(seat_user, "RUNS_ROOT", str(runs))
+    visited = []
+
+    @contextmanager
+    def visitor(root):
+        visited.append(root)
+        yield seat_user.Seat(7)
+
+    monkeypatch.setattr(seat_user, "visitor", visitor)
+    monkeypatch.setattr(seat_user, "available", lambda: True)
+    live = SimpleNamespace(ws=SimpleNamespace(users={"run": seat_user.Seat(2)}, user=seat_user.Seat(2)))
+    monkeypatch.setitem(cwr._LIVE, "abc", live)
+    with cwr._reader("abc", str(main)) as seat:
+        assert seat == seat_user.Seat(2) and visited == []
+    monkeypatch.delitem(cwr._LIVE, "abc")
+    with cwr._reader("abc", str(main)) as seat:
+        assert seat == seat_user.Seat(7) and visited == [str(runs / "abc")]
+    # A copy outside the runs folder (a run made before seat isolation) is no seat user's to visit.
+    with cwr._reader("abc", str(tmp_path / "elsewhere" / "main")) as seat:
+        assert seat is None
+    monkeypatch.setattr(seat_user, "available", lambda: False)
+    with cwr._reader("abc", str(main)) as seat:
+        assert seat is None
+
+
+@needs_git
+def test_a_finished_work_run_closes_its_folder(client, repo, monkeypatch):
+    from src import council_workspace
+
+    closed = []
+    monkeypatch.setattr(council_workspace.Workspace, "close", lambda ws: closed.append(ws.run_id))
+    _seats(monkeypatch)
+    resp = _start(client, _session(client), repo, rounds=1)
+    done = [ev for ev in _events(resp.text) if ev.get("type") == "done"]
+    assert done and closed == [done[0]["run_id"]]

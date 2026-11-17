@@ -320,21 +320,19 @@ def _git_env(**extra: str) -> Dict[str, str]:
     return env
 
 
-def _ask_working_copy(run_git, argv, workdir):
+def _ask_working_copy(run_git, argv, workdir, seat=None):
     """Run a read-only git question in the working copy at ``workdir``.
 
     A council run's working copy is writable by the seats, so its git config
-    is theirs. With seat isolation (src/seat_user.py) the question is put as
-    the seat user, with none of Odysseus's environment, so nothing a seat
-    wrote there runs as Odysseus.
+    is theirs. With seat isolation the caller passes ``seat``, a seat user
+    that can read the copy (src/seat_user.py): the question is put as that
+    user, with none of Odysseus's environment, so nothing a seat wrote there
+    runs as Odysseus.
     """
-    from src import seat_user
-
     plain = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
              "GIT_ASKPASS": ""}
-    if seat_user.available():
-        return run_git(seat_user.argv([argv[0], "-c", "safe.directory=*", *argv[1:]]), workdir,
-                       seat_user.environment(plain))
+    if seat is not None:
+        return run_git(seat.argv([argv[0], "-c", "safe.directory=*", *argv[1:]]), workdir, seat.env(plain))
     return run_git(argv, workdir, _git_env())
 
 
@@ -346,7 +344,7 @@ def _scrub(text: str, *secrets: str) -> str:
 
 
 def push_branch(owner_user: Optional[str], repo: str, workdir: str, branch: str,
-                run_git: Callable[..., Tuple[int, str, str]] = _run_git) -> Dict[str, str]:
+                run_git: Callable[..., Tuple[int, str, str]] = _run_git, seat=None) -> Dict[str, str]:
     """Push ``branch`` from the working copy at ``workdir`` to the same branch on GitHub.
 
     The repository must pass ``check_writable``, the branch must start with
@@ -366,12 +364,12 @@ def push_branch(owner_user: Optional[str], repo: str, workdir: str, branch: str,
 
     plain = _git_env()
     code, out, _err = _ask_working_copy(
-        run_git, ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], workdir)
+        run_git, ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}"], workdir, seat)
     sha = out.strip()
     if code != 0 or not _SHA_RE.match(sha):
         raise GitHubError(f"The working copy has no branch {branch}.")
     code, out, _err = _ask_working_copy(
-        run_git, ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects"], workdir)
+        run_git, ["git", "rev-parse", "--path-format=absolute", "--git-path", "objects"], workdir, seat)
     objects = out.strip()
     if code != 0 or not objects:
         raise GitHubError("That folder is not a git working copy.")

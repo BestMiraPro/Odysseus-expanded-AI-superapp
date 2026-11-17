@@ -13,6 +13,7 @@ import pytest
 
 from src import council_workspace as cw
 from src import seat_user
+from tests.helpers.seat_launcher import fake_launcher
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
 
@@ -482,12 +483,11 @@ posix_only = pytest.mark.skipif(os.name == "nt", reason="the seat user exists on
 def isolated(monkeypatch, tmp_path):
     """Seat isolation as in the container; the fake launcher logs each command and runs it as this user."""
     log = tmp_path / "launched"
-    launcher = tmp_path / "odysseus-seat"
-    launcher.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {log}\nexec "$@"\n')
-    launcher.chmod(0o755)
+    launcher = fake_launcher(tmp_path, f'printf "%s\\n" "$*" >> {log}\nexec "$@"')
     monkeypatch.setattr(seat_user, "LAUNCHER", str(launcher))
     monkeypatch.setattr(seat_user, "_probed", [None])
-    monkeypatch.setattr(seat_user, "_seat_gid", lambda: os.getgid())
+    monkeypatch.setattr(seat_user, "_gid", lambda slot: os.getgid())
+    monkeypatch.setattr(seat_user, "SLOT_DIR", str(tmp_path / "seat-slots"))
     return log
 
 
@@ -532,8 +532,10 @@ def test_with_isolation_seats_trust_the_runs_own_repositories_only(source, tmp_p
     assert [env[f"GIT_CONFIG_KEY_{i}"] for i in range(3)] == ["safe.directory"] * 3
     assert [env[f"GIT_CONFIG_VALUE_{i}"] for i in range(3)] == [str(ws.main), str(ws.workdir("seat-1")),
                                                                 str(ws.workdir("seat-2"))]
+    ws.close()
     monkeypatch.setattr(seat_user, "_probed", ["not in the container"])
-    assert "GIT_CONFIG_COUNT" not in ws.env("seat-1")
+    plain = cw.create_run(source, tmp_path / "plain", "goal", seats=2)
+    assert plain.users == {} and "GIT_CONFIG_COUNT" not in plain.env("seat-1")
 
 
 def _mode(path):
@@ -551,12 +553,65 @@ def test_with_isolation_seats_may_write_only_their_worktrees_and_their_outboxes(
         assert os.stat(path).st_gid == os.getgid()
     for who in ws.senders:
         assert _mode(ws.messages / "outbox" / who) == 0o770
+        assert _mode(ws.root / "homes" / who) == 0o770
     for path in (ws.main, ws.workdir("seat-1")):
         assert _mode(path) & 0o070 == 0o070
     # Every round and every audit puts it back.
     os.chmod(ws.messages, 0o770)
     ws.start_round()
     assert _mode(ws.messages) == 0o750
+
+
+@posix_only
+def test_with_isolation_every_seat_of_a_run_has_a_user_and_a_home_of_its_own(source, tmp_path, isolated):
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=2)
+    run = ws.user
+    seats = [ws.seat(who) for who in ws.senders]
+    # Four users for two seats: the run's own, one per seat, the chairman's.
+    assert len({run.slot, *(seat.slot for seat in seats)}) == 4
+    for who, seat in zip(ws.senders, seats):
+        # Its processes get the run's group, which the repository belongs to,
+        # and its home lasts the run.
+        assert seat.group == run.slot and seat.home == str(ws.root / "homes" / who)
+    assert run.group is None and run.home is None
+
+
+@posix_only
+def test_closing_a_run_shuts_its_folder_and_gives_its_users_back(source, tmp_path, isolated):
+    from tests.helpers.seat_launcher import kills
+
+    ws = cw.create_run(source, tmp_path / "runs", "goal", seats=1)
+    taken = dict(seat_user._held)
+    assert len(taken) == 3
+    before = len(kills(tmp_path))
+    ws.close()
+    assert _mode(ws.root) == 0o700 and seat_user._held == {}
+    # Whatever still ran as any of the run's users is killed.
+    assert len(kills(tmp_path)) == before + 3
+    # Odysseus's git no longer runs in a folder whose users are gone.
+    with pytest.raises(cw.WorkspaceError, match="has ended"):
+        ws.head()
+
+
+@posix_only
+def test_a_run_that_cannot_be_set_up_gives_its_users_back(tmp_path, isolated, monkeypatch):
+    monkeypatch.setattr(cw, "_set_up", lambda ws, path: (_ for _ in ()).throw(cw.WorkspaceError("no")))
+    source = tmp_path / "src"
+    source.mkdir()
+    for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "x"]):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=source, check=True,
+                       capture_output=True)
+    with pytest.raises(cw.WorkspaceError):
+        cw.create_run(str(source), tmp_path / "runs", "goal", seats=1)
+    assert seat_user._held == {}
+
+
+@posix_only
+def test_when_every_seat_user_is_taken_a_run_does_not_start(source, tmp_path, isolated, monkeypatch):
+    monkeypatch.setattr(seat_user, "SLOTS", 2)
+    with pytest.raises(cw.WorkspaceError, match="in use") as exc:
+        cw.create_run(source, tmp_path / "runs", "goal", seats=2)
+    assert exc.value.status == 503 and seat_user._held == {}
 
 
 @posix_only

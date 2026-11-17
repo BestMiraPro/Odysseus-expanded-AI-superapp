@@ -184,15 +184,14 @@ async def _run_tmux_bash(
         await asyncio.sleep(0.5)
 
 
-def _kill(proc) -> None:
+def _kill(proc, seat=None) -> None:
     try:
         proc.kill()
     except PermissionError:
         # A council seat's process runs as the seat user, which only that
         # user may signal (src/seat_user.py).
-        from src import seat_user
-
-        seat_user.kill(proc.pid)
+        if seat is not None:
+            seat.kill(proc.pid)
     except Exception:
         pass
 
@@ -223,6 +222,7 @@ async def _run_subprocess_streaming(
     *,
     timeout: float,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    seat=None,
 ) -> Tuple[str, str, Optional[int], bool]:
     started = time.time()
     stdout_full: list[str] = []
@@ -265,13 +265,13 @@ async def _run_subprocess_streaming(
         await asyncio.wait_for(proc.wait(), timeout=timeout)
     except asyncio.TimeoutError:
         timed_out = True
-        _kill(proc)
+        _kill(proc, seat)
         try:
             await asyncio.wait_for(proc.wait(), timeout=2)
         except Exception:
             pass
     except asyncio.CancelledError:
-        _kill(proc)
+        _kill(proc, seat)
         try:
             await asyncio.wait_for(proc.wait(), timeout=2)
         except Exception:
@@ -367,6 +367,7 @@ class BashTool:
             proc,
             timeout=DEFAULT_BASH_TIMEOUT,
             progress_cb=progress_cb,
+            seat=seat,
         )
         if timed_out:
             return {"error": f"bash: timed out after {DEFAULT_BASH_TIMEOUT}s — process killed", "exit_code": 124, "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
@@ -396,6 +397,7 @@ class PythonTool:
             proc,
             timeout=DEFAULT_PYTHON_TIMEOUT,
             progress_cb=progress_cb,
+            seat=seat,
         )
         if timed_out:
             return {"error": f"python: timed out after {DEFAULT_PYTHON_TIMEOUT}s — process killed", "exit_code": 124, "stdout": _truncate(stdout, MAX_OUTPUT_CHARS), "stderr": _truncate(stderr, MAX_OUTPUT_CHARS)}
