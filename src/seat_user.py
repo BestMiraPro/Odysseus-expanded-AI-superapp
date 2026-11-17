@@ -26,6 +26,11 @@ In the Docker image (Dockerfile, docker/entrypoint.sh):
   group of the run's seats: they share the run's repository with each other
   and with no other run. Each seat's home and outbox there belong to its own
   group.
+- What a seat user sends on the network is filtered by rules the entrypoint
+  sets as root: the internet is open, private addresses (the Compose network,
+  the Docker host) are not, and on localhost only ports ``LOCAL_PORTS_FROM``
+  and up are, where a seat's own test servers get their ports. ``unfiltered()``
+  checks that by having a seat user try a port below that.
 - A seat user cannot read the app's process environment or memory, or signal
   it, because it is another uid; the app cannot signal a seat's processes
   either, so ``Seat.kill`` does it as the seat user. Giving a user back
@@ -40,7 +45,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
 from contextlib import contextmanager
@@ -69,6 +76,8 @@ SLOTS = 64
 # entrypoint makes the folder for the app user alone.
 SLOT_DIR = "/run/odysseus-seats"
 RUNS_ROOT = "/council-runs"
+# On localhost a seat reaches only this port and above (docker/entrypoint.sh).
+LOCAL_PORTS_FROM = 32768
 # The only variables of Odysseus's own environment a seat process inherits.
 # Everything else (tokens, the database URL, proxies with passwords, ...)
 # stays behind; callers add what the seat needs, its model credential included.
@@ -81,7 +90,10 @@ _PROBE = """\
 """
 _PROBE_TIMEOUT = 30
 
+_CONNECT = "import socket, sys; sys.exit(0 if socket.create_connection(('127.0.0.1', int(sys.argv[1])), 5) else 1)"
+
 _probed: Optional[List[Optional[str]]] = None       # [reason or None] once probed
+_filter_probed: Optional[List[Optional[str]]] = None
 _held: Dict[int, int] = {}                          # seat user -> the descriptor holding its lock
 _held_lock = threading.Lock()
 _visiting = threading.Lock()
@@ -273,3 +285,40 @@ def unavailable() -> Optional[str]:
 
 def available() -> bool:
     return unavailable() is None
+
+
+def _probe_filter() -> Optional[str]:
+    why = unavailable()
+    if why:
+        return why
+    # A listener of Odysseus's own, on a port the filter keeps from seats.
+    for port in range(LOCAL_PORTS_FROM - 1, LOCAL_PORTS_FROM - 200, -1):
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", port))
+        except OSError:
+            listener.close()
+            continue
+        try:
+            listener.listen(1)
+            with user() as leased:
+                proc = subprocess.run(leased.argv([sys.executable, "-I", "-c", _CONNECT, str(port)]),
+                                      env=environment(), stdin=subprocess.DEVNULL, capture_output=True,
+                                      timeout=_PROBE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired, SeatsBusy) as exc:
+            return f"the check could not run: {exc}"
+        finally:
+            listener.close()
+        if proc.returncode == 0:
+            return ("a seat user connected to a port of Odysseus's own on localhost (the container needs the "
+                    "NET_ADMIN capability, which docker-compose.yml gives it, for the entrypoint to set the filter)")
+        return None
+    return "no free port to check with"
+
+
+def unfiltered() -> Optional[str]:
+    """Why a seat's network is not filtered here, or None when it is (checked once per process)."""
+    global _filter_probed
+    if _filter_probed is None:
+        _filter_probed = [_probe_filter()]
+    return _filter_probed[0]

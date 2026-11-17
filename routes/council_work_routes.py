@@ -70,7 +70,6 @@ def runs_root() -> Path:
     cannot go (a volume in docker-compose.yml); otherwise council-runs/ under
     the data folder.
     """
-    from src import seat_user
     from src.constants import DATA_DIR
 
     return Path(seat_user.RUNS_ROOT) if seat_user.available() else Path(DATA_DIR) / RUNS_DIRNAME
@@ -91,9 +90,12 @@ def in_docker() -> bool:
 
 def seats_not_isolated() -> Optional[str]:
     """Why the seats' processes cannot run as the separate seat user here, or None when they can."""
-    from src import seat_user
-
     return seat_user.unavailable()
+
+
+def seats_unfiltered() -> Optional[str]:
+    """Why the seats' network is not filtered here, or None when it is."""
+    return seat_user.unfiltered()
 
 
 def unauthenticated_access() -> Optional[str]:
@@ -140,6 +142,10 @@ def _refuse_unsafe(request: Request) -> None:
     if why:
         raise HTTPException(403, f"Work runs only start when every seat runs as the separate seat user, which "
                                  f"cannot read Odysseus's sessions, GitHub token or database, and here {why}.")
+    why = seats_unfiltered()
+    if why:
+        raise HTTPException(403, f"Work runs only start when the seats' network is filtered, so a seat's shell "
+                                 f"reaches the internet but not the services next to Odysseus, and here {why}.")
     why = unauthenticated_access()
     if why:
         raise HTTPException(403, f"Work runs need login on for every caller, and {why}: a seat's shell could "

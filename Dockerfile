@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     gosu \
     socat \
+    iptables \
     libgl1 \
     libglib2.0-0t64 \
     libxcb1 \

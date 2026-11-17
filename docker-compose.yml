@@ -1,6 +1,11 @@
 services:
   odysseus:
     build: .
+    # The entrypoint filters what Council seats can reach on the network
+    # (docker/entrypoint.sh, THREAT_MODEL.md), which takes NET_ADMIN. It is
+    # used as root before the app starts; the app's own user never holds it.
+    cap_add:
+      - NET_ADMIN
     ports:
       - "${APP_BIND:-127.0.0.1}:${APP_PORT:-7000}:7000"
       # Omnigent's chat web UI, bridged from its in-container loopback port.

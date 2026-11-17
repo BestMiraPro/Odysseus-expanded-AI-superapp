@@ -60,6 +60,7 @@ def allowed(monkeypatch, tmp_path):
     """Everything a work run needs: Docker, seat isolation, login on for everyone, alice an admin."""
     monkeypatch.setattr(cwr, "in_docker", lambda: True)
     monkeypatch.setattr(cwr, "seats_not_isolated", lambda: None)
+    monkeypatch.setattr(cwr, "seats_unfiltered", lambda: None)
     monkeypatch.delenv("AUTH_ENABLED", raising=False)
     monkeypatch.delenv("LOCALHOST_BYPASS", raising=False)
     monkeypatch.setattr("src.tool_security.owner_is_admin_or_single_user", lambda owner: owner == "alice")
@@ -261,6 +262,15 @@ def test_a_work_run_is_refused_when_an_unauthenticated_caller_could_get_in(clien
         monkeypatch.setenv(key, value)
     resp = _start(client, _session(client), repo)
     assert resp.status_code == 403 and words in resp.json()["detail"] and "login" in resp.json()["detail"]
+    assert _no_turns(db)
+
+
+@needs_git
+def test_a_work_run_is_refused_when_the_seats_network_is_not_filtered(client, db, repo, monkeypatch):
+    monkeypatch.setattr(cwr, "seats_unfiltered", lambda: "a seat user connected to a port of Odysseus's own")
+    resp = _start(client, _session(client), repo)
+    detail = resp.json()["detail"]
+    assert resp.status_code == 403 and "network is filtered" in detail and "connected to a port" in detail
     assert _no_turns(db)
 
 

@@ -111,6 +111,62 @@ install -d -o "$PUID" -g "$PGID" -m 0700 /run/odysseus-seats
 chown "$PUID:$PGID" /council-runs 2>/dev/null || true
 chmod 0711 /council-runs 2>/dev/null || true
 
+# Council seats' network (src/seat_user.py, THREAT_MODEL.md). Whatever a seat
+# user sends is filtered here, as root, before the app starts:
+#   - the internet stays open (the seat's model, package indexes, the web);
+#   - private and link-local addresses are refused: the other services on the
+#     Compose network, the Docker host and its LAN;
+#   - on localhost only ports 32768 and up are open, where a seat's own test
+#     servers get their ports. Odysseus and what it starts listen below that.
+# The name servers in /etc/resolv.conf stay reachable for DNS, and so does
+# each host:port in ODYSSEUS_SEAT_NET_ALLOW (comma-separated; for example a
+# model server on the Docker host that the seats should test against).
+# Needs the NET_ADMIN capability (docker-compose.yml grants it). Without it
+# nothing is filtered, the app sees that (seat_user.unfiltered) and work runs
+# do not start.
+SEAT_UIDS="$(getent passwd | awk -F: '$1 ~ /^odysseus-seat-[0-9]+$/ { print $3 }' | sort -n | sed -n '1p;$p' | paste -sd- -)"
+seat_filter() {
+    ipt="$1"; shift
+    "$ipt" -w -N ODYSSEUS_SEATS 2>/dev/null || "$ipt" -w -F ODYSSEUS_SEATS || return 1
+    "$ipt" -w -C OUTPUT -m owner --uid-owner "$SEAT_UIDS" -j ODYSSEUS_SEATS 2>/dev/null \
+        || "$ipt" -w -I OUTPUT -m owner --uid-owner "$SEAT_UIDS" -j ODYSSEUS_SEATS || return 1
+    for proto in tcp udp; do
+        "$ipt" -w -A ODYSSEUS_SEATS -o lo -p "$proto" --dport 32768:65535 -j ACCEPT || return 1
+    done
+    "$ipt" -w -A ODYSSEUS_SEATS -o lo -j REJECT || return 1
+    for net in "$@"; do
+        "$ipt" -w -A ODYSSEUS_SEATS -d "$net" -j REJECT || return 1
+    done
+}
+seat_network() {
+    [ -n "$SEAT_UIDS" ] && command -v iptables >/dev/null 2>&1 || return 1
+    seat_filter iptables 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 \
+        127.0.0.0/8 0.0.0.0/8 || return 1
+    # Exceptions go in front of the refusals. Docker's own resolver at
+    # 127.0.0.11 answers on a port it picks itself, so every port of it is open.
+    for ns in $(awk '$1 == "nameserver" && $2 !~ /:/ { print $2 }' /etc/resolv.conf 2>/dev/null); do
+        if [ "$ns" = 127.0.0.11 ]; then
+            iptables -w -I ODYSSEUS_SEATS -d "$ns" -j ACCEPT || return 1
+        else
+            for proto in tcp udp; do
+                iptables -w -I ODYSSEUS_SEATS -d "$ns" -p "$proto" --dport 53 -j ACCEPT || return 1
+            done
+        fi
+    done
+    for entry in $(printf '%s' "${ODYSSEUS_SEAT_NET_ALLOW:-}" | tr ',' ' '); do
+        host="${entry%:*}"; port="${entry##*:}"
+        for ip in $(getent ahostsv4 "$host" 2>/dev/null | awk '{ print $1 }' | sort -u); do
+            iptables -w -I ODYSSEUS_SEATS -d "$ip" -p tcp --dport "$port" -j ACCEPT \
+                || echo "Seat network: could not open $entry" >&2
+        done
+    done
+    # IPv6, where the container has it.
+    if [ -s /proc/net/if_inet6 ]; then
+        seat_filter ip6tables ::1/128 fc00::/7 fe80::/10 || return 1
+    fi
+}
+seat_network || echo "Seat network: not filtered (no NET_ADMIN capability?). Council work runs will not start." >&2
+
 # Cookbook installs vllm/etc. via `pip install --user`, which pulls
 # nvidia-cuda-* wheels into /app/.local but does not set CUDA_HOME or
 # symlink /usr/local/cuda. vllm 0.22+ then crashes during engine init

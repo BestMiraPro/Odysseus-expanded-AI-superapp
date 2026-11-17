@@ -33,8 +33,13 @@ trap cleanup EXIT INT TERM
 
 # The data and logs folders are bind mounts, as in docker-compose.yml.
 # /council-runs stays the image's own folder here, a real Linux filesystem as
-# the compose volume is.
-docker run -d --name "$NAME" \
+# the compose volume is. NET_ADMIN as in docker-compose.yml.
+# Without NET_ADMIN the entrypoint cannot filter the seats' network: the app
+# must notice, so that work runs do not start.
+echo "Without the NET_ADMIN capability:"
+docker run --rm "$IMAGE" python -c "from src import seat_user; why = seat_user.unfiltered(); print('  unfiltered:', why); raise SystemExit(0 if why else 1)"
+
+docker run -d --name "$NAME" --cap-add NET_ADMIN \
     -v "$tmp/data:/app/data" -v "$tmp/logs:/app/logs" \
     -e AUTH_ENABLED=true -e LOCALHOST_BYPASS=false \
     "$IMAGE" >/dev/null
@@ -55,4 +60,7 @@ except urllib.error.HTTPError:
     sleep 2
 done
 
+echo "The seats' network rules:"
+docker exec "$NAME" iptables -S ODYSSEUS_SEATS
+docker exec "$NAME" iptables -S OUTPUT
 docker exec -i -w /app "$NAME" gosu odysseus python - < scripts/seat_isolation_probe.py

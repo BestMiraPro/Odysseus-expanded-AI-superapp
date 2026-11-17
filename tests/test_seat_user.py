@@ -26,6 +26,7 @@ posix_only = pytest.mark.skipif(os.name == "nt", reason="the seat users exist on
 @pytest.fixture(autouse=True)
 def fresh_probe(monkeypatch, tmp_path):
     monkeypatch.setattr(seat_user, "_probed", None)
+    monkeypatch.setattr(seat_user, "_filter_probed", None)
     monkeypatch.setattr(seat_user, "SLOT_DIR", str(tmp_path / "slots"))
 
 
@@ -187,6 +188,46 @@ def test_a_finished_run_opens_to_one_visitor_and_closes_again(monkeypatch, tmp_p
         assert isinstance(seat, seat_user.Seat)
         assert stat.S_IMODE(os.stat(root).st_mode) == 0o2750
     assert stat.S_IMODE(os.stat(root).st_mode) == 0o700
+
+
+@posix_only
+def test_a_seat_user_that_reaches_a_low_port_on_localhost_means_no_filter(monkeypatch, tmp_path):
+    # The stand-in launcher filters nothing: the connection gets through.
+    _in_container(monkeypatch, _launcher(tmp_path))
+    monkeypatch.setattr(seat_user, "_probed", [None])
+    why = seat_user.unfiltered()
+    assert why and "connected to a port" in why and "NET_ADMIN" in why
+
+
+@posix_only
+def test_a_seat_user_kept_from_a_low_port_on_localhost_is_filtered(monkeypatch, tmp_path):
+    seen = tmp_path / "seen"
+    _in_container(monkeypatch, _launcher(tmp_path, f'echo "$@" > {seen}; exit 1'))
+    monkeypatch.setattr(seat_user, "_probed", [None])
+    assert seat_user.unfiltered() is None
+    port = int(seen.read_text().split()[-1])
+    assert port < seat_user.LOCAL_PORTS_FROM
+    # Checked once per process.
+    seen.unlink()
+    assert seat_user.unfiltered() is None and not seen.exists()
+
+
+def test_without_seat_users_the_network_is_not_filtered_either(monkeypatch):
+    monkeypatch.setattr(seat_user, "_probed", ["Odysseus is not running in its Docker container"])
+    assert "container" in seat_user.unfiltered()
+
+
+def test_the_entrypoint_filters_the_seat_users_network_and_compose_lets_it():
+    root = Path(__file__).resolve().parents[1]
+    entrypoint = (root / "docker" / "entrypoint.sh").read_text(encoding="utf-8")
+    assert f"--dport {seat_user.LOCAL_PORTS_FROM}:65535 -j ACCEPT" in entrypoint
+    assert '-m owner --uid-owner "$SEAT_UIDS" -j ODYSSEUS_SEATS' in entrypoint
+    for net in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "127.0.0.0/8", "fc00::/7"):
+        assert net in entrypoint
+    assert "iptables" in (root / "Dockerfile").read_text(encoding="utf-8")
+    for name in ("docker-compose.yml", "docker-compose.gpu-nvidia.yml", "docker-compose.gpu-amd.yml"):
+        compose = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+        assert compose["services"]["odysseus"]["cap_add"] == ["NET_ADMIN"], name
 
 
 def test_the_launcher_source_switches_only_to_the_compiled_in_seat_users():
