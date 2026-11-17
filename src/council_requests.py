@@ -53,8 +53,8 @@ FORMAT = (
 )
 
 HELP = (
-    "\nGitHub: Odysseus pushes the run's branch to GitHub after each round that changes it; never push it "
-    "yourself. Opening a pull request and merging one need the owner's approval, which only the owner can give, "
+    "\nGitHub: Odysseus pushes the run's branch to GitHub after each round that changes it, unless it tells "
+    "you it holds the push for the owner; never push it yourself. Opening a pull request and merging one need the owner's approval, which only the owner can give, "
     "one request at a time, in the Odysseus page.\n" + FORMAT + "\n"
     "A request covers the run's branch exactly as it is committed in the main copy when Odysseus reads your "
     "message, so ask once that work is committed there (usually the chairman, after integrating). If the branch "

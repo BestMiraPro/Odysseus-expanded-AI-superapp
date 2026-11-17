@@ -319,6 +319,12 @@ class Workspace:
                 left.append(who)
         return left
 
+    def workflows(self) -> List[str]:
+        """The GitHub Actions workflow files in main's HEAD (a push of the branch could start them)."""
+        listed = git(["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", ".github/workflows"], self.main,
+                     seat=self.user).stdout
+        return [name for name in listed.split("\0") if name]
+
     def keep(self, who: str, round_no: int) -> str:
         """Save ``who``'s branch as ``kept/round-N/<who>`` (the next round resets the seat); returns that name."""
         name = f"kept/round-{round_no}/{who}"

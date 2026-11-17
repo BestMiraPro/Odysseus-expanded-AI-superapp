@@ -1403,6 +1403,7 @@ function pushNote(w) {
     return `<span class="council-usage" title="${esc(`Odysseus pushed ${w.pushed.sha} to ${w.pushed.branch} in ${w.repo || ''}`)}">pushed ${esc(String(w.pushed.sha || '').slice(0, 10))}</span>`;
   }
   if (w.push_error) return `<span class="council-usage" title="${esc(w.push_error)}">push failed</span>`;
+  if (w.push_held) return `<span class="council-usage" title="${esc(w.push_held)}">not pushed</span>`;
   return '';
 }
 

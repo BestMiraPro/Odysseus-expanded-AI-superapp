@@ -331,6 +331,26 @@ def test_a_round_that_moved_main_is_pushed_and_one_that_did_not_is_not(github, c
 
 
 @needs_git
+def test_a_branch_with_workflows_is_not_pushed_until_the_owner_approves_a_pull_request(github, client, db, repo,
+                                                                                      monkeypatch):
+    from tests.test_council_workspace import _commit
+
+    # A push could start these on what the seats wrote, with the repository's secrets.
+    _commit(repo, ".github/workflows/ci.yml", "on: push\njobs: {}\n")
+    _, events, (t1, t2), _ = _run(client, repo, github, monkeypatch, {}, rounds=2)
+    w1, w2 = t1["work"], t2["work"]
+    assert events[-1]["reason"] == "max_rounds" and w1["head_sha"] != w1["base_sha"]
+    assert github.git.pushes == [] and github.writes() == []
+    assert w1["pushed"] is None and w1["push_error"] is None and "workflows" in w1["push_held"]
+    assert "workflows" in w2["push_held"] and not w1["github_off"]
+    # The seats are told once, and how the branch does reach GitHub.
+    (notice,) = [m for m in _odysseus_to(t1, "all") if "does not push this run's branch" in m["text"]]
+    assert "approves a request to open a pull request" in notice["text"]
+    # Round 2 holds its push too and does not repeat the notice (it is in that round's brief).
+    assert not [m for m in _odysseus_to(t2, "all") if m["text"].startswith("Odysseus does not push")]
+
+
+@needs_git
 def test_an_organisation_repository_gets_no_push_a_notice_and_the_run_goes_on(github, client, db, repo, monkeypatch):
     _, events, (t1, t2), _ = _run(client, repo, github, monkeypatch, {}, origin="https://github.com/augustalabs/x.git",
                                   rounds=2)

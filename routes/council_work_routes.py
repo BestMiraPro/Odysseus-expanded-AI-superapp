@@ -63,6 +63,11 @@ _LIVE: Dict[str, "_WorkRun"] = {}
 _WORK_LOCK = threading.Lock()
 
 
+PUSH_HELD = ("Odysseus does not push this run's branch to GitHub after each round: the branch holds GitHub Actions "
+             "workflows (.github/workflows), and a push could run them on work the owner has not seen. The branch "
+             "is pushed when the owner approves a request to open a pull request.")
+
+
 def runs_root() -> Path:
     """Where run folders live; they are kept when a run ends.
 
@@ -499,6 +504,7 @@ class _WorkRun:
         self.repo = repo                                     # owner/name of the GitHub origin, or None
         self.github_off = github_off                         # why the run has no GitHub features, or None
         self.outcomes: List[Notice] = []                     # the owner's decisions, for the seats
+        self.push_held_told = False                          # the seats were told why rounds are not pushed
         self.turns: Dict[int, str] = {}                      # round -> turn id
         self.works: Dict[str, Dict[str, Any]] = {}           # turn id -> its work data as last saved
         self.saved: set = set()                              # turn ids whose round reached save_round
@@ -527,6 +533,7 @@ class _WorkRun:
             "github_off": self.github_off,
             "pushed": record.get("pushed"),
             "push_error": record.get("push_error"),
+            "push_held": record.get("push_held"),
         }
 
     def first_notices(self) -> List[Notice]:
@@ -562,9 +569,19 @@ class _WorkRun:
                               "the owner can approve it, in the Odysseus page; Odysseus tells you when they decide.")
 
     async def after_round(self, record: Dict[str, Any]) -> List[Notice]:
-        """Push the run's branch when this round moved main. A refusal turns GitHub off for the rest of the run."""
+        """Push the run's branch when this round moved main. A refusal turns GitHub off for the rest of the run.
+
+        Not when the branch holds GitHub Actions workflows: a push could start
+        them, running what the seats wrote with the repository's secrets
+        before the owner has seen it. The branch then reaches GitHub only
+        with a pull request the owner approves (``_carry_out`` pushes it).
+        """
         if self.github_off or record.get("head") == record.get("base"):
             return []
+        if await asyncio.to_thread(self.ws.workflows):
+            record["push_held"] = PUSH_HELD
+            told, self.push_held_told = self.push_held_told, True
+            return [] if told else [Notice("all", PUSH_HELD)]
         try:
             pushed = await asyncio.to_thread(github_access.push_branch, self.owner, self.repo, str(self.ws.main),
                                              self.ws.branch, seat=self.ws.user)

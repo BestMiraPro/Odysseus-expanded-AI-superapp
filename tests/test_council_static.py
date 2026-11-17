@@ -130,6 +130,7 @@ def test_a_round_shows_its_requests_with_approve_and_deny():
 
 def test_a_round_shows_what_was_pushed():
     assert "w.pushed" in _function("pushNote") and "w.push_error" in _function("pushNote")
+    assert "w.push_held" in _function("pushNote")
     assert "pushNote(w)" in _function("renderTurn")
 
 
